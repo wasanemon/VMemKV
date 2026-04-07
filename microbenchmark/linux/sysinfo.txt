@@ -1,0 +1,83 @@
+=== Date ===
+Mon Apr  6 03:50:15 PM JST 2026
+
+=== OS ===
+NAME="Rocky Linux"
+VERSION="9.3 (Blue Onyx)"
+ID="rocky"
+ID_LIKE="rhel centos fedora"
+VERSION_ID="9.3"
+PLATFORM_ID="platform:el9"
+PRETTY_NAME="Rocky Linux 9.3 (Blue Onyx)"
+ANSI_COLOR="0;32"
+LOGO="fedora-logo-icon"
+CPE_NAME="cpe:/o:rocky:rocky:9::baseos"
+HOME_URL="https://rockylinux.org/"
+BUG_REPORT_URL="https://bugs.rockylinux.org/"
+SUPPORT_END="2032-05-31"
+ROCKY_SUPPORT_PRODUCT="Rocky-Linux-9"
+ROCKY_SUPPORT_PRODUCT_VERSION="9.3"
+REDHAT_SUPPORT_PRODUCT="Rocky Linux"
+REDHAT_SUPPORT_PRODUCT_VERSION="9.3"
+
+=== Kernel ===
+5.14.0-362.18.1.el9_3.x86_64
+
+=== CPU ===
+Architecture:                       x86_64
+CPU op-mode(s):                     32-bit, 64-bit
+Address sizes:                      46 bits physical, 48 bits virtual
+Byte Order:                         Little Endian
+CPU(s):                             8
+On-line CPU(s) list:                0-7
+Vendor ID:                          GenuineIntel
+Model name:                         Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz
+CPU family:                         6
+Model:                              85
+Thread(s) per core:                 1
+Core(s) per socket:                 1
+Socket(s):                          8
+Stepping:                           4
+BogoMIPS:                           3990.62
+Flags:                              fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault invpcid_single pti ssbd ibrs ibpb stibp tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm mpx avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat vnmi umip pku ospke md_clear arch_capabilities
+Virtualization:                     VT-x
+Hypervisor vendor:                  KVM
+Virtualization type:                full
+L1d cache:                          256 KiB (8 instances)
+L1i cache:                          256 KiB (8 instances)
+L2 cache:                           32 MiB (8 instances)
+L3 cache:                           128 MiB (8 instances)
+NUMA node(s):                       1
+NUMA node0 CPU(s):                  0-7
+Vulnerability Gather data sampling: Unknown: Dependent on hypervisor status
+Vulnerability Itlb multihit:        Not affected
+Vulnerability L1tf:                 Mitigation; PTE Inversion; VMX conditional cache flushes, SMT disabled
+Vulnerability Mds:                  Mitigation; Clear CPU buffers; SMT Host state unknown
+Vulnerability Meltdown:             Mitigation; PTI
+Vulnerability Mmio stale data:      Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+Vulnerability Retbleed:             Mitigation; IBRS
+Vulnerability Spec rstack overflow: Not affected
+Vulnerability Spec store bypass:    Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:           Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:           Mitigation; IBRS, IBPB conditional, STIBP disabled, RSB filling, PBRSB-eIBRS Not affected
+Vulnerability Srbds:                Not affected
+Vulnerability Tsx async abort:      Mitigation; Clear CPU buffers; SMT Host state unknown
+
+=== Memory ===
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       490Mi        13Gi        12Mi       1.3Gi        14Gi
+Swap:             0B          0B          0B
+
+=== THP ===
+[always] madvise never
+
+=== Compiler ===
+g++ (GCC) 11.4.1 20230605 (Red Hat 11.4.1-2)
+Copyright (C) 2021 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+
+=== Storage (data file device) ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vda2       120G  106G   14G  89% /

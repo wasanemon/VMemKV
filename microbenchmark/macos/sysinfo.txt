@@ -1,0 +1,33 @@
+=== Date ===
+Mon Apr  6 15:45:18 JST 2026
+
+=== OS ===
+ProductName:		macOS
+ProductVersion:		15.1
+BuildVersion:		24B2083
+
+=== Hardware ===
+      Model Name: MacBook Pro
+      Model Identifier: Mac16,8
+      Model Number: Z1FB000XHJ/A
+      Chip: Apple M4 Pro
+      Total Number of Cores: 12 (8 performance and 4 efficiency)
+      Memory: 48 GB
+
+=== CPU details ===
+Apple M4 Pro
+Logical CPUs: 12
+Physical CPUs: 12
+
+=== Memory ===
+Total: 48 GB
+
+=== Compiler ===
+Apple clang version 16.0.0 (clang-1600.0.26.6)
+Target: arm64-apple-darwin24.1.0
+Thread model: posix
+InstalledDir: /Library/Developer/CommandLineTools/usr/bin
+
+=== Storage (data file device) ===
+Filesystem      Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk3s5   460Gi   329Gi   102Gi    77%    1.8M  1.1G    0%   /System/Volumes/Data

@@ -1,0 +1,61 @@
+# =============================
+# OS / file manager artifacts
+# =============================
+.DS_Store
+**/.DS_Store
+Thumbs.db
+Desktop.ini
+
+# =============================
+# Editor / IDE artifacts
+# =============================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# =============================
+# C++ / build system artifacts
+# =============================
+build/
+**/build/
+
+CMakeFiles/
+**/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+
+Makefile
+*.ninja
+.ninja_*
+compile_commands.json
+
+# =============================
+# Compiled objects / binaries
+# =============================
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.dSYM/
+
+# =============================
+# Logs / temporary files
+# =============================
+*.log
+*.tmp
+*.temp
+*.bak
+
+# =============================
+# Markdown tooling cache
+# =============================
+.markdownlintcache

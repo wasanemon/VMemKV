@@ -1,0 +1,37 @@
+{
+  "config": {
+    "total_size_gb":    96,
+    "value_size_bytes": 4096,
+    "num_operations":   1000000,
+    "warmup_ops":       50000,
+    "lru_cache_pages":  20000,
+    "zipf_alpha":       1.00,
+    "zipf_n_pages":     25165824,
+    "prefault_mmap":        false,
+    "prefetch_ahead_pages": 0,
+    "threads":              1,
+    "scan_width":           0,
+    "huge_pages":           false
+  },
+  "results": {
+    "mmap": {
+      "throughput_ops_per_sec": 18545.4,
+      "latency_p50_us":          0.235,
+      "latency_p95_us":          166.422,
+      "latency_p99_us":          175.413,
+      "latency_p999_us":         190.965,
+      "total_time_sec":           53.922
+    },
+    "pread_lru": {
+      "throughput_ops_per_sec": 13147.9,
+      "latency_p50_us":          126.009,
+      "latency_p95_us":          165.875,
+      "latency_p99_us":          177.363,
+      "latency_p999_us":         196.372,
+      "total_time_sec":           76.058,
+      "cache_hit_rate":          0.4952,
+      "cache_hits":              495189,
+      "cache_misses":            504811
+    }
+  }
+}
