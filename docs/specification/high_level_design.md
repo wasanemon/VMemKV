@@ -24,7 +24,7 @@ FaultKVが不利な条件:
 - 超低遅延ストレージ
 - hot set が RAMに収まらない / 一様分布
 
-この条件はマイクロベンチマークの性能評価の結果に基づいている。評価については [microbenchmark/REPORT.md](../microbenchmark/REPORT.md) を参照。
+この条件はマイクロベンチマークの性能評価の結果に基づいている。評価については [microbenchmark/REPORT.md](../../microbenchmark/REPORT.md) を参照。
 
 ## 2. Features と Limitations
 
