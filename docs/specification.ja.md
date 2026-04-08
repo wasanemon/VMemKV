@@ -1,12 +1,12 @@
-# FaultKV: OS-Driven Larger-than-Memory KVS
+# VMemKV: OS-Driven Larger-than-Memory KVS
 
 ## 1. 概要
 
-**FaultKV** は、データ管理を **OS の仮想メモリシステムおよびfile-backed memory map (mmap) 機構** になるべく移譲するよう設計されたKVSである。
-`fork()` ベースのスナップショット、`mincore()` によるホット/コールドデータ検出、`mmap()` によるオンデマンドページロードなどを組み合わせることで、FaultKV は極めてシンプルなコードベースで堅牢なLarger-than-memory KVS を実現する。バッファプール、LRUによるページ置換アルゴリズム、Pointer swizzling、複雑なコンパクションといった従来コンポーネントを OS ネイティブのプリミティブに置き換え，シンプルなコードベースで実現する。
+**VMemKV** は、データ管理を **OS の仮想メモリシステムおよびfile-backed memory map (mmap) 機構** になるべく移譲するよう設計されたKVSである。
+`fork()` ベースのスナップショット、`mincore()` によるホット/コールドデータ検出、`mmap()` によるオンデマンドページロードなどを組み合わせることで、VMemKV は極めてシンプルなコードベースで堅牢なLarger-than-memory KVS を実現する。バッファプール、LRUによるページ置換アルゴリズム、Pointer swizzling、複雑なコンパクションといった従来コンポーネントを OS ネイティブのプリミティブに置き換え，シンプルなコードベースで実現する。
 
-FaultKVの非常に抽象化されたイメージは以下
-![alt text](images/faultkv_livereload.png)
+VMemKVの非常に抽象化されたイメージは以下
+![alt text](images/vmemkv_livereload.png)
 
 - メモリ上のバッファを Read-only region と Read/write region に分割する
 - 定期的に `fork()` し，バックグラウンドスレッドが全領域をソートする
@@ -15,21 +15,21 @@ FaultKVの非常に抽象化されたイメージは以下
 
 ## 2. Features & Limitations
 
-### What FaultKV can do:
+### What VMemKV can do:
 
 - **Larger-than-memory:** メモリ量を超えるデータを扱える．
 - **KVSインタフェース** Get / Update / Insert / Delete / ScanいわゆるCRUDL操作をサポートする．
 - **永続性:** WAL およびチェックポイントによりデータ整合性を保証する．
 - **シンプルなコードベース:** OS の仮想メモリ管理を活用することで、従来のKVSに必要な複雑なバッファ管理やページ置換ロジックを排除する．
 
-### What FaultKV cannot do:
+### What VMemKV cannot do:
 
 - **トランザクション:** 単一の Put/Delete 操作は原子であるが、複数操作のアトミックなグループ化はサポートしない。
 - **ファントム回避:** Get/Scan は、存在するキーを見逃す可能性がある。完全なファントム回避には、Precision Locking などの外部メカニズムが必要である。
 
 ## 3. SnapLog\<T\>
 
-FaultKVの設計を説明する前に，設計の中心となる重要なデータ構造 **SnapLog** を導入する．
+VMemKVの設計を説明する前に，設計の中心となる重要なデータ構造 **SnapLog** を導入する．
 
 **SnapLog\<T\>** は，読み取り専用の Read only stable regionと，追記専用の Append-only region を組み合わせた抽象データ構造である．
 SnapLogは以下のコンポーネントで構成される．
@@ -56,18 +56,18 @@ SnapLog は定期的にバックグラウンドのスレッドが `ap_region` �
 
 ## 4. High Level Design
 
-FaultKVは 2つのSnapLogインスタンスを二層構成で使用するKVSである．
+VMemKVは 2つのSnapLogインスタンスを二層構成で使用するKVSである．
 それぞれ **Tier 1 (memtable)** と **Tier 2 (Giant Buffer)** と呼ばれる。Tier 1 は固定長のインデックスエントリを保持する `SnapLog<IndexEntry>`であり、Tier 2 は生のキーバリューデータを保持するストレージ `SnapLog<ValueEntry>`である。
-Tier 1 はすべてメモリ上に存在し， `mlock()` によってスワップアウトを拒否する．FaultKVのすべてのキーが保持される．具体的には，Tier 1 に8GBのメモリを割り当てるとき，約2億エントリを保持できる（32バイト）．
+Tier 1 はすべてメモリ上に存在し， `mlock()` によってスワップアウトを拒否する．VMemKVのすべてのキーが保持される．具体的には，Tier 1 に8GBのメモリを割り当てるとき，約2億エントリを保持できる（32バイト）．
 Tier 2 はより大きなサイズで設計され、メモリ量を超えることが想定され，OSのファイルバック `mmap` を利用する．
 
-![alt text](images/faultkv.png)
+![alt text](images/vmemkv.png)
 IndexEntry は 各キーのprefixとhash値，そしてTier 2 におけるオフセットを持つ．
 ValueEntry は 実際のキーと値のペアを保持する可変長構造体である．
 
 ### 基本操作
 
-FaultKVは以下のような手続きでKeyからValueにアクセスする．
+VMemKVは以下のような手続きでKeyからValueにアクセスする．
 
 以下は `Get(key)` の例である．
 
@@ -83,14 +83,14 @@ FaultKVは以下のような手続きでKeyからValueにアクセスする．
 
 ### Checkpoint & Live Reload
 
-FaultKVは，定期的にチェックポイントを実行する．このチェックポイントが，永続性を保証し，かつFaultKVの順序断片化と空間断片化を制御する．
+VMemKVは，定期的にチェックポイントを実行する．このチェックポイントが，永続性を保証し，かつVMemKVの順序断片化と空間断片化を制御する．
 具体的には，`fork()` を用いて子プロセスを生成し、断片化を解消した新たなチェックポイントファイルを生成し，永続化する．親プロセスにはそのファイルを `mmap()` して新しいSnapLogインスタンスとして切り替えさせる．
 この一連の流れを **Live Reload** と呼ぶ．
 
 断片化を解消することは，Tier 1 については SnapLog の章で説明したものと全く同一のロジックで実行できる．
 Tier 2 については，key が Tier 1 にしか存在しないことから，キーを使ってソートする処理がTier 2 単独では実行できないため，Tier 1 の助けを借りてマージ処理を行う．具体的には，以下の手続きを取る．
 
-![alt text](images/faultkv_t2_reorganization.png)
+![alt text](images/vmemkv_t2_reorganization.png)
 
 1. Tier 1 の Background Merge を行う．
 2. `fork()` を行い別のプロセスに移動する．
@@ -109,7 +109,7 @@ Live Reload は，断片化が性能に悪影響を与える前に定期的に�
 
 ### Durability
 
-FaultKVは，WAL（Write-Ahead Log）を用いて、すべての更新操作の永続性を保証する．
+VMemKVは，WAL（Write-Ahead Log）を用いて、すべての更新操作の永続性を保証する．
 更新操作（Insert/Update/Delete）が発生すると、まず WAL にレコードが追記され、`fsync` される．これにより、障害が発生しても WAL をリプレイすることで、最後のコミットされた状態まで復旧できる．
 チェックポイント中あるいはBackground Merge中に発生した書き込みも，WALに永続化されている．
 チェックポイントはTier 1 と Tier 2 の両方を永続化するため、チェックポイント完了後は古い WAL ファイルを安全に削除できる．
@@ -159,11 +159,11 @@ struct SnapLog {
 | `scan(func)`    | `ro_region` と `ap_region` の全エントリに対して `func` を適用し，ヒットするエントリを返却する．`ro_region` からは二分探索，`ap_region` からは線形探索を行う。 |
 | `reorganize()`  | `background_merger` スレッドを起動し、`ap_region` のエントリをマージして `ro_region` に統合する。                                                             |
 
-### 5.2 FaultKV
+### 5.2 VMemKV
 
 ```cpp
 
-class FaultKV {
+class VMemKV {
 
     // 32バイト構造体 — 64B キャッシュラインに2エントリ収容
     struct IndexEntry {
@@ -188,7 +188,7 @@ class FaultKV {
 };
 ```
 
-### 5.3 FaultKV Operations
+### 5.3 VMemKV Operations
 
 - **Get:**
   1. `t1.scan()` で `key_prefix` が一致するエントリを収集し，`hash` と `hash(key)` を比較して `IndexEntry` を特定する．見つからなければ `NOT_FOUND` を返す．
@@ -244,7 +244,7 @@ class FaultKV {
 
 本節の最適化はすべてオプトインであり、互いに独立している。§5 で説明したシステムはこれらを一切有効化しなくても正しく動作する。各最適化は特定の性能特性を改善する。
 
-FaultKVに以下の追加フィールドを導入する．
+VMemKVに以下の追加フィールドを導入する．
 
 ```c++
     std::atomic<uint64_t> t2_live_entries{0};  // レコード数: アクティブな（削除されていない）キーバリューペア数
@@ -306,10 +306,10 @@ Scan 時に、Tier 1 から収集したオフセット群に基づいてどの T
 
 ## 付録 A: LineairDB との関係
 
-FaultKV は以下の LineairDB コンポーネントを置き換えるよう設計されている。
+VMemKV は以下の LineairDB コンポーネントを置き換えるよう設計されている。
 
 - **現状（As-is）:** 4つのコンポーネント (ロックフリーハッシュテーブル、Precision Locking インデックス（PLI）、WAL、CPR チェックポイント)。
-- **移行後（To-be）:** 単一の FaultKV インスタンス。同一の API（Get/Put/Delete/Scan）を公開し、同等の耐久性保証を提供する。**注記:** ファントム回避は FaultKV 単体では保証されない。そのためには依然として Precision Locking が必要である。LineairDB は　”FaultKVにトランザクション処理を追加するラッパー" として扱われる．
+- **移行後（To-be）:** 単一の VMemKV インスタンス。同一の API（Get/Put/Delete/Scan）を公開し、同等の耐久性保証を提供する。**注記:** ファントム回避は VMemKV 単体では保証されない。そのためには依然として Precision Locking が必要である。LineairDB は　”VMemKVにトランザクション処理を追加するラッパー" として扱われる．
 
 ## 付録 B: Andy Pavlo 論文の議論
 
@@ -324,25 +324,25 @@ Crotty, Leis, Pavlo（CIDR 2022, "Are You Sure You Want to Use MMAP in Your Data
 | **Page Eviction Ignorance** | OS の page replacement はアプリのアクセスセマンティクスを知らず、重要なページが予期せず evict される |
 | **Error Handling**          | I/O エラーが `SIGBUS` として返り、通常のエラーコードとして処理できない                               |
 
-### B.2 FaultKV における各批判への対応
+### B.2 VMemKV における各批判への対応
 
 **Transaction Safety について**
 
-FaultKV の mmap 領域（Tier 2 の `ro_region`）は**読み取り専用**である。書き込みは常に WAL および `ap_region`（append-only）に対して行われ、mmap を通じて dirty page が生じることはない。論文が問題としている「mmap でデータを直接読み書きする」ケース（旧 PostgreSQL 等）とは根本的に異なる用途であり、この批判は当たらない。
+VMemKV の mmap 領域（Tier 2 の `ro_region`）は**読み取り専用**である。書き込みは常に WAL および `ap_region`（append-only）に対して行われ、mmap を通じて dirty page が生じることはない。論文が問題としている「mmap でデータを直接読み書きする」ケース（旧 PostgreSQL 等）とは根本的に異なる用途であり、この批判は当たらない。
 
 **I/O Stalls について**
 
-この批判は**実在する問題**である。FaultKV はこれを次の設計で軽減する：
+この批判は**実在する問題**である。VMemKV はこれを次の設計で軽減する：
 
 - Tier 1 全体を `mlock()` で RAM に固定し、最重要パスの page fault をゼロにする（§6.1）
 - Checkpoint 時に `MADV_DONTNEED` を活用して、コールドデータで RAM を汚染しないようにする
 - Scan 時に `MADV_WILLNEED` バッチプリフェッチで次アクセスページを先読みする（§6.6）
 
-FaultKV は「クラウド VM のような比較的低速なストレージ（> ~50 µs）＋ hot set が RAM に収まるワークロード」を主要な適用場面として設定している。この条件下では mmap の page cache hit 優位性（~0.2 µs/op）がユーザランド LRU の miss コスト（~150 µs/op）を凌駕することが実測で確認されており，かりに fault が連発する状況でも性能は従来のユーザランド管理方式より悪化しない（[実験レポート](../microbenchmark/REPORT.md)参照）。一方で、アクセス局所性が低いワークロードや、頻繁な eviction が発生する環境では、mmap の性能が大きく劣化する可能性がある．
+VMemKV は「クラウド VM のような比較的低速なストレージ（> ~50 µs）＋ hot set が RAM に収まるワークロード」を主要な適用場面として設定している。この条件下では mmap の page cache hit 優位性（~0.2 µs/op）がユーザランド LRU の miss コスト（~150 µs/op）を凌駕することが実測で確認されており，かりに fault が連発する状況でも性能は従来のユーザランド管理方式より悪化しない（[実験レポート](../microbenchmark/REPORT.md)参照）。一方で、アクセス局所性が低いワークロードや、頻繁な eviction が発生する環境では、mmap の性能が大きく劣化する可能性がある．
 
 **Page Eviction Ignorance について**
 
-Tier 1 は `mlock()` で固定されるため eviction されない。Tier 2 については OS の page replacement に委ねる設計であり、これは FaultKV の意図的な選択である。アクセス局所性が高いワークロードでは OS の LRU と FaultKV のアクセスパターンが整合し、問題になりにくい。また `madvise(MADV_COLD)` / `madvise(MADV_DONTNEED)` でヒントを与える機構を checkpoint 処理で活用している（§5.4）。
+Tier 1 は `mlock()` で固定されるため eviction されない。Tier 2 については OS の page replacement に委ねる設計であり、これは VMemKV の意図的な選択である。アクセス局所性が高いワークロードでは OS の LRU と VMemKV のアクセスパターンが整合し、問題になりにくい。また `madvise(MADV_COLD)` / `madvise(MADV_DONTNEED)` でヒントを与える機構を checkpoint 処理で活用している（§5.4）。
 
 **Error Handling について**
 
@@ -350,7 +350,7 @@ Tier 1 は `mlock()` で固定されるため eviction されない。Tier 2 に
 
 ### B.3 mmap を利用する合理性
 
-上記の制約を踏まえてなお FaultKV が mmap を採用する理由は以下である：
+上記の制約を踏まえてなお VMemKV が mmap を採用する理由は以下である：
 
 1. **Larger-than-memory アクセスの実装コスト削減:** OS の page fault とmmap機構を利用することで、buffer pool manager・clock-sweep・pointer swizzling・page translation table といった従来 DBMS の重量コンポーネントを省略できる。コードベースの単純さはそれ自体が価値である。
 

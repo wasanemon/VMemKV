@@ -1,9 +1,9 @@
-# FaultKV High Level Design
+# VMemKV High Level Design
 
 ## 1. 概要
 
-FaultKV は、データ管理を OS の仮想メモリ機構（mmap, fork, mincore, madvise）へ可能な限り委譲する Larger-than-memory KVS である。
-FaultKVは、以下のコンポーネントから成り立つ。
+VMemKV は、データ管理を OS の仮想メモリ機構（mmap, fork, mincore, madvise）へ可能な限り委譲する Larger-than-memory KVS である。
+VMemKVは、以下のコンポーネントから成り立つ。
 
 - Tier 1: RAM 常駐のインデックス層
 - Tier 2: file-backed mmap を用いた大容量データ層
@@ -11,15 +11,15 @@ FaultKVは、以下のコンポーネントから成り立つ。
 - Checkpoint
 - Background Jobs
 
-FaultKVの狙いは、buffer pool・ページ置換アルゴリズム・複雑なコンパクションなどをOSに任せて、実装を単純に保ちながら実運用が可能な性能を確保することにある。
+VMemKVの狙いは、buffer pool・ページ置換アルゴリズム・複雑なコンパクションなどをOSに任せて、実装を単純に保ちながら実運用が可能な性能を確保することにある。
 競合を挙げると、LSM-Tree (RocksDB, LevelDB) に比肩する性能を持ちながら、Bitcask のようにシンプルな設計で、LMDB よりも大規模データを扱えることを目指す。
 
-FaultKVが有用な条件:
+VMemKVが有用な条件:
 
 - 比較的遅いストレージ（クラウド VM 等）
 - hot set が RAM に収まる
 
-FaultKVが不利な条件:
+VMemKVが不利な条件:
 
 - 超低遅延ストレージ
 - hot set が RAMに収まらない / 一様分布
@@ -41,7 +41,7 @@ FaultKVが不利な条件:
 
 ## 3. 設計の中核: SnapLog
 
-FaultKV の中核は SnapLog と呼ばれる二層構造のログである。
+VMemKV の中核は SnapLog と呼ばれる二層構造のログである。
 SnapLog は以下 2 領域を持つ。
 
 - `ro_region`: sorted / read-only
@@ -59,7 +59,7 @@ SnapLog は以下 2 領域を持つ。
 
 ## 4. 二層アーキテクチャ
 
-FaultKVは、SnapLogを２つ並べた二層構造を採用する。
+VMemKVは、SnapLogを２つ並べた二層構造を採用する。
 
 ### 4.1 Tier 1 (memtable)
 
@@ -73,7 +73,7 @@ FaultKVは、SnapLogを２つ並べた二層構造を採用する。
 - file-backed mmap により larger-than-memory を実現
 
 Tier 1 と Tier 2 の責務分離と、offset で両者を接続するレイアウトを示す。
-![FaultKV two tier layout](../images/faultkv.png)
+![VMemKV two tier layout](../images/vmemkv.png)
 
 ## 5. 操作の例
 
@@ -98,12 +98,12 @@ Tier 1 と Tier 2 の責務分離と、offset で両者を接続するレイア�
 
 ## 6. Checkpoint と Live Reload
 
-FaultKVのCheckpoint は耐久性確保だけでなく、２つの断片化を解消する。
+VMemKVのCheckpoint は耐久性確保だけでなく、２つの断片化を解消する。
 - Ordering Fragmentation: SnapLog の ap_region はunordered で、この領域が大きくなると Get / Scan 性能が劣化する。これを Ordering Fragmentation と呼ぶ。
 - Storage Fragmentation: Tier 1 / 2 ともに Delete を実施するたびに古いエントリが残り続け、ストレージを圧迫する。これを Storage Fragmentation と呼ぶ。
 
 fork と checkpoint file を介した live reload の世代切替フローを示す。
-![FaultKV mmap and live reload](../images/faultkv_livereload.png)
+![VMemKV mmap and live reload](../images/vmemkv_livereload.png)
 
 1. WAL ローテーション
 2. fork で CoW スナップショット
@@ -116,7 +116,7 @@ fork と checkpoint file を介した live reload の世代切替フローを示
 
 ## 7. 障害耐性と WAL
 
-以下の要素で、FaultKVは永続性を保証する。
+以下の要素で、VMemKVは永続性を保証する。
 
 - すべての更新は WAL を先行永続化
 - 障害時は チェックポイントの読み込み + WAL リプレイで復旧
@@ -138,7 +138,7 @@ fork と checkpoint file を介した live reload の世代切替フローを示
 
 ## Appendix A. LMDB とのアーキテクチャ比較
 
-| 観点 | FaultKV | LMDB |
+| 観点 | VMemKV | LMDB |
 | --- | --- | --- |
 | 基本構造 | 2 層 SnapLog（append + merge） | mmap 上の B+tree |
 | 更新戦略 | append 中心、後段再編成 | ページ copy-on-write |
@@ -149,12 +149,12 @@ fork と checkpoint file を介した live reload の世代切替フローを示
 
 ## Appendix B. LineairDB との関係
 
-FaultKV は LineairDB の KVS 部分を置き換える想定で設計される。
+VMemKV は LineairDB の KVS 部分を置き換える想定で設計される。
 
 - As-is: lock-free hashtable, PLI, WAL, CPR など複数要素でKVSを構成
-- To-be: FaultKV 単体を KVS 本体として使用
+- To-be: VMemKV 単体を KVS 本体として使用
 
-LineairDBはFaultKVにConcurrency Controlやテーブル・セカンダリインデックス機能を提供するラッパーとして扱われることになる。
+LineairDBはVMemKVにConcurrency Controlやテーブル・セカンダリインデックス機能を提供するラッパーとして扱われることになる。
 
 
 ## TODO

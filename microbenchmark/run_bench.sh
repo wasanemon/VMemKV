@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_bench.sh — Run all FaultKV microbenchmark experiments (macOS & Linux)
+# run_bench.sh — Run all VMemKV microbenchmark experiments (macOS & Linux)
 #
 # Usage:
 #   chmod +x run_bench.sh

@@ -1,4 +1,4 @@
-# FaultKV
+# VMemKV
 
 OS の仮想メモリ機構（`mmap` / `fork` / `mincore`）に I/O 管理を委譲する、Larger-than-memory KVS。
 
@@ -8,8 +8,8 @@ OS の仮想メモリ機構（`mmap` / `fork` / `mincore`）に I/O 管理を委
 
 | ドキュメント                                         | 概要                                                                |
 | ---------------------------------------------------- | ------------------------------------------------------------------- |
-| [docs/specification/high level design.md](docs/specification/high%20level%20design.md) | FaultKV 高レベル設計（目的・構成・比較・適用範囲）                  |
-| [docs/specification/low level design.md](docs/specification/low%20level%20design.md) | FaultKV 低レベル設計（データ構造・操作手順・最適化・パラメータ）    |
+| [docs/specification/high level design.md](docs/specification/high%20level%20design.md) | VMemKV 高レベル設計（目的・構成・比較・適用範囲）                  |
+| [docs/specification/low level design.md](docs/specification/low%20level%20design.md) | VMemKV 低レベル設計（データ構造・操作手順・最適化・パラメータ）    |
 | [docs/latency_survey.md](docs/latency_survey.md)     | ストレージレイテンシ調査：環境別ランダム 4 KB read レイテンシ参考値 |
 
 ### マイクロベンチマーク（mmap vs pread+LRU）
@@ -27,8 +27,8 @@ OS の仮想メモリ機構（`mmap` / `fork` / `mincore`）に I/O 管理を委
 .
 ├── docs/
 │   ├── specification/
-│   │   ├── high level design.md # FaultKV 高レベル設計
-│   │   └── low level design.md  # FaultKV 低レベル設計
+│   │   ├── high level design.md # VMemKV 高レベル設計
+│   │   └── low level design.md  # VMemKV 低レベル設計
 │   └── latency_survey.md     # ストレージレイテンシ調査
 └── microbenchmark/
     ├── bench.cpp              # ベンチマーク本体

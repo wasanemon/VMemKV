@@ -1,6 +1,6 @@
 # ストレージレイテンシ調査：環境別ランダム 4 KB read レイテンシ
 
-FaultKV の mmap vs pread+LRU 比較における「クロスオーバー点」を特定するための参考資料。
+VMemKV の mmap vs pread+LRU 比較における「クロスオーバー点」を特定するための参考資料。
 
 ## 環境別の代表的なレイテンシ（p50 目安）
 
@@ -27,11 +27,11 @@ FaultKV の mmap vs pread+LRU 比較における「クロスオーバー点」�
 [azure-disk]: https://learn.microsoft.com/en-us/azure/virtual-machines/disks-types
 [pavlo]: https://db.cs.cmu.edu/papers/2022/cidr2022-p13-crotty.pdf
 
-## FaultKV への含意
+## VMemKV への含意
 
 クロスオーバー点はおよそ **50–100 µs**（エンタープライズ NVMe 直結の上端）。
 
-| ストレージ速度                     | pread miss vs page fault | FaultKV 競争力 |
+| ストレージ速度                     | pread miss vs page fault | VMemKV 競争力 |
 | ---------------------------------- | ------------------------ | -------------- |
 | < 5 µs（最新 NVMe）                | pread ≪ page fault       | 劣る           |
 | ~100–200 µs（KVM / エンプラ NVMe） | pread ≈ page fault       | 同等以上       |

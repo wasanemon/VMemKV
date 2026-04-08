@@ -256,7 +256,8 @@ struct LatCollector
 // Workload modes:
 //  point mode  (scan_width=0): one random page access per "op"
 //  scan  mode  (scan_width=N): one op = MADV_WILLNEED N random pages,
-//                               then read all N (simulates FaultKV Scan prefetch)
+//                               then read all N (simulates VMemKV Scan
+//                               prefetch)
 
 static Result bench_mmap(const Config &cfg, const std::vector<size_t> &seq)
 {

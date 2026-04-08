@@ -1,4 +1,4 @@
-# FaultKV マイクロベンチマーク 総合レポート
+# VMemKV マイクロベンチマーク 総合レポート
 
 ## サブレポート
 
@@ -10,7 +10,7 @@
 
 ## 1. 背景と問い
 
-FaultKV は OS の仮想メモリ機構（mmap, swap, ページキャッシュ）を KVS のバッファ管理に使う設計です。カーネルがページの eviction・fetch・aging を担い、アプリケーション側では明示的なバッファ管理を行いません。
+VMemKV は OS の仮想メモリ機構（mmap, swap, ページキャッシュ）を KVS のバッファ管理に使う設計です。カーネルがページの eviction・fetch・aging を担い、アプリケーション側では明示的なバッファ管理を行いません。
 
 この設計に対する自然な問いがあります：
 
@@ -18,7 +18,7 @@ FaultKV は OS の仮想メモリ機構（mmap, swap, ページキャッシュ�
 
 直感的には、OS の page cache は「誰でも使えて賢い」一方、アプリケーション LRU は「自分のデータだけを管理する専用バッファ」です。
 しかし，基本的に，データベースの設計において前者は非推奨でした．[Andy Pavlo のMMAPに関する論文](https://db.cs.cmu.edu/papers/2022/cidr2022-p13-crotty.pdf) ではMMAPによるデータベース実装は強く非推奨とされています．
-とはいえ，FaultKVではこのAndy Pavlo論文で指摘されている問題の多くは回避する設計をとっています（[高レベル設計](../docs/specification/high%20level%20design.md), [低レベル設計](../docs/specification/low%20level%20design.md) 参照）．純粋に読み込みだけを問題にしたとき，どちらが優れているかは自明ではなく、実測で検証する必要があります。そこで 3 種類の環境（macOS / Linux KVM / Linux WSL2）でマイクロベンチマークを実施しました。
+とはいえ，VMemKVではこのAndy Pavlo論文で指摘されている問題の多くは回避する設計をとっています（[高レベル設計](../docs/specification/high%20level%20design.md), [低レベル設計](../docs/specification/low%20level%20design.md) 参照）．純粋に読み込みだけを問題にしたとき，どちらが優れているかは自明ではなく、実測で検証する必要があります。そこで 3 種類の環境（macOS / Linux KVM / Linux WSL2）でマイクロベンチマークを実施しました。
 
 ### 短い答え
 
@@ -264,9 +264,9 @@ hot set が RAM に収まるほど page cache hit 率が上がり、mmap の「l
 
 同じ Linux 系でも、仮想化層の違いで挙動は一致しません。
 
-### 5.2 FaultKV が期待できる条件
+### 5.2 VMemKV が期待できる条件
 
-以下の条件が揃うとき、FaultKV は LRU に対して 10× 以上の差をつけられます：
+以下の条件が揃うとき、VMemKV は LRU に対して 10× 以上の差をつけられます：
 
 1. **hot set が RAM の数分の 1 以下に収まる**（working set が RAM-resident）
 2. **ストレージレイテンシが > 10 µs 程度**（クラウド VM・HDD など）
@@ -282,7 +282,7 @@ hot set 800 MB（RAM 16 GB の 5%）+ THP（Linux KVM 環境）:
   → mmap が 199× 速い
 ```
 
-### 5.3 FaultKV が不向きな条件
+### 5.3 VMemKV が不向きな条件
 
 - **Apple Silicon Mac やハイエンド NVMe 環境**（pread miss が ~1 µs と非常に安く、LRU が cold 状態でも圧倒的に有利）
 - **cold start が頻繁な環境**（Kubernetes での頻繁な Pod 再起動など、steady-state に達する前に再起動される）
@@ -304,4 +304,4 @@ hot set 800 MB（RAM 16 GB の 5%）+ THP（Linux KVM 環境）:
 | 遅い                              | RAM を大幅に超える | **拮抗〜やや劣る**（cold fault が連発するが LRU の miss も高価） |
 | 速い（< 5 µs、最新 NVMe）         | どのサイズでも     | **乏しい**（pread miss が安いため LRU が有利）                   |
 
-FaultKV はクラウド環境のような「本番のストレージは遅い」という前提のもとで設計されています。開発機（Apple Silicon）で mmap が LRU に見劣りするのは、その SSD が例外的に高速すぎるためです。一方で Linux 系でも KVM と WSL2 で THP 挙動が異なるため、最終的な運用判断は配備先基盤での再計測（cold/warm/alpha/THP）を前提にするべきです。
+VMemKV はクラウド環境のような「本番のストレージは遅い」という前提のもとで設計されています。開発機（Apple Silicon）で mmap が LRU に見劣りするのは、その SSD が例外的に高速すぎるためです。一方で Linux 系でも KVM と WSL2 で THP 挙動が異なるため、最終的な運用判断は配備先基盤での再計測（cold/warm/alpha/THP）を前提にするべきです。

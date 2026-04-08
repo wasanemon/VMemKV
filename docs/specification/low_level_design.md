@@ -1,4 +1,4 @@
-# FaultKV Low Level Design
+# VMemKV Low Level Design
 
 ## 1. SnapLog<T>
 
@@ -56,11 +56,11 @@ ro_region と ap_region それぞれの探索・追記コストと基本操作�
 SnapLog のreorganize() の挙動を示す。ap_region を ro_region にマージしてソートされた状態で統合する。
 ![SnapLog reorganize](../images/snaplog_reorganization.png)
 
-## 2. FaultKV の物理レイアウト
+## 2. VMemKV の物理レイアウト
 
 ```cpp
 
-class FaultKV {
+class VMemKV {
 
     // 32バイト構造体 — 64B キャッシュラインに2エントリ収容
     struct IndexEntry {
@@ -140,13 +140,13 @@ class FaultKV {
 
 
 Tier 1 の順序に従って Tier 2 を再配置する checkpoint 時のデータ移送手順を示す。
-![FaultKV T2 reorganization](../images/faultkv_t2_reorganization.png)
+![VMemKV T2 reorganization](../images/vmemkv_t2_reorganization.png)
 
 ## 5. 最適化仕様（オプトイン）
 
 本節の最適化はすべてオプトインであり、互いに独立している。§5 で説明したシステムはこれらを一切有効化しなくても正しく動作する。各最適化は特定の性能特性を改善する。
 
-FaultKVに以下の追加フィールドを導入する．
+VMemKVに以下の追加フィールドを導入する．
 
 ```c++
     std::atomic<uint64_t> t2_live_entries{0};  // レコード数: アクティブな（削除されていない）キーバリューペア数

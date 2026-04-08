@@ -1,4 +1,4 @@
-# FaultKV マイクロベンチマーク レポート (Linux)
+# VMemKV マイクロベンチマーク レポート (Linux)
 
 ## 0. テスト環境
 
@@ -19,7 +19,7 @@
 
 ## 1. 目的
 
-FaultKV の中核仮説「OS の仮想メモリ機構（mmap + ページキャッシュ）はアプリケーション実装の LRU バッファプール（pread + explicit eviction）と競合しうるか？」を本環境（Linux KVM + Xeon）で実測で検証する。
+VMemKV の中核仮説「OS の仮想メモリ機構（mmap + ページキャッシュ）はアプリケーション実装の LRU バッファプール（pread + explicit eviction）と競合しうるか？」を本環境（Linux KVM + Xeon）で実測で検証する。
 
 ---
 
@@ -158,7 +158,7 @@ macOS と逆転した最大の結果：**cold でも mmap が LRU に勝つ**。
 
 ---
 
-### 3.5 Scan バッチプリフェッチの効果（FaultKV §6.6 相当）
+### 3.5 Scan バッチプリフェッチの効果（VMemKV §6.6 相当）
 
 1 回の「スキャン操作」= N ページの `MADV_WILLNEED` を一括発行してから N ページを一括読み。
 
@@ -223,7 +223,7 @@ macOS と逆転した最大の結果：**cold でも mmap が LRU に勝つ**。
 > - `hot set ≪ RAM`（例: 80 MB hot set / 16 GB RAM）→ THP 昇格が容易、TLB エントリが激減 → **大幅な高速化**
 > - `hot set ≈ RAM` または `hot set ≫ RAM` → compaction が常時発生 → **壊滅的な低下**
 >
-> したがって THP は FaultKV の適用場面（ホットデータが RAM に収まるワークロード）において本来非常に有利な条件が整いやすい。ただし THP の設定は `madvise`（アプリが明示的に要求した場合のみ昇格）に留め、`always`（OS が全域で積極昇格）は避けるべきである。
+> したがって THP は VMemKV の適用場面（ホットデータが RAM に収まるワークロード）において本来非常に有利な条件が整いやすい。ただし THP の設定は `madvise`（アプリが明示的に要求した場合のみ昇格）に留め、`always`（OS が全域で積極昇格）は避けるべきである。
 
 ---
 
@@ -302,14 +302,14 @@ Regime B: hot set ≈ RAM 以上（large hot set）
   → throughput 2,500 ops/sec まで崩壊 ✗
 ```
 
-### 5.4 FaultKV 設計への示唆
+### 5.4 VMemKV 設計への示唆
 
 | 設計判断                                                   | 本実験での根拠                                                                 |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | **ホットデータを RAM に収めるアーキテクチャ前提**          | Regime A（hot set ≪ RAM）でのみ THP + mmap が圧倒的に有利                      |
 | **THP は `madvise` モードで使用すること**                  | `always` モードでは大きな working set で compaction stall が致命的（Regime B） |
 | **`--huge-pages` は hot set サイズを事前に見積もって使用** | hot set が RAM に収まる確信がある場合のみ有効化する                            |
-| **warm + 小 hot set は最も FaultKV が輝く条件**            | hot set 800 MB + THP で **mmap 199×**、FaultKV の設計根拠として最も強い証拠    |
+| **warm + 小 hot set は最も VMemKV が輝く条件**            | hot set 800 MB + THP で **mmap 199×**、VMemKV の設計根拠として最も強い証拠    |
 
 ---
 
@@ -324,6 +324,6 @@ Regime B: hot set ≈ RAM 以上（large hot set）
 | hot set が LRU バッファに収まる場合は？ | **はい**（mmap 1.9×）                    |
 | THP（small hot set）の効果は？          | **絶大**（mmap **25×**、199×）           |
 | THP（全 working set）の効果は？         | **壊滅的**（mmap 0.19×）                 |
-| FaultKV が最も有利な条件は？            | hot set が RAM < 1/6、THP madvise モード |
+| VMemKV が最も有利な条件は？            | hot set が RAM < 1/6、THP madvise モード |
 
-> **総括:** 本環境（Linux KVM + 仮想ブロックデバイス）では、mmap の page fault コスト（~166 µs）と pread + O_DIRECT の I/O コスト（~150 µs）がほぼ等しい。このコスト均等化により cold 条件でも mmap が LRU を上回った。さらに THP を適切に（hot set を RAM に収める条件で）使用すると mmap が pread+LRU の 25–199× に達し、FaultKV の設計根拠を強く支持する結果となった。
+> **総括:** 本環境（Linux KVM + 仮想ブロックデバイス）では、mmap の page fault コスト（~166 µs）と pread + O_DIRECT の I/O コスト（~150 µs）がほぼ等しい。このコスト均等化により cold 条件でも mmap が LRU を上回った。さらに THP を適切に（hot set を RAM に収める条件で）使用すると mmap が pread+LRU の 25–199× に達し、VMemKV の設計根拠を強く支持する結果となった。

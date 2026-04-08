@@ -1,4 +1,4 @@
-# FaultKV マイクロベンチマーク レポート (Linux WSL2)
+# VMemKV マイクロベンチマーク レポート (Linux WSL2)
 
 ## 0. テスト環境
 
@@ -19,7 +19,7 @@
 
 ## 1. 目的
 
-FaultKV の中核仮説「OS の仮想メモリ機構（mmap + page cache）は、アプリ実装の `pread + LRU` バッファ管理と競合しうるか」を WSL2 環境で検証する。特に Linux KVM レポートとの差分を重視する。
+VMemKV の中核仮説「OS の仮想メモリ機構（mmap + page cache）は、アプリ実装の `pread + LRU` バッファ管理と競合しうるか」を WSL2 環境で検証する。特に Linux KVM レポートとの差分を重視する。
 
 ---
 
@@ -184,7 +184,7 @@ Linux KVM では THP がワークロードにより「劇的加速」か「壊�
 
 この差は、WSL2 のメモリ管理と Hyper-V 層の実装差が THP 実効に影響している可能性を示唆する。
 
-### 5.4 FaultKV 設計への示唆
+### 5.4 VMemKV 設計への示唆
 
 - WSL2 上でも mmap 設計は十分競争力がある（大半の条件で優位）。
 - ただし THP 評価は WSL2 単独で一般化すべきでない。最終判断は物理 Linux / KVM / クラウド VM で再確認が必要。
