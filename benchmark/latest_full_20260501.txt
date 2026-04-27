@@ -1,0 +1,574 @@
+
+| relative |               ns/op |                op/s |    err% |     total | ST / INSERT
+|---------:|--------------------:|--------------------:|--------:|----------:|:------------
+|   100.0% |            3,334.13 |          299,928.43 |   20.1% |      0.02 | :wavy_dash: `T1/AllOff/Insert` (Unstable with ~908.1 iters. Increase `minEpochIterations` to e.g. 9081)
+| 1,926.4% |              173.07 |        5,777,909.24 |    3.7% |      0.01 | `T1/Single/UseAppendMapV/Insert`
+|   103.2% |            3,230.39 |          309,559.99 |   17.4% |      0.02 | :wavy_dash: `T1/Single/UseBloomFilterV/Insert` (Unstable with ~871.9 iters. Increase `minEpochIterations` to e.g. 8719)
+|   103.4% |            3,224.33 |          310,141.98 |   18.4% |      0.02 | :wavy_dash: `T1/Single/UseSimdScanV/Insert` (Unstable with ~869.3 iters. Increase `minEpochIterations` to e.g. 8693)
+|   101.9% |            3,272.29 |          305,596.11 |   18.0% |      0.02 | :wavy_dash: `T1/Single/UseMemoryHintsV/Insert` (Unstable with ~908.8 iters. Increase `minEpochIterations` to e.g. 9088)
+| 1,947.8% |              171.17 |        5,841,998.71 |    9.0% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV/Insert` (Unstable with ~6,613.8 iters. Increase `minEpochIterations` to e.g. 66138)
+| 2,367.7% |              140.82 |        7,101,440.64 |    8.7% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Insert` (Unstable with ~7,678.5 iters. Increase `minEpochIterations` to e.g. 76785)
+| 1,938.0% |              172.04 |        5,812,621.06 |    9.0% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Insert` (Unstable with ~6,618.5 iters. Increase `minEpochIterations` to e.g. 66185)
+| 1,846.3% |              180.59 |        5,537,456.67 |    4.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Insert`
+|   163.6% |            2,038.55 |          490,545.52 |    3.7% |      0.01 | `RocksDB/Insert`
+
+| relative |               ns/op |                op/s |    err% |     total | ST / GET
+|---------:|--------------------:|--------------------:|--------:|----------:|:---------
+|   100.0% |            1,311.08 |          762,729.09 |   28.5% |      0.01 | :wavy_dash: `T1/AllOff/Get/Hit` (Unstable with ~748.3 iters. Increase `minEpochIterations` to e.g. 7483)
+|    63.9% |            2,053.22 |          487,039.86 |    1.4% |      0.01 | `T1/AllOff/Get/Miss`
+| 1,626.5% |               80.61 |       12,405,543.40 |    4.1% |      0.01 | `T1/Single/UseAppendMapV/Get/Hit`
+| 1,097.2% |              119.49 |        8,368,791.26 |    5.4% |      0.01 | :wavy_dash: `T1/Single/UseAppendMapV/Get/Miss` (Unstable with ~9,527.6 iters. Increase `minEpochIterations` to e.g. 95276)
+|   101.2% |            1,296.15 |          771,515.02 |   30.0% |      0.01 | :wavy_dash: `T1/Single/UseBloomFilterV/Get/Hit` (Unstable with ~737.8 iters. Increase `minEpochIterations` to e.g. 7378)
+|    62.9% |            2,085.99 |          479,388.48 |    0.1% |      0.01 | `T1/Single/UseBloomFilterV/Get/Miss`
+|   105.5% |            1,242.82 |          804,618.83 |   29.3% |      0.01 | :wavy_dash: `T1/Single/UseSimdScanV/Get/Hit` (Unstable with ~762.6 iters. Increase `minEpochIterations` to e.g. 7626)
+|    63.2% |            2,073.35 |          482,311.76 |    0.8% |      0.01 | `T1/Single/UseSimdScanV/Get/Miss`
+|   117.3% |            1,117.46 |          894,890.51 |   34.7% |      0.01 | :wavy_dash: `T1/Single/UseMemoryHintsV/Get/Hit` (Unstable with ~804.3 iters. Increase `minEpochIterations` to e.g. 8043)
+|    65.5% |            2,001.57 |          499,608.98 |    0.8% |      0.01 | `T1/Single/UseMemoryHintsV/Get/Miss`
+| 1,622.8% |               80.79 |       12,377,804.96 |    2.5% |      0.01 | `T1/Cumulative/UseAppendMapV/Get/Hit`
+|   896.1% |              146.31 |        6,834,648.57 |    4.9% |      0.01 | `T1/Cumulative/UseAppendMapV/Get/Miss`
+| 1,604.8% |               81.70 |       12,239,988.26 |    3.1% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Get/Hit`
+|   825.3% |              158.86 |        6,294,720.25 |    6.1% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Get/Miss` (Unstable with ~7,580.1 iters. Increase `minEpochIterations` to e.g. 75801)
+| 1,544.2% |               84.90 |       11,778,070.71 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Get/Hit`
+|   871.5% |              150.45 |        6,646,881.97 |    2.1% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Get/Miss`
+| 1,655.8% |               79.18 |       12,629,095.16 |    1.7% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Get/Hit`
+|   775.8% |              168.99 |        5,917,527.78 |    3.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Get/Miss`
+|   348.9% |              375.74 |        2,661,410.42 |    1.5% |      0.01 | `RocksDB/Get/Hit`
+|   314.9% |              416.40 |        2,401,563.49 |    4.4% |      0.01 | `RocksDB/Get/Miss`
+
+| relative |               ns/op |                op/s |    err% |     total | ST / UPDATE
+|---------:|--------------------:|--------------------:|--------:|----------:|:------------
+|   100.0% |            1,154.30 |          866,328.28 |   35.0% |      0.01 | :wavy_dash: `T1/AllOff/Update` (Unstable with ~788.8 iters. Increase `minEpochIterations` to e.g. 7888)
+| 1,240.7% |               93.04 |       10,748,173.40 |    0.6% |      0.01 | `T1/Single/UseAppendMapV/Update`
+|    99.2% |            1,163.66 |          859,359.90 |   34.3% |      0.01 | :wavy_dash: `T1/Single/UseBloomFilterV/Update` (Unstable with ~790.6 iters. Increase `minEpochIterations` to e.g. 7906)
+|    99.3% |            1,162.00 |          860,586.42 |   34.1% |      0.01 | :wavy_dash: `T1/Single/UseSimdScanV/Update` (Unstable with ~789.1 iters. Increase `minEpochIterations` to e.g. 7891)
+|    98.8% |            1,167.89 |          856,245.70 |   32.7% |      0.01 | :wavy_dash: `T1/Single/UseMemoryHintsV/Update` (Unstable with ~792.5 iters. Increase `minEpochIterations` to e.g. 7925)
+| 1,254.9% |               91.98 |       10,871,623.24 |    0.5% |      0.01 | `T1/Cumulative/UseAppendMapV/Update`
+| 1,265.9% |               91.18 |       10,967,240.66 |    1.1% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Update`
+| 1,256.3% |               91.88 |       10,883,483.98 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Update`
+| 1,287.4% |               89.66 |       11,153,321.93 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Update`
+|    48.8% |            2,366.88 |          422,497.81 |    1.6% |      0.01 | `RocksDB/Update`
+
+| relative |               ns/op |                op/s |    err% |     total | ST / DELETE
+|---------:|--------------------:|--------------------:|--------:|----------:|:------------
+|   100.0% |           20,253.92 |           49,373.16 |    0.0% |      2.03 | `T1/AllOff/Delete`
+|12,567.3% |              161.16 |        6,204,885.06 |    0.0% |      0.02 | `T1/Single/UseAppendMapV/Delete`
+|    99.1% |           20,433.79 |           48,938.55 |    0.0% |      2.04 | `T1/Single/UseBloomFilterV/Delete`
+|   100.5% |           20,162.65 |           49,596.66 |    0.0% |      2.02 | `T1/Single/UseSimdScanV/Delete`
+|    99.7% |           20,316.68 |           49,220.65 |    0.0% |      2.03 | `T1/Single/UseMemoryHintsV/Delete`
+|13,897.5% |              145.74 |        6,861,612.86 |    0.0% |      0.01 | `T1/Cumulative/UseAppendMapV/Delete`
+|12,935.4% |              156.58 |        6,386,596.53 |    0.0% |      0.02 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Delete`
+|12,945.4% |              156.46 |        6,391,528.82 |    0.0% |      0.02 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Delete`
+|15,302.8% |              132.35 |        7,555,462.00 |    0.0% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Delete`
+|   889.0% |            2,278.20 |          438,943.51 |    0.0% |      0.23 | `RocksDB/Delete`
+
+| relative |               ns/op |                op/s |    err% |     total | ST / SCAN/1000
+|---------:|--------------------:|--------------------:|--------:|----------:|:---------------
+|   100.0% |                0.85 |    1,174,567,982.25 |    1.1% |      0.01 | `T1/AllOff/Scan`
+|   114.9% |                0.74 |    1,349,176,932.30 |    0.5% |      0.01 | `T1/AllOff/Scan(reorg)`
+|    87.6% |                0.97 |    1,028,383,767.30 |    0.3% |      0.01 | `T1/Single/UseAppendMapV/Scan`
+|   114.9% |                0.74 |    1,349,149,443.50 |    0.3% |      0.01 | `T1/Single/UseAppendMapV/Scan(reorg)`
+|    70.4% |                1.21 |      826,611,429.27 |    1.7% |      0.01 | `T1/Single/UseBloomFilterV/Scan`
+|   114.1% |                0.75 |    1,340,101,097.68 |    0.7% |      0.01 | `T1/Single/UseBloomFilterV/Scan(reorg)`
+|    88.0% |                0.97 |    1,033,376,337.94 |    6.5% |      0.01 | :wavy_dash: `T1/Single/UseSimdScanV/Scan` (Unstable with ~1,205.6 iters. Increase `minEpochIterations` to e.g. 12056)
+|   112.7% |                0.76 |    1,323,301,985.37 |    1.0% |      0.01 | `T1/Single/UseSimdScanV/Scan(reorg)`
+|    85.6% |                1.00 |    1,004,865,904.72 |    2.6% |      0.01 | `T1/Single/UseMemoryHintsV/Scan`
+|   113.3% |                0.75 |    1,330,902,185.00 |    1.3% |      0.01 | `T1/Single/UseMemoryHintsV/Scan(reorg)`
+|    69.7% |                1.22 |      818,661,088.64 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV/Scan`
+|   116.0% |                0.73 |    1,362,473,926.95 |    0.4% |      0.01 | `T1/Cumulative/UseAppendMapV/Scan(reorg)`
+|    99.0% |                0.86 |    1,162,960,170.88 |    0.7% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Scan`
+|   112.2% |                0.76 |    1,318,405,579.83 |    1.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Scan(reorg)`
+|    77.8% |                1.09 |      913,397,235.39 |    3.0% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Scan`
+|   111.2% |                0.77 |    1,306,476,902.67 |    1.0% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Scan(reorg)`
+|    87.1% |                0.98 |    1,023,277,909.74 |    1.8% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Scan`
+|   112.3% |                0.76 |    1,319,151,894.86 |    0.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Scan(reorg)`
+|     1.6% |               54.70 |       18,281,392.42 |    0.9% |      0.01 | `RocksDB/Scan`
+
+| relative |               ns/op |                op/s |    err% |     total | ST / SCAN/5000
+|---------:|--------------------:|--------------------:|--------:|----------:|:---------------
+|   100.0% |                1.01 |      993,276,946.43 |    0.7% |      0.01 | `T1/AllOff/Scan`
+|   160.7% |                0.63 |    1,596,166,454.42 |    1.0% |      0.01 | `T1/AllOff/Scan(reorg)`
+|   107.2% |                0.94 |    1,064,300,877.86 |    0.3% |      0.01 | `T1/Single/UseAppendMapV/Scan`
+|   164.4% |                0.61 |    1,632,653,061.22 |    1.3% |      0.01 | `T1/Single/UseAppendMapV/Scan(reorg)`
+|   105.6% |                0.95 |    1,048,747,863.82 |    1.5% |      0.01 | `T1/Single/UseBloomFilterV/Scan`
+|   171.8% |                0.59 |    1,706,300,563.86 |    2.0% |      0.01 | `T1/Single/UseBloomFilterV/Scan(reorg)`
+|   100.8% |                1.00 |    1,001,463,750.81 |    0.6% |      0.01 | `T1/Single/UseSimdScanV/Scan`
+|   170.0% |                0.59 |    1,688,158,447.74 |    1.0% |      0.01 | `T1/Single/UseSimdScanV/Scan(reorg)`
+|   103.5% |                0.97 |    1,027,827,675.37 |    0.2% |      0.01 | `T1/Single/UseMemoryHintsV/Scan`
+|   164.5% |                0.61 |    1,633,472,009.81 |    0.9% |      0.01 | `T1/Single/UseMemoryHintsV/Scan(reorg)`
+|   105.7% |                0.95 |    1,049,732,295.93 |    0.8% |      0.01 | `T1/Cumulative/UseAppendMapV/Scan`
+|   167.4% |                0.60 |    1,662,409,172.01 |    0.5% |      0.01 | `T1/Cumulative/UseAppendMapV/Scan(reorg)`
+|   106.1% |                0.95 |    1,054,256,203.25 |    0.7% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Scan`
+|   169.0% |                0.60 |    1,678,484,249.68 |    0.5% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Scan(reorg)`
+|   104.6% |                0.96 |    1,038,651,257.62 |    2.8% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Scan`
+|   172.9% |                0.58 |    1,717,466,727.49 |    2.1% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Scan(reorg)`
+|   100.7% |                1.00 |      999,753,755.23 |    0.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Scan`
+|   171.9% |                0.59 |    1,707,776,042.89 |    1.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Scan(reorg)`
+|     1.9% |               53.56 |       18,671,718.82 |    1.5% |      0.02 | `RocksDB/Scan`
+
+| relative |               ns/op |                op/s |    err% |     total | ST / SCAN/10000
+|---------:|--------------------:|--------------------:|--------:|----------:|:----------------
+|   100.0% |                0.99 |    1,010,526,022.35 |    0.3% |      0.01 | `T1/AllOff/Scan`
+|   170.8% |                0.58 |    1,726,266,757.95 |    2.0% |      0.01 | `T1/AllOff/Scan(reorg)`
+|   101.3% |                0.98 |    1,024,128,466.67 |    0.4% |      0.01 | `T1/Single/UseAppendMapV/Scan`
+|   170.3% |                0.58 |    1,720,763,340.79 |    0.7% |      0.01 | `T1/Single/UseAppendMapV/Scan(reorg)`
+|   101.9% |                0.97 |    1,030,085,427.76 |    0.3% |      0.01 | `T1/Single/UseBloomFilterV/Scan`
+|   167.5% |                0.59 |    1,692,264,257.95 |    0.8% |      0.01 | `T1/Single/UseBloomFilterV/Scan(reorg)`
+|   100.4% |                0.99 |    1,014,263,074.48 |    1.1% |      0.01 | `T1/Single/UseSimdScanV/Scan`
+|   172.1% |                0.58 |    1,738,746,690.20 |    3.7% |      0.01 | `T1/Single/UseSimdScanV/Scan(reorg)`
+|   106.7% |                0.93 |    1,078,431,372.55 |    0.9% |      0.01 | `T1/Single/UseMemoryHintsV/Scan`
+|   165.5% |                0.60 |    1,672,352,957.06 |    0.9% |      0.01 | `T1/Single/UseMemoryHintsV/Scan(reorg)`
+|    99.6% |                0.99 |    1,006,094,323.21 |    3.5% |      0.01 | `T1/Cumulative/UseAppendMapV/Scan`
+|   168.3% |                0.59 |    1,700,809,937.42 |    1.2% |      0.01 | `T1/Cumulative/UseAppendMapV/Scan(reorg)`
+|   101.8% |                0.97 |    1,028,220,405.18 |    1.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Scan`
+|   167.6% |                0.59 |    1,694,025,993.13 |    1.2% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Scan(reorg)`
+|    95.3% |                1.04 |      963,313,076.75 |    0.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Scan`
+|   168.7% |                0.59 |    1,704,599,499.17 |    0.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Scan(reorg)`
+|    98.4% |                1.01 |      993,859,490.54 |    1.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Scan`
+|   180.8% |                0.55 |    1,827,411,167.51 |    0.5% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Scan(reorg)`
+|     1.8% |               53.74 |       18,606,814.75 |    1.3% |      0.03 | `RocksDB/Scan`
+
+
+=== Multi-threaded throughput (20.0 s per run, hw_concurrency=12) ===
+
+| MT / GET    T1/AllOff                        | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/AllOff                        |     1   |     0.50 |
+| MT / GET    T1/AllOff                        |     4   |     1.80 |
+| MT / GET    T1/AllOff                        |    12   |     2.83 |
+
+| MT / INSERT T1/AllOff                        | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/AllOff                        |     1   |     0.02 |
+| MT / INSERT T1/AllOff                        |     4   |     0.03 |
+| MT / INSERT T1/AllOff                        |    12   |     0.03 |
+
+| MT / MIXED  T1/AllOff (80R/20W)              | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/AllOff (80R/20W)              |     1   |     0.49 |
+| MT / MIXED  T1/AllOff (80R/20W)              |     4   |     1.48 |
+| MT / MIXED  T1/AllOff (80R/20W)              |    12   |     1.96 |
+
+| MT / GET    T1/Single/UseAppendMapV          | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/Single/UseAppendMapV          |     1   |    11.74 |
+| MT / GET    T1/Single/UseAppendMapV          |     4   |     8.93 |
+| MT / GET    T1/Single/UseAppendMapV          |    12   |     5.65 |
+
+| MT / INSERT T1/Single/UseAppendMapV          | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/Single/UseAppendMapV          |     1   |     4.35 |
+| MT / INSERT T1/Single/UseAppendMapV          |     4   |     2.23 |
+| MT / INSERT T1/Single/UseAppendMapV          |    12   |     1.56 |
+
+| MT / MIXED  T1/Single/UseAppendMapV (80R/20W) | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/Single/UseAppendMapV (80R/20W) |     1   |    11.08 |
+| MT / MIXED  T1/Single/UseAppendMapV (80R/20W) |     4   |     7.56 |
+| MT / MIXED  T1/Single/UseAppendMapV (80R/20W) |    12   |     4.80 |
+
+| MT / GET    T1/Single/UseBloomFilterV        | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/Single/UseBloomFilterV        |     1   |     0.45 |
+| MT / GET    T1/Single/UseBloomFilterV        |     4   |     1.26 |
+| MT / GET    T1/Single/UseBloomFilterV        |    12   |     2.11 |
+
+| MT / INSERT T1/Single/UseBloomFilterV        | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/Single/UseBloomFilterV        |     1   |     0.01 |
+| MT / INSERT T1/Single/UseBloomFilterV        |     4   |     0.02 |
+| MT / INSERT T1/Single/UseBloomFilterV        |    12   |     0.03 |
+
+| MT / MIXED  T1/Single/UseBloomFilterV (80R/20W) | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/Single/UseBloomFilterV (80R/20W) |     1   |     0.46 |
+| MT / MIXED  T1/Single/UseBloomFilterV (80R/20W) |     4   |     1.28 |
+| MT / MIXED  T1/Single/UseBloomFilterV (80R/20W) |    12   |     1.90 |
+
+| MT / GET    T1/Single/UseSimdScanV           | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/Single/UseSimdScanV           |     1   |     0.50 |
+| MT / GET    T1/Single/UseSimdScanV           |     4   |     1.45 |
+| MT / GET    T1/Single/UseSimdScanV           |    12   |     2.33 |
+
+| MT / INSERT T1/Single/UseSimdScanV           | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/Single/UseSimdScanV           |     1   |     0.02 |
+| MT / INSERT T1/Single/UseSimdScanV           |     4   |     0.03 |
+| MT / INSERT T1/Single/UseSimdScanV           |    12   |     0.03 |
+
+| MT / MIXED  T1/Single/UseSimdScanV (80R/20W) | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/Single/UseSimdScanV (80R/20W) |     1   |     0.49 |
+| MT / MIXED  T1/Single/UseSimdScanV (80R/20W) |     4   |     1.40 |
+| MT / MIXED  T1/Single/UseSimdScanV (80R/20W) |    12   |     0.98 |
+
+| MT / GET    T1/Single/UseMemoryHintsV        | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/Single/UseMemoryHintsV        |     1   |     0.50 |
+| MT / GET    T1/Single/UseMemoryHintsV        |     4   |     1.50 |
+| MT / GET    T1/Single/UseMemoryHintsV        |    12   |     2.37 |
+
+| MT / INSERT T1/Single/UseMemoryHintsV        | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/Single/UseMemoryHintsV        |     1   |     0.02 |
+| MT / INSERT T1/Single/UseMemoryHintsV        |     4   |     0.03 |
+| MT / INSERT T1/Single/UseMemoryHintsV        |    12   |     0.03 |
+
+| MT / MIXED  T1/Single/UseMemoryHintsV (80R/20W) | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/Single/UseMemoryHintsV (80R/20W) |     1   |     0.49 |
+| MT / MIXED  T1/Single/UseMemoryHintsV (80R/20W) |     4   |     1.37 |
+| MT / MIXED  T1/Single/UseMemoryHintsV (80R/20W) |    12   |     1.91 |
+
+| MT / GET    T1/Cumulative/UseAppendMapV      | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/Cumulative/UseAppendMapV      |     1   |    11.82 |
+| MT / GET    T1/Cumulative/UseAppendMapV      |     4   |     8.55 |
+| MT / GET    T1/Cumulative/UseAppendMapV      |    12   |     5.92 |
+
+| MT / INSERT T1/Cumulative/UseAppendMapV      | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/Cumulative/UseAppendMapV      |     1   |     4.31 |
+| MT / INSERT T1/Cumulative/UseAppendMapV      |     4   |     2.61 |
+| MT / INSERT T1/Cumulative/UseAppendMapV      |    12   |     1.55 |
+
+| MT / MIXED  T1/Cumulative/UseAppendMapV (80R/20W) | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/Cumulative/UseAppendMapV (80R/20W) |     1   |    11.33 |
+| MT / MIXED  T1/Cumulative/UseAppendMapV (80R/20W) |     4   |    10.87 |
+| MT / MIXED  T1/Cumulative/UseAppendMapV (80R/20W) |    12   |     5.02 |
+
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV |     1   |    11.86 |
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV |     4   |     9.31 |
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV |    12   |     5.99 |
+
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV |     1   |     4.36 |
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV |     4   |     2.76 |
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV |    12   |     1.59 |
+
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV (80R/20W) | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV (80R/20W) |     1   |    11.24 |
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV (80R/20W) |     4   |    10.08 |
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV (80R/20W) |    12   |     5.20 |
+
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV |     1   |    11.76 |
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV |     4   |     9.62 |
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV |    12   |     5.98 |
+
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV |     1   |     4.35 |
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV |     4   |     2.70 |
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV |    12   |     1.57 |
+
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV (80R/20W) | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV (80R/20W) |     1   |    11.30 |
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV (80R/20W) |     4   |    11.05 |
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV (80R/20W) |    12   |     5.03 |
+
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV |     1   |    11.77 |
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV |     4   |     9.46 |
+| MT / GET    T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV |    12   |     6.02 |
+
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV |     1   |     4.35 |
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV |     4   |     2.64 |
+| MT / INSERT T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV |    12   |     1.58 |
+
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV (80R/20W) | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV (80R/20W) |     1   |    11.22 |
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV (80R/20W) |     4   |    10.87 |
+| MT / MIXED  T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV (80R/20W) |    12   |     5.06 |
+
+| MT / GET    RocksDB                          | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / GET    RocksDB                          |     1   |     2.53 |
+| MT / GET    RocksDB                          |     4   |     7.59 |
+| MT / GET    RocksDB                          |    12   |     4.98 |
+
+| MT / INSERT RocksDB                          | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / INSERT RocksDB                          |     1   |     0.31 |
+| MT / INSERT RocksDB                          |     4   |     0.34 |
+| MT / INSERT RocksDB                          |    12   |     0.18 |
+
+| MT / MIXED  RocksDB (80R/20W)                | threads | M ops/s |
+|----------------------------------------------|---------|----------|
+| MT / MIXED  RocksDB (80R/20W)                |     1   |     0.77 |
+| MT / MIXED  RocksDB (80R/20W)                |     4   |     1.13 |
+| MT / MIXED  RocksDB (80R/20W)                |    12   |     0.72 |
+
+
+=== Data-scale: GET latency vs. dataset size ===
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / GET N=1000
+|---------:|--------------------:|--------------------:|--------:|----------:|:-------------------
+|   100.0% |              494.29 |        2,023,111.61 |    0.4% |      0.01 | `T1/AllOff/Zipf`
+|   164.5% |              300.55 |        3,327,195.93 |    1.1% |      0.01 | `T1/AllOff/Uniform`
+|   484.6% |              102.01 |        9,803,152.04 |    0.6% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+|   570.4% |               86.66 |       11,539,945.06 |    0.4% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|   100.4% |              492.18 |        2,031,792.60 |    0.4% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   185.9% |              265.84 |        3,761,612.24 |    4.7% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|   112.8% |              438.15 |        2,282,337.50 |    5.5% |      0.01 | :wavy_dash: `T1/Single/UseSimdScanV/Zipf` (Unstable with ~2,507.4 iters. Increase `minEpochIterations` to e.g. 25074)
+|   190.9% |              258.94 |        3,861,942.86 |    1.6% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|   100.4% |              492.47 |        2,030,577.90 |    0.3% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|   190.2% |              259.92 |        3,847,277.95 |    2.0% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+|   479.5% |              103.09 |        9,700,022.90 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+|   570.8% |               86.60 |       11,547,374.12 |    0.5% |      0.01 | `T1/Cumulative/UseAppendMapV/Uniform`
+|   485.9% |              101.72 |        9,831,288.74 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+|   565.7% |               87.37 |       11,445,549.19 |    0.2% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+|   480.5% |              102.87 |        9,720,705.15 |    0.5% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+|   567.0% |               87.17 |       11,471,756.17 |    0.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+|   475.1% |              104.04 |        9,611,569.12 |    1.0% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+|   569.1% |               86.86 |       11,513,316.91 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|   148.6% |              332.66 |        3,006,064.43 |    0.2% |      0.01 | `RocksDB/Zipf`
+|   155.6% |              317.71 |        3,147,542.01 |    0.4% |      0.01 | `RocksDB/Uniform`
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / GET N=5000
+|---------:|--------------------:|--------------------:|--------:|----------:|:-------------------
+|   100.0% |            1,930.58 |          517,979.21 |    0.6% |      0.01 | `T1/AllOff/Zipf`
+|   176.0% |            1,096.88 |          911,680.91 |    1.1% |      0.01 | `T1/AllOff/Uniform`
+| 2,015.2% |               95.80 |       10,438,190.71 |    1.1% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+| 2,171.6% |               88.90 |       11,248,441.67 |    2.2% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|   102.9% |            1,875.26 |          533,258.40 |    0.7% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   188.3% |            1,025.32 |          975,306.30 |    2.1% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|   104.0% |            1,856.41 |          538,675.03 |    1.3% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   187.8% |            1,028.05 |          972,716.49 |    2.0% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|   103.3% |            1,868.78 |          535,108.15 |    1.2% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|   190.7% |            1,012.38 |          987,774.99 |    1.4% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+| 2,048.5% |               94.24 |       10,611,011.77 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+| 2,186.3% |               88.30 |       11,324,512.68 |    1.5% |      0.01 | `T1/Cumulative/UseAppendMapV/Uniform`
+| 2,152.6% |               89.69 |       11,149,851.99 |    0.7% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+| 2,130.2% |               90.63 |       11,033,737.47 |    1.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+| 2,047.4% |               94.29 |       10,605,311.26 |    1.7% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+| 2,136.7% |               90.36 |       11,067,430.17 |    3.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+| 2,057.0% |               93.85 |       10,655,065.83 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+| 2,154.3% |               89.62 |       11,158,587.33 |    1.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|   476.2% |              405.44 |        2,466,443.34 |    1.2% |      0.01 | `RocksDB/Zipf`
+|   404.3% |              477.53 |        2,094,088.26 |    1.3% |      0.01 | `RocksDB/Uniform`
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / GET N=10000
+|---------:|--------------------:|--------------------:|--------:|----------:|:--------------------
+|   100.0% |            3,658.75 |          273,317.39 |    0.7% |      0.01 | `T1/AllOff/Zipf`
+|   174.6% |            2,094.95 |          477,337.92 |    1.7% |      0.01 | `T1/AllOff/Uniform`
+| 3,863.4% |               94.70 |       10,559,291.66 |    1.1% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+| 4,107.6% |               89.07 |       11,226,712.60 |    3.7% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|   100.2% |            3,650.61 |          273,927.00 |    0.9% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   177.2% |            2,064.45 |          484,390.22 |    0.7% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|   100.5% |            3,639.63 |          274,753.38 |    1.7% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   177.0% |            2,066.56 |          483,895.62 |    1.0% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|   100.4% |            3,643.39 |          274,469.81 |    0.8% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|   175.5% |            2,084.79 |          479,665.70 |    2.5% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+| 3,822.5% |               95.72 |       10,447,547.87 |    1.7% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+| 4,221.5% |               86.67 |       11,538,103.16 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV/Uniform`
+| 3,777.9% |               96.85 |       10,325,730.49 |    2.8% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+| 3,762.5% |               97.24 |       10,283,473.09 |    5.9% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform` (Unstable with ~10,147.7 iters. Increase `minEpochIterations` to e.g. 101477)
+| 3,839.5% |               95.29 |       10,494,117.65 |    6.5% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf` (Unstable with ~10,232.6 iters. Increase `minEpochIterations` to e.g. 102326)
+| 3,998.3% |               91.51 |       10,927,979.92 |    2.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+| 3,693.8% |               99.05 |       10,095,716.47 |    2.8% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+| 4,170.3% |               87.73 |       11,398,247.32 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|   941.6% |              388.56 |        2,573,612.50 |    0.6% |      0.01 | `RocksDB/Zipf`
+|   807.6% |              453.02 |        2,207,423.92 |    1.4% |      0.01 | `RocksDB/Uniform`
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / GET N=20000
+|---------:|--------------------:|--------------------:|--------:|----------:|:--------------------
+|   100.0% |            7,244.13 |          138,042.85 |    1.8% |      0.01 | `T1/AllOff/Zipf`
+|   180.9% |            4,003.95 |          249,753.06 |    2.3% |      0.01 | `T1/AllOff/Uniform`
+| 6,873.9% |              105.39 |        9,488,950.33 |    2.8% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+| 6,480.8% |              111.78 |        8,946,215.38 |    3.9% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|   102.4% |            7,077.23 |          141,298.23 |    1.4% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   180.1% |            4,022.40 |          248,607.75 |    1.8% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|    99.2% |            7,304.31 |          136,905.46 |    2.0% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   185.2% |            3,911.69 |          255,644.02 |    1.7% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|   100.5% |            7,204.77 |          138,796.85 |    0.8% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|   184.4% |            3,929.11 |          254,510.49 |    1.9% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+| 6,944.5% |              104.31 |        9,586,382.91 |   10.6% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV/Zipf` (Unstable with ~10,060.4 iters. Increase `minEpochIterations` to e.g. 100604)
+| 7,213.7% |              100.42 |        9,958,032.21 |    5.2% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV/Uniform` (Unstable with ~9,181.2 iters. Increase `minEpochIterations` to e.g. 91812)
+| 6,901.7% |              104.96 |        9,527,247.54 |    2.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+| 6,206.1% |              116.73 |        8,567,073.77 |    3.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+| 7,100.1% |              102.03 |        9,801,200.80 |    3.0% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+| 7,360.9% |               98.41 |       10,161,218.21 |    7.4% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform` (Unstable with ~9,419.3 iters. Increase `minEpochIterations` to e.g. 94193)
+| 6,871.4% |              105.42 |        9,485,445.44 |    1.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+| 6,418.4% |              112.86 |        8,860,184.86 |    7.3% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform` (Unstable with ~8,648.4 iters. Increase `minEpochIterations` to e.g. 86484)
+| 1,646.6% |              439.93 |        2,273,078.42 |    1.0% |      0.01 | `RocksDB/Zipf`
+| 1,460.3% |              496.05 |        2,015,907.16 |    1.1% |      0.01 | `RocksDB/Uniform`
+
+
+=== Data-scale: NEGATIVE GET latency vs. dataset size (after reorganize) ===
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / NEGATIVE_GET(reorg) N=1000
+|---------:|--------------------:|--------------------:|--------:|----------:|:-----------------------------------
+|   100.0% |               87.75 |       11,395,972.29 |    1.8% |      0.01 | `T1/AllOff/Zipf`
+|   106.8% |               82.15 |       12,172,507.50 |    0.5% |      0.01 | `T1/AllOff/Uniform`
+|    94.1% |               93.20 |       10,729,292.29 |    1.3% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+|   108.4% |               80.95 |       12,353,723.69 |    1.4% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|    99.7% |               88.06 |       11,356,533.76 |    1.5% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   118.5% |               74.07 |       13,500,371.66 |    0.8% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|    98.6% |               88.99 |       11,236,981.39 |    0.3% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   108.0% |               81.27 |       12,304,770.73 |    0.8% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|    99.4% |               88.25 |       11,331,175.84 |    1.4% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|   108.0% |               81.21 |       12,313,239.93 |    0.9% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+|    97.1% |               90.38 |       11,064,415.84 |    1.0% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+|   108.0% |               81.24 |       12,309,483.39 |    0.7% |      0.01 | `T1/Cumulative/UseAppendMapV/Uniform`
+|    96.6% |               90.87 |       11,004,883.42 |    0.5% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+|   118.1% |               74.30 |       13,459,540.67 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+|    96.5% |               90.92 |       10,998,461.20 |    0.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+|   116.6% |               75.24 |       13,291,252.40 |    2.0% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+|    97.5% |               89.96 |       11,116,629.71 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+|   116.7% |               75.22 |       13,293,837.08 |    0.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|    24.3% |              361.71 |        2,764,648.33 |    0.7% |      0.01 | `RocksDB/Zipf`
+|    26.4% |              332.25 |        3,009,753.83 |    0.9% |      0.01 | `RocksDB/Uniform`
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / NEGATIVE_GET(reorg) N=5000
+|---------:|--------------------:|--------------------:|--------:|----------:|:-----------------------------------
+|   100.0% |               91.40 |       10,940,370.41 |    1.0% |      0.01 | `T1/AllOff/Zipf`
+|    97.5% |               93.77 |       10,664,462.79 |    0.9% |      0.01 | `T1/AllOff/Uniform`
+|    92.1% |               99.19 |       10,081,404.56 |    2.6% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+|    97.8% |               93.50 |       10,695,140.63 |    0.6% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|    98.7% |               92.65 |       10,793,428.26 |    1.7% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   123.2% |               74.20 |       13,476,916.03 |    0.7% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|    97.1% |               94.09 |       10,628,386.20 |    0.5% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   103.3% |               88.47 |       11,302,840.64 |    3.4% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|    96.2% |               95.01 |       10,525,216.02 |    2.3% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|    99.4% |               91.98 |       10,872,085.33 |    0.7% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+|    94.8% |               96.41 |       10,372,677.22 |    1.8% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+|    99.3% |               92.06 |       10,862,484.18 |    0.8% |      0.01 | `T1/Cumulative/UseAppendMapV/Uniform`
+|    95.9% |               95.32 |       10,491,161.49 |    2.7% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+|   113.2% |               80.73 |       12,386,870.13 |    1.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+|    93.5% |               97.72 |       10,233,345.19 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+|   113.4% |               80.60 |       12,406,301.30 |    1.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+|    95.1% |               96.08 |       10,407,625.51 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+|   114.6% |               79.75 |       12,538,570.75 |    1.5% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|    28.2% |              323.83 |        3,088,018.60 |    2.2% |      0.01 | `RocksDB/Zipf`
+|    30.6% |              298.50 |        3,350,138.61 |    0.5% |      0.01 | `RocksDB/Uniform`
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / NEGATIVE_GET(reorg) N=10000
+|---------:|--------------------:|--------------------:|--------:|----------:|:------------------------------------
+|   100.0% |               98.01 |       10,202,813.97 |    0.1% |      0.01 | `T1/AllOff/Zipf`
+|   102.0% |               96.05 |       10,411,634.62 |    0.8% |      0.01 | `T1/AllOff/Uniform`
+|    94.0% |              104.26 |        9,591,717.67 |    0.8% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+|    99.0% |               98.97 |       10,104,378.50 |    2.7% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|   110.1% |               89.01 |       11,234,322.08 |    1.9% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   129.3% |               75.82 |       13,188,371.21 |    1.4% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|   101.8% |               96.31 |       10,382,692.54 |    0.4% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   104.0% |               94.26 |       10,608,733.04 |    1.3% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|   100.6% |               97.39 |       10,267,909.95 |    0.6% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|   101.8% |               96.28 |       10,386,526.30 |    1.1% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+|    95.1% |              103.06 |        9,703,036.25 |    2.9% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+|    99.5% |               98.55 |       10,146,737.43 |    5.5% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV/Uniform` (Unstable with ~10,191.1 iters. Increase `minEpochIterations` to e.g. 101911)
+|    99.6% |               98.44 |       10,158,007.22 |    1.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+|   119.4% |               82.12 |       12,178,037.57 |    2.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+|   103.4% |               94.81 |       10,547,147.26 |    1.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+|   119.4% |               82.10 |       12,180,115.86 |    0.8% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+|   101.8% |               96.31 |       10,382,718.20 |    1.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+|   119.2% |               82.19 |       12,166,685.84 |    3.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|    20.4% |              479.34 |        2,086,195.49 |    0.6% |      0.01 | `RocksDB/Zipf`
+|    22.9% |              427.07 |        2,341,534.07 |    0.9% |      0.01 | `RocksDB/Uniform`
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / NEGATIVE_GET(reorg) N=20000
+|---------:|--------------------:|--------------------:|--------:|----------:|:------------------------------------
+|   100.0% |               98.84 |       10,117,390.72 |    1.2% |      0.01 | `T1/AllOff/Zipf`
+|   100.3% |               98.58 |       10,144,156.55 |    1.4% |      0.01 | `T1/AllOff/Uniform`
+|    87.1% |              113.50 |        8,810,660.29 |    1.7% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+|    89.9% |              109.89 |        9,100,314.93 |    7.1% |      0.01 | :wavy_dash: `T1/Single/UseAppendMapV/Uniform` (Unstable with ~8,609.4 iters. Increase `minEpochIterations` to e.g. 86094)
+|   106.6% |               92.68 |       10,789,975.34 |    0.8% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   136.7% |               72.33 |       13,826,241.19 |    0.9% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|   101.7% |               97.19 |       10,288,803.25 |    1.6% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   102.1% |               96.79 |       10,331,894.48 |    0.8% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|    96.0% |              102.91 |        9,717,272.40 |    0.4% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|    95.5% |              103.47 |        9,665,029.79 |    0.3% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+|    90.9% |              108.73 |        9,197,064.23 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+|    86.7% |              114.06 |        8,767,514.70 |    7.5% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV/Uniform` (Unstable with ~9,213.6 iters. Increase `minEpochIterations` to e.g. 92136)
+|    94.1% |              105.05 |        9,518,965.13 |    4.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+|    95.3% |              103.72 |        9,641,430.33 |    8.6% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform` (Unstable with ~10,156.0 iters. Increase `minEpochIterations` to e.g. 101560)
+|    94.2% |              104.94 |        9,529,596.68 |    4.1% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+|   109.3% |               90.40 |       11,061,699.75 |    7.5% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform` (Unstable with ~11,398.3 iters. Increase `minEpochIterations` to e.g. 113983)
+|    96.6% |              102.29 |        9,775,871.18 |    2.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+|   103.7% |               95.29 |       10,494,613.12 |    4.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|    31.5% |              313.39 |        3,190,924.98 |    1.6% |      0.01 | `RocksDB/Zipf`
+|    26.3% |              376.44 |        2,656,497.94 |    0.8% |      0.01 | `RocksDB/Uniform`
+
+
+=== Data-scale: SCAN latency vs. dataset size (window=1000) ===
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / SCAN N=5000 win=1000
+|---------:|--------------------:|--------------------:|--------:|----------:|:-----------------------------
+|   100.0% |                4.17 |      240,052,235.37 |    3.6% |      0.01 | `T1/AllOff/Zipf`
+|   107.9% |                3.86 |      259,064,994.30 |    1.3% |      0.01 | `T1/AllOff/Uniform`
+|    96.3% |                4.32 |      231,285,988.48 |    0.7% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+|   108.9% |                3.82 |      261,474,817.39 |    2.1% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|   103.9% |                4.01 |      249,409,910.61 |    2.8% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|    94.1% |                4.43 |      225,772,296.96 |    0.5% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|   105.2% |                3.96 |      252,641,102.79 |    0.5% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   114.5% |                3.64 |      274,764,623.18 |    2.5% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|    92.6% |                4.50 |      222,361,604.26 |    7.1% |      0.01 | :wavy_dash: `T1/Single/UseMemoryHintsV/Zipf` (Unstable with ~232.7 iters. Increase `minEpochIterations` to e.g. 2327)
+|   106.1% |                3.93 |      254,738,275.58 |    1.6% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+|    87.3% |                4.77 |      209,550,501.24 |    1.0% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+|   108.6% |                3.83 |      260,813,428.02 |    1.2% |      0.01 | `T1/Cumulative/UseAppendMapV/Uniform`
+|   100.2% |                4.16 |      240,441,706.14 |    6.0% |      0.01 | :wavy_dash: `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf` (Unstable with ~259.7 iters. Increase `minEpochIterations` to e.g. 2597)
+|   105.9% |                3.93 |      254,275,106.89 |    1.5% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+|    87.0% |                4.79 |      208,916,888.82 |    1.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+|    97.7% |                4.27 |      234,419,845.94 |    1.1% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+|    98.3% |                4.24 |      235,867,373.50 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+|   109.6% |                3.80 |      263,008,354.83 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|     7.9% |               52.61 |       19,007,648.68 |    5.7% |      0.01 | :wavy_dash: `RocksDB/Zipf` (Unstable with ~20.0 iters. Increase `minEpochIterations` to e.g. 200)
+|     7.8% |               53.50 |       18,692,305.03 |    4.5% |      0.01 | `RocksDB/Uniform`
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / SCAN N=10000 win=1000
+|---------:|--------------------:|--------------------:|--------:|----------:|:------------------------------
+|   100.0% |                9.10 |      109,893,918.56 |    0.4% |      0.01 | `T1/AllOff/Zipf`
+|   128.2% |                7.10 |      140,926,640.93 |    0.8% |      0.01 | `T1/AllOff/Uniform`
+|   113.5% |                8.01 |      124,776,400.69 |    2.0% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+|   125.5% |                7.25 |      137,895,549.27 |    2.0% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|   118.4% |                7.68 |      130,129,390.02 |    0.8% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|   131.9% |                6.90 |      144,992,617.80 |    1.2% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|   116.5% |                7.81 |      128,043,685.04 |    1.5% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   127.8% |                7.12 |      140,480,950.18 |    0.5% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|   114.3% |                7.96 |      125,604,710.56 |    4.2% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|   129.2% |                7.04 |      141,949,272.09 |    1.7% |      0.01 | `T1/Single/UseMemoryHintsV/Uniform`
+|   117.7% |                7.73 |      129,350,777.59 |    1.2% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+|   112.5% |                8.09 |      123,626,599.26 |    2.0% |      0.01 | `T1/Cumulative/UseAppendMapV/Uniform`
+|   117.5% |                7.74 |      129,171,151.78 |    1.4% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+|   110.7% |                8.22 |      121,674,276.99 |    0.9% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+|   115.5% |                7.88 |      126,968,742.43 |    0.8% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+|   110.3% |                8.25 |      121,190,139.48 |    1.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+|   100.4% |                9.06 |      110,342,627.77 |    0.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+|   112.4% |                8.09 |      123,558,247.66 |    1.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|    16.6% |               54.67 |       18,292,682.93 |    1.8% |      0.01 | `RocksDB/Zipf`
+|    16.3% |               55.93 |       17,879,948.91 |    9.1% |      0.01 | :wavy_dash: `RocksDB/Uniform` (Unstable with ~19.3 iters. Increase `minEpochIterations` to e.g. 193)
+
+| relative |               ns/op |                op/s |    err% |     total | SCALE / SCAN N=20000 win=1000
+|---------:|--------------------:|--------------------:|--------:|----------:|:------------------------------
+|   100.0% |               15.84 |       63,138,347.26 |    5.4% |      0.01 | :wavy_dash: `T1/AllOff/Zipf` (Unstable with ~67.9 iters. Increase `minEpochIterations` to e.g. 679)
+|   115.1% |               13.76 |       72,652,075.41 |    2.2% |      0.01 | `T1/AllOff/Uniform`
+|    92.5% |               17.12 |       58,427,479.17 |    3.7% |      0.01 | `T1/Single/UseAppendMapV/Zipf`
+|   113.3% |               13.98 |       71,514,216.00 |    0.9% |      0.01 | `T1/Single/UseAppendMapV/Uniform`
+|    90.3% |               17.53 |       57,039,480.69 |    3.9% |      0.01 | `T1/Single/UseBloomFilterV/Zipf`
+|    99.7% |               15.88 |       62,967,240.65 |    1.1% |      0.01 | `T1/Single/UseBloomFilterV/Uniform`
+|   103.7% |               15.28 |       65,451,840.83 |    1.4% |      0.01 | `T1/Single/UseSimdScanV/Zipf`
+|   117.4% |               13.50 |       74,096,257.21 |    1.6% |      0.01 | `T1/Single/UseSimdScanV/Uniform`
+|   104.2% |               15.20 |       65,779,211.14 |    1.3% |      0.01 | `T1/Single/UseMemoryHintsV/Zipf`
+|   101.7% |               15.58 |       64,195,105.35 |    6.1% |      0.01 | :wavy_dash: `T1/Single/UseMemoryHintsV/Uniform` (Unstable with ~79.5 iters. Increase `minEpochIterations` to e.g. 795)
+|   101.4% |               15.62 |       64,005,376.45 |    1.9% |      0.01 | `T1/Cumulative/UseAppendMapV/Zipf`
+|   114.1% |               13.88 |       72,052,195.60 |    1.9% |      0.01 | `T1/Cumulative/UseAppendMapV/Uniform`
+|   104.9% |               15.09 |       66,253,208.24 |    0.3% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Zipf`
+|   111.6% |               14.19 |       70,484,581.50 |    1.2% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV/Uniform`
+|    88.8% |               17.83 |       56,087,673.31 |    0.7% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Zipf`
+|    93.2% |               17.00 |       58,817,169.42 |    1.6% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV/Uniform`
+|   105.6% |               15.00 |       66,649,874.36 |    0.8% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Zipf`
+|   118.2% |               13.40 |       74,647,334.74 |    0.8% |      0.01 | `T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV/Uniform`
+|    14.9% |              106.43 |        9,396,015.58 |    3.2% |      0.01 | `RocksDB/Zipf`
+|    15.8% |              100.34 |        9,966,363.52 |    4.3% |      0.01 | `RocksDB/Uniform`
+

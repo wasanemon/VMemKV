@@ -1,205 +1,425 @@
 # VMemKV Low Level Design
 
-## 1. SnapLog<T>
+## 1. Overview
+
+本書は [high_level_design.md](./high_level_design.md) を受けて、VMemKV の low-level なデータレイアウト、操作手順、バックグラウンド処理、opt-in 最適化、および主要パラメータを定義する。
+
+## 2. Core Data Structures
+
+### 2.1 Tier 1
+
+Tier 1 は fixed-size の `IndexEntry` を格納するインデックス層である。
+`sorted_region` と `append_region` はどちらも `IndexEntry` 配列として保持する。
 
 ```c++
-template <typename T>
-struct SnapLog {
-  private:
-    std::atomic<T>* ro_region{nullptr};
-    std::atomic<T>* ap_region{nullptr};
-    std::atomic<size_t> boundary_pos{0};
-    std::atomic<size_t> end_pos{0};
+using StoreKeyPrefix = std::array<uint64_t, 2>;   // 16-byte key prefix
 
-    std::function<bool(const T&, const T&)> comparator;
-    std::thread background_merger;
+struct IndexEntry {
+    StoreKeyPrefix key_prefix;  // primary sort key
+    uint64_t hash;              // hash(full_key)
+    uint64_t offset;            // logical offset into Tier 2
+};
 
-    std::atomic<size_t> epoch{0};
-    static thread_local size_t local_epoch{0};
-    std::vector<SnapLog*> old_snaps;
+struct T1Region {
+    IndexEntry* data;
+    uint64_t size;
+    uint64_t capacity;
+};
 
-    
-  public:
-    T& at(size_t i);
-    void append(const T& entry);
-    void scan(std::function<bool(const T&)> func);
-    void reorganize();
+struct T1Index {
+    T1Region sorted_region;
+    T1Region append_region;
+};
+
+constexpr uint64_t TOMBSTONE_OFFSET = UINT64_MAX;
+```
+
+**Fields**
+
+| Field | Meaning |
+| --- | --- |
+| `IndexEntry.key_prefix` | 主ソートキー。Tier 1 の並び順を決める。 |
+| `IndexEntry.hash` | フルキーのハッシュ値。prefix だけでは区別できない候補の絞り込みに使う。 |
+| `IndexEntry.offset` | Tier 2 上の論理オフセット。`UINT64_MAX` は tombstone。 |
+| `sorted_region` | `key_prefix` 順にソート済みの `IndexEntry` 配列。 |
+| `append_region` | 直近の insert を受ける未整列の `IndexEntry` 配列。 |
+
+**Invariants**
+
+- `sorted_region` は `key_prefix` 昇順である。
+- `append_region` は未整列である。
+- Tier 1 の live entry は、`sorted_region` と `append_region` を合わせて logical key ごとに高々 1 個であることを期待する。
+- `offset == TOMBSTONE_OFFSET` の entry は delete 済みであり、Get / Scan の結果に含めない。
+
+### 2.2 Tier 2
+
+Tier 2 は可変長 key/value record を格納する value 層である。
+`sorted_region` と `append_region` はどちらも file-backed な record 列であり、単一の論理オフセット空間として扱う。
+
+```c++
+struct ValueRecordHeader {
+    uint32_t key_len;
+    uint32_t value_len;
+    uint32_t alloc_len;     // allocated bytes for value payload
+    uint32_t flags;         // reserved
+    uint64_t version;       // optional: debug / validation use
+};
+
+// Layout on disk / mmap:
+// [ValueRecordHeader][key bytes][value bytes][padding up to alloc_len]
+
+struct T2Region {
+    uint8_t* base;
+    uint64_t bytes_used;
+    uint64_t bytes_capacity;
+};
+
+struct T2Store {
+    T2Region sorted_region;
+    T2Region append_region;
 };
 ```
 
+**Offset Space**
 
-| Fields              | Description                                                                                                  |
-| ------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `ro_region`         | 読み取り専用リージョン。ソート済み。                                                                         |
-| `ap_region`         | 読み書き可能なリージョン。unsortedで，単調増加してInsertされる．                                             |
-| `boundary_pos`      | `ap_region` が始まる論理インデックス。`ro_region` との境界．                                                 |
-| `end_pos`           | 最後に挿入されたエントリの次のインデックス（`== boundary + ログエントリ数`）。                               |
-| `comparator`        | エントリをソートするための比較関数。                                                                         |
-| `background_merger` | バックグラウンドで `ap_region` を `ro_region` にマージするスレッド。                                         |
-| `epoch`             | ガベージコレクションのためのエポックカウンタ。新しいSnapLogが有効化されるたびにインクリメントされる。        |
-| `local_epoch`       | スレッドローカルなエポックカウンタ。各スレッドはこの値を参照してガベージコレクションのタイミングを決定する。 |
-| `old_snaps`         | 古いSnapLogのリスト。ガベージコレクションの対象となる。                                                      |
+- `sorted_region` の先頭オフセットを `0` とする。
+- `sorted_region.bytes_used` の直後から `append_region` のオフセットが始まる。
+- したがって、Tier 2 は論理的には 1 本の巨大配列であり、`offset` から
+  - `offset < sorted_region.bytes_used` なら `sorted_region`
+  - それ以外なら `append_region`
+  を引く。
 
-**Primitives:**
+**Invariants**
 
-| Primitive       | Description                                                                                                                                                   |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `at(i)`         | `i < boundary_pos` なら `ro_region[i]` を、そうでなければ `ap_region[i − boundary_pos]` を返す。                                                              |
-| `append(entry)` | `entry` を `ap_region` の末尾に追加し、`end_pos` をインクリメントする。                                                                                       |
-| `scan(func)`    | `ro_region` と `ap_region` の全エントリに対して `func` を適用し，ヒットするエントリを返却する．`ro_region` からは二分探索，`ap_region` からは線形探索を行う。 |
-| `reorganize()`  | `background_merger` スレッドを起動し、`ap_region` のエントリをマージして `ro_region` に統合する。                                          
+- Tier 2 の live record は必ず Tier 1 のいずれかの live `IndexEntry.offset` から到達可能である。
+- Tier 1 から参照されていない Tier 2 record は garbage であり、`reorganize` で物理削除される。
+- `update` は可能なら既存 record を in-place で上書きする。
+- 新しい value が `alloc_len` を超える場合は新 record を `append_region` に追加し、Tier 1 の `offset` を差し替える。
 
+### 2.3 VMemKV State
 
-ro_region と ap_region それぞれの探索・追記コストと基本操作の対応を示す。
-![SnapLog primitives](../images/snaplog_primitives.png)
-
-SnapLog のreorganize() の挙動を示す。ap_region を ro_region にマージしてソートされた状態で統合する。
-![SnapLog reorganize](../images/snaplog_reorganization.png)
-
-## 2. VMemKV の物理レイアウト
-
-```cpp
-
-class VMemKV {
-
-    // 32バイト構造体 — 64B キャッシュラインに2エントリ収容
-    struct IndexEntry {
-        uint64_t key_prefix[2]; // 16バイトキープレフィックス（主ソートキー）
-        uint64_t hash;          // フルキーのハッシュ値。T2のルックアップキー
-        std::atomic<uint64_t> offset;        // T2 への論理バイトオフセット。UINT64_MAX = 墓石（削除済み）
-        constexpr static uint64_t DELETED_OFFSET = UINT64_MAX;
-    };
-
-    struct ValueEntry {
-        uint32_t key_len;
-        uint32_t value_len;
-        seqlock latch; // In-place update のためのエントリレベルのsequence lock
-        char data[];  // 可変長keyと可変長のvalueのペイロード。レイアウトは [key][value]。
-    };
-
-  private:
-    using T1 = SnapLog<IndexEntry>;  // Tier 1: 固定長インデックス配列
-    std::atomic<T1*> t1;
-    using T2 = SnapLog<AppendBuffer>;       // Tier 2: 生のキーバリューバイト列
-    std::atomic<T2*> t2;
+```c++
+struct VMemKV {
+    T1Index t1;
+    T2Store t2;
+    Wal wal;
 };
 ```
 
+本設計では、checkpoint reload 後の新世代も同じ `T1Index` / `T2Store` 形に再構築される。
 
-## 3. Operations
+## 3. Read / Write Operations
 
-- **Get:**
-  1. `t1.scan()` で `key_prefix` が一致するエントリを収集し，`hash` と `hash(key)` を比較して `IndexEntry` を特定する．見つからなければ `NOT_FOUND` を返す．
-  2. `t2.at(offset)` で `ValueEntry` を取得し，`key` が一致していることを確認して返却する． `key` が一致しない場合はハッシュ衝突であり，`NOT_FOUND` を返す．
-- **Insert:**
-  1. WAL に書き込み `fsync` する。
-  2. 新たなValueEntryを作成する． `t2.append()` で Tier 2 に追記する．このときの論理オフセットを記録する．
-  3. 新たなIndexEntryを作成する． `t1.append()` で Tier 1 に追記する．
-- **Update:**
-  1. `Get()` で既存のT2のValueEntryを取得する。見つからなければ `NOT_FOUND` を返す。
-  2. WAL に書き込み `fsync` する。
-  3. 既存エントリのサイズによって分岐．
-  - **In-place update:** 新しい値が既存エントリのサイズ以下の場合。`ValueEntry` の値を上書きする。
-  - **Append update:** 新しい値が既存エントリのサイズを超える場合。新たな `ValueEntry` を作成し、`t2.append()` で Tier 2 に追記する。このときの論理オフセットを記録する。次に、Tier 1 の `IndexEntry` の `offset` を新しいオフセットに更新する。
-- **Delete:**
-  1. `Get()` で既存のT2のValueEntryを取得する。見つからなければ `NOT_FOUND` を返す。
-  2. WAL に書き込み `fsync` する。
-  3. Tier 1 の `IndexEntry` の `offset` を `DELETED_OFFSET` に更新することで、削除されたことを示す。Tier 2 の `ValueEntry` はそのまま残るが、到達不能なtombstoneとなる。
-- **Scan `[start_key, end_key]`:**
-  1. `t1.scan()` で `key_prefix` が `[start_key, end_key]` の範囲にあるIndexEntryを収集する。
-  2. 各IndexEntryについて，`t2.at(offset)` で `ValueEntry` を取得し、`key` が `[start_key, end_key]` の範囲内にあることを確認して返却する。
+### 3.1 Get
 
-## 4. バックグラウンド処理
+入力は full key である。Tier 1 では `key_prefix` と `hash` で候補を絞り、Tier 2 で full key 一致を確認する。
 
-各バックグラウンド処理に専用のスレッドを割り当てる．
+**Procedure**
 
-- **T1 Background Merge:**
-  - `t1.ap_region` のエントリ数が `T1_UNSORTED_APPEND_REGION_DELTA_THRESHOLD` を超えた場合にトリガーされる．
-  - `t1.end_pos` をスナップショットし，`ep` として保存する．
-  - 新たな `t1` 構造体を作成し、`t1.ro_region` と `t1.ap_region` をマージして `t1.ro_region` にソートされた状態で格納する。
-    - 新しい `t1` の `ap_region` は空の新たな領域を `malloc` する。
-    - `boundary` は `ap_region` の開始位置に更新される。
-    - `end_pos` は `ro_region` のエントリ数に更新される。
-  - ここから，古い `t1` への書き込みをブロックする．
-    - 古い `t1` の `ap_region[ep, end_pos)` にある，マージ中に発生したエントリを新しい `t1` の `ap_region[0, ...)` にコピーする。これにより、マージ中に発生した書き込みが失われないようにする。
-    - `t1` をアトミックに新しい構造体に置き換える。
-    - 新たな構造体の `ap_region` に書き込みを許可する．
-  - 古い `t1` は `old_snaps` に追加され，すべてのスレッドが新しい `t1` に切り替わったことを確認した後に解放される。
-- **T1 & T2 チェックポイント:**
-  - 新しい WAL ファイルを作成する。
-  - `fork()` で子プロセスを生成し、メモリの CoW スナップショットを取得する。
-  - `t1` の Background Merge を行う．
-  - `t1` の `ro_region` をフルスキャンしながら、キーの順序で `t2` の `ValueEntry` を新しいチェックポイントファイルにコピーする。削除されたキー（tombstone）をスキップする。`t1` のオフセットを `t2` の新しいオフセットに置き換える。
-  - チェックポイントファイルのヘッダーを更新し，torn write がないことを保証する．
-  - チェックポイントファイルを永続化する。
-  - 古い WAL ファイルを削除する。
-- **Live Reload:**
-  - チェックポイントファイルを `mmap()` して新しい `t1` と `t2` の構造体を構築し、アトミックに切り替える。
-  - 古い `t1` と `t2` は `old_snaps` に追加され，すべてのスレッドが新しい構造体に切り替わったことを確認した後に解放される。
-  - 切り替え中に発生した書き込みは，切り替え後の `t1` と `t2` の `ap_region` にコピーする。これにより、切り替え中の書き込みが失われないようにする。
+1. `key_prefix = prefix(full_key)` と `hash = hash(full_key)` を計算する。
+2. `t1.append_region` を線形走査し、`key_prefix` が一致する候補を探す。
+3. append 側で見つからなければ、`t1.sorted_region` を `key_prefix` で二分探索し、候補 range を得る。
+4. 候補 `IndexEntry` について `hash` を照合する。
+5. `offset == TOMBSTONE_OFFSET` なら not found。
+6. `t2.at(offset)` で Tier 2 record を取得する。
+7. Tier 2 record の full key を比較し、一致すれば value を返す。違えば not found。
 
+**Complexity**
 
-Tier 1 の順序に従って Tier 2 を再配置する checkpoint 時のデータ移送手順を示す。
-![VMemKV T2 reorganization](../images/vmemkv_t2_reorganization.png)
+- base design: `O(|t1.append_region|) + O(log |t1.sorted_region|)`
+- opt-in で `append_region` 用 hashmap を有効化した場合: `O(1) + O(log |t1.sorted_region|)` expected
 
-## 5. 最適化仕様（オプトイン）
+### 3.2 Insert
 
-本節の最適化はすべてオプトインであり、互いに独立している。§5 で説明したシステムはこれらを一切有効化しなくても正しく動作する。各最適化は特定の性能特性を改善する。
+**Procedure**
 
-VMemKVに以下の追加フィールドを導入する．
+1. `Get(full_key)` を実行し、既存 entry がなければ続行する。
+2. WAL に insert record を append し、`fsync` する。
+3. Tier 2 `append_region` に新しい `ValueRecord` を書き込み、論理 `offset` を得る。
+4. `IndexEntry{key_prefix, hash, offset}` を作り、Tier 1 `append_region` に追加する。
 
-```c++
-    std::atomic<uint64_t> t2_live_entries{0};  // レコード数: アクティブな（削除されていない）キーバリューペア数
-    std::atomic<uint64_t> t2_append_count{0};  // レコード数: 直前の Live Reload 以降の Insert + Update 操作の累計数
-```
+**Failure Rule**
 
-### 6.1 Tier 1 メモリヒント
+- WAL 永続化前に Tier 1 / Tier 2 を更新してはならない。
 
-Tier 1 はすべての操作でアクセスされる最もホットなデータ構造であるため、起動時にページを固定・最適化する。
+### 3.3 Update
 
-- **`mlock(t1, size)`:** Tier 1 の全ページを物理 RAM に固定し、大きな Tier 2 バッファによるメモリ圧迫下でも OS がスワップアウトするのを防ぐ。
-- **`madvise(t1, size, MADV_HUGEPAGE)`:** 二分探索時の TLB 圧力を下げるため、Tier 1 配列に Transparent Huge Pages（2 MB ページ）を要求する。ヒュージページの分割を防ぐため `mlock()` と併せて適用する。
-- **`MADV_SEQUENTIAL`（一時的）:** シーケンシャル全スキャン（チェックポイント書き込みおよびbackground index merge）の直前に Tier 1 へ適用し、アグレッシブな先読みを有効化する。
+**Procedure**
 
-### 6.2 Group Commit & Early Lock Release & Flush Pipelining
+1. `Get(full_key)` で対象 entry を特定する。見つからなければ not found。
+2. WAL に update record を append し、`fsync` する。
+3. Tier 2 の既存 record を見る。
+4. `new_value_len <= alloc_len` なら Tier 2 record を in-place update する。
+5. それ以外なら Tier 2 `append_region` に新 record を追加し、新しい `offset` を得る。
+6. Tier 1 の該当 `IndexEntry.offset` を新しい `offset` に書き換える。
 
-詳細は [Aether](https://dl.acm.org/doi/10.14778/1920841.1920928)を参照．
+**Notes**
 
-1. 各ライターは共有 WAL バッファにレコードを追記し、ウェイターとしてエンキューする。この時点でエントリのラッチを解放し，読み書き可能にする． (Early Lock Release)
-2. 読み取りを行うスレッドも空のウェイターをエンキューする。これにより，未flushのデータを読んだトランザクションは，書き込みが失敗した場合にアボートされるため，Read uncommitted は発生しない (Flush Pipelining)。
-3. 専用のリーダーがグループ全体を代表して `fsync` を呼び出す。 (Group Commit)
-4. 専用のスレッドがウェイターを順番にデキューし、`fsync` が完了したことを通知する。これにより、グループ内のすべてのトランザクションがコミットされたことが保証される。
+- old Tier 2 record はその場では削除しない。
+- old Tier 2 record は Tier 1 から到達不能になり、後続の `reorganize` で物理削除される。
 
-これにより、耐久性保証を緩めることなく `fsync` コストを償却する．
-`WAL_SYNC_MODE: GROUP_COMMIT` で制御。
+### 3.4 Delete
 
-### 6.3 SIMD 高速化 Tier 1 スキャン
+**Procedure**
 
-`IndexEntry` は 32 バイトで配列は連続かつ mlock 済みのため、Tier 1 の線形スキャン（Scan での`ap_region` スキャン、Background Index Merge）はメモリバウンドではなく CPU バウンドである。AVX-512 は 1 命令で 16 個の `key_prefix` を比較でき、スカラーコードと比較してレンジフィルタリングおよびソートパスで 8〜16 倍のスループットを達成する。
+1. `Get(full_key)` で対象 entry を特定する。見つからなければ not found。
+2. WAL に delete record を append し、`fsync` する。
+3. Tier 1 の該当 `IndexEntry.offset` を `TOMBSTONE_OFFSET` に書き換える。
 
-### 6.4 `ap_region` 用ルックアップインデックス（`t1_unsorted_lookup`）
+**Notes**
 
-T1 の **log リージョンのみ**をカバーするロックフリーなオープンアドレッシングハッシュマップ（`hash` → `t1_index`）。
+- Tier 2 の record は delete 時には触らない。
+- delete 済み record は Tier 1 から到達不能になり、`reorganize` で物理削除される。
 
-有効化時、Get と Update は O(N) の `ap_region` に対する線形スキャンを単一の O(1) インデックスプローブで置き換える。`t1_unsorted_lookup[hash]` がインデックス `i` を直接返し、`t1.at(i)` で検証する。
+### 3.5 Scan
 
-- 容量は確保時に固定される。衝突は線形プロービングで解決する。
-- Background index merge のたびにクリア（新しい空のテーブルに置き換え）する。
+**Procedure**
 
-### 6.5 T1用 Bloom フィルタ（`t1_sorted_bloom`）
+1. Tier 1 `append_region` を線形走査し、範囲内の `IndexEntry` を候補に集める。
+2. Tier 1 `sorted_region` を `key_prefix` で二分探索し、範囲内候補を列挙する。
+3. 候補ごとに `offset != TOMBSTONE_OFFSET` を確認する。
+4. `offset` から Tier 2 record を取得する。
+5. full key を比較し、範囲内の record だけを返す。
 
-単一の Bloom フィルタ（`t1_sorted_bloom`）が`ro_region` のキーをカバーする．ネガティブルックアップは， `ro_region` についてはこのブルームフィルタで， `ap_region` については先述のハッシュテーブルで実行するためともに $O(1)$ になる。フィルタはBackground Index Merge時に再構築される。
+**Notes**
 
-### 6.6 Tier 2 プリフェッチ (`madvise(MADV_WILLNEED)`)
+- `key_prefix` はあくまで coarse filter である。
+- full key 比較は Tier 2 で行う。
 
-Scan 時に、Tier 1 から収集したオフセット群に基づいてどの Tier 2 ページにアクセスするかを予測できる。各オフセットに対応する Tier 2 ページに対して `madvise(MADV_WILLNEED)` を事前に発行し、OS が次のステップの前に非同期でロードできるようにする。
+## 4. Reorganize
 
-## 7. パラメータ
+### 4.1 Purpose
 
-- `T1_MAX_INDEX_SIZE`: Tier 1 インデックス配列の最大エントリ数。確保される実際のメモリ量は `T1_MAX_INDEX_SIZE × 32` バイト。キースペース全体を収容できる十分な値を設定しなければならない。
-- `T1_UNSORTED_APPEND_REGION_DELTA_THRESHOLD`: バックグラウンドインデックスマージのトリガー閾値。
-- `T2_MAX_VIRTUAL_MEMORY_SIZE`: Tier 2 の最大仮想アドレス空間サイズ。
-- `T2_CHECKPOINT_INTERVAL_SEC`: `fork()` ベースのチェックポイント実行間隔（秒）。
-- `T2_SPACE_FRAGMENTATION_THRESHOLD`: 空間断片化（墓石）の閾値。
-- `T2_ORDERING_FRAGMENTATION_THRESHOLD`: 順序断片化（スキャン性能）の閾値。
-- `WAL_SYNC_MODE`: WAL の `fsync` ポリシー（例: `EVERY_WRITE`、`PERIODIC`）。
+`reorganize` は次の 2 種類の断片化を解消する。
+
+- Ordering Fragmentation:
+  `append_region` が未整列で肥大化し、Get / Scan が遅くなる。
+- Storage Fragmentation:
+  delete や append-update の結果、Tier 1 から参照されない古い Tier 2 record が蓄積する。
+
+### 4.2 T1 Reorganize
+
+T1 `reorganize` は T2 と独立に実行できる。
+
+**Input**
+
+- 現在の `t1.sorted_region`
+- 現在の `t1.append_region`
+
+**Output**
+
+- 新しい `t1.sorted_region`
+- 空の `t1.append_region`
+
+**Procedure**
+
+1. `sorted_region` と `append_region` の全 `IndexEntry` を読み出す。
+2. `offset == TOMBSTONE_OFFSET` の entry を除外する。
+3. `key_prefix` 順にソートする。
+4. 必要なら重複 key を解消する。
+5. 新しい `sorted_region` を構築する。
+6. `append_region` を空にする。
+
+**Effect**
+
+- Ordering Fragmentation を解消する。
+- delete 済み entry を Tier 1 から取り除く。
+
+### 4.3 T2 Reorganize
+
+T2 `reorganize` は Tier 1 の offset を更新する必要があるため、T1 `reorganize` とセットで実行する。
+
+**Input**
+
+- T1 の `reorganize` 後 `sorted_region`
+- T1 の現 `append_region`
+- 現在の Tier 2 全 record
+
+**Output**
+
+- 新しい Tier 2 `sorted_region`
+- 新しい Tier 2 `append_region`
+- 新しい offset を反映した Tier 1
+
+**Procedure**
+
+1. T1 `sorted_region` の順に各 live `IndexEntry` を走査する。
+2. 各 `IndexEntry.offset` から Tier 2 record を取得し、新しい T2 `sorted_region` にコピーする。
+3. コピー先 offset を計算し、対応する T1 `IndexEntry.offset` を新 offset に書き換える。
+4. 次に T1 `append_region` の各 live `IndexEntry` について同様に Tier 2 record をコピーし、新しい T2 `append_region` を構築する。
+5. Tombstone 化されている entry と、Tier 1 から参照されない Tier 2 record はコピーしない。
+
+**Effect**
+
+- Tier 2 の Storage Fragmentation を解消する。
+- Tier 1 の offset を新世代の Tier 2 へ張り直す。
+
+## 5. Checkpoint Reload
+
+### 5.1 Motivation
+
+T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時に旧世代と新世代を持つとメモリ圧迫が大きい。
+そのため、T2 `reorganize` は必ず checkpoint file を介して行い、完成したファイルを `mmap` で読み込む。
+
+### 5.2 Flow
+
+`checkpoint reload` は次の手順で行う。
+
+1. 新しい checkpoint file を T1, T2 用に作成する。
+2. `fork` で CoW スナップショットを作る。
+3. child 側で `fork` 直後の snapshot LSN を記録する。
+4. child 側で T1 `reorganize` を実行し、新しい T1 in-memory state を作る。
+5. child 側で T2 `reorganize` を実行し、新しい T2 checkpoint file を構築する。
+6. T2 の新 offset を反映済みの T1 を T1 checkpoint file に書き出す。
+7. checkpoint file 完成後、親側で短時間 stop-the-world に入る。
+8. 親側で新 checkpoint file を `mmap(MAP_PRIVATE)` して、新しい T1 / T2 を作る。
+9. T1 file は `mlock` する。
+10. child 側 snapshot LSN の次の WAL record から、親側で stop-the-world 中に確定した最新 LSN までを replay する。
+11. replay 結果を新しい T1 / T2 に反映する。
+12. 新世代へ切り替える。
+13. stop-the-world を解除する。
+14. 不要になった WAL と旧 checkpoint を削除する。
+
+### 5.3 Correctness Rule
+
+- WAL replay は snapshot LSN の次の record から始める。
+- replay の終点は stop-the-world 中に親側で確定した最新 LSN である。
+- child 側 snapshot に含まれている更新を replay してはならない。
+- stop-the-world 開始後に新たなクライアント操作を入れてはならない。
+
+## 6. Concurrency Contract
+
+### 6.1 Base Assumption
+
+point operation は通常時にオンラインで進める。
+一方、checkpoint reload の最終切り替えだけは短時間の stop-the-world を許容する。
+
+この節では具体的な同期機構そのものではなく、各操作がどの操作と競合し、競合時に何を保証すべきかを定義する。
+
+### 6.2 Required Guarantees
+
+- Get / Scan は通常時にオンラインで実行できる。
+- Insert / Update / Delete は WAL 永続化後に T1 / T2 を更新する。
+- T1-only `reorganize` は T2 と独立して高頻度に走らせてよい。
+- T2 `reorganize` は checkpoint reload の一部としてのみ実行する。
+- checkpoint reload の最終段階だけは全クライアント操作を止める。
+- stop-the-world 開始前に開始された操作については、retry・snapshot・serialization のいずれかで整合を保つ。
+
+### 6.3 Operation Concurrency Matrix
+
+以下の表は、各操作の並行実行可否と必要な扱いを定義する。
+
+- `Allowed`: 特別な停止なしに並行実行してよい
+- `Allowed with retry/snapshot`: 並行実行してよいが、snapshot 読みまたは retry が必要
+- `Serialized`: 同一 key に対しては直列化が必要
+- `Blocked in final STW`: checkpoint reload の最終 stop-the-world では停止する
+
+| Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize | Checkpoint reload |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Get` | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Blocked in final STW |
+| `Scan` | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Blocked in final STW |
+| `Insert` (distinct key) | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Blocked in final STW |
+| `Insert` (same key) | Allowed | Allowed | Serialized | Serialized | Allowed with retry/snapshot | Blocked in final STW |
+| `Update/Delete` (distinct key) | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Blocked in final STW |
+| `Update/Delete` (same key) | Allowed | Allowed | Serialized | Serialized | Allowed with retry/snapshot | Blocked in final STW |
+| `T1 reorganize` | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Single-flight | Blocked in final STW |
+| `Checkpoint reload` | Blocked in final STW | Blocked in final STW | Blocked in final STW | Blocked in final STW | Blocked in final STW | Single-flight |
+
+### 6.4 Conflict Resolution Rules
+
+#### Point Operations vs Point Operations
+
+- 同一 key に対する Insert / Update / Delete は直列化しなければならない。
+- 異なる key に対する point operation は独立に進めてよい。
+- Get / Scan は進行中の Insert / Update / Delete と競合してもよいが、観測結果は「旧状態」または「新状態」のいずれかでなければならず、破損した中間状態を見てはならない。
+
+#### T1 Reorganize vs Readers
+
+- Get / Scan は T1 `reorganize` と並行してよい。
+- ただし、reader は
+  - 旧 `sorted_region` / `append_region` の snapshot を読み切る
+  - または切り替えを検出して retry する
+  のどちらかで整合を保たなければならない。
+
+#### T1 Reorganize vs Writers
+
+- Insert / Update / Delete は T1 `reorganize` と並行してよい。
+- ただし、writer は
+  - 旧世代に対して成功し、その後 merge 境界以降の差分として扱われる
+  - または切り替えを検出して retry する
+  のどちらかで、更新を失わないことが必要である。
+
+#### Checkpoint Reload vs All Operations
+
+- child 側での `reorganize` / checkpoint file 構築中は、親側の Get / Scan / Insert / Update / Delete を継続してよい。
+- 最終段階では stop-the-world に入り、新しい操作開始を止める。
+- stop-the-world 中に、新世代の T1 / T2 を `mmap` し、WAL replay により snapshot 以降の差分を反映する。
+- 新世代への切り替えが完了するまでは、クライアントへ新世代を公開してはならない。
+
+### 6.5 Implementation Candidates
+
+本書は mutex-free 実装を必須とはしない。
+上記の並行性契約を満たすなら、次のいずれも許容する。
+
+- coarse-grained lock
+- per-region lock
+- per-entry seqlock
+- pointer swap + epoch based reclamation
+- reader snapshot + writer retry
+
+`seqlock` は有力な実装候補だが、設計仕様として必須ではない。
+low-level design が要求するのは同期機構の名前ではなく、6.2 から 6.4 に記した concurrency contract である。
+
+## 7. Opt-in Optimizations
+
+本節の最適化はすべて opt-in であり、無効でも正しく動作する。
+
+### 7.1 Tier 1 Memory Hints
+
+- `mlock(t1, size)`:
+  Tier 1 を物理 RAM に固定し、Tier 2 圧迫下でもスワップアウトを防ぐ。
+- `madvise(t1, size, MADV_HUGEPAGE)`:
+  TLB 圧力を下げる。
+- `MADV_SEQUENTIAL`:
+  T1 full scan の直前に適用し、先読みを促す。
+
+### 7.2 Group Commit / Early Lock Release / Flush Pipelining
+
+詳細は [Aether](https://dl.acm.org/doi/10.14778/1920841.1920928) を参照。
+
+- WAL をグループで `fsync` する。
+- エントリロック解放を WAL flush 完了前に前倒しする。
+- 読み取りも waiter を介して未 flush データの整合を取る。
+
+### 7.3 SIMD Tier 1 Scan
+
+`IndexEntry` は fixed-size かつ連続配置なので、Tier 1 の append scan や range scan は SIMD 最適化しやすい。
+
+### 7.4 Tier 1 Append Lookup Index
+
+`append_region` 線形走査を高速化する補助 hash index を追加できる。
+
+- key: `hash(full_key)`
+- value: `append_region` index
+
+有効化時、Get / Update の append 探索を expected `O(1)` に短縮できる。
+
+### 7.5 Sorted Bloom Filter
+
+`sorted_region` 全体に Bloom filter を付与し、negative lookup を高速化できる。
+
+### 7.6 Tier 2 Prefetch
+
+Scan 時に Tier 1 から得た offset 群に対して `madvise(MADV_WILLNEED)` を出し、Tier 2 を先読みする。
+
+## 8. Parameters
+
+| Parameter | Meaning |
+| --- | --- |
+| `T1_MAX_INDEX_SIZE` | Tier 1 最大 entry 数 |
+| `T1_REORGANIZE_THRESHOLD` | T1 `append_region` が肥大化したときの reorganize 閾値 |
+| `T2_MAX_VIRTUAL_MEMORY_SIZE` | Tier 2 最大仮想アドレス空間 |
+| `T2_CHECKPOINT_INTERVAL_SEC` | checkpoint reload 実行周期 |
+| `T2_STORAGE_FRAGMENTATION_THRESHOLD` | Tier 2 storage fragmentation の閾値 |
+| `T2_ORDERING_FRAGMENTATION_THRESHOLD` | Tier 2 ordering fragmentation の閾値 |
+| `WAL_SYNC_MODE` | WAL `fsync` ポリシー |
