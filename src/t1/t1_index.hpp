@@ -1,12 +1,19 @@
 // t1_index.hpp — Fixed-size two-region in-memory index with lock-free readers.
 //
 // Public API:
-// - get(key) -> uint64_t
+// - get(key) -> Payload
 // - insert(key, value) -> bool
 // - update(key, value) -> bool
 // - remove(key) -> bool
 // - scan(lo, hi, callback) -> size_t
 // - reorganize() -> void
+//
+// Representation model:
+// - Tier 1 stores a 64-bit payload per key.
+// - `PayloadModeV == T1PayloadMode::Offset64` interprets that payload as a
+//   Tier 2 logical offset.
+// - `PayloadModeV == T1PayloadMode::Inline64` interprets that payload as a
+//   covering 64-bit value.
 //
 // Concurrency model:
 // - Readers (get/scan) are lock-free and retry only if they race with reorganize.
@@ -18,6 +25,9 @@
 // - Optional append-map publication uses a short dedicated mutex.
 //
 // Optimizations:
+// - `PayloadModeV`:
+//   selects whether the 64-bit payload is interpreted as Tier 2 offsets or
+//   as index-level covering values
 // - `UseAppendMapV`:
 //   maintain a lock-free append hash index so append-region point lookup avoids linear scan
 // - `UseBloomFilterV`:
@@ -50,16 +60,24 @@
 #include "optimizations/memory_hints.hpp"
 #include "optimizations/simd_scan.hpp"
 
+enum class T1PayloadMode
+{
+    Offset64,
+    Inline64,
+};
+
 template <bool UseAppendMapV = false,
           bool UseBloomFilterV = false,
           bool UseSimdScanV = false,
-          bool UseMemoryHintsV = false>
+          bool UseMemoryHintsV = false,
+          T1PayloadMode PayloadModeV = T1PayloadMode::Offset64>
 struct T1Config
 {
     static constexpr bool UseAppendMap = UseAppendMapV;
     static constexpr bool UseBloomFilter = UseBloomFilterV;
     static constexpr bool UseSimdScan = UseSimdScanV;
     static constexpr bool UseMemoryHints = UseMemoryHintsV;
+    static constexpr T1PayloadMode PayloadMode = PayloadModeV;
 };
 
 template <typename Config = T1Config<>>
@@ -67,7 +85,12 @@ class BasicT1Index
 {
 public:
     using Key = StoreKey;
+    using Payload = uint64_t;
     static constexpr size_t APPEND_CAP = 1u << 21; // 2,097,152 entries
+    static constexpr T1PayloadMode PayloadMode = Config::PayloadMode;
+    static constexpr bool StoresOffsets = PayloadMode == T1PayloadMode::Offset64;
+    static constexpr bool StoresInline64Values = PayloadMode == T1PayloadMode::Inline64;
+    static constexpr Payload TombstonePayload = STORE_NOT_FOUND;
 
     BasicT1Index()
         : sorted_region_(std::make_shared<SortedRegion>()),
@@ -83,7 +106,7 @@ public:
     BasicT1Index(const BasicT1Index &) = delete;
     BasicT1Index &operator=(const BasicT1Index &) = delete;
 
-    uint64_t get(Key key) const
+    Payload get(Key key) const
     {
         const uint64_t hash = fnv(key);
         while (true)
@@ -95,7 +118,8 @@ public:
 
             if (resolved.append != nullptr)
             {
-                const uint64_t value = resolved.append->value.load(std::memory_order_acquire);
+                const Payload value =
+                    resolved.append->payload_bits.load(std::memory_order_acquire);
                 if (end_reorg_read(seq))
                     return value;
                 continue;
@@ -103,7 +127,8 @@ public:
 
             if (resolved.sorted != nullptr)
             {
-                const uint64_t value = resolved.sorted->value.load(std::memory_order_acquire);
+                const Payload value =
+                    resolved.sorted->payload_bits.load(std::memory_order_acquire);
                 if (end_reorg_read(seq))
                     return value;
                 continue;
@@ -114,7 +139,7 @@ public:
         }
     }
 
-    bool insert(Key key, uint64_t value)
+    bool insert(Key key, Payload value)
     {
         const uint64_t hash = fnv(key);
         return with_key_write_lock(key, hash, [&](const ResolvedSlot &target)
@@ -137,7 +162,7 @@ public:
             return true; });
     }
 
-    bool update(Key key, uint64_t value)
+    bool update(Key key, Payload value)
     {
         const uint64_t hash = fnv(key);
         return with_key_write_lock(key, hash, [&](const ResolvedSlot &target)
@@ -156,7 +181,7 @@ public:
                                    {
             if (!target.found() || !is_live(target.load()))
                 return false;
-            target.store(STORE_NOT_FOUND);
+            target.store(TombstonePayload);
             mark_stripe_modified(hash);
             return true; });
     }
@@ -177,7 +202,8 @@ public:
                 const SortedSlot &slot = sorted->slots[i];
                 if (hi < slot.key)
                     break;
-                const uint64_t value = slot.value.load(std::memory_order_acquire);
+                const Payload value =
+                    slot.payload_bits.load(std::memory_order_acquire);
                 if (!is_live(value))
                     continue;
                 cb(slot.key, value);
@@ -231,31 +257,32 @@ private:
     static constexpr size_t kKeyStripeCount = 256;
     using StripeVersions = std::array<uint64_t, kKeyStripeCount>;
 
-    // Temporary value type used only while rebuilding sorted_region during reorganize.
+    // Temporary payload snapshot used while rebuilding sorted_region during reorganize.
     struct EntrySnapshot
     {
         Key key{};
-        uint64_t value{STORE_NOT_FOUND};
+        Payload payload_bits{TombstonePayload};
         uint64_t hash{0};
     };
 
-    // Sorted entries are immutable except for the value field, which supports in-place updates.
+    // Sorted entries are immutable except for the payload field, which supports
+    // in-place updates.
     struct SortedSlot
     {
         Key key{};
         uint64_t hash{0};
-        mutable std::atomic<uint64_t> value{STORE_NOT_FOUND};
+        mutable std::atomic<Payload> payload_bits{TombstonePayload};
     };
 
     // Append entries are published in two phases:
-    // 1. fill key/hash/value
+    // 1. fill key/hash/payload
     // 2. set published=true
     // Readers ignore unpublished slots.
     struct AppendSlot
     {
         Key key{};
         uint64_t hash{0};
-        std::atomic<uint64_t> value{STORE_NOT_FOUND};
+        std::atomic<Payload> payload_bits{TombstonePayload};
         std::atomic<bool> published{false};
     };
 
@@ -281,7 +308,8 @@ private:
             {
                 slots[i].key = entries[i].key;
                 slots[i].hash = entries[i].hash;
-                slots[i].value.store(entries[i].value, std::memory_order_relaxed);
+                slots[i].payload_bits.store(entries[i].payload_bits,
+                                            std::memory_order_relaxed);
                 if constexpr (Config::UseBloomFilter)
                     bloom.add(entries[i].hash);
             }
@@ -310,19 +338,19 @@ private:
             return append != nullptr || sorted != nullptr;
         }
 
-        uint64_t load() const noexcept
+        Payload load() const noexcept
         {
             if (append != nullptr)
-                return append->value.load(std::memory_order_acquire);
-            return sorted->value.load(std::memory_order_acquire);
+                return append->payload_bits.load(std::memory_order_acquire);
+            return sorted->payload_bits.load(std::memory_order_acquire);
         }
 
-        void store(uint64_t value) const noexcept
+        void store(Payload value) const noexcept
         {
             if (append != nullptr)
-                append->value.store(value, std::memory_order_release);
+                append->payload_bits.store(value, std::memory_order_release);
             else
-                sorted->value.store(value, std::memory_order_release);
+                sorted->payload_bits.store(value, std::memory_order_release);
         }
     };
 
@@ -365,12 +393,12 @@ private:
             }
         }
 
-        void publish(size_t index, Key key, uint64_t hash, uint64_t value) noexcept
+        void publish(size_t index, Key key, uint64_t hash, Payload value) noexcept
         {
             // Publish order matters: readers may observe tail_ before this slot is visible.
             slots_[index].key = key;
             slots_[index].hash = hash;
-            slots_[index].value.store(value, std::memory_order_relaxed);
+            slots_[index].payload_bits.store(value, std::memory_order_relaxed);
             slots_[index].published.store(true, std::memory_order_release);
         }
 
@@ -438,7 +466,8 @@ private:
                 const AppendSlot &slot = slots_[i];
                 if (!slot.published.load(std::memory_order_acquire))
                     continue;
-                const uint64_t value = slot.value.load(std::memory_order_acquire);
+                const Payload value =
+                    slot.payload_bits.load(std::memory_order_acquire);
                 if (!is_live(value))
                     continue;
                 out.push_back(EntrySnapshot{slot.key, value, slot.hash});
@@ -450,9 +479,9 @@ private:
         std::atomic<size_t> tail_{0};
     };
 
-    static bool is_live(uint64_t value) noexcept
+    static bool is_live(Payload value) noexcept
     {
-        return value != STORE_NOT_FOUND;
+        return value != TombstonePayload;
     }
 
     static uint64_t fnv(const Key &key) noexcept
@@ -583,7 +612,8 @@ private:
         for (size_t i = 0; i < old_sorted->size; ++i)
         {
             const SortedSlot &slot = old_sorted->slots[i];
-            const uint64_t value = slot.value.load(std::memory_order_acquire);
+            const Payload value =
+                slot.payload_bits.load(std::memory_order_acquire);
             if (!is_live(value))
                 continue;
             merged.push_back(EntrySnapshot{slot.key, value, slot.hash});
@@ -714,4 +744,7 @@ private:
     const uint64_t instance_id_;
 };
 
-using T1Index = BasicT1Index<>;
+using T1OffsetIndex = BasicT1Index<>;
+using T1Inline64Index =
+    BasicT1Index<T1Config<false, false, false, false, T1PayloadMode::Inline64>>;
+using T1Index = T1Inline64Index;

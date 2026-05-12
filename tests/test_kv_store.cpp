@@ -34,7 +34,8 @@ struct StoreFactory<T1Index>
     }
 };
 
-using T1IndexOptimized = BasicT1Index<T1Config<true, true, true, true>>;
+using T1IndexOptimized =
+    BasicT1Index<T1Config<true, true, true, true, T1PayloadMode::Inline64>>;
 
 template <>
 struct StoreFactory<T1IndexOptimized>

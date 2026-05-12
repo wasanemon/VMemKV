@@ -53,13 +53,15 @@ VMemKV は、この `Reorganizing Two-Region` を性質の異なる 2 つの層�
 ### 4.1 Tier 1
 
 Tier 1 は fixed-size インデックス層である。
-`IndexEntry` は `key prefix + key hash + offset` を持ち、point lookup と range scan の起点になる。key hash はフルキーをハッシュ化したもので，オフセットは後述するTier 2 におけるデータの位置を示す．
+`IndexEntry` は `key prefix + key hash + payload` を持ち、point lookup と range scan の起点になる。key hash はフルキーをハッシュ化したものである。base design において payload は後述する Tier 2 の位置を示す `offset` である。
 
 Tier 1 固有のポイントは以下
 
 - fixed-size entry なので、高密度な配列として保持しやすい
 - `sorted_region` は key 順のIndexEntry配列、`append_region` は unorderedなIndexEntry配列．
 - すべての操作が触るホットな層なので、`mlock` や huge page などのメモリ最適化対象になる
+
+また，opt-in 最適化として，ある index 全体について payload を `offset` ではなく 64-bit value として解釈する **index-level covering** を導入してもよい．この場合，small fixed-size value に限っては Tier 1 のヒットだけで `Get()` が完結し，Tier 2 アクセスを省略できる．
 
 ### 4.2 Tier 2
 
@@ -99,6 +101,8 @@ Tier 1 と Tier 2 の責務分離と、`offset` で両者を接続するレイ�
 
 - prefix, hash 一致だが実際のキーは異なる場合を区別するために照合する．
 
+index-level covering を有効にした index では，3. は不要であり，Tier 1 の payload をそのまま返す．
+
 ### 5.2 Insert
 
 1. `Get()` によってすでにエントリが存在するか確認
@@ -106,13 +110,17 @@ Tier 1 と Tier 2 の責務分離と、`offset` で両者を接続するレイ�
 3. Tier 2 `append_region` に value record を追加し，offsetを得る
 4. Tier 1 `append_region` に `IndexEntry` を追加し，その offset を書く
 
+index-level covering を有効にした index では，3. を省略し，Tier 1 entry の payload に 64-bit value を直接書く．
+
 ### 5.3 Update / Delete / Scan
 
 - Update: `Get()` でエントリを特定し，WAL 書き込みを行い、Tier 2 が in-place update 可能なら既存 record を更新し、不可能なら Tier 2 append + Tier 1 offset 更新を行う
 - Delete: `Get()` でエントリを特定し，WAL書き込みを行い，Tier 1 上で offset を tombstone にする．Tier 2 にはアクセスしない．
 - Scan: まず Tier 1 で範囲を絞り込み、得られた offset 集合を使って Tier 2 で value records を収集して返す
 
-Update についても Delete についても，古いデータの削除は　T1の offset を書き換えるだけで行われるのが重要なポイントである．T1 の offset がポインタ/参照だとみなしたとき，これらのT2の削除されたデータは参照カウントがゼロになったものといえる．これらは，後述する `reorganize()` で物理削除される．
+index-level covering を有効にした index では，Update / Delete / Scan も Tier 1 payload だけで完結する．
+
+payload が offset の index については，Update と Delete における古いデータの削除は T1 の offset を書き換えるだけで行われるのが重要なポイントである．T1 の offset がポインタ/参照だとみなしたとき，これらの T2 の削除されたデータは参照カウントがゼロになったものといえる．これらは，後述する `reorganize()` で物理削除される．
 
 ## 6. Reorganize, Checkpoint, Live Reload
 
@@ -193,6 +201,8 @@ TODO: ジャイアントロックでfork後に追加されたエントリの同�
 - Group Commit / Early Lock Release / Flush Pipelining
 - SIMD による Tier 1 scan 高速化
 - T1 の `append_region` の hashmap化による Get の O(1) 化
+- index-level covering
+- entry-level adaptive covering
 - `sorted_region` ネガティブルックアップ用 Bloom filter による miss時の O(1)化
 - Tier 2 `MADV_WILLNEED` prefetch
 

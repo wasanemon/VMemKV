@@ -26,7 +26,7 @@ inline size_t scan_append_scalar(const Slot *append_region,
         const Slot &slot = append_region[i];
         if (!slot.published.load(std::memory_order_acquire))
             continue;
-        const uint64_t value = slot.value.load(std::memory_order_acquire);
+        const uint64_t value = slot.payload_bits.load(std::memory_order_acquire);
         if (!is_live(value) || slot.key < lo || hi < slot.key)
             continue;
         cb(slot.key, value);
@@ -81,7 +81,7 @@ inline size_t scan_append_simd(const Slot *append_region,
                 mask &= mask - 1;
                 continue;
             }
-            const uint64_t value = slot.value.load(std::memory_order_acquire);
+            const uint64_t value = slot.payload_bits.load(std::memory_order_acquire);
             if (is_live(value) && !(slot.key < lo) && !(hi < slot.key))
             {
                 cb(slot.key, value);
