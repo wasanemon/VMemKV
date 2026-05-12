@@ -60,7 +60,7 @@
 #include "optimizations/memory_hints.hpp"
 #include "optimizations/simd_scan.hpp"
 
-enum class T1PayloadMode
+enum class T1PayloadMode : uint8_t
 {
     Offset64,
     Inline64,
