@@ -141,6 +141,8 @@ public:
 
     bool insert(Key key, Payload value)
     {
+        if (value == TombstonePayload)
+            return false;
         const uint64_t hash = fnv(key);
         return with_key_write_lock(key, hash, [&](const ResolvedSlot &target)
                                    {
@@ -164,6 +166,8 @@ public:
 
     bool update(Key key, Payload value)
     {
+        if (value == TombstonePayload)
+            return false;
         const uint64_t hash = fnv(key);
         return with_key_write_lock(key, hash, [&](const ResolvedSlot &target)
                                    {
