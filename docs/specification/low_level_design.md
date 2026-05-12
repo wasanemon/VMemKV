@@ -32,7 +32,7 @@ struct T1Index {
     T1PayloadMode payload_mode;
 };
 
-constexpr uint64_t TOMBSTONE_OFFSET = UINT64_MAX;
+constexpr uint64_t TOMBSTONE_PAYLOAD = UINT64_MAX;
 
 enum class T1PayloadMode : uint8_t {
     Offset64,
