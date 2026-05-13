@@ -34,7 +34,8 @@ struct StoreFactory<T1Index>
     }
 };
 
-using T1IndexOptimized = BasicT1Index<T1Config<true, true, true, true>>;
+using T1IndexOptimized =
+    BasicT1Index<T1Config<true, true, true, true, T1PayloadMode::Inline64>>;
 
 template <>
 struct StoreFactory<T1IndexOptimized>
@@ -93,6 +94,13 @@ TEST_CASE_TEMPLATE("insert duplicate returns false, value unchanged", Store, STO
     CHECK(s->get(k("a")) == 10u);
 }
 
+TEST_CASE_TEMPLATE("insert rejects STORE_NOT_FOUND payload in T1", Store, T1Index, T1IndexOptimized)
+{
+    auto s = StoreFactory<Store>::make();
+    CHECK_FALSE(s->insert(k("a"), STORE_NOT_FOUND));
+    CHECK(s->get(k("a")) == STORE_NOT_FOUND);
+}
+
 TEST_CASE_TEMPLATE("update existing key", Store, STORE_TYPES)
 {
     auto s = StoreFactory<Store>::make();
@@ -105,6 +113,14 @@ TEST_CASE_TEMPLATE("update missing key returns false", Store, STORE_TYPES)
 {
     auto s = StoreFactory<Store>::make();
     CHECK_FALSE(s->update(k("z"), 1));
+}
+
+TEST_CASE_TEMPLATE("update rejects STORE_NOT_FOUND payload in T1", Store, T1Index, T1IndexOptimized)
+{
+    auto s = StoreFactory<Store>::make();
+    CHECK(s->insert(k("a"), 1));
+    CHECK_FALSE(s->update(k("a"), STORE_NOT_FOUND));
+    CHECK(s->get(k("a")) == 1u);
 }
 
 TEST_CASE_TEMPLATE("remove existing key", Store, STORE_TYPES)

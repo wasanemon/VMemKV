@@ -17,7 +17,7 @@ using StoreKeyPrefix = std::array<uint64_t, 2>;   // 16-byte key prefix
 struct IndexEntry {
     StoreKeyPrefix key_prefix;  // primary sort key
     uint64_t hash;              // hash(full_key)
-    uint64_t offset;            // logical offset into Tier 2
+    uint64_t payload_bits;      // offset or inline 64-bit value
 };
 
 struct T1Region {
@@ -29,9 +29,15 @@ struct T1Region {
 struct T1Index {
     T1Region sorted_region;
     T1Region append_region;
+    T1PayloadMode payload_mode;
 };
 
-constexpr uint64_t TOMBSTONE_OFFSET = UINT64_MAX;
+constexpr uint64_t TOMBSTONE_PAYLOAD = UINT64_MAX;
+
+enum class T1PayloadMode : uint8_t {
+    Offset64,
+    Inline64,
+};
 ```
 
 **Fields**
@@ -40,16 +46,26 @@ constexpr uint64_t TOMBSTONE_OFFSET = UINT64_MAX;
 | --- | --- |
 | `IndexEntry.key_prefix` | 主ソートキー。Tier 1 の並び順を決める。 |
 | `IndexEntry.hash` | フルキーのハッシュ値。prefix だけでは区別できない候補の絞り込みに使う。 |
-| `IndexEntry.offset` | Tier 2 上の論理オフセット。`UINT64_MAX` は tombstone。 |
+| `IndexEntry.payload_bits` | index 全体の `payload_mode` に応じて解釈される 64-bit payload。`UINT64_MAX` は tombstone。 |
 | `sorted_region` | `key_prefix` 順にソート済みの `IndexEntry` 配列。 |
 | `append_region` | 直近の insert を受ける未整列の `IndexEntry` 配列。 |
+| `payload_mode` | `payload_bits` を `offset` とみなすか、inline 64-bit value とみなすかを決める index 単位の設定。 |
 
 **Invariants**
 
 - `sorted_region` は `key_prefix` 昇順である。
 - `append_region` は未整列である。
 - Tier 1 の live entry は、`sorted_region` と `append_region` を合わせて logical key ごとに高々 1 個であることを期待する。
-- `offset == TOMBSTONE_OFFSET` の entry は delete 済みであり、Get / Scan の結果に含めない。
+- `payload_bits == TOMBSTONE_OFFSET` の entry は delete 済みであり、Get / Scan の結果に含めない。
+
+### 2.1.1 Index-Level Payload Mode
+
+Tier 1 は 64-bit payload を保持するインデックスであり、その意味は index 全体の `payload_mode` で決まる。
+
+- `payload_mode == Offset64`: `payload_bits` は Tier 2 の論理オフセット
+- `payload_mode == Inline64`: `payload_bits` は Tier 1 に直接格納された 64-bit value
+
+後者は index-level covering であり、small fixed-size value を対象に Tier 1 のみで `Get()` を完結させられる。現在の standalone な T1 実装はこの `Inline64` モードを使う。一方、full VMemKV の base design は `Offset64` モードである。
 
 ### 2.2 Tier 2
 
@@ -91,7 +107,7 @@ struct T2Store {
 
 **Invariants**
 
-- Tier 2 の live record は必ず Tier 1 のいずれかの live `IndexEntry.offset` から到達可能である。
+- Tier 2 の live record は必ず Tier 1 のいずれかの live `IndexEntry.payload_bits` から到達可能である。
 - Tier 1 から参照されていない Tier 2 record は garbage であり、`reorganize` で物理削除される。
 - `update` は可能なら既存 record を in-place で上書きする。
 - 新しい value が `alloc_len` を超える場合は新 record を `append_region` に追加し、Tier 1 の `offset` を差し替える。
@@ -110,6 +126,8 @@ struct VMemKV {
 
 ## 3. Read / Write Operations
 
+本節の手順は、特に断りがなければ `payload_mode == Offset64` を前提に記述する。`payload_mode == Inline64` の index では Tier 2 に関する手順を省略し、Tier 1 の `payload_bits` を直接読み書きする。
+
 ### 3.1 Get
 
 入力は full key である。Tier 1 では `key_prefix` と `hash` で候補を絞り、Tier 2 で full key 一致を確認する。
@@ -120,8 +138,8 @@ struct VMemKV {
 2. `t1.append_region` を線形走査し、`key_prefix` が一致する候補を探す。
 3. append 側で見つからなければ、`t1.sorted_region` を `key_prefix` で二分探索し、候補 range を得る。
 4. 候補 `IndexEntry` について `hash` を照合する。
-5. `offset == TOMBSTONE_OFFSET` なら not found。
-6. `t2.at(offset)` で Tier 2 record を取得する。
+5. `payload_bits == TOMBSTONE_OFFSET` なら not found。
+6. `t2.at(payload_bits)` で Tier 2 record を取得する。
 7. Tier 2 record の full key を比較し、一致すれば value を返す。違えば not found。
 
 **Complexity**
@@ -136,7 +154,7 @@ struct VMemKV {
 1. `Get(full_key)` を実行し、既存 entry がなければ続行する。
 2. WAL に insert record を append し、`fsync` する。
 3. Tier 2 `append_region` に新しい `ValueRecord` を書き込み、論理 `offset` を得る。
-4. `IndexEntry{key_prefix, hash, offset}` を作り、Tier 1 `append_region` に追加する。
+4. `IndexEntry{key_prefix, hash, payload_bits}` を作り、Tier 1 `append_region` に追加する。
 
 **Failure Rule**
 
@@ -151,7 +169,7 @@ struct VMemKV {
 3. Tier 2 の既存 record を見る。
 4. `new_value_len <= alloc_len` なら Tier 2 record を in-place update する。
 5. それ以外なら Tier 2 `append_region` に新 record を追加し、新しい `offset` を得る。
-6. Tier 1 の該当 `IndexEntry.offset` を新しい `offset` に書き換える。
+6. Tier 1 の該当 `IndexEntry.payload_bits` を新しい `offset` に書き換える。
 
 **Notes**
 
@@ -164,7 +182,7 @@ struct VMemKV {
 
 1. `Get(full_key)` で対象 entry を特定する。見つからなければ not found。
 2. WAL に delete record を append し、`fsync` する。
-3. Tier 1 の該当 `IndexEntry.offset` を `TOMBSTONE_OFFSET` に書き換える。
+3. Tier 1 の該当 `IndexEntry.payload_bits` を `TOMBSTONE_OFFSET` に書き換える。
 
 **Notes**
 
@@ -177,8 +195,8 @@ struct VMemKV {
 
 1. Tier 1 `append_region` を線形走査し、範囲内の `IndexEntry` を候補に集める。
 2. Tier 1 `sorted_region` を `key_prefix` で二分探索し、範囲内候補を列挙する。
-3. 候補ごとに `offset != TOMBSTONE_OFFSET` を確認する。
-4. `offset` から Tier 2 record を取得する。
+3. 候補ごとに `payload_bits != TOMBSTONE_OFFSET` を確認する。
+4. `payload_bits` から Tier 2 record を取得する。
 5. full key を比較し、範囲内の record だけを返す。
 
 **Notes**
@@ -214,7 +232,7 @@ T1 `reorganize` は T2 と独立に実行できる。
 **Procedure**
 
 1. `sorted_region` と `append_region` の全 `IndexEntry` を読み出す。
-2. `offset == TOMBSTONE_OFFSET` の entry を除外する。
+2. `payload_bits == TOMBSTONE_OFFSET` の entry を除外する。
 3. `key_prefix` 順にソートする。
 4. 必要なら重複 key を解消する。
 5. 新しい `sorted_region` を構築する。
@@ -224,10 +242,11 @@ T1 `reorganize` は T2 と独立に実行できる。
 
 - Ordering Fragmentation を解消する。
 - delete 済み entry を Tier 1 から取り除く。
+- `payload_mode == Inline64` の index では、この処理だけで完結する。
 
 ### 4.3 T2 Reorganize
 
-T2 `reorganize` は Tier 1 の offset を更新する必要があるため、T1 `reorganize` とセットで実行する。
+T2 `reorganize` は Tier 1 の offset を更新する必要があるため、`payload_mode == Offset64` の index に対してのみ T1 `reorganize` とセットで実行する。
 
 **Input**
 
@@ -244,8 +263,8 @@ T2 `reorganize` は Tier 1 の offset を更新する必要があるため、T1 
 **Procedure**
 
 1. T1 `sorted_region` の順に各 live `IndexEntry` を走査する。
-2. 各 `IndexEntry.offset` から Tier 2 record を取得し、新しい T2 `sorted_region` にコピーする。
-3. コピー先 offset を計算し、対応する T1 `IndexEntry.offset` を新 offset に書き換える。
+2. 各 `IndexEntry.payload_bits` から Tier 2 record を取得し、新しい T2 `sorted_region` にコピーする。
+3. コピー先 offset を計算し、対応する T1 `IndexEntry.payload_bits` を新 offset に書き換える。
 4. 次に T1 `append_region` の各 live `IndexEntry` について同様に Tier 2 record をコピーし、新しい T2 `append_region` を構築する。
 5. Tombstone 化されている entry と、Tier 1 から参照されない Tier 2 record はコピーしない。
 
@@ -404,11 +423,26 @@ low-level design が要求するのは同期機構の名前ではなく、6.2 �
 
 有効化時、Get / Update の append 探索を expected `O(1)` に短縮できる。
 
-### 7.5 Sorted Bloom Filter
+### 7.5 Index-Level Covering
+
+index 単位で `payload_mode == Inline64` を選び、Tier 1 payload を 64-bit value として解釈する。
+
+- small fixed-size value workload では Tier 2 アクセスを完全に省略できる
+- WAL / checkpoint では index の payload mode をメタデータとして永続化する
+
+### 7.6 Entry-Level Adaptive Covering
+
+entry ごとに `offset` と inline 64-bit value を切り替える adaptive covering を行う。
+
+- 64bits 以下の小さいデータはcoveringし，大きいデータのみT2に保存することで可変長データをよりコンパクトに扱えるようになる
+- その代わり entry ごとの payload tag が必要になる
+- Get / Scan / reorganize / checkpoint の分岐は index-level covering より複雑になる
+
+### 7.7 Sorted Bloom Filter
 
 `sorted_region` 全体に Bloom filter を付与し、negative lookup を高速化できる。
 
-### 7.6 Tier 2 Prefetch
+### 7.8 Tier 2 Prefetch
 
 Scan 時に Tier 1 から得た offset 群に対して `madvise(MADV_WILLNEED)` を出し、Tier 2 を先読みする。
 
