@@ -48,7 +48,7 @@ VMemKV の中核となる概念は、`sorted_region` と `append_region` の 2 �
 
 ## 4. 二層アーキテクチャ
 
-VMemKV は、この `Reorganizing Two-Region` を性質の異なる 2 つの層に適用して構成される。
+VMemKV は、`Reorganizing Two-Region` を持つ Tier 1 と、Tier 1 の offset から参照される Tier 2 value store によって構成される。
 
 ### 4.1 Tier 1
 
@@ -71,9 +71,9 @@ Tier 1 から渡される `offset` で参照され、実際の key/value record 
 Tier 2 固有のポイントは次の程度である。
 
 - variable-size record を扱う
-- `sorted_region` は `reorganize` 後に生まれるプライマリキー (T1の順序）でソート済みのvalue record の配列であり、`append_region` は 直近で insert されたvalue record の配列である．
-- Tier 2 は `sorted_region` と `append_region` がどちらも配列であり，同じオフセットで参照する．すなわち，`sorted_region` の冒頭がoffset 0であり，その末尾+1が `append_region` の開始地点となる，単一の巨大な配列となる．
-- `update` は可能なら in-place update するが、record サイズが既存の割り当てサイズを超える場合に `insert` になる
+- file-backed mmap 上の単一 byte array として保持され、`offset` はその先頭からの byte offset である
+- insert や、更新後の value が既存 record の割り当て長に収まらない update では、末尾に新しい record を追記し、その offset を Tier 1 に保存する
+- `update` は可能なら in-place update するが、更新後の value が既存 record の割り当て長を超える場合は新しい record への追記になる
 - larger-than-memory 性と durability の中心を担う
 
 Tier 1 と Tier 2 の責務分離と、`offset` で両者を接続するレイアウトを示す。
@@ -95,7 +95,7 @@ Tier 1 と Tier 2 の責務分離と、`offset` で両者を接続するレイ�
 
 3. `offset` を用いて Tier 2 の record を参照する
 
-- Tier 2 は `sorted_region` と `append_region` がどちらも配列であり，同じオフセットで参照可能なため．どちらのregion にあろうとアクセス可能
+- Tier 2 は単一 byte array であり、`base + offset` から record を参照できる
 
 4. フルキー一致を確認して返却する
 
@@ -107,14 +107,14 @@ index-level covering を有効にした index では，3. は不要であり，T
 
 1. `Get()` によってすでにエントリが存在するか確認
 2. WAL append + `fsync`
-3. Tier 2 `append_region` に value record を追加し，offsetを得る
+3. Tier 2 の末尾に value record を追加し，offsetを得る
 4. Tier 1 `append_region` に `IndexEntry` を追加し，その offset を書く
 
 index-level covering を有効にした index では，3. を省略し，Tier 1 entry の payload に 64-bit value を直接書く．
 
 ### 5.3 Update / Delete / Scan
 
-- Update: `Get()` でエントリを特定し，WAL 書き込みを行い、Tier 2 が in-place update 可能なら既存 record を更新し、不可能なら Tier 2 append + Tier 1 offset 更新を行う
+- Update: `Get()` でエントリを特定し，WAL 書き込みを行い、Tier 2 が in-place update 可能なら既存 record を更新し、不可能なら Tier 2 末尾追記 + Tier 1 offset 更新を行う
 - Delete: `Get()` でエントリを特定し，WAL書き込みを行い，Tier 1 上で offset を tombstone にする．Tier 2 にはアクセスしない．
 - Scan: まず Tier 1 で範囲を絞り込み、得られた offset 集合を使って Tier 2 で value records を収集して返す
 
@@ -128,7 +128,7 @@ payload が offset の index については，Update と Delete における古
 
 VMemKV が解消したい断片化は 2 種類ある。
 
-- Ordering Fragmentation: `append_region` は unordered なので、この領域が大きくなると Scan 性能が劣化する．
+- Ordering Fragmentation: Tier 1 の `append_region` は unordered なので、この領域が大きくなると Scan 性能が劣化する．
 - Storage Fragmentation: Tier 1 / Tier 2 ともに Delete や append update を繰り返すとoffsetで参照されていない古いデータが残り、領域を圧迫する
 
 `reorganize` はこのニーズに応える．
@@ -136,8 +136,8 @@ VMemKV が解消したい断片化は 2 種類ある。
 - T1の reorganize:
   - `append_region` と `sorted_region` をマージし，ソートすることで Ordering Fragmentation を解消する．このとき，offset が tombstone のエントリ（Delete済みのもの）はスキップする．
 - T2の reorganize:
-  - T1の `sorted_region` の順序で T2からデータをコピーし， T2の`sorted_region`を再構築する．
-  - T1 の `append_region` の要素について， T2 からデータをコピーし，T2の `append_region` を再構築する．
+  - T1 の live entry 順に T2 からデータをコピーし，新しい単一 byte array を構築する．
+  - コピー先 offset を T1 に書き戻す．
   - これらの処理において，かつての tombstone はT1にはすでに含まれず，また，参照offsetが切れているT2のrecordはコピーされないため，Storage Fragmentation が解消される．
 
 T1 の reorganize はT2とは独立して実行できる．すなわち，T1の `reorganize()` を高頻度で実施してもよい．しかし，T2の `reorganize` はオフセット（位置）の変更を伴うため，T1の `reorganize` とセットで実行しなければならない．この時の並行処理については，6.2節で詳しく述べる．
@@ -150,9 +150,9 @@ Tier 2 は checkpoint 時の再配置により storage fragmentation をまと�
 
 ### 6.2 live reload　& checkpoint
 
-VMemKVの `reorganize` の一連の処理の結果として，T1, T2 それぞれについて，新規に `sorted_region` と `append_region` が生まれることになる．これを現在使用中のものと差し替えるにあたって，二つの問題がある．
+VMemKVの `reorganize` の一連の処理の結果として，T1 については新規に `sorted_region` と `append_region` が生まれ、T2 については新しい単一 byte array が生まれることになる．これを現在使用中のものと差し替えるにあたって，二つの問題がある．
 
-1. 停止時間を最小化したい．`reorganize` のために二つの region をフルスキャンすることになるが，その際にはオンラインで読み取りたい．短時間のstop-the-worldにしたい．
+1. 停止時間を最小化したい．`reorganize` のために T1 の region と T2 の byte array を走査することになるが，その際にはオンラインで読み取りたい．短時間のstop-the-worldにしたい．
 2. メモリ領域を大幅に圧迫する．フルスキャンしたうえでフルコピーを行うため，キャッシュラインに与える影響は大きく，`reorganize` 中の性能劣化は避けられない．T1は軽量のためフルスキャン＆フルコピーしても性能影響は限定的だが，T2のそれは非常に問題である．
 
 この二つの問題を解決するため，VMemKVでは，**T2のreorganize が行われる際には必ずcheckpointingを行い，ファイルを介してlive reloadする**ことで，メモリ消費を抑えつつ永続化を行う．これを `checkpoint reload` と呼ぶ．以下のフローで行う．
@@ -177,7 +177,7 @@ TODO: ジャイアントロックでfork後に追加されたエントリの同�
 
 `reorganize` と checkpoint reloadは強く関連するが、同一の操作ではない。後者が前者に依存している．
 
-- `reorganize`: 各 tier の `append_region` を `sorted_region` に吸収し、**断片化**を解消するための処理
+- `reorganize`: Tier 1 では `append_region` を `sorted_region` に吸収し、Tier 2 では live record を新しい byte array に詰め直して、**断片化**を解消するための処理
 - checkpoint reload: 永続化済みの一貫した世代を新たに作り、**durability**を保証する処理 (checkpoint)．また，reorganize後のT2のデータをチェックポイントファイルを介して`mmap` で読み込むことで，メモリ負荷を抑えるアプローチ (reload)．
 
 この分離は重要である。特に Tier 1 はホットなインデックス層なので、読み性能を維持しするために checkpoint より高い頻度で単独 `reorganize` される。したがって，Tier 1 は「チェックポイントファイルを書き出さない reorganize」も存在する．
