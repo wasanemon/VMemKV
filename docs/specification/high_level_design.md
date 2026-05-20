@@ -78,7 +78,7 @@ Tier 2 固有のポイントは次の程度である。
 
 Tier 1 と Tier 2 の責務分離と、`offset` で両者を接続するレイアウトを示す。
 
-![VMemKV two tier layout](../images/two_tier.png)
+![VMemKV two tier layout](../images/two_tier.svg)
 
 ## 5. 操作の例
 
@@ -157,7 +157,7 @@ VMemKVの `reorganize` の一連の処理の結果として，T1 については
 
 この二つの問題を解決するため，VMemKVでは，**T2のreorganize が行われる際には必ずcheckpointingを行い，ファイルを介してlive reloadする**ことで，メモリ消費を抑えつつ永続化を行う．これを `checkpoint reload` と呼ぶ．以下のフローで行う．
 
-![live reload](../images/live_reload_checkpoint.png)
+![live reload](../images/live_reload_checkpoint.svg)
 
 1. 新規のチェックポイントファイル (T1, T2で2ファイル) を作成する．
 2. `fork` で CoW スナップショットを取る
