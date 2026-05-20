@@ -85,7 +85,7 @@ struct ValueRecordHeader {
 // [ValueRecordHeader][key bytes][value bytes][padding up to alloc_len]
 
 struct T2Store {
-    uint8_t* base;
+    std::byte* base;
     uint64_t bytes_used;      // next append offset
     uint64_t bytes_capacity;  // mapped byte length
 };
