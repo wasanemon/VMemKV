@@ -180,7 +180,7 @@ TODO: ジャイアントロックでfork後に追加されたエントリの同�
 - `reorganize`: Tier 1 では `append_region` を `sorted_region` に吸収し、Tier 2 では live record を新しい byte array に詰め直して、**断片化**を解消するための処理
 - checkpoint reload: 永続化済みの一貫した世代を新たに作り、**durability**を保証する処理 (checkpoint)．また，reorganize後のT2のデータをチェックポイントファイルを介して`mmap` で読み込むことで，メモリ負荷を抑えるアプローチ (reload)．
 
-この分離は重要である。特に Tier 1 はホットなインデックス層なので、読み性能を維持しするために checkpoint より高い頻度で単独 `reorganize` される。したがって，Tier 1 は「チェックポイントファイルを書き出さない reorganize」も存在する．
+この分離は重要である。特に Tier 1 はホットなインデックス層なので、読み性能を維持するために checkpoint より高い頻度で単独 `reorganize` される。したがって，Tier 1 は「チェックポイントファイルを書き出さない reorganize」も存在する．
 
 一方 Tier 2 の `reorganize` は必ずチェックポイントを伴う．
 

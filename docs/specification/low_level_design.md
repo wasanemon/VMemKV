@@ -96,7 +96,7 @@ struct T2Store {
 - `base` の先頭オフセットを `0` とする。
 - `bytes_used` は次に追記する record の offset を表す。
 - record offset は `0 <= offset < bytes_used` を満たす必要がある。
-- `at(offset)` はrecord offset を受け取り、`base + offset` を `ValueRecordHeader` として解釈し、header に続く key bytes / value bytes を読む。
+- record offset を参照する際は、`base + offset` を `ValueRecordHeader*` として解釈し、header に続く key bytes / value bytes を読む。
 
 **Invariants**
 
