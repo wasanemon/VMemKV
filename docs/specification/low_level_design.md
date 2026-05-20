@@ -204,7 +204,7 @@ struct VMemKV {
 `reorganize` は次の 2 種類の断片化を解消する。
 
 - Ordering Fragmentation:
-  Tier 1 `append_region` が未整列で肥大化し、Get / Scan が遅くなる。
+  Tier 1 `append_region` ならびにTier 2全体が未整列で肥大化し、Get / Scan が遅くなる。
 - Storage Fragmentation:
   delete や append-update の結果、Tier 1 から参照されない古い Tier 2 record が蓄積する。
 
