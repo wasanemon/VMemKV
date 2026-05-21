@@ -96,7 +96,7 @@ struct T2Store {
 - `base` の先頭オフセットを `0` とする。
 - `bytes_used` は次に追記する record の offset を表す。
 - record offset は `0 <= offset < bytes_used` を満たす必要がある。
-- record の開始 offset は `alignof(ValueRecordHeader)` 境界（現在は 8-byte 境界）にアラインされる。
+- record の開始 offset は `alignof(ValueRecordHeader)` 境界にアラインされる。
 - record offset を参照する際は、`base + offset` を `ValueRecordHeader*` として解釈し、header に続く key bytes / value bytes を読む。
 
 **Invariants**
@@ -105,7 +105,7 @@ struct T2Store {
 - Tier 1 から参照されていない Tier 2 record は garbage であり、`reorganize` で物理削除される。
 - `update` は可能なら既存 record を in-place で上書きする。
 - 新しい value が `alloc_len` を超える場合は `bytes_used` 位置に新 record を追加し、Tier 1 の `offset` を差し替える。
-- 追記時の `bytes_used` の増分は `ValueRecordHeader + key bytes + value bytes + padding（alloc_len まで）+ 次 record のアラインメント調整` の合計で決まる。
+- 追記時の `bytes_used` の増分は、`ValueRecordHeader + key bytes + value bytes + padding（alloc_len まで）` に、次の record 開始位置を `alignof(ValueRecordHeader)` 境界に揃えるための調整を加えた合計で決まる。
 
 ### 2.3 VMemKV State
 
