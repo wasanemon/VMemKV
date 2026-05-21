@@ -107,7 +107,7 @@ index-level covering を有効にした index では，3. は不要であり，T
 
 1. `Get()` によってすでにエントリが存在するか確認
 2. WAL append + `fsync`
-3. Tier 2 の末尾に value record を追加し，offsetを得る
+3. Tier 2 の末尾に value record を追加し，offset を得る
 4. Tier 1 `append_region` に `IndexEntry` を追加し，その offset を書く
 
 index-level covering を有効にした index では，3. を省略し，Tier 1 entry の payload に 64-bit value を直接書く．
