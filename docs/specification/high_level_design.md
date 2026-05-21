@@ -129,7 +129,7 @@ payload が offset の index については，Update と Delete における古
 VMemKV が解消したい断片化は 2 種類ある。
 
 - Ordering Fragmentation: Tier 1 の `append_region`、ならびにTier 2は unordered なので、この領域へのアクセス回数が増えると Scan 性能が劣化する．
-- Storage Fragmentation: Tier 1 / Tier 2 ともに Delete や append update を繰り返すとoffsetで参照されていない古いデータが残り、領域を圧迫する
+- Storage Fragmentation: Tier 1 / Tier 2 ともに Delete や append update を繰り返すと offset で参照されていない古いデータが残り、領域を圧迫する
 
 `reorganize` はこのニーズに応える．
 
