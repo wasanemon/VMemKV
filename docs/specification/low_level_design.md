@@ -106,6 +106,9 @@ struct T2Store {
 - `update` は可能なら既存 record を in-place で上書きする。
 - 新しい value が `alloc_len` を超える場合は `bytes_used` 位置に新 record を追加し、Tier 1 の `offset` を差し替える。
 - 追記時の `bytes_used` の増分は、`ValueRecordHeader + key bytes + value bytes + padding（alloc_len まで）` に、次の record 開始位置を `alignof(ValueRecordHeader)` 境界に揃えるための調整を加えた合計で決まる。
+- 常に `bytes_used <= bytes_capacity` を満たす。
+- 追記要求で容量不足 (`bytes_used + required_bytes > bytes_capacity`) になった場合、その write request はキューに保持し、次回 checkpoint & reload で Tier 2 の再構築・拡張を待ってから書き込む。
+- checkpoint & reload では Tier 2 がデフラグされて空き容量が増える場合があり、キューされた write request の実際の書き込み offset は enqueue 時点の `bytes_used` と一致するとは限らない。
 
 ### 2.3 VMemKV State
 
