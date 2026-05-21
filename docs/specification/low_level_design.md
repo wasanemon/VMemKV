@@ -70,7 +70,7 @@ Tier 1 は 64-bit payload を保持するインデックスであり、その意
 ### 2.2 Tier 2
 
 Tier 2 は可変長 key/value record を格納する value 層である。
-`sorted_region` と `append_region` はどちらも file-backed な record 列であり、単一の論理オフセット空間として扱う。
+Tier 2 は file-backed mmap 上の単一 byte array として保持し、Tier 1 の `payload_bits` に格納された byte offset から record を参照する。
 
 ```c++
 struct ValueRecordHeader {
@@ -84,33 +84,31 @@ struct ValueRecordHeader {
 // Layout on disk / mmap:
 // [ValueRecordHeader][key bytes][value bytes][padding up to alloc_len]
 
-struct T2Region {
-    uint8_t* base;
-    uint64_t bytes_used;
-    uint64_t bytes_capacity;
-};
-
 struct T2Store {
-    T2Region sorted_region;
-    T2Region append_region;
+    std::byte* base;
+    uint64_t bytes_used;      // next append offset
+    uint64_t bytes_capacity;  // mapped byte length
 };
 ```
 
 **Offset Space**
 
-- `sorted_region` の先頭オフセットを `0` とする。
-- `sorted_region.bytes_used` の直後から `append_region` のオフセットが始まる。
-- したがって、Tier 2 は論理的には 1 本の巨大配列であり、`offset` から
-  - `offset < sorted_region.bytes_used` なら `sorted_region`
-  - それ以外なら `append_region`
-  を引く。
+- `base` の先頭オフセットを `0` とする。
+- `bytes_used` は次に追記する record の offset を表す。
+- record offset は `0 <= offset < bytes_used` を満たす必要がある。
+- record の開始 offset は `alignof(ValueRecordHeader)` 境界にアラインされる。
+- record offset を参照する際は、`base + offset` を `ValueRecordHeader*` として解釈し、header に続く key bytes / value bytes を読む。
 
 **Invariants**
 
 - Tier 2 の live record は必ず Tier 1 のいずれかの live `IndexEntry.payload_bits` から到達可能である。
 - Tier 1 から参照されていない Tier 2 record は garbage であり、`reorganize` で物理削除される。
 - `update` は可能なら既存 record を in-place で上書きする。
-- 新しい value が `alloc_len` を超える場合は新 record を `append_region` に追加し、Tier 1 の `offset` を差し替える。
+- 新しい value が `alloc_len` を超える場合は `bytes_used` 位置に新 record を追加し、Tier 1 の `offset` を差し替える。
+- 追記時の `bytes_used` の増分は、`ValueRecordHeader + key bytes + value bytes + padding（alloc_len まで）` に、次の record 開始位置を `alignof(ValueRecordHeader)` 境界に揃えるための調整を加えた合計で決まる。
+- 常に `bytes_used <= bytes_capacity` を満たす。
+- 追記要求で容量不足 (`bytes_used + required_bytes > bytes_capacity`) になった場合、その write request はキューに保持し、次回 checkpoint & reload で Tier 2 の再構築・拡張を待ってから書き込む。
+- checkpoint & reload では Tier 2 がデフラグされて空き容量が増える場合があり、キューされた write request の実際の書き込み offset は enqueue 時点の `bytes_used` と一致するとは限らない。
 
 ### 2.3 VMemKV State
 
@@ -153,7 +151,7 @@ struct VMemKV {
 
 1. `Get(full_key)` を実行し、既存 entry がなければ続行する。
 2. WAL に insert record を append し、`fsync` する。
-3. Tier 2 `append_region` に新しい `ValueRecord` を書き込み、論理 `offset` を得る。
+3. Tier 2 の `bytes_used` 位置に新しい `ValueRecord` を書き込み、論理 `offset` を得る。
 4. `IndexEntry{key_prefix, hash, payload_bits}` を作り、Tier 1 `append_region` に追加する。
 
 **Failure Rule**
@@ -168,7 +166,7 @@ struct VMemKV {
 2. WAL に update record を append し、`fsync` する。
 3. Tier 2 の既存 record を見る。
 4. `new_value_len <= alloc_len` なら Tier 2 record を in-place update する。
-5. それ以外なら Tier 2 `append_region` に新 record を追加し、新しい `offset` を得る。
+5. それ以外なら Tier 2 の `bytes_used` 位置に新 record を追加し、新しい `offset` を得る。
 6. Tier 1 の該当 `IndexEntry.payload_bits` を新しい `offset` に書き換える。
 
 **Notes**
@@ -211,7 +209,7 @@ struct VMemKV {
 `reorganize` は次の 2 種類の断片化を解消する。
 
 - Ordering Fragmentation:
-  `append_region` が未整列で肥大化し、Get / Scan が遅くなる。
+  Tier 1 `append_region` の肥大化により候補探索・確認コストが増え、Get / Scan が遅くなる。加えて、Tier 2 の肥大化や局所性低下、append-update による参照先の散在により、主に Scan が遅くなり、Get でもページフォルト増加などで間接的に悪化しうる。
 - Storage Fragmentation:
   delete や append-update の結果、Tier 1 から参照されない古い Tier 2 record が蓄積する。
 
@@ -256,16 +254,15 @@ T2 `reorganize` は Tier 1 の offset を更新する必要があるため、`pa
 
 **Output**
 
-- 新しい Tier 2 `sorted_region`
-- 新しい Tier 2 `append_region`
+- 新しい `T2Store`
 - 新しい offset を反映した Tier 1
 
 **Procedure**
 
 1. T1 `sorted_region` の順に各 live `IndexEntry` を走査する。
-2. 各 `IndexEntry.payload_bits` から Tier 2 record を取得し、新しい T2 `sorted_region` にコピーする。
+2. 各 `IndexEntry.payload_bits` から Tier 2 record を取得し、新しい `T2Store` の `bytes_used` 位置にコピーする。
 3. コピー先 offset を計算し、対応する T1 `IndexEntry.payload_bits` を新 offset に書き換える。
-4. 次に T1 `append_region` の各 live `IndexEntry` について同様に Tier 2 record をコピーし、新しい T2 `append_region` を構築する。
+4. 次に T1 `append_region` の各 live `IndexEntry` について同様に Tier 2 record をコピーする。
 5. Tombstone 化されている entry と、Tier 1 から参照されない Tier 2 record はコピーしない。
 
 **Effect**
