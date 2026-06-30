@@ -500,3 +500,72 @@ TEST_CASE_TEMPLATE("scan with integral keys verifies lexicographical ordering", 
     CHECK(keys[2] == 10u);
     CHECK(keys[3] == 100u);
 }
+
+TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write paths")
+{
+    const std::string path = "test_inlining.bin";
+    const uint64_t cap = 1024 * 1024;
+    
+    SUBCASE("InlineShort behavior (1-7 bytes)")
+    {
+        using InlineStore = vmemkv::variants::VMemKV_T2_InlineAll;
+        auto s = std::make_unique<InlineStore>(path, cap);
+        
+        uint64_t initial_bytes = s->t2().bytes_used();
+        CHECK(initial_bytes == 0);
+        
+        // 1. 1-7 bytes (should inline)
+        std::vector<std::byte> val_short(5, std::byte{0xAB});
+        s->insert("key1", val_short);
+        
+        // Inline success = no T2 file capacity usage
+        CHECK(s->t2().bytes_used() == 0);
+        
+        // Verify read back
+        auto res = s->get_bytes("key1");
+        REQUIRE(res.has_value());
+        CHECK(res->size() == 5);
+        CHECK((*res)[0] == std::byte{0xAB});
+        
+        // 2. 8+ bytes (should bypass inlining, going to T2)
+        std::vector<std::byte> val_long(12, std::byte{0xCD});
+        s->insert("key2", val_long);
+        
+        CHECK(s->t2().bytes_used() > 0);
+        
+        std::filesystem::remove(path);
+    }
+
+    SUBCASE("Inline8B behavior (8 bytes integral with LSB=1)")
+    {
+        using InlineStore = vmemkv::variants::VMemKV_T2_InlineAll;
+        auto s = std::make_unique<InlineStore>(path, cap);
+        
+        // 8B Odd integer (LSB=1, bits 60-62=0) -> should inline
+        uint64_t val_lsb_1 = 0x003456789ABCDEF1ULL;
+        std::vector<std::byte> val_lsb_1_bytes(8);
+        std::memcpy(val_lsb_1_bytes.data(), &val_lsb_1, 8);
+        
+        s->insert("key_odd", val_lsb_1_bytes);
+        
+        // Inline success = no T2 file capacity usage
+        CHECK(s->t2().bytes_used() == 0);
+        
+        auto res1 = s->get_bytes("key_odd");
+        REQUIRE(res1.has_value());
+        uint64_t read_val1 = 0;
+        std::memcpy(&read_val1, res1->data(), 8);
+        CHECK(read_val1 == val_lsb_1);
+        
+        // 8B Even integer (LSB=0) -> should not inline
+        uint64_t val_lsb_0 = 0x123456789ABCDEF0ULL;
+        std::vector<std::byte> val_lsb_0_bytes(8);
+        std::memcpy(val_lsb_0_bytes.data(), &val_lsb_0, 8);
+        
+        s->insert("key_even", val_lsb_0_bytes);
+        
+        CHECK(s->t2().bytes_used() > 0);
+        
+        std::filesystem::remove(path);
+    }
+}
