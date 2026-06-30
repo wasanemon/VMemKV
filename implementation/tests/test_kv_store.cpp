@@ -26,8 +26,6 @@
 
 // Verify that all major variants satisfy the C++20 KVStore concept
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_Baseline>);
-static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_T2_Inline1To7B>);
-static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_T2_Inline8B>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_T2_InlineAll>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDB>);
 
@@ -105,8 +103,6 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>>
     vmemkv::variants::VMemKV_Ablation_No_BloomFilter, \
     vmemkv::variants::VMemKV_Ablation_No_SimdScan, \
     vmemkv::variants::VMemKV_Ablation_No_MemoryHints, \
-    vmemkv::variants::VMemKV_T2_Inline1To7B, \
-    vmemkv::variants::VMemKV_T2_Inline8B, \
     vmemkv::variants::VMemKV_T2_InlineAll
 
 // 競合バックエンドのバリエーション（RocksDBStoreなど）
@@ -358,7 +354,7 @@ TEST_CASE("Offset64 + append-map disambiguates long keys sharing a prefix")
     CHECK(idx->put(to_span(k1), 9));
     CHECK(idx->get(to_span(k1)) == 9u);
 
-    idx->reorganize([](uint64_t p) { return p; });
+    idx->reorganize([](uint64_t p, uint64_t) { return p; });
     CHECK(idx->get(to_span(k1)) == 9u);
     CHECK(idx->get(to_span(k2)) == 2u);
 }
@@ -506,7 +502,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
     const std::string path = "test_inlining.bin";
     const uint64_t cap = 1024 * 1024;
     
-    SUBCASE("InlineShort behavior (1-7 bytes)")
+    SUBCASE("T1InlineValue behavior (1-8 bytes)")
     {
         using InlineStore = vmemkv::variants::VMemKV_T2_InlineAll;
         auto s = std::make_unique<InlineStore>(path, cap);
@@ -527,42 +523,37 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
         CHECK(res->size() == 5);
         CHECK((*res)[0] == std::byte{0xAB});
         
-        // 2. 8+ bytes (should bypass inlining, going to T2)
-        std::vector<std::byte> val_long(12, std::byte{0xCD});
-        s->insert("key2", val_long);
+        // 2. 8 bytes Odd integer (should inline)
+        uint64_t val_odd = 0x003456789ABCDEF1ULL;
+        std::vector<std::byte> val_odd_bytes(8);
+        std::memcpy(val_odd_bytes.data(), &val_odd, 8);
         
-        CHECK(s->t2().bytes_used() > 0);
-        
-        std::filesystem::remove(path);
-    }
-
-    SUBCASE("Inline8B behavior (8 bytes integral with LSB=1)")
-    {
-        using InlineStore = vmemkv::variants::VMemKV_T2_InlineAll;
-        auto s = std::make_unique<InlineStore>(path, cap);
-        
-        // 8B Odd integer (LSB=1, bits 60-62=0) -> should inline
-        uint64_t val_lsb_1 = 0x003456789ABCDEF1ULL;
-        std::vector<std::byte> val_lsb_1_bytes(8);
-        std::memcpy(val_lsb_1_bytes.data(), &val_lsb_1, 8);
-        
-        s->insert("key_odd", val_lsb_1_bytes);
-        
-        // Inline success = no T2 file capacity usage
+        s->insert("key_odd", val_odd_bytes);
         CHECK(s->t2().bytes_used() == 0);
         
-        auto res1 = s->get_bytes("key_odd");
-        REQUIRE(res1.has_value());
-        uint64_t read_val1 = 0;
-        std::memcpy(&read_val1, res1->data(), 8);
-        CHECK(read_val1 == val_lsb_1);
+        auto res_odd = s->get_bytes("key_odd");
+        REQUIRE(res_odd.has_value());
+        uint64_t read_odd = 0;
+        std::memcpy(&read_odd, res_odd->data(), 8);
+        CHECK(read_odd == val_odd);
+
+        // 3. 8 bytes Even integer (should inline now!)
+        uint64_t val_even = 0x123456789ABCDEF0ULL;
+        std::vector<std::byte> val_even_bytes(8);
+        std::memcpy(val_even_bytes.data(), &val_even, 8);
         
-        // 8B Even integer (LSB=0) -> should not inline
-        uint64_t val_lsb_0 = 0x123456789ABCDEF0ULL;
-        std::vector<std::byte> val_lsb_0_bytes(8);
-        std::memcpy(val_lsb_0_bytes.data(), &val_lsb_0, 8);
+        s->insert("key_even", val_even_bytes);
+        CHECK(s->t2().bytes_used() == 0); // Correctly inlined now!
         
-        s->insert("key_even", val_lsb_0_bytes);
+        auto res_even = s->get_bytes("key_even");
+        REQUIRE(res_even.has_value());
+        uint64_t read_even = 0;
+        std::memcpy(&read_even, res_even->data(), 8);
+        CHECK(read_even == val_even);
+        
+        // 4. 9+ bytes (should bypass inlining, going to T2)
+        std::vector<std::byte> val_long(12, std::byte{0xCD});
+        s->insert("key2", val_long);
         
         CHECK(s->t2().bytes_used() > 0);
         

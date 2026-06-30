@@ -58,8 +58,9 @@ public:
                 return kNotFound;
 
             const Slot &slot = slot_at(static_cast<size_t>(observed - 1));
+            const uint64_t slot_clean_hash = slot.hash & ~(15ULL << 60);
             if (slot.published.load(std::memory_order_acquire) &&
-                slot.hash == hash && slot.key == key)
+                slot_clean_hash == hash && slot.key == key)
             {
                 return observed;
             }
@@ -92,8 +93,9 @@ public:
             }
 
             const Slot &slot = slot_at(static_cast<size_t>(expected - 1));
+            const uint64_t slot_clean_hash = slot.hash & ~(15ULL << 60);
             if (slot.published.load(std::memory_order_acquire) &&
-                slot.hash == hash && slot.key == key)
+                slot_clean_hash == hash && slot.key == key)
             {
                 buckets_[pos].slot_plus_one.store(slot_plus_one,
                                                   std::memory_order_release);

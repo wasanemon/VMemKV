@@ -68,20 +68,17 @@ namespace variants {
     // ─── B. T1 Index Optimizations (Ablation/Subtractive Study) ──────────────
     // Measures the individual performance contribution of each T1 feature
     // by disabling it from the fully optimized configuration.
-    using VMemKV_Ablation_No_AppendMap   = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, MemoryHints, InlineShort, Inline8B>>>;
-    using VMemKV_Ablation_No_BloomFilter = StoreAdapter<VMemKVImpl<Config<AppendMap, SimdScan, MemoryHints, InlineShort, Inline8B>>>;
-    using VMemKV_Ablation_No_SimdScan     = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, MemoryHints, InlineShort, Inline8B>>>;
-    using VMemKV_Ablation_No_MemoryHints  = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan, InlineShort, Inline8B>>>;
+    using VMemKV_Ablation_No_AppendMap   = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue>>>;
+    using VMemKV_Ablation_No_BloomFilter = StoreAdapter<VMemKVImpl<Config<AppendMap, SimdScan, MemoryHints, T1InlineValue>>>;
+    using VMemKV_Ablation_No_SimdScan     = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, MemoryHints, T1InlineValue>>>;
+    using VMemKV_Ablation_No_MemoryHints  = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan, T1InlineValue>>>;
 
     // ─── C. T2 Storage Value Inlining (Ablation/Subtractive Study) ───────────
-    // Measures the performance impact of different value-inlining policies on the T2 file
-    // (Disabled / 1-7B only / 8B only).
+    // Measures the performance impact of value-inlining policies.
     using VMemKV_T2_NoInline            = VMemKV_Cumulative_Step4; // No inlining (equivalent to Step 4)
-    using VMemKV_T2_Inline1To7B         = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan, MemoryHints, InlineShort>>>;
-    using VMemKV_T2_Inline8B            = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan, MemoryHints, Inline8B>>>;
 
     // ─── D. Master List of All Unique Configurations ─────────────────────────
-    // The unified collection of all 13 unique configuration variants, ensuring no
+    // The unified collection of all unique configuration variants, ensuring no
     // duplicate evaluations during tests or benchmarks.
     using AllPossibleTypes = std::tuple<
         VMemKV_Baseline,
@@ -93,8 +90,6 @@ namespace variants {
         VMemKV_Ablation_No_BloomFilter,
         VMemKV_Ablation_No_SimdScan,
         VMemKV_Ablation_No_MemoryHints,
-        VMemKV_T2_Inline1To7B,
-        VMemKV_T2_Inline8B,
         VMemKV_T2_InlineAll,
         VMemKV_RocksDB
     >;

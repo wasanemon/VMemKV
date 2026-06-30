@@ -93,8 +93,7 @@ public:
         if constexpr (ConfigT::UseBloomFilter)  parts.push_back("Bloom");
         if constexpr (ConfigT::UseSimdScan)     parts.push_back("Simd");
         if constexpr (ConfigT::UseMemoryHints)  parts.push_back("Hints");
-        if constexpr (ConfigT::UseInlineShort)  parts.push_back("InlineShort");
-        if constexpr (ConfigT::UseInline8B)     parts.push_back("Inline8B");
+        if constexpr (ConfigT::UseT1InlineValue)  parts.push_back("T1InlineValue");
 
         if (parts.empty())
             return "VMemKV/Baseline";
@@ -148,13 +147,17 @@ public:
         } fd_guard{temp_fd};
 
         try {
-            t1_.reorganize([&](uint64_t old_payload) -> uint64_t {
+            t1_.reorganize([&](uint64_t old_payload, uint64_t old_hash) -> uint64_t {
                 if (old_payload == vmemkv::STORE_NOT_FOUND)
                     return vmemkv::STORE_NOT_FOUND;
 
-                if (inline_value::is_inline_payload<ConfigT::UseInlineShort, ConfigT::UseInline8B>(old_payload))
+                if constexpr (ConfigT::UseT1InlineValue)
                 {
-                    return old_payload;
+                    const bool is_inline = (old_hash & (1ULL << 63)) != 0;
+                    if (is_inline)
+                    {
+                        return old_payload;
+                    }
                 }
 
                 std::shared_ptr<const vmemkv::T2Memory> mem = t2_.get_memory();
@@ -229,13 +232,14 @@ public:
         if (t1_.get(full_key) != vmemkv::STORE_NOT_FOUND)
             return false;
 
-        if (const auto inline_payload = try_make_inline_payload(full_key, value))
+        uint8_t inline_size = 0;
+        if (const auto inline_payload = try_make_inline_payload(full_key, value, inline_size))
         {
-            return t1_.put(full_key, *inline_payload);
+            return t1_.put(full_key, *inline_payload, true, inline_size);
         }
 
         const uint64_t offset = t2_.append(full_key, value);
-        return t1_.put(full_key, offset);
+        return t1_.put(full_key, offset, false, 0);
     }
 
     // Retrieves a value associated with the key.
@@ -243,14 +247,20 @@ public:
     // - Guarantees: Resolves inline value directly, otherwise reads T2 record at the T1 offset.
     uint64_t get_impl(std::span<const std::byte> full_key) const
     {
-        if constexpr (ConfigT::UseInlineShort || ConfigT::UseInline8B)
+        if constexpr (ConfigT::UseT1InlineValue)
         {
-            const uint64_t payload = t1_.get(full_key);
-            if (payload != vmemkv::STORE_NOT_FOUND &&
-                inline_value::is_inline_payload<ConfigT::UseInlineShort, ConfigT::UseInline8B>(payload))
+            const auto res = t1_.get_with_hash(full_key);
+            if (res.payload_bits != vmemkv::STORE_NOT_FOUND)
             {
-                const auto val_bytes = inline_value::unpack(payload);
-                return decode_u64(val_bytes);
+                const bool is_inline = (res.raw_hash & (1ULL << 63)) != 0;
+                if (is_inline)
+                {
+                    uint64_t size_code = (res.raw_hash >> 60) & 7ULL;
+                    size_t size = (size_code == 0) ? 8 : static_cast<size_t>(size_code);
+
+                    const auto val_bytes = inline_value::unpack(res.payload_bits, size);
+                    return decode_u64(val_bytes);
+                }
             }
         }
 
@@ -267,15 +277,17 @@ public:
     {
         std::lock_guard<std::mutex> key_lock(key_mutex(full_key));
 
-        uint64_t old_payload = t1_.get(full_key);
+        const auto res = t1_.get_with_hash(full_key);
+        uint64_t old_payload = res.payload_bits;
         if (old_payload == vmemkv::STORE_NOT_FOUND)
             return false;
 
-        const bool was_inline = inline_value::is_inline_payload<ConfigT::UseInlineShort, ConfigT::UseInline8B>(old_payload);
+        const bool was_inline = (res.raw_hash & (1ULL << 63)) != 0;
 
-        if (const auto inline_payload = try_make_inline_payload(full_key, value))
+        uint8_t inline_size = 0;
+        if (const auto inline_payload = try_make_inline_payload(full_key, value, inline_size))
         {
-            return t1_.put(full_key, *inline_payload);
+            return t1_.put(full_key, *inline_payload, true, inline_size);
         }
 
         if (!was_inline)
@@ -289,7 +301,7 @@ public:
         }
 
         const uint64_t offset = t2_.append(full_key, value);
-        return t1_.put(full_key, offset);
+        return t1_.put(full_key, offset, false, 0);
     }
 
     // Logically removes a key from the store.
@@ -311,13 +323,18 @@ public:
     // - Contract: Resolves inline value directly, otherwise fetches raw T2 record.
     std::optional<std::vector<std::byte>> get_bytes_impl(std::span<const std::byte> full_key) const
     {
-        if constexpr (ConfigT::UseInlineShort || ConfigT::UseInline8B)
+        if constexpr (ConfigT::UseT1InlineValue)
         {
-            const uint64_t payload = t1_.get(full_key);
-            if (payload != vmemkv::STORE_NOT_FOUND &&
-                inline_value::is_inline_payload<ConfigT::UseInlineShort, ConfigT::UseInline8B>(payload))
+            const auto res = t1_.get_with_hash(full_key);
+            if (res.payload_bits != vmemkv::STORE_NOT_FOUND)
             {
-                return inline_value::unpack(payload);
+                const bool is_inline = (res.raw_hash & (1ULL << 63)) != 0;
+                if (is_inline)
+                {
+                    uint64_t size_code = (res.raw_hash >> 60) & 7ULL;
+                    size_t size = (size_code == 0) ? 8 : static_cast<size_t>(size_code);
+                    return inline_value::unpack(res.payload_bits, size);
+                }
             }
         }
 
@@ -344,31 +361,38 @@ public:
         {
             std::shared_ptr<const vmemkv::T2Memory> mem = t2_.get_memory();
             t1_.scan(lo, hi,
-                     [&](std::span<const std::byte> index_key, uint64_t payload)
+                     [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash)
                      {
-                         if (payload == vmemkv::STORE_NOT_FOUND)
-                             return;
+                          if (payload == vmemkv::STORE_NOT_FOUND)
+                              return;
 
-                         if (inline_value::is_inline_payload<ConfigT::UseInlineShort, ConfigT::UseInline8B>(payload))
-                         {
-                             const auto val_bytes = inline_value::unpack(payload);
-                             uint64_t val = decode_u64(val_bytes);
-                             size_t len = 16;
-                             while (len > 0 && index_key[len - 1] == std::byte{0}) {
-                                 --len;
-                             }
-                             std::vector<std::byte> key(index_key.begin(), index_key.begin() + len);
-                             if (!key_in_range(key, lo, hi))
-                                 return;
-                             items.push_back({key, val});
-                         }
-                         else
-                         {
-                             const T2RecordView record = t2_.at(payload, mem);
-                             if (!key_in_range(record.key, lo, hi))
+                          if constexpr (ConfigT::UseT1InlineValue)
+                          {
+                              const bool is_inline = (hash & (1ULL << 63)) != 0;
+                              if (is_inline)
+                              {
+                                  uint64_t size_code = (hash >> 60) & 7ULL;
+                                  size_t size = (size_code == 0) ? 8 : static_cast<size_t>(size_code);
+
+                                  const auto val_bytes = inline_value::unpack(payload, size);
+                                  uint64_t val = decode_u64(val_bytes);
+                                  size_t len = 16;
+                                  while (len > 0 && index_key[len - 1] == std::byte{0}) {
+                                      --len;
+                                  }
+                                  std::vector<std::byte> key(index_key.begin(), index_key.begin() + len);
+                                  if (!key_in_range(key, lo, hi))
+                                      return;
+                                  items.push_back({key, val});
                                   return;
-                             items.push_back({std::vector<std::byte>(record.key.begin(), record.key.end()), decode_u64(record.value)});
-                         }
+                              }
+                          }
+
+                          // T2 record branch
+                          const T2RecordView record = t2_.at(payload, mem);
+                          if (!key_in_range(record.key, lo, hi))
+                               return;
+                          items.push_back({std::vector<std::byte>(record.key.begin(), record.key.end()), decode_u64(record.value)});
                      });
         }
 
@@ -382,29 +406,16 @@ public:
 private:
     std::filesystem::path t2_path() const { return "t2_flat.db"; }
 
-    std::optional<uint64_t> try_make_inline_payload(std::span<const std::byte> full_key, std::span<const std::byte> value) const noexcept
+    std::optional<uint64_t> try_make_inline_payload(std::span<const std::byte> full_key, std::span<const std::byte> value, uint8_t &out_size) const noexcept
     {
-        if constexpr (ConfigT::UseInlineShort || ConfigT::UseInline8B)
+        if constexpr (ConfigT::UseT1InlineValue)
         {
             if (full_key.size() <= t1_detail::kPrefixBytes)
             {
-                if constexpr (ConfigT::UseInlineShort)
+                if (value.size() >= 1 && value.size() <= 8)
                 {
-                    if (value.size() >= 1 && value.size() <= 7)
-                    {
-                        return inline_value::pack(value);
-                    }
-                }
-                if constexpr (ConfigT::UseInline8B)
-                {
-                    if (value.size() == 8)
-                    {
-                        const uint64_t val_u64 = decode_u64(value);
-                        if ((val_u64 & 1ULL) != 0 && (val_u64 & (7ULL << 60)) == 0)
-                        {
-                            return inline_value::pack(value);
-                        }
-                    }
+                    out_size = static_cast<uint8_t>(value.size());
+                    return inline_value::pack(value);
                 }
             }
         }
@@ -471,13 +482,15 @@ private:
         std::span<const std::byte> full_key,
         const std::shared_ptr<const vmemkv::T2Memory> &mem) const
     {
-        const uint64_t payload = t1_.get(full_key);
+        const auto res = t1_.get_with_hash(full_key);
+        const uint64_t payload = res.payload_bits;
         if (payload == vmemkv::STORE_NOT_FOUND)
             return std::nullopt;
 
-        if constexpr (ConfigT::UseInlineShort || ConfigT::UseInline8B)
+        if constexpr (ConfigT::UseT1InlineValue)
         {
-            if (inline_value::is_inline_payload<ConfigT::UseInlineShort, ConfigT::UseInline8B>(payload))
+            const bool is_inline = (res.raw_hash & (1ULL << 63)) != 0;
+            if (is_inline)
                 return std::nullopt;
         }
 

@@ -46,7 +46,7 @@ inline uint64_t hash_full_key(std::span<const std::byte> key) noexcept
         hash ^= static_cast<uint8_t>(b);
         hash *= prime;
     }
-    return hash;
+    return hash & ~(15ULL << 60);
 }
 
 } // namespace t1_detail
@@ -106,30 +106,42 @@ public:
     T1Index(const T1Index &) = delete;
     T1Index &operator=(const T1Index &) = delete;
 
-    // Retrieves the 64-bit payload associated with a key prefix.
-    // - Thread-safety: Lock-free and concurrently readable while reorganization is in progress.
-    // - Guarantees: Returns the latest visible value or STORE_NOT_FOUND if not found.
-    Payload get(std::span<const std::byte> key) const
+    struct LookupResult
+    {
+        Payload payload_bits;
+        uint64_t raw_hash;
+    };
+
+    // Retrieves the 64-bit payload and raw hash associated with a key prefix.
+    LookupResult get_with_hash(std::span<const std::byte> key) const
     {
         const auto [prefix, hash] = prepare_key_and_hash(key);
 
-        return read_optimistic([&]() -> Payload {
+        return read_optimistic([&]() -> LookupResult {
             const auto sorted = sorted_region_.load(std::memory_order_acquire);
 
             // 1. check append region
             if (const AppendSlot *slot = find_append(prefix, hash))
             {
-                return slot->payload_bits.load(std::memory_order_acquire);
+                return LookupResult{slot->payload_bits.load(std::memory_order_acquire), slot->hash};
             }
 
             // 2. check sorted region
             if (const SortedSlot *slot = find_sorted(*sorted, prefix, hash))
             {
-                return slot->payload_bits.load(std::memory_order_acquire);
+                return LookupResult{slot->payload_bits.load(std::memory_order_acquire), slot->hash};
             }
 
-            return STORE_NOT_FOUND;
+            return LookupResult{STORE_NOT_FOUND, 0};
         });
+    }
+
+    // Retrieves the 64-bit payload associated with a key prefix.
+    // - Thread-safety: Lock-free and concurrently readable while reorganization is in progress.
+    // - Guarantees: Returns the latest visible value or STORE_NOT_FOUND if not found.
+    Payload get(std::span<const std::byte> key) const
+    {
+        return get_with_hash(key).payload_bits;
     }
 
     // Inserts or updates the 64-bit payload for a given key prefix.
@@ -137,14 +149,22 @@ public:
     // - Guarantees: Writes to the append region if the key does not exist; updates the slot in-place if it does.
     // - Note on Concurrency: This write method does not require a SeqLock retry loop because
     //   concurrent writes with reorganize are reconciled by the re-check of write_version_ during Phase 2 of reorganize.
-    bool put(std::span<const std::byte> key, Payload value)
+    bool put(std::span<const std::byte> key, Payload value, bool is_inline = false, uint8_t inline_size = 0)
     {
         const auto [prefix, hash] = prepare_key_and_hash(key);
+
+        uint64_t stored_hash = hash;
+        if (is_inline)
+        {
+            stored_hash |= (1ULL << 63);
+            stored_hash |= (static_cast<uint64_t>(inline_size & 7ULL) << 60);
+        }
 
         ResolvedSlot slot = resolve(prefix, hash);
         if (slot.found())
         {
             slot.store(value);
+            slot.store_hash(stored_hash);
             write_version_.fetch_add(1, std::memory_order_release);
             return true;
         }
@@ -153,7 +173,7 @@ public:
         if (index >= APPEND_CAP)
             throw std::runtime_error("T1 Append Region Full");
 
-        append_region_.publish(index, prefix, hash, value);
+        append_region_.publish(index, prefix, stored_hash, value);
         publish_append_index(index, prefix, hash);
         write_version_.fetch_add(1, std::memory_order_release);
         return true;
@@ -185,7 +205,7 @@ public:
             {
                 if (!(entry.key < lo) && !(hi < entry.key))
                 {
-                    cb(prefix_to_span(entry.key), entry.payload_bits);
+                    cb(prefix_to_span(entry.key), entry.payload_bits, entry.hash);
                     ++match_count;
                 }
             }
@@ -236,7 +256,7 @@ public:
 
         for (auto &entry : merged)
         {
-            entry.payload_bits = offset_mapper(entry.payload_bits);
+            entry.payload_bits = offset_mapper(entry.payload_bits, entry.hash);
         }
 
         std::shared_ptr<const SortedRegion> next_sorted =
@@ -297,7 +317,10 @@ private:
                 slots[i].payload_bits.store(entries[i].payload_bits,
                                             std::memory_order_relaxed);
                 if constexpr (Config::UseBloomFilter)
-                    bloom.add(entries[i].hash);
+                {
+                    const uint64_t clean_h = entries[i].hash & ~(15ULL << 60);
+                    bloom.add(clean_h);
+                }
             }
         }
     };
@@ -327,6 +350,14 @@ private:
                 append->payload_bits.store(value, std::memory_order_release);
             else
                 sorted->payload_bits.store(value, std::memory_order_release);
+        }
+
+        void store_hash(uint64_t hash) const noexcept
+        {
+            if (append != nullptr)
+                append->hash = hash;
+            else
+                const_cast<SortedSlot *>(sorted)->hash = hash;
         }
     };
 
@@ -402,7 +433,8 @@ private:
             const AppendSlot &slot = slots_[static_cast<size_t>(slot_plus_one - 1)];
             if (!slot.published.load(std::memory_order_acquire))
                 return nullptr;
-            return (slot.key == key && slot.hash == hash) ? &slot : nullptr;
+            const uint64_t slot_clean_hash = slot.hash & ~(15ULL << 60);
+            return (slot.key == key && slot_clean_hash == hash) ? &slot : nullptr;
         }
 
         AppendSlot *find_linear(Key key, uint64_t hash) noexcept
@@ -419,7 +451,8 @@ private:
                 const AppendSlot &slot = slots_[i - 1];
                 if (!slot.published.load(std::memory_order_acquire))
                     continue;
-                if (slot.hash == hash && slot.key == key)
+                const uint64_t slot_clean_hash = slot.hash & ~(15ULL << 60);
+                if (slot_clean_hash == hash && slot.key == key)
                     return &slot;
             }
             return nullptr;
@@ -503,7 +536,8 @@ private:
 
         while (found != end && found->key == key)
         {
-            if (found->hash == hash)
+            const uint64_t slot_clean_hash = found->hash & ~(15ULL << 60);
+            if (slot_clean_hash == hash)
             {
                 return found;
             }
