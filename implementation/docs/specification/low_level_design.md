@@ -12,7 +12,7 @@ Tier 1 は fixed-size の `IndexEntry` を格納するインデックス層で�
 `sorted_region` と `append_region` はどちらも `IndexEntry` 配列として保持する。
 
 ```c++
-using StoreKeyPrefix = std::array<uint64_t, 2>;   // 16-byte key prefix
+using StoreKeyPrefix = std::array<std::byte, 16>; // 16-byte key prefix
 
 struct IndexEntry {
     StoreKeyPrefix key_prefix;  // primary sort key
@@ -58,14 +58,12 @@ enum class T1PayloadMode : uint8_t {
 - Tier 1 の live entry は、`sorted_region` と `append_region` を合わせて logical key ごとに高々 1 個であることを期待する。
 - `payload_bits == TOMBSTONE_OFFSET` の entry は delete 済みであり、Get / Scan の結果に含めない。
 
-### 2.1.1 Index-Level Payload Mode
+### 2.1.1 Dynamic Inline Optimizations
 
-Tier 1 は 64-bit payload を保持するインデックスであり、その意味は index 全体の `payload_mode` で決まる。
+Tier 1 は 64-bit payload を保持するインデックスである。T1/T2ハイブリッド構成において、値のサイズが 64-bit（8バイト）以下のときにディスク（Tier 2）へのアペンド書き込みをバイパスして、T1 の payload 領域内に直接バリューをインライン格納する「動的インライン最適化」がサポートされている。これによって、小さなサイズの値に対してディスクI/Oや mmap デリファレンスを完全に省略し、インメモリKVS並みの極限の検索速度を実現できる。
 
-- `payload_mode == Offset64`: `payload_bits` は Tier 2 の論理オフセット
-- `payload_mode == Inline64`: `payload_bits` は Tier 1 に直接格納された 64-bit value
+（動的インライン最適化の具体的な実装アプローチとそれぞれのトレードオフについては、後述の **「7.5 Dynamic T1 Inline Optimization」** を参照。）
 
-後者は index-level covering であり、small fixed-size value を対象に Tier 1 のみで `Get()` を完結させられる。現在の standalone な T1 実装はこの `Inline64` モードを使う。一方、full VMemKV の base design は `Offset64` モードである。
 
 ### 2.2 Tier 2
 
@@ -277,6 +275,11 @@ T2 `reorganize` は Tier 1 の offset を更新する必要があるため、`pa
 T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時に旧世代と新世代を持つとメモリ圧迫が大きい。
 そのため、T2 `reorganize` は必ず checkpoint file を介して行い、完成したファイルを `mmap` で読み込む。
 
+> [!NOTE]
+> 新世代の T2 ファイル構築時、`mmap(MAP_SHARED)` でマッピングしてアペンド追記する設計ではなく、通常の `write()` システムコールを用いたシーケンシャル書き出しを採用します。
+> ファイルを拡張しながら `mmap` でアペンド書き込みを行うと、ページ境界を越えるたびにカーネル側でマイナーページフォルト（Page Fault）が発生し、メモリ割り当てとページテーブル更新による CPU サイクル浪費が発生します。
+> これに対し、通常の `write()` はカーネルページキャッシュのバッファリングが高度に効き、ページフォルトを伴わずにシーケンシャルデータを高速に流し込めます。また、一時的な mmap 状態を管理する必要がなくなるため、リソース管理のバグが排除され堅牢性が向上します。書き出し完了した新ファイルを、最後に `MAP_PRIVATE` で再オープン（mmap）します。
+
 ### 5.2 Flow
 
 `checkpoint reload` は次の手順で行う。
@@ -329,6 +332,7 @@ point operation は通常時にオンラインで進める。
 - `Allowed with retry/snapshot`: 並行実行してよいが、snapshot 読みまたは retry が必要
 - `Serialized`: 同一 key に対しては直列化が必要
 - `Blocked in final STW`: checkpoint reload の最終 stop-the-world では停止する
+- `Single-flight`: 並行呼び出し時、すでに他スレッドで処理が進行中であれば、待機せずに即座に処理をスキップしてリターンする（直列化による連続した空振りコンパクションとブロッキングを避けるため、アトミックフラグによって制御される）。
 
 | Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize | Checkpoint reload |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -427,13 +431,24 @@ index 単位で `payload_mode == Inline64` を選び、Tier 1 payload を 64-bit
 - small fixed-size value workload では Tier 2 アクセスを完全に省略できる
 - WAL / checkpoint では index の payload mode をメタデータとして永続化する
 
-### 7.6 Entry-Level Adaptive Covering
+### 7.6 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
 
-entry ごとに `offset` と inline 64-bit value を切り替える adaptive covering を行う。
+エントリーごとに T2 オフセットとインライン 64-bit 値を動的に切り替える最適化である。値が 8バイト（64ビット）以下のときに Tier 2 への書き出しをバイパスして Tier 1 インデックスの payload 領域内に直接バリューをインライン格納する。
 
-- 64bits 以下の小さいデータはcoveringし，大きいデータのみT2に保存することで可変長データをよりコンパクトに扱えるようになる
-- その代わり entry ごとの payload tag が必要になる
-- Get / Scan / reorganize / checkpoint の分岐は index-level covering より複雑になる
+本最適化は `vmemkv::Config` のテンプレート引数タグ（`T1InlineValue`）を介して制御される。
+
+#### 7.6.1 メタデータとハッシュのエンコーディング
+T1のインデックススロットに十分な空きビット領域がないため、64ビットのハッシュフィールド（`hash`）の最上位4ビットをメタデータ領域として再利用し、フラグとサイズ情報を格納する。
+
+- **Bit 63 (`is_inline`)**: `1` の場合はインラインデータ、`0` の場合は T2オフセットを表す。
+- **Bits 62-60 (`inline_size`)**: インラインデータのバイトサイズ（1〜8バイト）を表す。サイズ `8` は `0` としてエンコードされる。
+- **Bits 59-0 (`clean_hash`)**: 実際の60ビットFnvハッシュキー。インデックスの検索、Bloom filterの登録・判定、SIMDスキャン等のハッシュ比較時には、上位4ビットをマスクしてこの60ビット部分のみを比較する。
+
+#### 7.6.2 インライン化の動作
+- **T2 オフセットとの識別 (判定)**:
+  - 読み出し時、T1から取得したスロットハッシュの最上位ビット（Bit 63）を確認するだけで、T2をフェッチせずにインラインかオフセットかを100%確実に識別できる。
+- **値が 1〜8 バイトの場合**:
+  - `payload_bits` に対するビットシフトやビットの埋め込みは行わず、64ビットのビットパターンをそのまま無加工で格納し、デコード時は `inline_size` に従いバイトコピーを行う。これにより、`double`、`time`、連番のサロゲートキー（偶数・奇数を問わず）など、あらゆる64ビット以内のデータ型を完全にインライン化できる。
 
 ### 7.7 Sorted Bloom Filter
 

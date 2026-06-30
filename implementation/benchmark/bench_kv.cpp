@@ -18,37 +18,29 @@
 #include <nanobench.h>
 
 #include <atomic>
+#include <tuple>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <cstddef>
 #include <memory>
 #include <random>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "../src/t1/t1_index.hpp"
-#ifdef ENABLE_ROCKSDB
-#include "../src/kvs/rocksdb_store.hpp"
+#include <vmemkv/vmemkv.hpp>
+#include <rivals/rocksdb_store.hpp>
 #include <unistd.h>
-#endif
-
-using T1AllOff = BasicT1Index<T1Config<false, false, false, false>>;
-using T1SingleAppendMap = BasicT1Index<T1Config<true, false, false, false>>;
-using T1SingleBloomFilter = BasicT1Index<T1Config<false, true, false, false>>;
-using T1SingleSimdScan = BasicT1Index<T1Config<false, false, true, false>>;
-using T1SingleMemoryHints = BasicT1Index<T1Config<false, false, false, true>>;
-using T1Cumulative1 = BasicT1Index<T1Config<true, false, false, false>>;
-using T1Cumulative2 = BasicT1Index<T1Config<true, true, false, false>>;
-using T1Cumulative3 = BasicT1Index<T1Config<true, true, true, false>>;
-using T1Cumulative4 = BasicT1Index<T1Config<true, true, true, true>>;
 
 namespace nb = ankerl::nanobench;
 using Clock = std::chrono::steady_clock;
 
 // ---- Key helpers -------------------------------------------------------------
-// "key_%07d" = 11 chars, fits in 16 bytes -> stored fully in StoreKey.
+// "key_%07d" = 11 chars, fits in the 16-byte index prefix.
 // Zero-padded so lexicographic order == numeric order (needed for SCAN).
 
 static std::string ikey(int i)
@@ -58,7 +50,7 @@ static std::string ikey(int i)
     return buf;
 }
 
-static StoreKey make_key(int i) { return make_store_key(ikey(i)); }
+static std::string make_key(int i) { return ikey(i); }
 
 template <typename Store>
 static void populate(Store &store, int n)
@@ -124,39 +116,44 @@ static std::string rdb_path()
 }
 #endif
 
-template <typename Fn>
-static void for_each_t1_variant(Fn &&fn)
+template <typename Constructor>
+static auto make_vmemkv(const std::string &path, Constructor &&constructor)
 {
-    fn("T1/AllOff", []
-       { return std::make_unique<T1AllOff>(); });
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return constructor();
+}
 
-    fn("T1/Single/UseAppendMapV", []
-       { return std::make_unique<T1SingleAppendMap>(); });
-    fn("T1/Single/UseBloomFilterV", []
-       { return std::make_unique<T1SingleBloomFilter>(); });
-    fn("T1/Single/UseSimdScanV", []
-       { return std::make_unique<T1SingleSimdScan>(); });
-    fn("T1/Single/UseMemoryHintsV", []
-       { return std::make_unique<T1SingleMemoryHints>(); });
+template <typename Tuple, typename Fn, std::size_t... Is>
+void for_each_in_tuple_impl(Fn&& fn, std::index_sequence<Is...>) {
+    (fn(static_cast<std::tuple_element_t<Is, Tuple>*>(nullptr)), ...);
+}
 
-    fn("T1/Cumulative/UseAppendMapV", []
-       { return std::make_unique<T1Cumulative1>(); });
-    fn("T1/Cumulative/UseAppendMapV+UseBloomFilterV", []
-       { return std::make_unique<T1Cumulative2>(); });
-    fn("T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV", []
-       { return std::make_unique<T1Cumulative3>(); });
-    fn("T1/Cumulative/UseAppendMapV+UseBloomFilterV+UseSimdScanV+UseMemoryHintsV", []
-       { return std::make_unique<T1Cumulative4>(); });
+template <typename Tuple, typename Fn>
+void for_each_in_tuple(Fn&& fn) {
+    for_each_in_tuple_impl<Tuple>(std::forward<Fn>(fn), std::make_index_sequence<std::tuple_size_v<Tuple>>{});
 }
 
 template <typename Fn>
 static void for_each_store_variant(Fn &&fn)
 {
-    for_each_t1_variant(fn);
-#ifdef ENABLE_ROCKSDB
-    fn("RocksDB", []
-       { return std::make_unique<RocksDBStore>(rdb_path()); });
-#endif
+    for_each_in_tuple<vmemkv::variants::AllPossibleTypes>([&](auto* dummy) {
+        using Store = std::remove_pointer_t<decltype(dummy)>;
+        if constexpr (Store::kIsEnabled) {
+            std::string filename = "bench_" + Store::name() + ".bin";
+            std::replace(filename.begin(), filename.end(), '/', '_');
+
+            fn(Store::name().c_str(), [&]() {
+                return make_vmemkv(filename, [&]() {
+                    if constexpr (std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDB>) {
+                        return std::make_unique<Store>(filename);
+                    } else {
+                        return std::make_unique<Store>(filename, 1u << 26);
+                    }
+                });
+            });
+        }
+    });
 }
 
 // =============================================================================
@@ -238,7 +235,7 @@ static void bench_scan(nb::Bench &b, const char *name, int n, MakeStore make)
     b.batch(n).run(name, [&]
                    {
         size_t cnt = store->scan(make_key(0), make_key(n - 1),
-                                 [](StoreKey, uint64_t v) { nb::doNotOptimizeAway(v); });
+                                 [](std::span<const std::byte>, uint64_t v) { nb::doNotOptimizeAway(v); });
         nb::doNotOptimizeAway(cnt); });
 }
 
@@ -251,7 +248,7 @@ static void bench_scan_reorg(nb::Bench &b, const char *name, int n, MakeStore ma
     b.batch(n).minEpochIterations(5).run(name, [&]
                                          {
         size_t cnt = store->scan(make_key(0), make_key(n - 1),
-                                 [](StoreKey, uint64_t v) { nb::doNotOptimizeAway(v); });
+                                 [](std::span<const std::byte>, uint64_t v) { nb::doNotOptimizeAway(v); });
         nb::doNotOptimizeAway(cnt); });
 }
 
@@ -312,13 +309,13 @@ static void bench_scan_vs_size(nb::Bench &b, const char *tag,
                         {
         int s = zipf(rng);
         size_t cnt = store->scan(make_key(s), make_key(s + scan_n - 1),
-                                 [](StoreKey, uint64_t v) { nb::doNotOptimizeAway(v); });
+                                 [](std::span<const std::byte>, uint64_t v) { nb::doNotOptimizeAway(v); });
         nb::doNotOptimizeAway(cnt); });
     b.batch(scan_n).run(std::string(tag) + "/Uniform", [&]
                         {
         int s = uni(rng);
         size_t cnt = store->scan(make_key(s), make_key(s + scan_n - 1),
-                                 [](StoreKey, uint64_t v) { nb::doNotOptimizeAway(v); });
+                                 [](std::span<const std::byte>, uint64_t v) { nb::doNotOptimizeAway(v); });
         nb::doNotOptimizeAway(cnt); });
 }
 
@@ -492,16 +489,17 @@ int main(int argc, char **argv)
     {
         nb::Bench b;
         b.title("ST / SCAN/" + std::to_string(n)).unit("op").warmup(1).relative(true);
-        for_each_t1_variant([&](const char *name, auto make)
-                            {
+        for_each_store_variant([&](const char *name, auto make)
+                               {
             std::string scan = std::string(name) + "/Scan";
-            std::string scan_reorg = std::string(name) + "/Scan(reorg)";
             bench_scan(b, scan.c_str(), n, make);
-            bench_scan_reorg(b, scan_reorg.c_str(), n, make); });
-#ifdef ENABLE_ROCKSDB
-        bench_scan(b, "RocksDB/Scan", n, []
-                   { return std::make_unique<RocksDBStore>(rdb_path()); });
-#endif
+
+            if (std::string(name) != "RocksDB")
+            {
+                std::string scan_reorg = std::string(name) + "/Scan(reorg)";
+                bench_scan_reorg(b, scan_reorg.c_str(), n, make);
+            }
+        });
     }
 
     // ---- MT ------------------------------------------------------------------

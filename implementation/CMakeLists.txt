@@ -4,17 +4,26 @@ project(VMemKV CXX)
 # Allow older 3rd-party CMake files that use cmake_minimum_required(VERSION 3.0)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-# ── Interface library for src/ headers ───────────────────────────────────────
-option(ENABLE_ROCKSDB "Build with RocksDB backend" OFF)
+# ── Interface library for headers ─────────────────────────────────────────────
+option(ENABLE_ROCKSDB "Build with RocksDB backend" ON)
 add_library(vmemkv_headers INTERFACE)
-target_include_directories(vmemkv_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(vmemkv_headers INTERFACE 
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# ── Static library for source implementation ─────────────────────────────────
+add_library(vmemkv STATIC
+  src/t2_flat_file/t2_flat_file.cpp
+)
+target_link_libraries(vmemkv PUBLIC vmemkv_headers)
 
 # ── doctest (single-header, header-only test framework) ─────────────────────
 include(FetchContent)
@@ -49,7 +58,10 @@ if(ENABLE_ROCKSDB)
 endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
-add_subdirectory(tests)
+option(ENABLE_TESTS "Build tests" ON)
+if(ENABLE_TESTS)
+  add_subdirectory(tests)
+endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 option(ENABLE_BENCHMARK "Build nanobench suite" ON)

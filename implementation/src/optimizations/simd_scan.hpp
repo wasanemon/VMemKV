@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -103,7 +104,7 @@ inline size_t scan_append(const Slot *append_region,
                           Callback &cb,
                           IsLive is_live)
 {
-    if constexpr (UseSimdScan)
+    if constexpr (UseSimdScan && std::is_same_v<typename Key::value_type, uint64_t>)
     {
 #if defined(__x86_64__) || defined(_M_X64)
         return scan_append_simd(append_region, append_size, lo, hi, cb, is_live);
