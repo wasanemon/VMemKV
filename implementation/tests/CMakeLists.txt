@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 
 # ─── test_kv_store ────────────────────────────────────────────────────────────
-add_executable(test_kv_store test_kv_store.cpp)
-target_link_libraries(test_kv_store PRIVATE vmemkv_headers doctest::doctest)
-target_compile_options(test_kv_store PRIVATE -Wall -Wextra)
+add_executable(test_kv_store test_kv_store.cpp test_main.cpp)
+target_link_libraries(test_kv_store PRIVATE vmemkv vmemkv_headers doctest::doctest)
+target_compile_options(test_kv_store PRIVATE -Wall -Wextra -ftime-trace -ftime-report -H)
+
 
 if(ENABLE_ROCKSDB AND RocksDB_FOUND)
   target_compile_definitions(test_kv_store PRIVATE ENABLE_ROCKSDB=1)

@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+#include <vmemkv/config.hpp>
+#include "../api/utils.hpp"
 
 #if __has_include(<sys/mman.h>)
 #include <sys/mman.h>
@@ -22,9 +24,8 @@ inline std::pair<void *, size_t> page_span(const void *ptr, size_t bytes)
         return {nullptr, 0};
     const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
     const uintptr_t page = static_cast<uintptr_t>(page_size);
-    const uintptr_t aligned_start = start & ~(page - 1);
-    const uintptr_t end = start + bytes;
-    const uintptr_t aligned_end = (end + page - 1) & ~(page - 1);
+    const uintptr_t aligned_start = vmemkv::align_down(start, page);
+    const uintptr_t aligned_end = vmemkv::align_up(start + bytes, page);
     if (aligned_end <= aligned_start)
         return {nullptr, 0};
     return {reinterpret_cast<void *>(aligned_start), aligned_end - aligned_start};

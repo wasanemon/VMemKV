@@ -12,7 +12,7 @@ Tier 1 は fixed-size の `IndexEntry` を格納するインデックス層で�
 `sorted_region` と `append_region` はどちらも `IndexEntry` 配列として保持する。
 
 ```c++
-using StoreKeyPrefix = std::array<uint64_t, 2>;   // 16-byte key prefix
+using StoreKeyPrefix = std::array<std::byte, 16>; // 16-byte key prefix
 
 struct IndexEntry {
     StoreKeyPrefix key_prefix;  // primary sort key
@@ -58,14 +58,12 @@ enum class T1PayloadMode : uint8_t {
 - Tier 1 の live entry は、`sorted_region` と `append_region` を合わせて logical key ごとに高々 1 個であることを期待する。
 - `payload_bits == TOMBSTONE_OFFSET` の entry は delete 済みであり、Get / Scan の結果に含めない。
 
-### 2.1.1 Index-Level Payload Mode
+### 2.1.1 Dynamic Inline Optimizations
 
-Tier 1 は 64-bit payload を保持するインデックスであり、その意味は index 全体の `payload_mode` で決まる。
+Tier 1 は 64-bit payload を保持するインデックスである。T1/T2ハイブリッド構成において、値のサイズが 64-bit（8バイト）以下のときにディスク（Tier 2）へのアペンド書き込みをバイパスして、T1 の payload 領域内に直接バリューをインライン格納する「動的インライン最適化」がサポートされている。これによって、小さなサイズの値に対してディスクI/Oや mmap デリファレンスを完全に省略し、インメモリKVS並みの極限の検索速度を実現できる。
 
-- `payload_mode == Offset64`: `payload_bits` は Tier 2 の論理オフセット
-- `payload_mode == Inline64`: `payload_bits` は Tier 1 に直接格納された 64-bit value
+（動的インライン最適化の具体的な実装アプローチとそれぞれのトレードオフについては、後述の **「7.5 Dynamic T1 Inline Optimization」** を参照。）
 
-後者は index-level covering であり、small fixed-size value を対象に Tier 1 のみで `Get()` を完結させられる。現在の standalone な T1 実装はこの `Inline64` モードを使う。一方、full VMemKV の base design は `Offset64` モードである。
 
 ### 2.2 Tier 2
 
@@ -277,6 +275,11 @@ T2 `reorganize` は Tier 1 の offset を更新する必要があるため、`pa
 T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時に旧世代と新世代を持つとメモリ圧迫が大きい。
 そのため、T2 `reorganize` は必ず checkpoint file を介して行い、完成したファイルを `mmap` で読み込む。
 
+> [!NOTE]
+> 新世代の T2 ファイル構築時、`mmap(MAP_SHARED)` でマッピングしてアペンド追記する設計ではなく、通常の `write()` システムコールを用いたシーケンシャル書き出しを採用します。
+> ファイルを拡張しながら `mmap` でアペンド書き込みを行うと、ページ境界を越えるたびにカーネル側でマイナーページフォルト（Page Fault）が発生し、メモリ割り当てとページテーブル更新による CPU サイクル浪費が発生します。
+> これに対し、通常の `write()` はカーネルページキャッシュのバッファリングが高度に効き、ページフォルトを伴わずにシーケンシャルデータを高速に流し込めます。また、一時的な mmap 状態を管理する必要がなくなるため、リソース管理のバグが排除され堅牢性が向上します。書き出し完了した新ファイルを、最後に `MAP_PRIVATE` で再オープン（mmap）します。
+
 ### 5.2 Flow
 
 `checkpoint reload` は次の手順で行う。
@@ -329,6 +332,7 @@ point operation は通常時にオンラインで進める。
 - `Allowed with retry/snapshot`: 並行実行してよいが、snapshot 読みまたは retry が必要
 - `Serialized`: 同一 key に対しては直列化が必要
 - `Blocked in final STW`: checkpoint reload の最終 stop-the-world では停止する
+- `Single-flight`: 並行呼び出し時、すでに他スレッドで処理が進行中であれば、待機せずに即座に処理をスキップしてリターンする（直列化による連続した空振りコンパクションとブロッキングを避けるため、アトミックフラグによって制御される）。
 
 | Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize | Checkpoint reload |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -427,13 +431,29 @@ index 単位で `payload_mode == Inline64` を選び、Tier 1 payload を 64-bit
 - small fixed-size value workload では Tier 2 アクセスを完全に省略できる
 - WAL / checkpoint では index の payload mode をメタデータとして永続化する
 
-### 7.6 Entry-Level Adaptive Covering
+### 7.6 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
 
-entry ごとに `offset` と inline 64-bit value を切り替える adaptive covering を行う。
+エントリーごとに T2 オフセットとインライン 64-bit 値を動的に切り替える最適化である。値が 64ビット以下のときに Tier 2 への書き出しをバイパスして Tier 1 インデックスの payload 領域内に直接バリューをインライン格納する。
 
-- 64bits 以下の小さいデータはcoveringし，大きいデータのみT2に保存することで可変長データをよりコンパクトに扱えるようになる
-- その代わり entry ごとの payload tag が必要になる
-- Get / Scan / reorganize / checkpoint の分岐は index-level covering より複雑になる
+本最適化では、アブレーション研究（論文の性能比較）での検証が容易となるよう、1〜7バイト（可変長）のインライン化と、8バイト固定長（数値型等）のインライン化を個別にトグルできるように設計されている。これは `vmemkv::Config` のテンプレート引数タグ（`InlineShort`, `Inline8B`）を介して制御される。
+
+#### 7.6.1 インラインタグの構成
+- **`vmemkv::InlineShort`**: 1〜7バイトの短い文字列や構造体のみをインライン化。
+- **`vmemkv::Inline8B`**: 8バイトの固定長データ（LSBが1）のみをインライン化。
+- 両方のタグを指定することで、両方を有効化したハイブリッドインライン化となる。また、両方のタグを指定しないことでインライン化を無効化（ベースライン）できる。
+
+#### 7.6.2 ビットエンコーディングと判定の仕組み
+本設計の決定的な強みは、トグルの設定（1-7B, 8B, 両方）に関わらず、インライン判定とエンコード・デコードのロジックが **完全に同一（共通）** であり、オーバーヘッドが極めて低くシンプルに維持されている点にある。
+
+- **T2 オフセットとの識別 (判定)**:
+  - 有効な T2 レコードは常に 8 バイトアライメントされている（下位 3 ビットが `000` になるため、必然的に最下位 1 ビットは常に `0` である）という物理的制約を利用。
+  - 最下位 1 ビット（第0ビット）をインラインタグとして使用し、インライン時は常に `1` をセットする。これにより、読み出し（Get）時は最下位1ビットを確認するだけで **T2 を一切フェッチせずに 100% 確実に判定** できる（Read 偽陽性 0%）。
+- **値が 1〜7 バイトの場合のエンコード**:
+  - 最上位 3 ビット（第60〜62ビット）に元のデータ長（1〜7）を格納し、実データを左に 1 ビットシフトして最下位ビットを `1` にする。
+- **値が 8 バイトの場合のエンコード**:
+  - 実データの最下位ビットが `1`（奇数）かつ上位 3 ビットが `000`（小さな整数や double など）の場合にインライン化可能。
+  - 値をそのまま無加工で格納する（上位3ビットが `000` であるため、デコード時に「長さ8」と自動判定される）。
+  - 条件を満たさない場合は T2 にフォールバックする（偶数 8バイト値のフォールバック率は 50%）。
 
 ### 7.7 Sorted Bloom Filter
 
