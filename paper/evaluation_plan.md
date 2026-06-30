@@ -1,60 +1,60 @@
-# VMemKV Evaluation Plan
+# VMemKV 評価計画
 
-This memo defines the evaluation strategy for the VMemKV paper.  It is written as a planning document, not as final paper text.
+このメモは、VMemKV 論文の評価戦略を定義するためのものです。最終的な論文本体ではなく、評価設計のための計画文書として書いています。
 
-Target branch / implementation baseline: `wasanemon/VMemKV` `paper-writing`, based on the `pr-14` design direction.
+対象ブランチ / 実装基準: `wasanemon/VMemKV` の `paper-writing` ブランチ。設計方針としては `pr-14` の方向性を基準にします。
 
-Core paper claim:
+論文の中心主張:
 
-> VMemKV is an in-place-first, two-tier key-value store over virtual memory. It keeps KV-specific metadata and update control in a compact mutable T1 index, while delegating larger-than-memory value residency to the OS through an mmap-backed T2 region.
+> VMemKV は、virtual memory 上に構築された in-place-first な二層 key-value store である。KV 固有の metadata と update control は compact かつ mutable な T1 index に保持し、larger-than-memory な value residency は mmap-backed T2 region を通じて OS に委譲する。
 
-Therefore, the evaluation should not be a generic KV benchmark suite.  It should answer whether this specific claim is credible.
+したがって、評価は一般的な KV benchmark suite であってはいけません。この特定の主張が信頼できるかどうかを答える必要があります。
 
 ---
 
-## 1. Evaluation Questions
+## 1. 評価で答えるべき問い
 
-### RQ1. Does in-place-first updating reduce update amplification?
+### RQ1. in-place-first update は update amplification を削減するか？
 
-VMemKV's most distinctive claim is that existing keys can usually be updated without turning every update into a new logical version.
+VMemKV の最も特徴的な主張は、既存 key に対する update を、多くの場合、新しい logical version に変換せずに実行できる点です。
 
-The key experiment is not just throughput.  We need to measure whether VMemKV writes fewer bytes per logical update than append/version-based designs.
+ここで重要な実験は、単なる throughput ではありません。VMemKV が append/version-based design と比べて、logical update あたりの書き込み量を本当に削減できるかを測る必要があります。
 
-Required metrics:
+必要な指標:
 
 - update throughput
 - p50 / p95 / p99 update latency
-- logical value bytes updated
-- T2 bytes appended
-- T2 bytes overwritten in place
-- physical device bytes written if available
+- 更新された logical value bytes
+- T2 に append された bytes
+- T2 上で in-place overwrite された bytes
+- 取得可能であれば physical device bytes written
 - in-place update hit rate
 - append fallback rate
-- T2 garbage bytes generated
+- 生成された T2 garbage bytes
 
-Expected result:
+期待される結果:
 
-- Fixed-size updates should mostly hit the T2 in-place path.
-- Value-growth updates should fall back to append + T1 offset swing.
-- VMemKV should show low update amplification for stable-size values and degrade gracefully as values grow.
+- fixed-size update は、ほとんど T2 in-place path に乗るべきである。
+- value-growth update は、append + T1 offset swing に fallback するべきである。
+- VMemKV は、stable-size value に対して低い update amplification を示し、value が成長するにつれて性能・書き込み量が段階的に悪化することを示すべきである。
 
-This is the most important evaluation for the paper.
+これは論文にとって最も重要な評価です。
 
 ---
 
-### RQ2. Where is the boundary between in-place update and append fallback?
+### RQ2. in-place update と append fallback の境界はどこにあるか？
 
-VMemKV should not claim that every update is physically in place.  The correct claim is in-place-first.
+VMemKV は、すべての update が物理的に in-place であると主張すべきではありません。正しい主張は in-place-first です。
 
-We need an experiment that intentionally crosses the boundary:
+意図的に境界を跨ぐ実験が必要です。
 
 - same-size overwrite
 - shrink update
-- small growth within preallocated `alloc_len`, if supported
-- growth beyond `alloc_len`
+- もしサポートされていれば、事前確保された `alloc_len` 内に収まる小さな growth
+- `alloc_len` を超える growth
 - random growth distribution
 
-Required metrics:
+必要な指標:
 
 - in-place hit rate
 - append fallback rate
@@ -63,108 +63,108 @@ Required metrics:
 - unreachable T2 bytes
 - reorganize reclaimable bytes
 
-Expected result:
+期待される結果:
 
-- same-size and shrink updates should be stable and cheap
-- value-growth updates should increase T2 garbage and eventually require reorganization
+- same-size update と shrink update は安定して軽いはずである。
+- value-growth update は T2 garbage を増やし、最終的に reorganization を必要とするはずである。
 
-If `alloc_len` currently equals `value_len`, then the first implementation can only show same-size/shrink as in-place and growth as append fallback.  A later slack-allocation variant can test whether reserve space improves in-place hit rate.
+現在の `alloc_len` が `value_len` と同じである場合、最初の実装では same-size/shrink のみが in-place となり、growth は append fallback になることを示せばよいです。後続の slack-allocation variant を追加できるなら、reserve space が in-place hit rate を改善するかを検証できます。
 
 ---
 
-### RQ3. Does OS-delegated larger-than-memory value management work under intended conditions?
+### RQ3. OS に委譲した larger-than-memory value management は、想定条件で機能するか？
 
-VMemKV delegates value residency to the OS.  This should be evaluated under larger-than-memory conditions, not only in-memory microbenchmarks.
+VMemKV は value residency を OS に委譲します。したがって、評価は in-memory microbenchmark だけではなく、larger-than-memory 条件で行う必要があります。
 
-Vary:
+変化させる要素:
 
 - dataset size / DRAM ratio: in-memory, near-memory, 2x memory, 4x memory
 - access distribution: uniform, Zipf alpha 0.8, 1.0, 1.2
 - value size: 64 B, 1 KiB, 4 KiB, 16 KiB
 - workload mix: read-only, read-heavy, update-heavy, mixed
 
-Required metrics:
+必要な指標:
 
 - throughput
 - p50 / p95 / p99 / p999 latency
 - major page faults
 - minor page faults
-- page fault time if available
+- 取得可能であれば page fault time
 - SSD read bandwidth
 - SSD write bandwidth
 - CPU cycles / instruction count
-- LLC misses and dTLB misses if available
+- 取得可能であれば LLC misses と dTLB misses
 
-Expected result:
+期待される結果:
 
-- VMemKV should be most convincing when T1 remains memory-resident and T2 exceeds memory.
-- Uniform cold access over a much larger-than-memory value region may be bad; this is acceptable if the paper scopes the target workload honestly.
-- Skewed workloads should show the value of OS page cache residency.
+- T1 が memory-resident に保たれ、T2 が memory を超える条件で、VMemKV は最も説得力を持つべきである。
+- memory を大きく超える value region に対する uniform cold access は悪い可能性がある。この場合でも、論文で target workload を正直に scope できていれば問題ない。
+- skewed workload では、OS page cache residency の価値が見えるべきである。
 
 ---
 
-### RQ4. Does the mutable T1 index remain efficient across both sorted and append regions?
+### RQ4. mutable T1 index は、sorted region と append region の両方で効率的に動くか？
 
-The unusual part of T1 is that both `sorted_region` and `append_region` can update payloads without moving the ordering key.
+T1 の珍しい点は、`sorted_region` と `append_region` の両方で、ordering key を動かさずに payload を update できることです。
 
-We need to show update cost for keys in:
+以下の key 位置ごとに update cost を示す必要があります。
 
-- append_region before reorganize
-- sorted_region after reorganize
-- mixed state with both regions populated
+- reorganize 前の append_region にある key
+- reorganize 後の sorted_region にある key
+- 両 region が混在している状態
 
-Required metrics:
+必要な指標:
 
-- update throughput by key location
-- get throughput by key location
-- scan throughput before / after T1 reorganize
+- key location ごとの update throughput
+- key location ごとの get throughput
+- T1 reorganize 前後の scan throughput
 - append_region size sensitivity
-- effect of AppendMap
+- AppendMap の効果
 
-Expected result:
+期待される結果:
 
-- Existing-key updates should not become expensive simply because a key moved into sorted_region.
-- AppendMap should matter for point lookup/update when append_region is large.
-- Reorganize should improve scan and negative lookup behavior.
+- 既存 key の update は、その key が sorted_region に移っただけで高コスト化してはいけない。
+- append_region が大きい場合、point lookup/update に対して AppendMap が重要になるべきである。
+- Reorganize は scan と negative lookup の挙動を改善するべきである。
 
 ---
 
-### RQ5. Is reorganization a deferred repair mechanism rather than the normal update path?
+### RQ5. reorganization は通常 update path ではなく、deferred repair mechanism として機能するか？
 
-VMemKV's story is not that reorganization disappears.  The story is that reorganization is decoupled from the normal update path.
+VMemKV の主張は、reorganization が不要になるというものではありません。主張は、reorganization が通常 update path から切り離されているという点です。
 
-Evaluate:
+評価するもの:
 
-- insert-heavy workload causing ordering fragmentation
-- delete-heavy workload causing T2 unreachable records
-- fixed-size update-heavy workload causing little T2 garbage
-- value-growth update-heavy workload causing T2 garbage
-- scan before and after reorganize
-- foreground latency during background or periodic reorganization
+- ordering fragmentation を生む insert-heavy workload
+- T2 unreachable records を生む delete-heavy workload
+- T2 garbage をほとんど生まない fixed-size update-heavy workload
+- T2 garbage を生む value-growth update-heavy workload
+- reorganize 前後の scan
+- background または periodic reorganization 中の foreground latency
 
-Required metrics:
+必要な指標:
 
 - reorganize duration
-- stop-the-world or publish pause time, if any
-- bytes copied during T2 reorganization
-- bytes reclaimed
-- T1 append_region size before / after
-- T2 bytes_used before / after
-- foreground p99 latency during reorganize
+- stop-the-world または publish pause time がある場合はその時間
+- T2 reorganization 中に copy された bytes
+- reclaim された bytes
+- reorganization 前後の T1 append_region size
+- reorganization 前後の T2 bytes_used
+- reorganization 中の foreground p99 latency
 
-Expected result:
+期待される結果:
 
-- Fixed-size updates should create little or no T2 garbage.
-- Deletes and growth updates should create reclaimable T2 garbage.
-- Reorganization should improve scan locality and reclaim space, but should not be necessary for every update to become visible.
+- fixed-size update は T2 garbage をほとんど、またはまったく生成しないべきである。
+- delete と growth update は reclaimable T2 garbage を生成するべきである。
+- Reorganization は scan locality を改善し、space を reclaim するべきだが、update の可視化そのものに毎回必要であってはいけない。
 
 ---
 
-### RQ6. Which optimizations are essential, and which are secondary?
+### RQ6. どの最適化が本質的で、どの最適化が補助的か？
 
-The implementation already exposes many variants.  The evaluation should avoid treating all optimizations as equally important.
+実装にはすでに多くの variant が公開されています。評価では、すべての最適化を同じ重要度で扱わない方がよいです。
 
-Existing variant families:
+既存の variant family:
 
 - Baseline
 - cumulative T1 optimizations: AppendMap -> BloomFilter -> SimdScan -> MemoryHints
@@ -172,7 +172,7 @@ Existing variant families:
 - inline value variants: no inline / 1-7B inline / 8B inline / all inline
 - RocksDB adapter
 
-Required metrics:
+必要な指標:
 
 - point lookup latency
 - update latency
@@ -181,24 +181,24 @@ Required metrics:
 - memory overhead
 - T2 access count
 
-Expected result:
+期待される結果:
 
-- AppendMap should be essential for point operations when append_region is large.
-- BloomFilter should mainly help negative lookup after reorganize.
-- SIMD and MemoryHints should be treated as secondary unless measurements show otherwise.
-- Inline values should matter for tiny value workloads, but should not be the main paper claim.
+- append_region が大きい場合、AppendMap は point operation に必須であるべきである。
+- BloomFilter は主に reorganize 後の negative lookup に効くべきである。
+- SIMD と MemoryHints は、測定結果がそう示さない限り、二次的な最適化として扱うべきである。
+- Inline values は tiny value workload では重要になるべきだが、論文の main claim にしてはいけない。
 
 ---
 
-### RQ7. Does VMemKV reduce implementation complexity?
+### RQ7. VMemKV は実装複雑性を下げているか？
 
-Implementation simplicity is a contribution, but it should be presented carefully.  Do not claim "easy" subjectively.  Measure or tabulate what VMemKV does not implement.
+Implementation simplicity は貢献ですが、慎重に提示する必要があります。主観的に「簡単」と主張するのではなく、VMemKV が何を実装していないかを測る、または表で示すべきです。
 
-Suggested evidence:
+提示すべき evidence:
 
-- component table comparing VMemKV, RocksDB/LSM, value-log design, buffer-pool design
-- lines of code for core T1/T2/reorganize path, excluding tests and benchmarks
-- number of major storage-engine mechanisms required:
+- VMemKV、RocksDB/LSM、value-log design、buffer-pool design の component table
+- tests と benchmarks を除いた core T1/T2/reorganize path の lines of code
+- 必要となる主要 storage-engine mechanism の数:
   - user-space buffer pool
   - page replacement policy
   - multi-level compaction scheduler
@@ -207,59 +207,59 @@ Suggested evidence:
   - pointer swizzling
   - explicit read cache
 
-Expected framing:
+期待される framing:
 
-> VMemKV reduces DB-side responsibility by keeping logical control in T1 and delegating physical value residency to the OS.  This does not eliminate storage management; it narrows it.
+> VMemKV は、logical control を T1 に保持し、physical value residency を OS に委譲することで、DB 側の責務を減らす。これは storage management を消すのではなく、storage management の範囲を狭める設計である。
 
-This should be a small table in the paper, not a large benchmark section.
+これは論文中では大きな benchmark section ではなく、小さな table として提示するのがよいです。
 
 ---
 
 ## 2. Baselines
 
-### Required baselines
+### 必須 baseline
 
 #### B1. RocksDB
 
-Purpose:
+目的:
 
-- compare against a practical LSM-based storage engine
-- already integrated through the `VMemKV_RocksDB` adapter
+- 実用的な LSM-based storage engine と比較する。
+- すでに `VMemKV_RocksDB` adapter 経由で統合されている。
 
-Use for:
+使用対象:
 
 - point get/update/delete/insert
 - mixed workload
-- range scan if adapter supports comparable scan semantics
-- update amplification comparison if physical bytes can be measured
+- adapter が同等の scan semantics をサポートする場合は range scan
+- physical bytes を測定できるなら update amplification comparison
 
-Notes:
+注意:
 
-- RocksDB tuning must be documented.
-- Compression should probably be disabled for clean byte-amplification comparisons.
-- WAL / fsync policy must be stated, especially because VMemKV durability is not finalized.
+- RocksDB tuning は明記する必要がある。
+- byte amplification をきれいに比較するため、compression はおそらく無効化すべきである。
+- とくに VMemKV の durability が未確定であるため、WAL / fsync policy は必ず記述する必要がある。
 
 #### B2. VMemKV append-update baseline
 
-Purpose:
+目的:
 
-- isolate the value of in-place-first updates
+- in-place-first update の価値を分離して示す。
 
-This is the most important missing baseline.
+これは最も重要な未実装 baseline です。
 
-Definition:
+定義:
 
-- On every update, always append a new T2 record and update the T1 offset.
-- Do not call `update_value_at`, even when the value fits in the old allocation.
+- すべての update で、常に新しい T2 record を append し、T1 offset を更新する。
+- value が old allocation に収まる場合でも、`update_value_at` を呼ばない。
 
-This mimics value-log update behavior while keeping the same T1/T2 infrastructure.
+これは、同じ T1/T2 infrastructure を保ったまま、value-log style の update behavior を模倣する baseline です。
 
-Needed implementation:
+必要な実装:
 
-- add a config tag such as `AppendOnlyUpdate` or `DisableT2InPlaceUpdate`
-- expose it as a benchmark variant
+- `AppendOnlyUpdate` または `DisableT2InPlaceUpdate` のような config tag を追加する。
+- benchmark variant として公開する。
 
-Use for:
+使用対象:
 
 - RQ1 update amplification
 - RQ2 in-place boundary
@@ -267,11 +267,11 @@ Use for:
 
 #### B3. VMemKV baseline / all-on variants
 
-Purpose:
+目的:
 
-- distinguish the base architecture from opt-in optimizations
+- base architecture と opt-in optimizations を区別する。
 
-Use:
+使用するもの:
 
 - `VMemKV_Baseline`
 - cumulative variants
@@ -280,44 +280,44 @@ Use:
 
 #### B4. mmap-only / OS-only baseline
 
-Purpose:
+目的:
 
-- show that VMemKV is not merely mmap
+- VMemKV が単なる mmap ではないことを示す。
 
-Minimal version:
+最小構成:
 
-- mmap-backed array/file access without T1/T2 logical control
-- or a simple unordered-map index + mmap value file, if implementing a true KVS baseline is feasible
+- T1/T2 の logical control を持たない mmap-backed array/file access
+- あるいは、真の KVS baseline を実装できるなら、simple unordered-map index + mmap value file
 
-This is useful but not more important than B2.
+これは有用ですが、B2 ほど重要ではありません。
 
-### Optional baselines
+### Optional baseline
 
 #### B5. pread + LRU baseline
 
-Purpose:
+目的:
 
-- compare OS-delegated residency against explicit user-space caching
+- OS-delegated residency と明示的 user-space caching を比較する。
 
-Existing microbenchmark results can motivate this, but a KV-integrated pread+LRU baseline would be stronger.
+既存の microbenchmark results は motivation として使えますが、KV-integrated な pread+LRU baseline があるとより強いです。
 
-Use only if time permits.
+時間がある場合のみ実装します。
 
 #### B6. LevelDB
 
-Purpose:
+目的:
 
-- classic LSM baseline
+- classic LSM baseline と比較する。
 
-Optional if RocksDB is already used and benchmark time is limited.
+RocksDB をすでに使い、benchmark 時間が限られる場合は optional でよいです。
 
 #### B7. Bitcask-like append-only baseline
 
-Purpose:
+目的:
 
-- compare against append-only data file + in-memory index
+- append-only data file + in-memory index と比較する。
 
-Useful if implemented cheaply.  Otherwise, B2 already captures the most important value-log-style update behavior inside the VMemKV framework.
+安く実装できるなら有用です。そうでない場合、B2 が VMemKV framework 内で最も重要な value-log-style update behavior をすでに捉えます。
 
 ---
 
@@ -327,64 +327,64 @@ Useful if implemented cheaply.  Otherwise, B2 already captures the most importan
 
 - sequential insert
 - random insert
-- dataset construction for later workloads
+- 後続 workload のための dataset construction
 
-Metrics:
+指標:
 
 - load throughput
 - bytes written
 - T2 bytes_used
 - T1 size
 
-Purpose:
+目的:
 
-- show append-friendly insert behavior
-- prepare datasets for read/update/scan experiments
+- append-friendly insert behavior を示す。
+- read/update/scan experiments の dataset を作る。
 
 ---
 
 ### W2. Fixed-size update
 
-Input:
+入力:
 
-- preload N keys with fixed-size values
-- repeatedly update existing keys with the same value size
+- N keys を fixed-size values で preload する。
+- 既存 key に対して、同じ value size で繰り返し update する。
 
-Parameters:
+パラメータ:
 
 - value size: 8 B, 64 B, 1 KiB, 4 KiB
 - access distribution: uniform and Zipf
 - thread count: 1, 4, hardware concurrency
 
-Metrics:
+指標:
 
 - update throughput
 - p50/p95/p99 latency
 - in-place hit rate
 - append fallback rate
-- bytes written per logical update
+- logical update あたりの bytes written
 - T2 bytes_used growth
 
-Purpose:
+目的:
 
-- primary proof for in-place-first update claim
+- in-place-first update claim の主要な証拠にする。
 
 ---
 
 ### W3. Value-growth update
 
-Input:
+入力:
 
-- preload N keys with values of size S
-- update with values of size S, 2S, 4S, or random growth
+- N keys を size S の values で preload する。
+- size S, 2S, 4S, または random growth の values で update する。
 
-Parameters:
+パラメータ:
 
 - initial size: 64 B, 1 KiB
 - new size: same, +16 B, 2x, 4x
-- optional slack allocation: 0%, 25%, 50%, 100% if implemented
+- optional slack allocation: 実装されている場合、0%, 25%, 50%, 100%
 
-Metrics:
+指標:
 
 - in-place hit rate
 - append fallback rate
@@ -392,28 +392,28 @@ Metrics:
 - reorganization reclaim ratio
 - update latency
 
-Purpose:
+目的:
 
-- draw the boundary of the in-place-first claim
+- in-place-first claim の境界を描く。
 
 ---
 
 ### W4. Mixed read/update workload
 
-Suggested YCSB-like mixes:
+推奨する YCSB-like mixes:
 
 - A-like: 50% read / 50% update
 - B-like: 95% read / 5% update
 - C-like: 100% read
 - F-like: read-modify-write
 
-Parameters:
+パラメータ:
 
 - uniform vs Zipf alpha 1.0
 - value size: 64 B, 1 KiB, 4 KiB
 - dataset / memory ratio: in-memory, 2x, 4x
 
-Metrics:
+指標:
 
 - throughput
 - latency CDF
@@ -421,63 +421,63 @@ Metrics:
 - page faults
 - SSD bandwidth
 
-Purpose:
+目的:
 
-- show end-to-end behavior under realistic mixes
+- realistic mix における end-to-end behavior を示す。
 
 ---
 
 ### W5. Range scan and scan-after-reorganize
 
-Input:
+入力:
 
-- preload ordered keys
-- test scan windows of different sizes
-- run before and after T1/T2 reorganize
+- ordered keys を preload する。
+- 異なる scan window size を試す。
+- T1/T2 reorganize 前後で測る。
 
-Parameters:
+パラメータ:
 
 - scan window: 100, 1K, 10K keys
 - dataset size: in-memory and larger-than-memory
-- append_region fraction: 0%, 10%, 50%, 100% before reorg
+- reorg 前の append_region fraction: 0%, 10%, 50%, 100%
 
-Metrics:
+指標:
 
 - scan throughput
 - per-record scan latency
 - page faults
 - T2 read locality
-- effect of reorganization
+- reorganization の効果
 
-Purpose:
+目的:
 
-- support the claim that reorganization repairs ordering/locality rather than making updates visible
+- reorganization が update visibility のためではなく、ordering/locality の repair のためであることを示す。
 
 ---
 
 ### W6. Delete-heavy workload
 
-Input:
+入力:
 
-- preload N keys
-- delete a fraction of keys
-- measure reads/scans before and after reorganize
+- N keys を preload する。
+- key の一部を delete する。
+- reorganize 前後で reads/scans を測る。
 
-Parameters:
+パラメータ:
 
 - delete ratio: 10%, 50%, 90%
-- uniform vs clustered deletes
+- uniform deletes vs clustered deletes
 
-Metrics:
+指標:
 
 - delete throughput
 - T2 unreachable bytes
-- scan cost before/after reorg
-- bytes reclaimed by reorg
+- reorg 前後の scan cost
+- reorg によって reclaim された bytes
 
-Purpose:
+目的:
 
-- show T1 tombstone behavior and deferred T2 garbage collection
+- T1 tombstone behavior と deferred T2 garbage collection を示す。
 
 ---
 
@@ -487,18 +487,18 @@ Purpose:
 
 - operations per second
 - p50 / p95 / p99 / p999 latency
-- latency CDF for update-heavy workloads
-- throughput during background reorganization
+- update-heavy workload の latency CDF
+- background reorganization 中の throughput
 
 ### Storage metrics
 
-- logical payload bytes inserted/updated
+- inserted/updated された logical payload bytes
 - T2 bytes appended
 - T2 bytes overwritten in place
 - T2 bytes_used
 - unreachable T2 bytes
-- bytes reclaimed by reorganization
-- physical device bytes written, if available
+- reorganization で reclaim された bytes
+- 取得可能であれば physical device bytes written
 
 Derived metrics:
 
@@ -511,7 +511,7 @@ reclaim_ratio = bytes_reclaimed_by_reorg / unreachable_bytes_before_reorg
 
 ### OS / hardware metrics
 
-Linux preferred:
+Linux を推奨します。
 
 - `perf stat`
   - page-faults
@@ -522,8 +522,8 @@ Linux preferred:
   - cache-misses
   - dTLB-load-misses
   - LLC-load-misses
-- `/proc/self/stat` or `getrusage`
-  - minor / major faults per process
+- `/proc/self/stat` または `getrusage`
+  - process ごとの minor / major faults
 - `iostat -dx`
   - read/write bandwidth
   - device utilization
@@ -532,27 +532,27 @@ Linux preferred:
 
 ### Memory control
 
-Larger-than-memory evaluation needs controlled memory pressure.
+larger-than-memory 評価には、制御された memory pressure が必要です。
 
-Options:
+選択肢:
 
-- run inside a cgroup with memory limit
-- use a fixed-memory VM
-- vary dataset size relative to machine memory
-- explicitly drop page cache between cold runs, if permitted
-- report warm and cold results separately
+- memory limit 付き cgroup 内で実行する。
+- fixed-memory VM を使う。
+- machine memory に対して dataset size を変化させる。
+- 許可される環境では、cold run の前に明示的に page cache を drop する。
+- warm results と cold results を分けて報告する。
 
-Do not mix cold-start and steady-state results without labeling them.
+cold-start 結果と steady-state 結果を、label なしに混ぜてはいけません。
 
 ---
 
-## 5. Required Instrumentation
+## 5. 必要な Instrumentation
 
-Current benchmark support is useful but not enough for the paper's main claim.
+現在の benchmark support は有用ですが、論文の main claim には不十分です。
 
-Add a lightweight `Stats` structure to VMemKV, ideally exposed through the benchmark harness.
+軽量な `Stats` structure を VMemKV に追加し、できれば benchmark harness から取得できるようにします。
 
-Suggested counters:
+推奨 counters:
 
 ```cpp
 struct VMemKVStats {
@@ -580,7 +580,7 @@ struct VMemKVStats {
 };
 ```
 
-Minimum required counters:
+最低限必要な counters:
 
 - `t2_in_place_updates`
 - `t2_append_update_fallbacks`
@@ -589,13 +589,13 @@ Minimum required counters:
 - `reorganize_bytes_reclaimed`
 - `reorganize_duration_ns`
 
-Without these, the paper cannot convincingly support the in-place-first claim.
+これらがないと、in-place-first claim を説得力を持って裏付けることはできません。
 
 ---
 
-## 6. Priority Plan
+## 6. 優先度付き計画
 
-### P0: Must-have for the paper
+### P0: 論文に必須
 
 1. **Fixed-size update vs append-update baseline**
    - VMemKV all-on
@@ -617,43 +617,43 @@ Without these, the paper cannot convincingly support the in-place-first claim.
    - delete-heavy and value-growth workloads
    - metrics: reclaimed bytes, duration, scan improvement, foreground p99
 
-5. **Ablation using existing VMemKV variants**
+5. **既存 VMemKV variants を使った ablation**
    - baseline, cumulative, all-on, no AppendMap, no BloomFilter, no MemoryHints, inline variants
-   - focus on which optimization supports which claim
+   - どの optimization がどの claim を支えるかに集中する。
 
-### P1: Strongly recommended
+### P1: 強く推奨
 
 1. Implementation simplicity table
 2. T1 update cost by key location: append_region vs sorted_region
-3. Negative lookup after reorganize with BloomFilter
+3. BloomFilter あり/なしの reorganize 後 negative lookup
 4. Memory ratio and Zipf alpha sweep
-5. Tail latency during reorganization
+5. Reorganization 中の tail latency
 
-### P2: Optional / only if time permits
+### P2: optional / 時間がある場合のみ
 
 1. pread+LRU KV baseline
 2. LevelDB baseline
 3. Bitcask-like baseline
 4. THP / madvise sweep
-5. crash recovery / restart time, only after durability design is finalized
+5. durability design が確定した後の crash recovery / restart time
 
 ---
 
-## 7. What Not to Evaluate Yet
+## 7. まだ評価しないもの
 
-Avoid spending effort on evaluations that do not support the current paper claim.
+現在の paper claim を支えない評価には、労力を割きすぎないようにします。
 
-Do not prioritize:
+優先しないもの:
 
 - distributed transactions
 - phantom avoidance
 - secondary indexes
 - full SQL/DBMS workloads
-- crash consistency, unless the write/recovery design is finalized
-- detailed SIMD microbenchmarks beyond the ablation
-- every possible RocksDB tuning permutation
+- write/recovery design が確定していない状態での crash consistency
+- ablation を超えた詳細な SIMD microbenchmarks
+- あらゆる RocksDB tuning permutation
 
-The paper should be judged on:
+この論文は、以下によって評価されるべきです。
 
 1. in-place-first update behavior
 2. OS-delegated larger-than-memory value management
@@ -663,7 +663,7 @@ The paper should be judged on:
 
 ---
 
-## 8. Suggested Evaluation Section Outline
+## 8. Evaluation section の推奨 outline
 
 ```text
 8. Evaluation
@@ -689,34 +689,34 @@ The paper should be judged on:
        Small table comparing DB-side mechanisms across VMemKV, LSM, value-log, buffer-pool designs.
 ```
 
-If the paper must be shorter, merge 8.3 into 8.2 and 8.6 into the relevant experiment sections.
+論文を短くする必要がある場合は、8.3 を 8.2 に統合し、8.6 を関連する各 experiment section に吸収します。
 
 ---
 
-## 9. Minimal Benchmark Implementation Checklist
+## 9. 最小限の benchmark 実装 checklist
 
-For Nakazono-san or implementation owner:
+中園氏、または実装担当者向け:
 
-- [ ] Add VMemKV stats counters for T1/T2 update paths.
-- [ ] Add config to disable T2 in-place update and force append-on-update.
-- [ ] Add benchmark mode: fixed-size update.
-- [ ] Add benchmark mode: value-growth update.
-- [ ] Add benchmark mode: mixed read/update with configurable ratios.
-- [ ] Add benchmark mode: dataset size / value size sweep.
-- [ ] Add benchmark mode: scan before/after reorganize.
-- [ ] Add benchmark output as machine-readable CSV or JSON.
-- [ ] Record page faults and process RSS for each run.
-- [ ] Record T2 bytes_used and bytes reclaimed.
-- [ ] Document RocksDB options and sync policy.
+- [ ] T1/T2 update path 用の VMemKV stats counters を追加する。
+- [ ] T2 in-place update を無効化し、force append-on-update する config を追加する。
+- [ ] benchmark mode: fixed-size update を追加する。
+- [ ] benchmark mode: value-growth update を追加する。
+- [ ] benchmark mode: configurable ratio の mixed read/update を追加する。
+- [ ] benchmark mode: dataset size / value size sweep を追加する。
+- [ ] benchmark mode: scan before/after reorganize を追加する。
+- [ ] benchmark output を machine-readable CSV または JSON にする。
+- [ ] 各 run で page faults と process RSS を記録する。
+- [ ] T2 bytes_used と bytes reclaimed を記録する。
+- [ ] RocksDB options と sync policy を文書化する。
 
 ---
 
-## 10. Expected Paper Figures
+## 10. 論文に載せたい図
 
 ### Figure 1: Update amplification
 
-- x-axis: value size or workload type
-- y-axis: bytes written per logical update
+- x-axis: value size または workload type
+- y-axis: logical update あたりの bytes written
 - lines: VMemKV in-place, VMemKV append-update, RocksDB
 
 ### Figure 2: In-place boundary
@@ -732,21 +732,21 @@ For Nakazono-san or implementation owner:
 
 ### Figure 4: Page fault behavior
 
-- x-axis: dataset / memory ratio or Zipf alpha
+- x-axis: dataset / memory ratio または Zipf alpha
 - y-axis: major faults / operation
 
 ### Figure 5: Reorganization effect
 
-- before/after bars for scan throughput, T2 bytes_used, reclaimed bytes
+- scan throughput, T2 bytes_used, reclaimed bytes の before/after bars
 
 ### Figure 6: Ablation
 
-- bar chart for key operations under VMemKV variants
-- emphasize AppendMap / BloomFilter / Inline effects only where relevant
+- VMemKV variants に対する key operations の bar chart
+- 関連する箇所でのみ AppendMap / BloomFilter / Inline effects を強調する。
 
 ### Table 1: Implementation responsibility
 
-Compare VMemKV, LSM/RocksDB, WiscKey-like value-log, buffer-pool engine.
+VMemKV、LSM/RocksDB、WiscKey-like value-log、buffer-pool engine を比較する。
 
 Columns:
 
@@ -760,32 +760,32 @@ Columns:
 
 ---
 
-## 11. How to Interpret Possible Negative Results
+## 11. Negative results が出た場合の解釈
 
-The evaluation should be robust even if VMemKV does not win every throughput graph.
+VMemKV がすべての throughput graph で勝たなくても、評価は成立するように設計するべきです。
 
-### If RocksDB is faster in some workloads
+### 一部 workload で RocksDB が速い場合
 
-This does not invalidate the paper if VMemKV shows:
+以下を示せていれば、論文の主張は崩れません。
 
-- lower update amplification for stable-size updates
-- simpler implementation responsibility
-- competitive larger-than-memory behavior under the intended workload regime
+- stable-size updates に対して update amplification が低い。
+- implementation responsibility が少ない。
+- 想定 workload regime で larger-than-memory behavior が competitive である。
 
-### If mmap-backed T2 is worse on very fast NVMe
+### very fast NVMe 上で mmap-backed T2 が不利な場合
 
-Frame this as a scope condition.  OS-delegated residency is expected to be workload- and device-dependent.
+これは scope condition として扱います。OS-delegated residency は workload と device に依存することが予想されます。
 
-### If value-growth updates create significant garbage
+### value-growth updates が大量の garbage を生む場合
 
-This is expected.  It supports the in-place-first boundary and motivates reorganization.
+これは想定内です。in-place-first の境界を示し、reorganization の必要性を動機づける結果として扱えます。
 
-### If SIMD or MemoryHints do not help much
+### SIMD や MemoryHints があまり効かない場合
 
-Treat them as secondary optimizations.  Do not make them central claims.
+これらは secondary optimizations として扱います。中心主張にしてはいけません。
 
 ---
 
-## 12. One-Sentence Evaluation Goal
+## 12. 評価の一文目標
 
-The evaluation should demonstrate that VMemKV's architecture is not just "mmap plus a hash table".  It should show that a mutable T1 index, allocation-preserving T2 updates, and deferred reorganization together make in-place-first larger-than-memory KV storage plausible and measurable.
+評価が示すべきことは、VMemKV が単なる「mmap plus a hash table」ではないという点です。mutable T1 index、allocation-preserving T2 updates、deferred reorganization が組み合わさることで、in-place-first な larger-than-memory KV storage が実現可能であり、測定可能な性質として現れることを示す必要があります。
