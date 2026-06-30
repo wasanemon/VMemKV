@@ -39,14 +39,15 @@ This document compares the current code state against the academic specification
 
 ---
 
-## 4. Fork-Based Checkpointing vs. Thread-Safe Reorganize
-* **Status**: 🟡 **Specification Divergence**
+## 4. Standardizing on Thread-Safe Reorganize (Deprecating Fork)
+* **Status**: 🟢 **Design Standardized (LLD Revision Needed)**
 * **LLD Specification**:
-  - The Low Level Design specifies that `reorganize` should create a child process via `fork()` (Copy-on-Write) to compile the new T2 file in the background while the parent continues servicing client requests.
-* **Current State**:
-  - The current codebase uses a simpler thread-safe mutex-exclusion block (`reorganize_mutex_`) to rebuild T2 inline.
+  - The Low Level Design specified using `fork()` to build checkpoints in a child process (copy-on-write).
+* **Consensus & Rationale**:
+  - **Deprecate `fork()`**: Forking in multi-threaded C++ applications carries a high risk of deadlocks (e.g., if another thread holds a mutex at the fork point, it remains permanently locked in the child process). Additionally, `fork()` causes physical memory overcommit issues due to copy-on-write page replication under write-heavy workloads, and degrades OS portability.
+  - **Prefer Thread-Safe In-Process Sync**: The refined `read_optimistic` (SeqLock) protocol inside `T1Index` already enables safe, concurrent, and lock-free reader operations. Reorganizing using internal coordination thread-locks is more resilient, portable, and memory-efficient.
 * **Action Items**:
-  - Evaluate if the complexity of fork-based background execution is necessary, or update the LLD to standardize on the thread-safe in-process mutex approach.
+  - Revise the HLD/LLD documents to remove references to `fork()` during reorganize and formally standardize on the thread-safe background thread/mutex-exclusion model.
 
 ---
 
@@ -57,3 +58,22 @@ This document compares the current code state against the academic specification
 * **Action Items**:
   - Design a checkpointing scheme to serialize T1's `SortedRegion` and `BloomFilter` to a dedicated metadata file (`t1_index.chk`) upon clean shutdowns.
   - Allow fast-boot recovery by loading the T1 checkpoint and only tailing/scanning the T2 file from the checkpoint timestamp.
+
+---
+
+## 6. Code Quality & CI Automation
+* **Status**: 🔴 **Not Implemented**
+* **Goal**: Establish automated gates for C++ style consistency, static analysis, and regression testing.
+* **Action Items**:
+  - **`clang-format` (Local Pre-commit Hook via CMake)**:
+    - Introduce a `.clang-format` style configuration.
+    - Set up a Git pre-commit hook in `githooks/pre-commit` to automatically run `clang-format -i` and re-stage C++ changes upon `git commit`.
+    - Integrate a git hook configurations script inside `CMakeLists.txt` (using `core.hooksPath`) to automatically and dependency-free install the hook when developers run CMake.
+  - **`clang-tidy` (CI-only Target)**:
+    - Configure a `.clang-tidy` profile to flag memory safety issues, redundant copies, and C++20/C++23 code violations.
+    - *Note on Hook Exclusion*: **Do NOT run `clang-tidy` in the local pre-commit hook**. Since `clang-tidy` compiles the AST (abstract syntax tree) and requires `compile_commands.json` dependencies, running it on commit introduces high latency (seconds to minutes) and breaks developer workflow loop. Instead, defer static analysis entirely to CI.
+  - **GitHub Actions (CI)**: Set up a workflow (`.github/workflows/ci.yml`) to automatically trigger on push/PR to:
+    1. Run `clang-format --dry-run` style checks.
+    2. Run `clang-tidy` static analysis (where compile commands are stably built).
+    3. Compile the repository under both Clang and GCC.
+    4. Run all unit tests and verify they pass cleanly.
