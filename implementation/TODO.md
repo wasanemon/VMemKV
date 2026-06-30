@@ -1,67 +1,39 @@
-# VMemKV Implementation Gap & Remaining TODO List
+# VMemKV Implementation Plan & Remaining TODO List
 
-This document compares the current code state against the academic specifications (High Level Design / Low Level Design) and physical durability trade-offs of VMemKV, identifying architectural gaps, pending implementations, and necessary design revisions.
+This document outlines the roadmap to implement the full, robust architecture of VMemKV based on the academic specifications (HLD/LLD), supporting both disk-efficient In-place updates and crash-resilient Write-Ahead Logging (WAL).
 
 ---
 
-## 1. Crash Recovery & Index Reload via T2 (Critical Spec Gap)
+## 1. Implement Write-Ahead Log (WAL) & Crash Recovery
 * **Status**: 🔴 **Not Implemented**
-* **The Inline-Value Recovery Paradox**:
-  - `InlineShort` and `Inline8B` optimizations store raw values directly within T1 (in-memory index) payload fields and completely bypass T2 disk writes.
-  - Since T1 is purely volatile, a sudden crash wipes out all inlined values.
-  - If recovery is done solely by scanning T2 records sequentially, **all inline values are permanently lost** because they were never committed to the T2 file.
-* **Resolution (T2 Inline Logging Model)**:
-  - Add a **`RECORD_FLAG_INLINE`** bit flag to `ValueRecordHeader::flags`.
-  - When inserting an inlined value, still write a lightweight inline record (metadata header + raw 1-8B value) sequentially into T2, and call `fsync()`.
-  - Upon recovery, scan T2 sequentially. If the `RECORD_FLAG_INLINE` flag is set, pack the value back into T1 payload instead of registering a T2 file offset.
-  - During `reorganize` (compaction), these inline records will automatically be GC'ed (omitted from the new T2 file) because they are not referenced by offsets in T1.
-
----
-
-## 2. Durability & the `MAP_PRIVATE` Conundrum
-* **Status**: 🔴 **Design Inconsistency**
-* **The Conundrum**:
-  - The persistent file mapping `T2FlatFile` currently uses `MAP_PRIVATE` for write operations on the memory-mapped region.
-  - Under `MAP_PRIVATE`, memory updates are copy-on-write (COW) and are **never synchronized back to the underlying storage media** by the OS kernel automatically.
-  - Thus, unless a `reorganize` (checkpoint) merges memory changes back to disk sequentially, any updates to T2 are lost on crash/reboot.
-* **Resolution (Asymmetric Read-Write Model)**:
-  - **Write path**: Completely bypass mmap writes. Perform T2 appends via standard `write()` system calls, followed by `fdatasync()` / `fsync()` to guarantee transaction durability before returning a commit to the client.
-  - **Read path**: Keep the read path lock-free by accessing the file via `mmap(MAP_PRIVATE | PROT_READ)`.
-
----
-
-## 3. Specification (HLD / LLD) Revisions
-* **Status**: 🔴 **Not Implemented**
-* **Task**: Update `docs/specification/high_level_design.md` and `low_level_design.md` to reflect these major architectural changes:
-  - **Remove WAL**: Replace references to a separate `Wal` structure and double-write logging with the asymmetric T2-as-WAL (No-Double-Write) model.
-  - **Inline Logging**: Document the `RECORD_FLAG_INLINE` mechanism.
-  - **mmap Avoidance on Write**: Document why mmap writing is deprecated (citing Andy Pavlo's *mmap-in-DBMS* limitations) and how T2 is read via `MAP_PRIVATE` but written via `write()/fsync()`.
-
----
-
-## 4. Standardizing on Thread-Safe Reorganize (Deprecating Fork)
-* **Status**: 🟢 **Design Standardized (LLD Revision Needed)**
-* **LLD Specification**:
-  - The Low Level Design specified using `fork()` to build checkpoints in a child process (copy-on-write).
-* **Consensus & Rationale**:
-  - **Deprecate `fork()`**: Forking in multi-threaded C++ applications carries a high risk of deadlocks (e.g., if another thread holds a mutex at the fork point, it remains permanently locked in the child process). Additionally, `fork()` causes physical memory overcommit issues due to copy-on-write page replication under write-heavy workloads, and degrades OS portability.
-  - **Prefer Thread-Safe In-Process Sync**: The refined `read_optimistic` (SeqLock) protocol inside `T1Index` already enables safe, concurrent, and lock-free reader operations. Reorganizing using internal coordination thread-locks is more resilient, portable, and memory-efficient.
-* **Action Items**:
-  - Revise the HLD/LLD documents to remove references to `fork()` during reorganize and formally standardize on the thread-safe background thread/mutex-exclusion model.
-
----
-
-## 5. T1 Index Checkpointing (Fast Boot Recovery)
-* **Status**: 🟡 **Deferred/Optional**
 * **Specification Requirement**: 
-  For very large stores (e.g., 256GB+), scanning the entire T2 file during boot can take several seconds.
+  - To support safe **In-place updates** on Tier 2 (already implemented in `VMemKVImpl::update_impl`) without risking data corruption (Torn Writes), a dedicated **Write-Ahead Log (WAL)** is required.
+  - All write operations (`insert`, `update`, `delete`), including in-memory `InlineShort` and `Inline8B` mutations, must be sequentially appended to the WAL and `fsync`ed before client commit.
+* **T2 Memory & Durability Alignment**:
+  - **T2 Map Private**: With the WAL securely `fsync`ed, the main `T2FlatFile` database can safely remain mapped via `MAP_PRIVATE` (buffered in memory). Runtime disk synchronization I/O for T2 is 0.
+  - **Crash Protection**: If a crash occurs during a T2 in-place update, the corruption is completely resolved upon recovery by playing back the WAL to rebuild the consistent memory state.
 * **Action Items**:
-  - Design a checkpointing scheme to serialize T1's `SortedRegion` and `BloomFilter` to a dedicated metadata file (`t1_index.chk`) upon clean shutdowns.
-  - Allow fast-boot recovery by loading the T1 checkpoint and only tailing/scanning the T2 file from the checkpoint timestamp.
+  - Implement the `Wal` class handles sequential logging and crash-safe file flushes conforming to HLD/LLD structures (e.g., LLD 2.3).
+  - Integrate WAL logging into `VMemKVImpl` write pipelines.
+  - Implement the recovery parser to play back log records and restore active T1/T2 states.
 
 ---
 
-## 6. Code Quality & CI Automation
+## 2. Implement T1/T2 Checkpointing & WAL Truncation (No-Fork)
+* **Status**: 🔴 **Not Implemented**
+* **The Checkpoint Strategy (Fast Boot)**:
+  - Periodically, or during `reorganize`, dump a stable T1 index checkpoint file (`t1_index.chk`) alongside a defragmented T2 database file to disk.
+  - This allows **Fast Boot Recovery**: upon startup, the system loads the T1 checkpoint instantaneously and only scans the tail-end of the WAL (log entries created after the checkpoint LSN) to recover state, bypassing the need to scan the entire T2 file.
+* **Deprecating Forking (LLD Revision Needed)**:
+  - Standardize on **thread-safe, in-process background serialization** instead of the LLD-specified `fork()` (Copy-on-Write) model. This eliminates the risk of multi-threaded deadlocks (fork-safety issues) and OOM Killer page-replication overhead.
+* **Action Items**:
+  - Design the T1 index serialization interface (`t1_index.chk`).
+  - Implement in-process thread-safe checkpointing and log truncation (`wal.truncate_before(checkpoint_lsn)`).
+  - Update `docs/specification/low_level_design.md` to deprecate `fork()` in favor of thread-safe background threads.
+
+---
+
+## 3. Code Quality & CI Automation
 * **Status**: 🔴 **Not Implemented**
 * **Goal**: Establish automated gates for C++ style consistency, static analysis, and regression testing.
 * **Action Items**:
@@ -71,9 +43,5 @@ This document compares the current code state against the academic specification
     - Integrate a git hook configurations script inside `CMakeLists.txt` (using `core.hooksPath`) to automatically and dependency-free install the hook when developers run CMake.
   - **`clang-tidy` (CI-only Target)**:
     - Configure a `.clang-tidy` profile to flag memory safety issues, redundant copies, and C++20/C++23 code violations.
-    - *Note on Hook Exclusion*: **Do NOT run `clang-tidy` in the local pre-commit hook**. Since `clang-tidy` compiles the AST (abstract syntax tree) and requires `compile_commands.json` dependencies, running it on commit introduces high latency (seconds to minutes) and breaks developer workflow loop. Instead, defer static analysis entirely to CI.
-  - **GitHub Actions (CI)**: Set up a workflow (`.github/workflows/ci.yml`) to automatically trigger on push/PR to:
-    1. Run `clang-format --dry-run` style checks.
-    2. Run `clang-tidy` static analysis (where compile commands are stably built).
-    3. Compile the repository under both Clang and GCC.
-    4. Run all unit tests and verify they pass cleanly.
+    - Defer static analysis entirely to CI to avoid local commit latency.
+  - **GitHub Actions (CI)**: Set up a workflow (`.github/workflows/ci.yml`) to automatically trigger on push/PR to run format checks, run tidy analysis, compile under Clang/GCC, and verify all tests.
