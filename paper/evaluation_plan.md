@@ -8,9 +8,7 @@
 
 ## 0. 評価計画の前提
 
-VMemKV の主張は、in-place update だけではありません。
-
-repo の high-level design / README から見える本来の設計思想は、以下です。
+VMemKVの設計思想は、以下です。
 
 > VMemKV は、データ管理を OS の仮想メモリ機構（`mmap`, `fork`, `mincore`, `madvise`）へ可能な限り委譲する Larger-than-memory KVS である。
 
@@ -40,7 +38,7 @@ repo の high-level design / README から見える本来の設計思想は、�
 
 > **VMemKV は、OS に larger-than-memory 管理を委譲しつつ、T1/T2 の責務分離によって、単純な実装と競争力のある性能を両立できるか。**
 
-in-place update は重要ですが、主役ではありません。in-place update は、VMemKV が LSM / value-log 系と異なる update path を持つことを示す補助的な評価軸として扱います。
+in-place update は重要ですが、VMemKV が LSM / value-log 系と異なる update path を持つことを示す補助的な評価軸として扱います。
 
 ---
 
