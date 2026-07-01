@@ -67,8 +67,8 @@ VMemKV の中核は、RAM 常駐 T1 index と mmap-backed T2 value region の分
 
 評価すること:
 
-- T1 が hot metadata / logical control plane として機能するか。
-- T2 が OS-managed large value region として機能するか。
+- T1 が頻繁に参照される metadata と検索・scan の制御を担うか。
+- T2 が OS の page cache で管理される大容量 value 領域として機能するか。
 - T1 optimizations が point lookup / scan にどう効くか。
 - T2 access が page fault / SSD I/O とどう結びつくか。
 
@@ -85,7 +85,7 @@ VMemKV は複雑な LSM compaction の代わりに、T1/T2 reorganization と ba
 - T1 から参照されない T2 bytes
 - bytes reclaimed
 - reorganize duration
-- foreground p99 latency during background work
+- 通常処理の p99 latency during background work
 
 ---
 
@@ -124,7 +124,7 @@ in-place update は主役ではなく、補助評価として扱います。
 
 - same-size update
 - value-growth update
-- update amplification
+- update による書き込み増幅
 - append fallback rate
 - T2 garbage bytes
 
@@ -142,7 +142,7 @@ in-place update は主役ではなく、補助評価として扱います。
 
 目的:
 
-- OS-delegated value residency の有効性を示す。
+- OS に委譲した value 常駐管理の有効性を示す。
 - page cache が満杯になり、OS がページを追い出し始める前後で性能が大きく崩れないかを確認する。
 
 変化させるもの:
@@ -169,7 +169,7 @@ in-place update は主役ではなく、補助評価として扱います。
 目的:
 
 - LSM-tree baseline に対する競争力を示す。
-- value size と write amplification が性能差にどう影響するかを示す。
+- value size と書き込み増幅が性能差にどう影響するかを示す。
 
 workload:
 
@@ -195,7 +195,7 @@ value size:
 - logical bytes written
 - WAL bytes written
 - device bytes written
-- write amplification: device bytes written / logical bytes written
+- 書き込み増幅: device bytes written / logical bytes written
 - storage usage
 
 注意:
@@ -236,7 +236,7 @@ value size:
 
 - reorganize が ordering / storage fragmentation を修復することを示す。
 - update/delete によって発生した不要な T2 record をどれだけ回収できるかを示す。
-- reorganize 中に foreground workload がどれだけ影響を受けるかを測る。
+- reorganize 中に通常処理がどれだけ影響を受けるかを測る。
 
 workload:
 
@@ -256,7 +256,7 @@ workload:
 - bytes reclaimed
 - reclaimed bytes / copied bytes
 - reorganize duration
-- foreground p99 latency during reorganization
+- reorganize 中の通常処理の p99 latency
 - major page faults per operation before / after reorganize
 
 この実験では、reorganize を単なる scan 高速化ではなく、不要データの回収処理としても評価します。VMemKV では、delete や value-growth update によって T1 から参照されない T2 record が残るため、reorganize がその領域を回収できることを示す必要があります。
@@ -267,7 +267,7 @@ workload:
 
 目的:
 
-- VMemKV が単なる mmap file access ではなく、T1/T2 logical control と reorganize を持つ設計であることを示す。
+- VMemKV が単なる mmap file access ではなく、T1/T2 による検索・scan・reorganize の制御を持つ設計であることを示す。
 
 baseline:
 
@@ -357,14 +357,14 @@ optional baseline です。
 - operations/sec
 - p50 / p95 / p99 latency
 - latency CDF, if possible
-- long run における operations/sec と p99 latency の時系列
+- 長時間 run における operations/sec と p99 latency の時系列
 
 ### Storage
 
 - logical bytes written
 - WAL bytes written
 - device bytes written
-- write amplification: device bytes written / logical bytes written
+- 書き込み増幅: device bytes written / logical bytes written
 - storage usage
 - T2 bytes_used
 - T2 bytes appended
@@ -390,7 +390,7 @@ optional baseline です。
 - bytes copied
 - bytes reclaimed
 - reclaimed bytes / copied bytes
-- foreground p99 latency during reorganize
+- reorganize 中の通常処理の p99 latency
 - scan throughput before / during / after reorganize
 
 ---
@@ -403,16 +403,16 @@ optional baseline です。
 - [ ] T2 bytes_used / bytes_appended を記録する。
 - [ ] T1 から参照されない T2 bytes を記録する。
 - [ ] logical bytes written / WAL bytes written / device bytes written を記録する。
-- [ ] write amplification を計算できるようにする。
+- [ ] 書き込み増幅を計算できるようにする。
 - [ ] T1 hit/miss breakdown を記録する。
 - [ ] reorganization duration / copied bytes / reclaimed bytes を記録する。
-- [ ] reorganization before / during / after の foreground latency を記録する。
+- [ ] reorganization before / during / after の通常処理 latency を記録する。
 - [ ] dataset / memory ratio sweep を実行できるようにする。
 - [ ] value size sweep を実行できるようにする。
 - [ ] 1 KiB / 16 KiB value で RocksDB comparison を実行できるようにする。
 - [ ] YCSB A-F に相当する workload mix を実行できるようにする。
 - [ ] mixed read/write ratio を configurable にする。
-- [ ] long run の throughput / p99 / page faults / SSD bandwidth を時系列で出力する。
+- [ ] 長時間 run の throughput / p99 / page faults / SSD bandwidth を時系列で出力する。
 - [ ] RocksDB options と sync policy を文書化する。
 - [ ] VMemKV variants を benchmark output で明確に識別する。
 - [ ] simple mmap KVS baseline を追加する。
@@ -513,7 +513,7 @@ VMemKV, RocksDB/LSM, WiscKey-like value-log, Bitcask-like KVS, LMDB, explicit bu
 
 ### very fast NVMe で mmap-backed T2 が不利な場合
 
-scope condition として扱います。OS-delegated residency の有利不利は、storage latency と workload locality に依存します。
+適用条件として扱います。OS に委譲した value 常駐管理の有利不利は、storage latency と workload locality に依存します。
 
 ### uniform cold workload で page fault が支配的になる場合
 
