@@ -77,6 +77,7 @@ VMemKV の主 baseline は RocksDB です。可能なら RocksDB BlobDB と Leve
 - update-heavy
 - scan-heavy
 - get hit / miss
+- YCSB系
 
 VMemKV が全 workload で勝つ必要はありません。重要なのは、target workload で競争力を示し、得意条件と不得意条件を明確にすることです。
 
