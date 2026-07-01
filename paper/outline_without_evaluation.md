@@ -1,6 +1,6 @@
 # VMemKV 論文: Evaluation を除いた章立て
 
-このファイルは、`paper/evaluation_plan.md` の E0〜E7 に自然に接続する形で、Evaluation section 以外の論文構成を整理するためのメモである。
+このファイルは、対象ブランチの `paper/evaluation_plan.md` に自然に接続する形で、Evaluation section 以外の論文構成を整理するためのメモである。
 
 本文は最終的には英語で書くが、本メモは草稿化前の設計資料として日本語で記述する。
 
@@ -17,6 +17,8 @@ VMemKV 論文は、以下の論理で進めるのがよい。
 5. 評価では、この設計がどの条件で成立し、どの条件で崩れるかを E0〜E7 で確認する。
 
 重要なのは、VMemKV を「RocksDB より常に速い KVS」として書かないことである。主張は、OS 委譲型 larger-than-memory 管理と T1/T2 責務分離が成立する条件を明らかにすることに置く。
+
+in-place update は重要な特徴だが、中心主張ではなく、update-heavy workload における補助的な強みとして扱う。特に、既存 allocation に収まる更新で T2 garbage generation、storage usage、reorganization pressure を抑えられる可能性を説明する。ただし、任意サイズの更新を常に in-place にできるとは断定しない。
 
 ---
 
@@ -54,8 +56,9 @@ Abstract
    5.1 T1 index layout and responsibilities
    5.2 T2 mmap-backed value region
    5.3 Get / Insert / Update / Delete paths
-   5.4 Scan path and ordering fragmentation
-   5.5 Optional T1 optimizations: AppendMap, BloomFilter, SimdScan, MemoryHints, Inline64
+   5.4 Update semantics and in-place update
+   5.5 Scan path and ordering fragmentation
+   5.6 Optional T1 optimizations: AppendMap, BloomFilter, SimdScan, MemoryHints, Inline64
 
 6. Reorganization, Checkpoint, and Recovery
    6.1 Why fragmentation arises
@@ -122,14 +125,15 @@ Introduction では、いきなり mmap の話から始めるより、larger-tha
 3. WiscKey / BlobDB は value を LSM から分離するが、value-log GC と crash consistency が新たな責務になる。
 4. mmap-based KVS は OS に委譲できるが、page fault / eviction / writeback / TLB shootdown のリスクがある。
 5. VMemKV は、metadata control は T1 に残し、large value residency は T2 + OS に委譲する設計を取る。
-6. contribution と evaluation questions を提示する。
+6. in-place update は補助的な強みとして触れる。特に fixed-size / bounded-growth update-heavy workload で T2 garbage と reorganization pressure を抑えうる点を述べる。ただし中心 thesis にはしない。
+7. contribution と evaluation questions を提示する。
 
 Evaluation への接続:
 
 - E1: larger-than-memory behavior
-- E2: RocksDB comparison
+- E2: YCSB-based comparison with RocksDB
 - E3: T1/T2 design breakdown
-- E5: simple mmap baseline
+- E5: mmap-only microbaseline
 - E7: implementation responsibility table
 
 ### 2. Background and Motivation
@@ -146,8 +150,8 @@ Evaluation への接続:
 
 Evaluation への接続:
 
-- E2 で RocksDB / BlobDB と比較する理由を導入する。
-- E5 で simple mmap baseline を置く理由を導入する。
+- E2 で YCSB-based RocksDB / BlobDB comparison を置く理由を導入する。
+- E5 で mmap-only microbaseline を置く理由を導入する。
 - E7 で implementation responsibility table を置く理由を導入する。
 
 ### 3. Design Goals and Scope
@@ -207,7 +211,7 @@ Evaluation への接続:
 
 - E3: T1/T2 design breakdown
 - E4: reorganization and checkpoint behavior
-- E5: simple mmap baseline
+- E5: mmap-only microbaseline
 
 ### 5. T1/T2 Data Model and Operation Paths
 
@@ -223,18 +227,28 @@ Evaluation への接続:
 - Get / Insert / Update / Delete / Scan の path。
 - Optional optimizations: AppendMap, BloomFilter, SimdScan, MemoryHints, Inline64。
 
+#### 5.x Update semantics and in-place update
+
+in-place update については、以下のように限定して書く。
+
+- VMemKV can update values in place when the new value fits the existing allocation.
+- This applies to the mmap-backed T2 region, not only to DRAM-resident values.
+- If the new value exceeds the current allocation, VMemKV appends a new T2 record and updates the T1 offset.
+- This feature is not the central thesis, but it can reduce garbage generation and reorganization pressure for fixed-size or bounded-growth update-heavy workloads.
+
 過剰主張を避ける点:
 
 - Optional optimization の効果は評価前に断定しない。
 - in-place update を中心主張にしない。
+- 任意サイズの update が常に in-place 可能とは書かない。
 - scan が常に速いとは言わない。
 
 Evaluation への接続:
 
 - E1: DRAM-resident vs larger-than-memory behavior
-- E2: read-heavy / update-heavy / scan-heavy workload
+- E2: YCSB-based read-heavy / update-heavy / scan-heavy workload
 - E3: variant breakdown
-- E5: simple mmap baseline
+- E5: mmap-only microbaseline
 
 ### 6. Reorganization, Checkpoint, and Recovery
 
@@ -243,6 +257,7 @@ Evaluation への接続:
 書くべき内容:
 
 - update / delete によって ordering fragmentation と storage fragmentation が発生すること。
+- in-place update は append-only value-log designs と比べて T2 garbage generation を抑えうるが、すべての garbage を消すわけではないこと。
 - T1-only reorganization と T2 reorganization の違い。
 - T2 reorganization が live record を再配置し、garbage bytes を回収すること。
 - checkpoint reload がどの段階で foreground operation を止めるか。
@@ -251,6 +266,7 @@ Evaluation への接続:
 注意点:
 
 - 「compaction がない」と書くのではなく、「LSM-style multi-level compaction を中心機構にしない」と書く。
+- in-place update によって GC / reorganization が不要になるとは書かない。
 - recovery は exhaustive crash testing ではなく sanity check として扱う。
 - checkpoint の foreground interference は評価で測る対象であり、事前に小さいと断定しない。
 
@@ -300,7 +316,8 @@ Evaluation の後に置く章だが、evaluation 以外の草稿を書く段階�
 - VMemKV が苦手になりうる条件。
 - mmap 批判との関係。
 - RocksDB に負けた場合の解釈。
-- simple mmap baseline が速かった場合の解釈。
+- mmap-only microbaseline が速かった場合の解釈。
+- in-place update の効果が限定的だった場合の解釈。
 - production KVS として残る課題。
 
 重要な点:
@@ -338,7 +355,7 @@ Conclusion では、最終的な評価結果に応じて strong / modest な結�
 評価結果が良い場合:
 
 - target workload で practical performance を示した、と書ける。
-- T1/T2 split が simple mmap baseline との差分を作った、と書ける。
+- T1/T2 split が mmap-only microbaseline との差分を作った、と書ける。
 
 評価結果が mixed の場合:
 
@@ -349,3 +366,53 @@ Conclusion では、最終的な評価結果に応じて strong / modest な結�
 
 - mmap-based larger-than-memory KVS の限界を T1/T2 split とともに実験的に characterization した、と書く。
 - ただし、この場合は system paper としての主張を慎重に再構成する必要がある。
+
+---
+
+## 章立て上の注意
+
+### Evaluation 前に書きすぎない
+
+Evaluation section より前で、結果を先取りする表現は避ける。
+
+避ける表現:
+
+- `We show that VMemKV outperforms RocksDB ...`
+- `VMemKV achieves lower tail latency ...`
+- `The T1/T2 split improves scan performance ...`
+
+使う表現:
+
+- `Our evaluation is designed to answer whether ...`
+- `We investigate how ...`
+- `We evaluate the effect of ...`
+- `The design is intended to ...`
+
+### Related Work を早めに全部書かない
+
+Background and Motivation では、設計動機に必要な先行研究だけを説明する。
+
+詳細な比較や網羅的整理は Related Work に回す。
+
+### Discussion を必ず置く
+
+VMemKV は mmap を使うため、mmap 批判との衝突を避けられない。Discussion で limitation を正面から扱うことで、査読者に「著者は mmap の弱点を理解している」と示す必要がある。
+
+---
+
+## 最終的な書き出し方針
+
+まずは以下の順で草稿化するのがよい。
+
+1. Introduction
+2. Design Goals and Scope
+3. VMemKV Architecture Overview
+4. T1/T2 Data Model and Operation Paths
+5. Reorganization, Checkpoint, and Recovery
+6. Background and Motivation
+7. Related Work
+8. Discussion and Limitations
+9. Abstract
+10. Conclusion
+
+Abstract と Conclusion は評価結果が入るまで final にしない。
