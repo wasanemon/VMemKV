@@ -183,10 +183,10 @@ workload:
 - YCSB A-F に相当する workload
 
 value size:
-
+- 64 B
 - 1 KiB
-- 16 KiB
-- 可能なら 64 B と 4 KiB も追加する。
+- (4 KiB)
+- (16 KiB)
 
 指標:
 
@@ -396,32 +396,7 @@ optional baseline です。
 
 ---
 
-## 6. 実装担当者向け checklist
-
-- [ ] benchmark output を CSV または JSON にする。
-- [ ] run ごとに dataset size, value size, thread count, workload mix を記録する。
-- [ ] page faults と RSS を記録する。
-- [ ] T2 bytes_used / bytes_appended を記録する。
-- [ ] T1 から参照されない T2 bytes を記録する。
-- [ ] logical bytes written / WAL bytes written / device bytes written を記録する。
-- [ ] 書き込み増幅を計算できるようにする。
-- [ ] T1 hit/miss breakdown を記録する。
-- [ ] reorganization duration / copied bytes / reclaimed bytes を記録する。
-- [ ] reorganization before / during / after の通常処理 latency を記録する。
-- [ ] dataset / memory ratio sweep を実行できるようにする。
-- [ ] value size sweep を実行できるようにする。
-- [ ] 1 KiB / 16 KiB value で RocksDB comparison を実行できるようにする。
-- [ ] YCSB A-F に相当する workload mix を実行できるようにする。
-- [ ] mixed read/write ratio を configurable にする。
-- [ ] 長時間 run の throughput / p99 / page faults / SSD bandwidth を時系列で出力する。
-- [ ] RocksDB options と sync policy を文書化する。
-- [ ] VMemKV variants を benchmark output で明確に識別する。
-- [ ] simple mmap KVS baseline を追加する。
-- [ ] 可能なら append-update-only VMemKV variant を追加する。
-
----
-
-## 7. Evaluation section の構成案
+## 6. Evaluation section の構成案
 
 ```text
 8. Evaluation
@@ -454,7 +429,7 @@ optional baseline です。
 
 ---
 
-## 8. 論文に載せたい図・表
+## 7. 論文に載せたい図・表
 
 ### Figure 1. Larger-than-memory throughput and tail latency
 
@@ -499,7 +474,7 @@ VMemKV, RocksDB/LSM, WiscKey-like value-log, Bitcask-like KVS, LMDB, explicit bu
 
 ---
 
-## 9. Negative results の扱い
+## 8. Negative results の扱い
 
 ### RocksDB が一部 workload で速い場合
 
@@ -530,7 +505,7 @@ VMemKV, RocksDB/LSM, WiscKey-like value-log, Bitcask-like KVS, LMDB, explicit bu
 
 ---
 
-## 10. 評価の一文目標
+## 9. 評価の一文目標
 
 > VMemKV が、単なる mmap file access ではなく、RAM-resident T1 index と mmap-backed T2 value layer の責務分離によって、OS に larger-than-memory 管理を委譲しながら、単純な実装と実用的な性能を両立できることを示す。
 
