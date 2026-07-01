@@ -20,7 +20,7 @@ VMemKV の評価で答えるべき中心問いは、次です。
 - LMDB のような mmap-based KVS より大規模な dataset を扱うことを目指す。
 - buffer pool、page replacement policy、複雑な multi-level compaction を自前で持たない。
 
-in-place update は重要な特徴ですが、評価の中心ではありません。中心は **OS-delegated larger-than-memory management** と **T1/T2 responsibility separation** です。in-place update は update-heavy workload における補助的な強みとして評価します。
+in-place update は重要な特徴ですが、評価の中心ではありません。中心は **OS に委譲した larger-than-memory 管理** と **T1/T2 の責務分離** です。in-place update は update-heavy workload における補助的な強みとして評価します。
 
 ---
 
@@ -38,6 +38,7 @@ T2 value region が DRAM を超える条件で、OS page cache / page fault / st
 - tail latency
 - SSD read/write bandwidth
 - access skew の影響
+- page cache が満杯になり、OS がページを追い出し始める前後の性能変化
 
 ---
 
@@ -54,6 +55,7 @@ VMemKV の主 baseline は RocksDB です。可能なら LevelDB も追加しま
 - delete
 - scan
 - read-heavy / write-heavy mixed workload
+- YCSB A-F に相当する read/write/scan mix
 
 VMemKV が全 workload で勝つ必要はありません。重要なのは、想定 workload で競争力を示し、得意条件と不得意条件を明確にすることです。
 
@@ -78,8 +80,9 @@ VMemKV は複雑な LSM compaction の代わりに、T1/T2 reorganization と ba
 
 見るもの:
 
-- scan before / after reorganize
+- scan before / during / after reorganize
 - T2 bytes_used before / after reorganize
+- T1 から参照されない T2 bytes
 - bytes reclaimed
 - reorganize duration
 - foreground p99 latency during background work
@@ -140,6 +143,7 @@ in-place update は主役ではなく、補助評価として扱います。
 目的:
 
 - OS-delegated value residency の有効性を示す。
+- page cache が満杯になり、OS がページを追い出し始める前後で性能が大きく崩れないかを確認する。
 
 変化させるもの:
 
@@ -154,6 +158,9 @@ in-place update は主役ではなく、補助評価として扱います。
 - p50 / p95 / p99 latency
 - major/minor page faults
 - SSD read/write bandwidth
+- throughput, p99 latency, major faults, SSD bandwidth の時系列
+
+この実験では、run 全体の平均値だけでなく、時間経過も記録します。平均値だけでは、page cache が空いている初期状態と、ページの追い出しが続く状態を区別できないためです。
 
 ---
 
@@ -162,6 +169,7 @@ in-place update は主役ではなく、補助評価として扱います。
 目的:
 
 - LSM-tree baseline に対する競争力を示す。
+- value size と write amplification が性能差にどう影響するかを示す。
 
 workload:
 
@@ -172,19 +180,29 @@ workload:
 - delete
 - scan
 - mixed read/write
+- YCSB A-F に相当する workload
+
+value size:
+
+- 1 KiB
+- 16 KiB
+- 可能なら 64 B と 4 KiB も追加する。
 
 指標:
 
 - throughput
-- latency
-- bytes written, if available
+- p50 / p95 / p99 latency
+- logical bytes written
+- WAL bytes written
+- device bytes written
+- write amplification: device bytes written / logical bytes written
 - storage usage
-- tail latency
 
 注意:
 
 - RocksDB options, compression, WAL/sync policy を必ず明記する。
 - VMemKV の durability scope と揃わない場合は、その差を明記する。
+- compression は無効を基本とし、有効にする場合は別条件として扱う。
 
 ---
 
@@ -217,26 +235,68 @@ workload:
 目的:
 
 - reorganize が ordering / storage fragmentation を修復することを示す。
+- update/delete によって発生した不要な T2 record をどれだけ回収できるかを示す。
+- reorganize 中に foreground workload がどれだけ影響を受けるかを測る。
 
 workload:
 
 - insert-heavy
 - delete-heavy
+- same-size update-heavy
 - value-growth update-heavy
-- scan before / after reorganize
+- scan before / during / after reorganize
+- T1 から参照されない T2 record の割合: 0%, 25%, 50%, 75%
 
 指標:
 
-- scan throughput before / after
+- scan throughput before / during / after
 - T2 bytes_used before / after
+- T1 から参照されない T2 bytes
 - bytes copied
 - bytes reclaimed
+- reclaimed bytes / copied bytes
 - reorganize duration
 - foreground p99 latency during reorganization
+- major page faults per operation before / after reorganize
+
+この実験では、reorganize を単なる scan 高速化ではなく、不要データの回収処理としても評価します。VMemKV では、delete や value-growth update によって T1 から参照されない T2 record が残るため、reorganize がその領域を回収できることを示す必要があります。
 
 ---
 
-### E5. Implementation responsibility table
+### E5. Simple mmap KVS baseline
+
+目的:
+
+- VMemKV が単なる mmap file access ではなく、T1/T2 logical control と reorganize を持つ設計であることを示す。
+
+baseline:
+
+- mmap-backed value file + simple unordered_map index
+- T1 sorted_region / append_region なし
+- T1/T2 reorganize なし
+- durability scope は VMemKV とできるだけ揃える。揃わない場合は差を明記する。
+
+workload:
+
+- get hit / miss
+- update
+- scan
+- larger-than-memory sweep
+- value-growth update-heavy
+
+指標:
+
+- throughput
+- p50 / p95 / p99 latency
+- major/minor page faults
+- SSD read/write bandwidth
+- storage usage
+
+この baseline は、VMemKV の比較対象を増やすためではなく、mmap だけでは説明できない部分を切り分けるために使います。VMemKV が優位な場合は、T1/T2 分離、reorganize、memory hints のどれが効いているかを E3 と合わせて説明します。
+
+---
+
+### E6. Implementation responsibility table
 
 目的:
 
@@ -252,19 +312,6 @@ workload:
 ## 4. 推奨実験
 
 時間があれば以下を追加します。
-
-### E6. Simple mmap KVS baseline
-
-目的:
-
-- VMemKV が単なる mmap file access ではなく、T1/T2 logical control を持つ設計であることを示す。
-
-候補:
-
-- mmap-backed value file + simple unordered_map index
-- T1/T2 reorganize なし
-
----
 
 ### E7. in-place update behavior
 
@@ -290,15 +337,14 @@ workload:
 
 ---
 
-### E8. LMDB / LevelDB / Bitcask-like baseline
+### E8. LMDB / Bitcask-like baseline
 
 optional baseline です。
 
-- LevelDB: classic LSM baseline
 - LMDB: mmap-based KVS baseline
 - Bitcask-like: simple append-only KVS baseline
 
-入れられれば有用ですが、RocksDB comparison と LTM sweep より優先度は低いです。
+入れられれば有用ですが、RocksDB comparison、larger-than-memory sweep、simple mmap baseline より優先度は低いです。LevelDB は E2 で扱える場合に追加します。
 
 ---
 
@@ -311,21 +357,29 @@ optional baseline です。
 - operations/sec
 - p50 / p95 / p99 latency
 - latency CDF, if possible
+- long run における operations/sec と p99 latency の時系列
 
 ### Storage
 
+- logical bytes written
+- WAL bytes written
+- device bytes written
+- write amplification: device bytes written / logical bytes written
+- storage usage
 - T2 bytes_used
 - T2 bytes appended
 - T2 bytes overwritten in place, if measured
-- T2 unreachable bytes estimate
+- T1 から参照されない T2 bytes
 - bytes reclaimed by reorganization
 
 ### OS / Hardware
 
 - major page faults
 - minor page faults
+- page faults per operation
 - RSS
 - SSD read/write bandwidth
+- SSD read/write bandwidth の時系列
 - CPU cycles / instructions, if available
 - dTLB / LLC misses, if available
 
@@ -335,7 +389,9 @@ optional baseline です。
 - reorganize duration
 - bytes copied
 - bytes reclaimed
+- reclaimed bytes / copied bytes
 - foreground p99 latency during reorganize
+- scan throughput before / during / after reorganize
 
 ---
 
@@ -345,14 +401,21 @@ optional baseline です。
 - [ ] run ごとに dataset size, value size, thread count, workload mix を記録する。
 - [ ] page faults と RSS を記録する。
 - [ ] T2 bytes_used / bytes_appended を記録する。
+- [ ] T1 から参照されない T2 bytes を記録する。
+- [ ] logical bytes written / WAL bytes written / device bytes written を記録する。
+- [ ] write amplification を計算できるようにする。
 - [ ] T1 hit/miss breakdown を記録する。
 - [ ] reorganization duration / copied bytes / reclaimed bytes を記録する。
+- [ ] reorganization before / during / after の foreground latency を記録する。
 - [ ] dataset / memory ratio sweep を実行できるようにする。
 - [ ] value size sweep を実行できるようにする。
+- [ ] 1 KiB / 16 KiB value で RocksDB comparison を実行できるようにする。
+- [ ] YCSB A-F に相当する workload mix を実行できるようにする。
 - [ ] mixed read/write ratio を configurable にする。
+- [ ] long run の throughput / p99 / page faults / SSD bandwidth を時系列で出力する。
 - [ ] RocksDB options と sync policy を文書化する。
 - [ ] VMemKV variants を benchmark output で明確に識別する。
-- [ ] 可能なら simple mmap KVS baseline を追加する。
+- [ ] simple mmap KVS baseline を追加する。
 - [ ] 可能なら append-update-only VMemKV variant を追加する。
 
 ---
@@ -365,16 +428,18 @@ optional baseline です。
        Hardware, OS, filesystem, storage, memory limit, compiler, RocksDB configuration.
 
    8.2 Larger-than-Memory Behavior
-       Dataset/memory ratio, page faults, value size, skew, throughput, tail latency.
+       Dataset/memory ratio, page faults, value size, skew, throughput, tail latency,
+       time-series behavior, and simple mmap baseline.
 
    8.3 Comparison with LSM-tree Baselines
-       VMemKV vs RocksDB/LevelDB for load, get, update, delete, scan, mixed workloads.
+       VMemKV vs RocksDB/LevelDB for load, get, update, delete, scan, mixed workloads,
+       YCSB A-F style workloads, value-size sensitivity, and write amplification.
 
    8.4 T1/T2 Design Breakdown
        VMemKV variants, T1 optimizations, T2 access behavior, inline values.
 
    8.5 Reorganization and Background Jobs
-       Scan before/after reorg, storage reclaim, foreground latency during background work.
+       Scan before/during/after reorg, storage reclaim, copied bytes, foreground latency.
 
    8.6 Update Path Behavior
        Stable-size update, value-growth update, in-place vs append-update baseline.
@@ -394,17 +459,19 @@ optional baseline です。
 
 - x-axis: dataset / memory ratio
 - y-axis: throughput and p99 latency
-- series: VMemKV, RocksDB, optional mmap-only / LMDB
+- series: VMemKV, RocksDB, simple mmap, optional LMDB
 
-### Figure 2. Page fault behavior
+### Figure 2. Larger-than-memory time-series behavior
 
-- x-axis: dataset / memory ratio or Zipf alpha
-- y-axis: major/minor faults per operation
+- x-axis: elapsed time
+- y-axis: throughput, p99 latency, major faults, SSD bandwidth
+- show cold start, warm state, and steady state separately if needed
 
 ### Figure 3. VMemKV vs RocksDB workload comparison
 
-- workload: load, get, update, delete, scan, mixed
-- y-axis: throughput or normalized throughput
+- workload: load, YCSB A-F style workloads, get, update, delete, scan, mixed
+- value size: 1 KiB and 16 KiB
+- y-axis: throughput, p99 latency, write amplification
 
 ### Figure 4. T1/T2 ablation
 
@@ -413,9 +480,10 @@ optional baseline です。
 
 ### Figure 5. Reorganization effect
 
-- scan throughput before/after
-- T2 bytes_used before/after
-- bytes reclaimed
+- scan throughput before / during / after
+- T2 bytes_used before / after
+- T1 から参照されない T2 bytes
+- bytes copied and bytes reclaimed
 - foreground p99 during background work
 
 ### Figure 6. Update path behavior
@@ -439,7 +507,7 @@ VMemKV, RocksDB/LSM, WiscKey-like value-log, Bitcask-like KVS, LMDB, explicit bu
 重要なのは以下です。
 
 - target workload で競争力があること
-- LTM 条件で OS-delegated value management が破綻しないこと
+- DRAM より大きい dataset 条件で、OS に委譲した value residency が破綻しないこと
 - 実装責務が少ないこと
 - T1/T2 の責務分離が測定可能な効果を持つこと
 
@@ -449,11 +517,15 @@ scope condition として扱います。OS-delegated residency の有利不利�
 
 ### uniform cold workload で page fault が支配的になる場合
 
-想定内です。VMemKV の得意条件と不得意条件を明確にする結果として扱います。
+想定内です。VMemKV の得意条件と不得意条件を明確にする結果として扱います。平均値だけでなく時系列を見ることで、初期状態と steady state を分けて説明します。
+
+### simple mmap baseline が一部 workload で速い場合
+
+問題ありません。その場合は、VMemKV の T1/T2 分離、reorganize、memory hints の効果が出る条件と出ない条件を明確にします。
 
 ### in-place update の効果が限定的な場合
 
-中心主張は崩れません。in-place update は補助的な強みであり、主張の中心は OS-delegated LTM management と T1/T2 responsibility separation です。
+中心主張は崩れません。in-place update は補助的な強みであり、主張の中心は OS に委譲した larger-than-memory 管理と T1/T2 の責務分離です。
 
 ---
 
