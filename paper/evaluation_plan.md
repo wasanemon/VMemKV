@@ -1,8 +1,5 @@
 # VMemKV 評価計画
 
-このメモは、VMemKV 論文の evaluation section を設計するための最終的な評価計画です。
-対象は `wasanemon/VMemKV` の `paper-writing` ブランチ、設計方針は `pr-14` を基準にします。
-
 ---
 
 ## 1. 評価の中心問い
