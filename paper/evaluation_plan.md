@@ -229,6 +229,7 @@ thread count:
 
 - 1
 - 8
+- それ以上
 - physical cores
 - logical cores
 
@@ -491,33 +492,7 @@ crash point:
 - checksum / full scan result
 
 ---
-
-## 7. 実装担当者向け checklist
-
-- [ ] benchmark output を CSV または JSON にする。
-- [ ] run ごとに dataset size, value size, thread count, workload mix を記録する。
-- [ ] cgroup memory limit を設定し、VMemKV と RocksDB を同じ memory budget で比較する。
-- [ ] RocksDB options, block cache size, I/O mode, compression, WAL/sync policy を記録する。
-- [ ] VMemKV の durability scope を記録する。
-- [ ] warmup duration, run duration, repetition count を記録する。
-- [ ] error bars または標準偏差を出せるようにする。
-- [ ] page faults, RSS, cgroup memory usage を記録する。
-- [ ] SSD read/write bandwidth を記録する。
-- [ ] throughput / p99 / page faults / SSD bandwidth を時系列で出力する。
-- [ ] logical bytes written / WAL bytes written / device bytes written を記録する。
-- [ ] write amplification を計算できるようにする。
-- [ ] T2 bytes_used / bytes_appended を記録する。
-- [ ] T1 から参照されない T2 bytes を記録する。
-- [ ] T1 hit/miss breakdown を記録する。
-- [ ] reorganization duration / copied bytes / reclaimed bytes を記録する。
-- [ ] fork time / stop-the-world time / WAL replay time を記録する。
-- [ ] crash 後の recovery time / replayed WAL bytes / recovered key count を記録する。
-- [ ] VMemKV variants を benchmark output で明確に識別する。
-- [ ] simple mmap KVS baseline を追加する。
-
----
-
-## 8. Evaluation section の構成案
+## 9. Evaluation section の構成案
 
 ```text
 8. Evaluation
@@ -557,7 +532,7 @@ crash point:
 
 ---
 
-## 9. 論文に載せたい図・表
+## 8. 論文に載せたい図・表
 
 ### Figure 1. Larger-than-memory throughput and tail latency
 
@@ -607,7 +582,7 @@ VMemKV, RocksDB/LSM, WiscKey-like value-log, Bitcask-like KVS, LMDB, explicit bu
 
 ---
 
-## 10. Negative results の扱い
+## 9. Negative results の扱い
 
 ### RocksDB が一部 workload で速い場合
 
@@ -642,7 +617,7 @@ VMemKV, RocksDB/LSM, WiscKey-like value-log, Bitcask-like KVS, LMDB, explicit bu
 
 ---
 
-## 11. 評価の一文目標
+## 10. 評価の一文目標
 
 > VMemKV が、単なる mmap file access ではなく、RAM-resident T1 index と mmap-backed T2 value layer の責務分離によって、OS に larger-than-memory 管理を委譲しながら、単純な実装と実用的な性能を両立できる条件を示す。
 
