@@ -17,7 +17,7 @@ VMemKV の評価で答えるべき中心問いは、次です。
 
 - RocksDB / LevelDB のような LSM-tree に比肩する性能を目指す。
 - Bitcask のような単純な設計を目指す。
-- LMDB のような mmap-based KVS より大規模な dataset を扱うことを目指す。
+- LMDB のように mmap を使う既存 KVS とは異なり、RAM 常駐の T1 index と mmap-backed な T2 value 領域を分離し、大容量 value を含む larger-than-memory workload を対象にする。
 - buffer pool、page replacement policy、複雑な multi-level compaction を自前で持たない。
 
 in-place update は重要な特徴ですが、評価の中心ではありません。中心は **OS に委譲した larger-than-memory 管理** と **T1/T2 の責務分離** です。in-place update は update-heavy workload における補助的な強みとして評価します。
