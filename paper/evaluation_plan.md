@@ -60,9 +60,10 @@ in-place update は重要な特徴ですが、評価の中心ではありませ�
        copied bytes, reclaimed bytes, fork time, stop-the-world time,
        WAL replay time, memory high-water mark, TLB shootdowns.
 
-   8.6 Simple mmap Upper-Bound Baseline
-       mmap-backed value file + unordered_map index.
-       Used as a weak-durability upper-bound baseline, not a durability-matched baseline.
+   8.6 mmap-only Microbaseline
+       mmap-backed value file + in-memory unordered_map index.
+       Used only to estimate the raw cost of mmap-backed value access;
+       it is not a durability-matched competitor.
 
    8.7 Recovery and Crash-Consistency
        Crash during load/update/checkpoint/reorganization.
@@ -418,19 +419,22 @@ workload:
 
 ---
 
-### E5. Simple mmap KVS upper-bound baseline
+### E5. mmap-only microbaseline
 
 目的:
 
-- mmap 単体で得られる性能上限を見積もる。
-- VMemKV が、単なる mmap file access に近い性能を保ちながら、T1/T2 reorganization、checkpoint、WAL recovery を提供できるかを示す。
+- durability-matched competitor ではなく、raw mmap-backed value access のコストを見積もる。
+- VMemKV の T1/T2 organization、reorganization、checkpoint、WAL recovery が追加する機能コストを切り分ける。
+- VMemKV の性能が単に mmap を使っているだけで説明できるのか、それとも T1/T2 設計による差分があるのかを確認する。
 
 baseline:
 
-- mmap-backed value file + simple unordered_map index
+- mmap-backed value file + in-memory `unordered_map<key, offset/length>` index
 - T1 sorted_region / append_region なし
 - T1/T2 reorganization なし
-- WAL / checkpoint / recovery は持たない、または VMemKV より弱い durability scope として明記する。
+- checkpoint なし
+- WAL recovery なし
+- crash consistency なし、または VMemKV より弱い durability scope として明記する
 
 workload:
 
@@ -451,7 +455,7 @@ workload:
 - instructions/op
 - TLB shootdowns
 
-この baseline は durability を揃えた比較対象ではありません。mmap だけで得られる性能上限を示すための baseline として扱います。
+この baseline は VMemKV や RocksDB と公平に競わせる competitor ではありません。機能を削った最小構成により、mmap-backed value access 自体の性能参照点を得るための microbaseline として扱います。
 
 ---
 
@@ -625,7 +629,7 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
 
 - x-axis: thread count
 - y-axis: throughput and p99 / p99.9 latency
-- series: VMemKV DRAM-resident, VMemKV larger-than-memory, RocksDB, simple mmap
+- series: VMemKV DRAM-resident, VMemKV larger-than-memory, RocksDB, mmap-only microbaseline
 
 ### Figure 2. Larger-than-memory time-series behavior
 
@@ -697,9 +701,9 @@ VMemKV, RocksDB/LSM, WiscKey-like value-log, Bitcask-like KVS, LMDB, explicit bu
 
 想定内です。VMemKV の得意条件と不得意条件を明確にする結果として扱います。平均値だけでなく時系列を見ることで、初期状態と steady state を分けて説明します。
 
-### simple mmap upper-bound baseline が速い場合
+### mmap-only microbaseline が速い場合
 
-想定内です。simple mmap baseline は durability を揃えた比較対象ではなく、mmap 単体の性能上限を示すための baseline です。VMemKV がその性能上限にどれだけ近づきつつ、reorganization、checkpoint、WAL recovery を提供できるかを説明します。
+想定内です。mmap-only microbaseline は durability を揃えた競合ではなく、raw mmap-backed value access の性能参照点です。VMemKV がその参照点に対してどれだけの overhead を払い、T1/T2 organization、reorganization、checkpoint、WAL recovery を提供しているかを説明します。
 
 ### checkpoint 中に memory spike が出る場合
 
