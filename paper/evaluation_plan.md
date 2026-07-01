@@ -67,17 +67,23 @@ T2 value region が DRAM を超える条件で、OS page cache / page fault / st
 - thread count を増やしたときの scalability
 - cycles/op, instructions/op, TLB shootdowns
 
-### Q2. RocksDB に対して競争力があるか？
+### Q2. YCSB-based RocksDB 比較で競争力があるか？
 
-VMemKV の主 baseline は RocksDB です。16 KiB value の write amplification 比較では RocksDB BlobDB も測ります。可能なら LevelDB も追加します。
+VMemKV の主 baseline は RocksDB です。KVS 論文としての標準 macrobenchmark を明確にするため、RocksDB comparison は YCSB-based comparison として構成します。
+
+本編では YCSB load phase と Workload A, B, C, E, F を使います。Workload D は read-latest / insert-heavy の補助 workload として扱い、余力があれば appendix に回します。
+
+16 KiB value の write amplification 比較では、通常の RocksDB だけでなく RocksDB BlobDB も測ります。これは、VMemKV が large value を T2 に分離する設計であるため、RocksDB 側にも value-separated variant を含めないと比較が不公平になりやすいためです。可能なら LevelDB も補助 baseline として追加します。
 
 見る workload:
 
-- load
-- read-heavy
-- update-heavy
-- scan-heavy
-- get hit / miss
+- YCSB load phase
+- YCSB Workload A: update-heavy
+- YCSB Workload B: read-heavy
+- YCSB Workload C: read-only
+- YCSB Workload E: short scan
+- YCSB Workload F: read-modify-write
+- YCSB Workload D: read-latest / insert-heavy, optional
 
 VMemKV が全 workload で勝つ必要はありません。重要なのは、target workload で競争力を示し、得意条件と不得意条件を明確にすることです。
 
@@ -219,21 +225,28 @@ VMemKV は WAL と checkpoint による durability を持つ設計です。評�
 
 ---
 
-### E2. RocksDB comparison
+### E2. YCSB-based comparison with RocksDB
 
 目的:
 
-- LSM-tree baseline に対する競争力を示す。
+- KVS 論文として標準的な YCSB-based macrobenchmark で、LSM-tree baseline に対する競争力を示す。
 - value size と write amplification が性能差にどう影響するかを示す。
 - RocksDB と VMemKV の thread scaling を比較する。
+- VMemKV が全 workload で勝つことではなく、target workload での競争力と得意・不得意条件を明確にする。
 
 本編で使う workload:
 
-- load
-- read-heavy
-- update-heavy
-- scan-heavy
-- get hit / miss
+- YCSB load phase
+- YCSB Workload A: update-heavy
+- YCSB Workload B: read-heavy
+- YCSB Workload C: read-only
+- YCSB Workload E: short scan
+- YCSB Workload F: read-modify-write
+
+optional / appendix:
+
+- YCSB Workload D: read-latest / insert-heavy
+- full YCSB A-F summary, if space permits
 
 value size:
 
@@ -248,29 +261,36 @@ thread count:
 - physical cores
 - logical cores
 
+比較対象:
+
+- VMemKV
+- RocksDB
+- RocksDB BlobDB, for 16 KiB values and write amplification comparison
+- LevelDB, optional
+
+比較条件:
+
+- VMemKV と RocksDB の memory budget を揃える。
+- VMemKV と RocksDB の durability scope を揃えた条件を最低 1 本作る。
+- RocksDB の block cache size, compression, WAL/sync policy, I/O mode を明記する。
+- 16 KiB value では RocksDB BlobDB を含め、non-value-separated RocksDB だけとの不公平な比較を避ける。
+
 指標:
 
 - throughput
 - p50 / p95 / p99 / p99.9 latency
+- storage usage
 - logical bytes written
 - WAL bytes written
 - device bytes written
 - device write amplification: device bytes written / logical bytes written
 - engine write amplification: engine-written bytes / logical bytes written
 - reorganization copied bytes
-- storage usage
 - cycles/op
 - instructions/op
 - TLB shootdowns
 
 `engine-written bytes` は、VMemKV では WAL bytes、T2 append / overwrite bytes、reorganization copied bytes を含めます。RocksDB では WAL / memtable flush / compaction / blob write など、engine が発行した書き込みを含めます。device write amplification と engine write amplification は混同しません。
-
-注意:
-
-- RocksDB options, compression, WAL/sync policy を必ず明記する。
-- VMemKV と RocksDB の durability scope を揃えた条件を最低 1 本作る。
-- durability scope が揃わない追加条件は、主結果ではなく補助結果として扱う。
-- 16 KiB value の write amplification 比較では RocksDB BlobDB を含める。
 
 ---
 
@@ -452,10 +472,11 @@ crash point:
 
 本編では扱わず、余力がある場合だけ追加します。
 
+- YCSB Workload D
+- full YCSB A-F summary, if not all workloads fit in the main text
 - LMDB
 - LevelDB
-- full YCSB A-F
-- full value-size sweep: 64 B, 4 KiB など
+- full value-size sweep: 64 B, 4 KiB, 64 KiB など
 - latency CDF
 - Bitcask-like baseline
 - append-update-only VMemKV variant
@@ -465,8 +486,9 @@ crash point:
 
 | 実験 | 優先度 | 理由 |
 | --- | --- | --- |
+| YCSB Workload D | 中 | read-latest / insert-heavy の補助 workload。中心主張には A/B/C/E/F の方が直結する |
+| full YCSB A-F summary | 中 | 標準 benchmark としての見栄えは上がるが、本編には多い場合がある |
 | LMDB | 中 | mmap-based KVS 代表として有用 |
-| full YCSB A-F | 中 | 再現性は上がるが本編には多い |
 | full value-size sweep | 中 | 傾向確認用。主張には 1 KiB / 16 KiB で足りる |
 | latency CDF | 低 | p99 / p99.9 と時系列で代替可能 |
 | Bitcask-like baseline | 低 | 自作 baseline の公平性説明が必要 |
@@ -562,11 +584,16 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
        page faults, value size, skew, throughput/p99/p99.9/faults/
        bandwidth time-series, cycles/op, TLB shootdowns.
 
-   8.3 Comparison with RocksDB
-       Load, read-heavy, update-heavy, scan-heavy workloads.
-       1 KiB and 16 KiB values.
-       Throughput, tail latency, storage usage, device write amplification,
-       engine write amplification. Include BlobDB for 16 KiB write amplification.
+   8.3 YCSB-based Comparison with RocksDB
+       YCSB load phase and workloads A, B, C, E, and F.
+       Workload D is optional and reported in the appendix if space permits.
+       Use 1 KiB and 16 KiB values.
+       Compare VMemKV with RocksDB under matched memory and durability settings.
+       Include RocksDB BlobDB for 16 KiB values to avoid an unfair comparison
+       against a non-value-separated RocksDB configuration.
+       Report throughput, p50/p95/p99/p99.9 latency, storage usage,
+       logical bytes written, WAL bytes written, device bytes written,
+       device write amplification, and engine write amplification.
 
    8.4 T1/T2 Design Breakdown
        AppendMap, BloomFilter, SimdScan, MemoryHints, Inline64.
@@ -605,9 +632,10 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
 - x-axis: elapsed time
 - y-axis: throughput, p99 / p99.9 latency, major faults, SSD bandwidth
 
-### Figure 3. VMemKV vs RocksDB workload comparison
+### Figure 3. YCSB-based VMemKV vs RocksDB workload comparison
 
-- workload: load, read-heavy, update-heavy, scan-heavy
+- workload: YCSB load, A, B, C, E, F
+- optional / appendix: YCSB D
 - value size: 1 KiB and 16 KiB
 - y-axis: throughput, p99 latency, device write amplification, engine write amplification
 - include RocksDB BlobDB for 16 KiB write amplification
