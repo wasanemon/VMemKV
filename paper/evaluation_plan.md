@@ -26,7 +26,56 @@ in-place update は重要な特徴ですが、評価の中心ではありませ�
 
 ---
 
-## 2. Scope
+## 2. Evaluation section の構成案
+
+```text
+8. Evaluation
+   8.1 Experimental Setup
+       Hardware, filesystem, SSD, cgroup memory limit, RocksDB options,
+       VMemKV durability scope, msync/writeback policy, thread counts,
+       warmup, repetitions.
+
+   8.2 Larger-than-Memory Behavior and Thread Scalability
+       DRAM-resident vs larger-than-memory runs, dataset/memory ratio,
+       page faults, value size, skew, throughput/p99/p99.9/faults/
+       bandwidth time-series, cycles/op, TLB shootdowns.
+
+   8.3 YCSB-based Comparison with RocksDB
+       YCSB load phase and workloads A, B, C, E, and F.
+       Workload D is optional and reported in the appendix if space permits.
+       Use 1 KiB and 16 KiB values.
+       Compare VMemKV with RocksDB under matched memory and durability settings.
+       Include RocksDB BlobDB for 16 KiB values to avoid an unfair comparison
+       against a non-value-separated RocksDB configuration.
+       Report throughput, p50/p95/p99/p99.9 latency, storage usage,
+       logical bytes written, WAL bytes written, device bytes written,
+       device write amplification, and engine write amplification.
+
+   8.4 T1/T2 Design Breakdown
+       AppendMap, BloomFilter, SimdScan, MemoryHints, Inline64.
+       Show only workloads where each optimization should matter.
+
+   8.5 Reorganization and Checkpoint Behavior
+       Scan before/during/after, T2 unreachable bytes,
+       copied bytes, reclaimed bytes, fork time, stop-the-world time,
+       WAL replay time, memory high-water mark, TLB shootdowns.
+
+   8.6 Simple mmap Upper-Bound Baseline
+       mmap-backed value file + unordered_map index.
+       Used as a weak-durability upper-bound baseline, not a durability-matched baseline.
+
+   8.7 Recovery and Crash-Consistency
+       Crash during load/update/checkpoint/reorganization.
+       Recovery time as a function of WAL size and checkpoint age,
+       WAL replay bytes, recovered key count, checksum.
+
+   8.8 Implementation Responsibility
+       One table comparing DB-side responsibilities.
+```
+
+---
+
+## 3. Scope
 
 本稿の評価対象は standalone KVS としての VMemKV です。
 
@@ -49,7 +98,7 @@ in-place update は重要な特徴ですが、評価の中心ではありませ�
 
 ---
 
-## 3. 評価軸
+## 4. 評価軸
 
 ### Q1. OS 委譲型 larger-than-memory 管理は機能するか？
 
@@ -142,7 +191,7 @@ VMemKV は WAL と checkpoint による durability を持つ設計です。評�
 
 ---
 
-## 4. 本編に残す必須実験
+## 5. 本編に残す必須実験
 
 ### E0. Experimental setup and fairness
 
@@ -468,7 +517,7 @@ crash point:
 
 ---
 
-## 5. Appendix / optional に回す実験
+## 6. Appendix / optional に回す実験
 
 本編では扱わず、余力がある場合だけ追加します。
 
@@ -499,7 +548,7 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
 
 ---
 
-## 6. 必要な指標
+## 7. 必要な指標
 
 ### Performance
 
@@ -567,55 +616,6 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
 - replayed WAL bytes
 - recovered key count
 - checksum / full scan result
-
----
-
-## 7. Evaluation section の構成案
-
-```text
-8. Evaluation
-   8.1 Experimental Setup
-       Hardware, filesystem, SSD, cgroup memory limit, RocksDB options,
-       VMemKV durability scope, msync/writeback policy, thread counts,
-       warmup, repetitions.
-
-   8.2 Larger-than-Memory Behavior and Thread Scalability
-       DRAM-resident vs larger-than-memory runs, dataset/memory ratio,
-       page faults, value size, skew, throughput/p99/p99.9/faults/
-       bandwidth time-series, cycles/op, TLB shootdowns.
-
-   8.3 YCSB-based Comparison with RocksDB
-       YCSB load phase and workloads A, B, C, E, and F.
-       Workload D is optional and reported in the appendix if space permits.
-       Use 1 KiB and 16 KiB values.
-       Compare VMemKV with RocksDB under matched memory and durability settings.
-       Include RocksDB BlobDB for 16 KiB values to avoid an unfair comparison
-       against a non-value-separated RocksDB configuration.
-       Report throughput, p50/p95/p99/p99.9 latency, storage usage,
-       logical bytes written, WAL bytes written, device bytes written,
-       device write amplification, and engine write amplification.
-
-   8.4 T1/T2 Design Breakdown
-       AppendMap, BloomFilter, SimdScan, MemoryHints, Inline64.
-       Show only workloads where each optimization should matter.
-
-   8.5 Reorganization and Checkpoint Behavior
-       Scan before/during/after, T2 unreachable bytes,
-       copied bytes, reclaimed bytes, fork time, stop-the-world time,
-       WAL replay time, memory high-water mark, TLB shootdowns.
-
-   8.6 Simple mmap Upper-Bound Baseline
-       mmap-backed value file + unordered_map index.
-       Used as a weak-durability upper-bound baseline, not a durability-matched baseline.
-
-   8.7 Recovery and Crash-Consistency
-       Crash during load/update/checkpoint/reorganization.
-       Recovery time as a function of WAL size and checkpoint age,
-       WAL replay bytes, recovered key count, checksum.
-
-   8.8 Implementation Responsibility
-       One table comparing DB-side responsibilities.
-```
 
 ---
 
