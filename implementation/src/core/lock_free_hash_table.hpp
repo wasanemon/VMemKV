@@ -16,109 +16,82 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <bit>
 
-template <typename Key,
-          typename Slot,
-          size_t SlotCapacity>
-class LockFreeHashTable
-{
-public:
-    using slot_index_type = uint32_t;
-    static constexpr slot_index_type kEmpty = 0;
-    static constexpr slot_index_type kNotFound = 0;
-    static constexpr size_t kBucketCount =
-        std::bit_ceil(SlotCapacity * 2);
+template <typename Key, typename Slot, size_t SlotCapacity>
+class LockFreeHashTable {
+ public:
+  using slot_index_type = uint32_t;
+  static constexpr slot_index_type kEmpty = 0;
+  static constexpr slot_index_type kNotFound = 0;
+  static constexpr size_t kBucketCount = std::bit_ceil(SlotCapacity * 2);
 
-    LockFreeHashTable() = default;
+  LockFreeHashTable() = default;
 
-    LockFreeHashTable(const LockFreeHashTable &) = delete;
-    LockFreeHashTable &operator=(const LockFreeHashTable &) = delete;
+  LockFreeHashTable(const LockFreeHashTable &) = delete;
+  auto operator=(const LockFreeHashTable &) -> LockFreeHashTable & = delete;
 
-    void clear() noexcept
-    {
-        for (Bucket &bucket : buckets_)
-            bucket.slot_plus_one.store(kEmpty, std::memory_order_release);
+  void clear() noexcept {
+    for (Bucket &bucket : buckets_) {
+      bucket.slot_plus_one.store(kEmpty, std::memory_order_release);
     }
+  }
 
-    // Caller-provided hash, e.g. hash(full_key) for T1 append indexing.
-    template <typename SlotAccessor>
-    slot_index_type find_slot_index(const Key &key,
-                                    uint64_t hash,
-                                    SlotAccessor &&slot_at) const noexcept
-    {
-        size_t pos = bucket_index(hash);
-        for (size_t probe = 0; probe < kBucketCount; ++probe)
-        {
-            const slot_index_type observed =
-                buckets_[pos].slot_plus_one.load(std::memory_order_acquire);
-            if (observed == kEmpty)
-                return kNotFound;
-
-            const Slot &slot = slot_at(static_cast<size_t>(observed - 1));
-            if (slot.published.load(std::memory_order_acquire) &&
-                slot.clean_hash() == hash && slot.key == key)
-            {
-                return observed;
-            }
-            pos = next_pos(pos);
-        }
+  // Caller-provided hash, e.g. hash(full_key) for T1 append indexing.
+  template <typename SlotAccessor>
+  auto find_slot_index(const Key &key, uint64_t hash, SlotAccessor &&slot_at) const noexcept -> slot_index_type {
+    size_t pos = bucket_index(hash);
+    for (size_t probe = 0; probe < kBucketCount; ++probe) {
+      const slot_index_type observed = buckets_[pos].slot_plus_one.load(std::memory_order_acquire);
+      if (observed == kEmpty) {
         return kNotFound;
+      }
+
+      const Slot &slot = slot_at(static_cast<size_t>(observed - 1));
+      if (slot.published.load(std::memory_order_acquire) && slot.clean_hash() == hash && slot.key == key) {
+        return observed;
+      }
+      pos = next_pos(pos);
     }
+    return kNotFound;
+  }
 
-    template <typename SlotAccessor>
-    bool publish_slot(const Key &key,
-                      uint64_t hash,
-                      slot_index_type slot_plus_one,
-                      SlotAccessor &&slot_at) noexcept
-    {
-        size_t pos = bucket_index(hash);
-        for (size_t probe = 0; probe < kBucketCount; ++probe)
-        {
-            slot_index_type expected = kEmpty;
-            if (buckets_[pos].slot_plus_one.compare_exchange_strong(
-                    expected, slot_plus_one,
-                    std::memory_order_release,
-                    std::memory_order_relaxed))
-            {
-                return true;
-            }
-            if (expected == kEmpty)
-            {
-                pos = next_pos(pos);
-                continue;
-            }
+  template <typename SlotAccessor>
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  auto publish_slot(const Key &key, slot_index_type slot_plus_one, uint64_t hash, SlotAccessor &&slot_at) noexcept
+      -> bool {
+    size_t pos = bucket_index(hash);
+    for (size_t probe = 0; probe < kBucketCount; ++probe) {
+      slot_index_type expected = kEmpty;
+      if (buckets_[pos].slot_plus_one.compare_exchange_strong(
+              expected, slot_plus_one, std::memory_order_release, std::memory_order_relaxed)) {
+        return true;
+      }
+      if (expected == kEmpty) {
+        pos = next_pos(pos);
+        continue;
+      }
 
-            const Slot &slot = slot_at(static_cast<size_t>(expected - 1));
-            if (slot.published.load(std::memory_order_acquire) &&
-                slot.clean_hash() == hash && slot.key == key)
-            {
-                buckets_[pos].slot_plus_one.store(slot_plus_one,
-                                                  std::memory_order_release);
-                return true;
-            }
-            pos = next_pos(pos);
-        }
-        return false;
+      const Slot &slot = slot_at(static_cast<size_t>(expected - 1));
+      if (slot.published.load(std::memory_order_acquire) && slot.clean_hash() == hash && slot.key == key) {
+        buckets_[pos].slot_plus_one.store(slot_plus_one, std::memory_order_release);
+        return true;
+      }
+      pos = next_pos(pos);
     }
+    return false;
+  }
 
-private:
-    struct Bucket
-    {
-        std::atomic<slot_index_type> slot_plus_one{kEmpty};
-    };
+ private:
+  struct Bucket {
+    std::atomic<slot_index_type> slot_plus_one{kEmpty};
+  };
 
-    static size_t bucket_index(uint64_t hash) noexcept
-    {
-        return static_cast<size_t>(hash) & (kBucketCount - 1);
-    }
+  static auto bucket_index(uint64_t hash) noexcept -> size_t { return static_cast<size_t>(hash) & (kBucketCount - 1); }
 
-    static size_t next_pos(size_t pos) noexcept
-    {
-        return (pos + 1) & (kBucketCount - 1);
-    }
+  static auto next_pos(size_t pos) noexcept -> size_t { return (pos + 1) & (kBucketCount - 1); }
 
-    std::array<Bucket, kBucketCount> buckets_{};
+  std::array<Bucket, kBucketCount> buckets_{};
 };

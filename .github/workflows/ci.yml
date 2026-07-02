@@ -1,0 +1,56 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [clang++, g++]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          clang \
+          clang-format \
+          clang-tidy \
+          librocksdb-dev
+
+    - name: Verify Code Formatting
+      run: |
+        # Run clang-format dry-run to check for style violations in C++ files
+        find implementation/src implementation/tests implementation/benchmark \( -name "*.cpp" -o -name "*.hpp" \) -print0 | xargs -0 clang-format --dry-run --Werror
+
+    - name: Configure CMake
+      run: |
+        cmake -S implementation -B build \
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_WARN_DEPRECATED=OFF \
+          -DENABLE_ROCKSDB=ON
+
+    - name: Run clang-tidy Static Analysis
+      if: matrix.compiler == 'clang++'
+      run: |
+        cmake --build build --target clang-tidy-check
+
+    - name: Build
+      run: |
+        cmake --build build --config Release
+
+    - name: Run Tests
+      run: |
+        cd build
+        ctest --output-on-failure

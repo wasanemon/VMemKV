@@ -16,144 +16,167 @@
 
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include <nanobench.h>
+#include <unistd.h>
 
-#include <atomic>
-#include <tuple>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
-#include <cstdio>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
 #include <memory>
 #include <random>
+#include <rivals/rocksdb_store.hpp>
 #include <span>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
-
 #include <vmemkv/vmemkv.hpp>
-#include <rivals/rocksdb_store.hpp>
-#include <unistd.h>
 
 namespace nb = ankerl::nanobench;
 using Clock = std::chrono::steady_clock;
+
+namespace {
+constexpr std::size_t kIndexKeyBufferBytes = 16;
+constexpr std::size_t kInlineValueBytes = 8;
+constexpr double kZipfPivot = 1.5;
+constexpr double kHalfStep = 0.5;
+constexpr uint64_t kStoreCapacityBytes = 4ULL << 30;
+constexpr uint64_t kBenchmarkSeed = 42;
+constexpr int kScanReorgMinEpochIterations = 5;
+constexpr int kMtTitleWidth = 44;
+constexpr int kMtDividerWidth = 46;
+constexpr int kMtValueWidth = 8;
+constexpr int kHotValueBytes = 256;
+constexpr int kWarmValueBytes = 1024;
+constexpr double kMinimumElapsedSeconds = 0.0001;
+constexpr int kMaxMtInsertKeys = 2'000'000;
+constexpr double kDefaultMtDurationSeconds = 20.0;
+constexpr int kDeleteEpochIterations = 100'000;
+}  // namespace
 
 // ---- Key helpers -------------------------------------------------------------
 // "key_%07d" = 11 chars, fits in the 16-byte index prefix.
 // Zero-padded so lexicographic order == numeric order (needed for SCAN).
 
-static std::string ikey(int i)
-{
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "key_%07d", i);
-    return buf;
+static auto ikey(int index) -> std::string {
+  std::array<char, kIndexKeyBufferBytes> key_buffer{};
+  std::snprintf(key_buffer.data(), key_buffer.size(), "key_%07d", index);
+  return key_buffer.data();
 }
 
-static std::string make_key(int i) { return ikey(i); }
+static auto make_key(int index) -> std::string { return ikey(index); }
+
+struct PopulateOptions {
+  size_t key_count;
+  size_t value_size = kInlineValueBytes;
+};
 
 template <typename Store>
-static void populate(Store &store, int n)
-{
-    for (int i = 0; i < n; ++i)
-        store.insert(make_key(i), static_cast<uint64_t>(i));
+static void populate(Store &store, PopulateOptions options) {
+  std::string dummy(options.value_size, 'a');
+  for (size_t i = 0; i < options.key_count; ++i) {
+    store.insert(make_key(static_cast<int>(i)), dummy);
+  }
 }
 
 // ---- Zipf distribution -------------------------------------------------------
 // Zipf(alpha, N): samples integers in [0,N) with P(k) proportional to 1/(k+1)^alpha.
 // Uses the rejection-inversion method (Hormann & Derflinger 1996).
 
-class ZipfDistribution
-{
-public:
-    ZipfDistribution(int n, double alpha)
-        : n_(n), alpha_(alpha),
-          h_integral_x1_(h_integral(1.5) - 1.0),
-          h_integral_inf_(h_integral((double)n + 0.5)),
-          s_(1.0 - h_integral_inv(h_integral(1.5) - 1.0)) {}
+class ZipfDistribution {
+ public:
+  struct Params {
+    int item_count;
+    double alpha;
+  };
 
-    int operator()(std::mt19937_64 &rng)
-    {
-        std::uniform_real_distribution<double> uni(0.0, 1.0);
-        while (true)
-        {
-            double u = h_integral_inf_ + uni(rng) * (h_integral_x1_ - h_integral_inf_);
-            double x = h_integral_inv(u);
-            int k = (int)(x + 0.5);
-            if (k < 1)
-                k = 1;
-            if (k > n_)
-                k = n_;
-            if (k - x <= s_ || u >= h_integral((double)k + 0.5) - h(k))
-                return k - 1;
-        }
-    }
+  explicit ZipfDistribution(Params params)
+      : item_count_(params.item_count),
+        alpha_(params.alpha),
+        h_integral_x1_(h_integral(kZipfPivot) - 1.0),
+        h_integral_inf_(h_integral(static_cast<double>(params.item_count) + kHalfStep)),
+        s_(1.0 - h_integral_inv(h_integral(kZipfPivot) - 1.0)) {}
 
-private:
-    int n_;
-    double alpha_, h_integral_x1_, h_integral_inf_, s_;
-    double h(double x) const { return std::exp(-alpha_ * std::log(x)); }
-    double h_integral(double x) const
-    {
-        if (alpha_ == 1.0)
-            return std::log(x);
-        return std::exp((1.0 - alpha_) * std::log(x)) / (1.0 - alpha_);
+  auto operator()(std::mt19937_64 &rng) -> int {
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    while (true) {
+      double uniform_sample = h_integral_inf_ + uni(rng) * (h_integral_x1_ - h_integral_inf_);
+      double sample_position = h_integral_inv(uniform_sample);
+      int rank = static_cast<int>(std::lround(sample_position));
+      if (rank < 1) {
+        rank = 1;
+      }
+      if (rank > item_count_) {
+        rank = item_count_;
+      }
+      if (rank - sample_position <= s_ ||
+          uniform_sample >= h_integral(static_cast<double>(rank) + kHalfStep) - h(rank)) {
+        return rank - 1;
+      }
     }
-    double h_integral_inv(double u) const
-    {
-        if (alpha_ == 1.0)
-            return std::exp(u);
-        return std::exp(std::log(u * (1.0 - alpha_)) / (1.0 - alpha_));
+  }
+
+ private:
+  int item_count_;
+  double alpha_, h_integral_x1_, h_integral_inf_, s_;
+  [[nodiscard]] auto h(double input_value) const -> double { return std::exp(-alpha_ * std::log(input_value)); }
+  [[nodiscard]] auto h_integral(double input_value) const -> double {
+    if (alpha_ == 1.0) {
+      return std::log(input_value);
     }
+    return std::exp((1.0 - alpha_) * std::log(input_value)) / (1.0 - alpha_);
+  }
+  [[nodiscard]] auto h_integral_inv(double integral_value) const -> double {
+    if (alpha_ == 1.0) {
+      return std::exp(integral_value);
+    }
+    return std::exp(std::log(integral_value * (1.0 - alpha_)) / (1.0 - alpha_));
+  }
 };
 
-#ifdef ENABLE_ROCKSDB
-static std::string rdb_path()
-{
-    static std::atomic<int> cnt{0};
-    return "/tmp/vmemkv_bench_" + std::to_string(::getpid()) +
-           "_" + std::to_string(cnt.fetch_add(1, std::memory_order_relaxed));
-}
-#endif
-
 template <typename Constructor>
-static auto make_vmemkv(const std::string &path, Constructor &&constructor)
-{
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-    return constructor();
+static auto make_vmemkv(const std::string &path, Constructor &&constructor) {
+  std::error_code error_code;
+  std::filesystem::remove(path, error_code);
+  return constructor();
 }
 
-template <typename Tuple, typename Fn, std::size_t... Is>
-void for_each_in_tuple_impl(Fn&& fn, std::index_sequence<Is...>) {
-    (fn(static_cast<std::tuple_element_t<Is, Tuple>*>(nullptr)), ...);
+template <typename Tuple, typename Visitor, std::size_t... Indices>
+void for_each_in_tuple_impl(Visitor &&visitor, std::index_sequence<Indices...> index_sequence_unused) {
+  (void)index_sequence_unused;
+  (visitor(static_cast<std::tuple_element_t<Indices, Tuple> *>(nullptr)), ...);
 }
 
-template <typename Tuple, typename Fn>
-void for_each_in_tuple(Fn&& fn) {
-    for_each_in_tuple_impl<Tuple>(std::forward<Fn>(fn), std::make_index_sequence<std::tuple_size_v<Tuple>>{});
+template <typename Tuple, typename Visitor>
+void for_each_in_tuple(Visitor &&visitor) {
+  for_each_in_tuple_impl<Tuple>(std::forward<Visitor>(visitor), std::make_index_sequence<std::tuple_size_v<Tuple>>{});
 }
 
-template <typename Fn>
-static void for_each_store_variant(Fn &&fn)
-{
-    for_each_in_tuple<vmemkv::variants::AllPossibleTypes>([&](auto* dummy) {
-        using Store = std::remove_pointer_t<decltype(dummy)>;
-        if constexpr (Store::kIsEnabled) {
-            std::string filename = "bench_" + Store::name() + ".bin";
-            std::replace(filename.begin(), filename.end(), '/', '_');
+template <typename Visitor>
+static void for_each_store_variant(Visitor &&visitor) {
+  for_each_in_tuple<vmemkv::variants::AllPossibleTypes>([&](auto *dummy) {
+    using Store = std::remove_pointer_t<decltype(dummy)>;
+    if constexpr (Store::kIsEnabled) {
+      std::string filename = "bench_" + Store::name() + ".bin";
+      std::replace(filename.begin(), filename.end(), '/', '_');
 
-            fn(Store::name().c_str(), [&]() {
-                return make_vmemkv(filename, [&]() {
-                    if constexpr (std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDB>) {
-                        return std::make_unique<Store>(filename);
-                    } else {
-                        return std::make_unique<Store>(filename, 1u << 26);
-                    }
-                });
-            });
-        }
-    });
+      visitor(Store::name().c_str(), [&]() {
+        return make_vmemkv(filename, [&]() {
+          if constexpr (std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDB>) {
+            return std::make_unique<Store>(filename);
+          } else {
+            return std::make_unique<Store>(filename, kStoreCapacityBytes);
+          }
+        });
+      });
+    }
+  });
 }
 
 // =============================================================================
@@ -161,95 +184,103 @@ static void for_each_store_variant(Fn &&fn)
 // =============================================================================
 
 template <typename MakeStore>
-static void bench_insert(nb::Bench &b, const char *name, MakeStore make)
-{
-    auto store = make();
-    std::atomic<int> k{0};
-    b.run(name, [&]
-          {
-        int i = k.fetch_add(1, std::memory_order_relaxed);
-        bool ok = store->insert(make_key(i), static_cast<uint64_t>(i));
-        nb::doNotOptimizeAway(ok); });
+static void bench_insert(nb::Bench &bench, const char *name, MakeStore make, size_t val_size = kInlineValueBytes) {
+  auto store = make();
+  std::atomic<int> key_counter{0};
+  std::string dummy(val_size, 'a');
+  bench.run(name, [&] {
+    int key_index = key_counter.fetch_add(1, std::memory_order_relaxed);
+    bool inserted = store->insert(make_key(key_index), dummy);
+    nb::doNotOptimizeAway(inserted);
+  });
 }
 
 template <typename MakeStore>
-static void bench_get_hit(nb::Bench &b, const char *name, MakeStore make)
-{
-    constexpr int N = 5000;
-    auto store = make();
-    populate(*store, N);
-    int i = 0;
-    b.run(name, [&]
-          {
-        uint64_t v = store->get(make_key(i++ % N));
-        nb::doNotOptimizeAway(v); });
+static void bench_get_hit(nb::Bench &bench, const char *name, MakeStore make, size_t val_size = kInlineValueBytes) {
+  constexpr int key_count = 5000;
+  auto store = make();
+  populate(*store, {key_count, val_size});
+  int key_index = 0;
+  bench.run(name, [&] {
+    if (val_size == kInlineValueBytes) {
+      uint64_t value = store->get(make_key(key_index++ % key_count));
+      nb::doNotOptimizeAway(value);
+    } else {
+      auto value = store->get_bytes(make_key(key_index++ % key_count));
+      nb::doNotOptimizeAway(value);
+    }
+  });
 }
 
 template <typename MakeStore>
-static void bench_get_miss(nb::Bench &b, const char *name, MakeStore make)
-{
-    constexpr int N = 5000;
-    auto store = make();
-    populate(*store, N);
-    int i = 0;
-    b.run(name, [&]
-          {
-        uint64_t v = store->get(make_key(N + i++));
-        nb::doNotOptimizeAway(v); });
+static void bench_get_miss(nb::Bench &bench, const char *name, MakeStore make, size_t val_size = kInlineValueBytes) {
+  constexpr int key_count = 5000;
+  auto store = make();
+  populate(*store, {key_count, val_size});
+  int key_index = 0;
+  bench.run(name, [&] {
+    if (val_size == kInlineValueBytes) {
+      uint64_t value = store->get(make_key(key_count + key_index++));
+      nb::doNotOptimizeAway(value);
+    } else {
+      auto value = store->get_bytes(make_key(key_count + key_index++));
+      nb::doNotOptimizeAway(value);
+    }
+  });
 }
 
 template <typename MakeStore>
-static void bench_update(nb::Bench &b, const char *name, MakeStore make)
-{
-    constexpr int N = 5000;
-    auto store = make();
-    populate(*store, N);
-    int i = 0;
-    b.run(name, [&]
-          {
-        bool ok = store->update(make_key(i % N), static_cast<uint64_t>(i));
-        nb::doNotOptimizeAway(ok); ++i; });
+static void bench_update(nb::Bench &bench, const char *name, MakeStore make, size_t val_size = kInlineValueBytes) {
+  constexpr int key_count = 5000;
+  auto store = make();
+  populate(*store, {key_count, val_size});
+  int key_index = 0;
+  std::string dummy(val_size, 'a');
+  bench.run(name, [&] {
+    bool updated = store->update(make_key(key_index % key_count), dummy);
+    nb::doNotOptimizeAway(updated);
+    ++key_index;
+  });
 }
 
 template <typename MakeStore>
-static void bench_delete(nb::Bench &b, const char *name, MakeStore make)
-{
-    // Delete cannot be benchmarked with an open-ended time loop because once
-    // all keys are gone the lambda degenerates into a near no-op branch.  Use
-    // one fixed epoch so every measured iteration deletes a live key exactly once.
-    constexpr int N = 100000;
-    auto store = make();
-    populate(*store, N);
-    int i = 0;
-    b.run(name, [&]
-          {
-        bool ok = store->remove(make_key(i++));
-        nb::doNotOptimizeAway(ok); });
+static void bench_delete(nb::Bench &bench, const char *name, MakeStore make, size_t val_size = kInlineValueBytes) {
+  // Delete cannot be benchmarked with an open-ended time loop because once
+  // all keys are gone the lambda degenerates into a near no-op branch.  Use
+  // one fixed epoch so every measured iteration deletes a live key exactly once.
+  constexpr int key_count = 100000;
+  auto store = make();
+  populate(*store, {key_count, val_size});
+  int key_index = 0;
+  bench.run(name, [&] {
+    bool removed = store->remove(make_key(key_index++));
+    nb::doNotOptimizeAway(removed);
+  });
 }
 
 template <typename MakeStore>
-static void bench_scan(nb::Bench &b, const char *name, int n, MakeStore make)
-{
-    auto store = make();
-    populate(*store, n);
-    b.batch(n).run(name, [&]
-                   {
-        size_t cnt = store->scan(make_key(0), make_key(n - 1),
-                                 [](std::span<const std::byte>, uint64_t v) { nb::doNotOptimizeAway(v); });
-        nb::doNotOptimizeAway(cnt); });
+static void bench_scan(nb::Bench &bench, const char *name, int scan_count, MakeStore make) {
+  auto store = make();
+  populate(*store, {static_cast<size_t>(scan_count)});
+  bench.batch(scan_count).run(name, [&] {
+    size_t result_count = store->scan(make_key(0),
+                                      make_key(scan_count - 1),
+                                      [](std::span<const std::byte>, uint64_t value) { nb::doNotOptimizeAway(value); });
+    nb::doNotOptimizeAway(result_count);
+  });
 }
 
 template <typename MakeStore>
-static void bench_scan_reorg(nb::Bench &b, const char *name, int n, MakeStore make)
-{
-    auto store = make();
-    populate(*store, n);
-    store->reorganize(); // no-op for RocksDB; merges ap->ro for T1Only
-    b.batch(n).minEpochIterations(5).run(name, [&]
-                                         {
-        size_t cnt = store->scan(make_key(0), make_key(n - 1),
-                                 [](std::span<const std::byte>, uint64_t v) { nb::doNotOptimizeAway(v); });
-        nb::doNotOptimizeAway(cnt); });
+static void bench_scan_reorg(nb::Bench &bench, const char *name, int scan_count, MakeStore make) {
+  auto store = make();
+  populate(*store, {static_cast<size_t>(scan_count)});
+  store->reorganize();  // no-op for RocksDB; merges ap->ro for T1Only
+  bench.batch(scan_count).minEpochIterations(kScanReorgMinEpochIterations).run(name, [&] {
+    size_t result_count = store->scan(make_key(0),
+                                      make_key(scan_count - 1),
+                                      [](std::span<const std::byte>, uint64_t value) { nb::doNotOptimizeAway(value); });
+    nb::doNotOptimizeAway(result_count);
+  });
 }
 
 // =============================================================================
@@ -257,305 +288,411 @@ static void bench_scan_reorg(nb::Bench &b, const char *name, int n, MakeStore ma
 // =============================================================================
 
 template <typename MakeStore>
-static void bench_get_vs_size(nb::Bench &b, const char *tag, int n, MakeStore make)
-{
-    auto store = make();
-    populate(*store, n);
-    std::mt19937_64 rng(42);
-    ZipfDistribution zipf(n, 1.0);
-    std::uniform_int_distribution<int> uni(0, n - 1);
-    b.run(std::string(tag) + "/Zipf", [&]
-          {
-        uint64_t v = store->get(make_key(zipf(rng)));
-        nb::doNotOptimizeAway(v); });
-    b.run(std::string(tag) + "/Uniform", [&]
-          {
-        uint64_t v = store->get(make_key(uni(rng)));
-        nb::doNotOptimizeAway(v); });
+static void bench_get_vs_size(nb::Bench &bench, const char *tag, int item_count, MakeStore make) {
+  auto store = make();
+  populate(*store, {static_cast<size_t>(item_count)});
+  std::mt19937_64 rng(kBenchmarkSeed);
+  ZipfDistribution zipf({item_count, 1.0});
+  std::uniform_int_distribution<int> uniform_index(0, item_count - 1);
+  bench.run(std::string(tag) + "/Zipf", [&] {
+    uint64_t value = store->get(make_key(zipf(rng)));
+    nb::doNotOptimizeAway(value);
+  });
+  bench.run(std::string(tag) + "/Uniform", [&] {
+    uint64_t value = store->get(make_key(uniform_index(rng)));
+    nb::doNotOptimizeAway(value);
+  });
 }
 
 template <typename MakeStore>
-static void bench_negative_get_vs_size_reorg(nb::Bench &b,
-                                             const char *tag,
-                                             int n,
-                                             MakeStore make)
-{
-    auto store = make();
-    populate(*store, n);
-    store->reorganize();
-    std::mt19937_64 rng(42);
-    ZipfDistribution zipf(n, 1.0);
-    std::uniform_int_distribution<int> uni(0, n - 1);
-    b.run(std::string(tag) + "/Zipf", [&]
-          {
-        uint64_t v = store->get(make_key(n + zipf(rng)));
-        nb::doNotOptimizeAway(v); });
-    b.run(std::string(tag) + "/Uniform", [&]
-          {
-        uint64_t v = store->get(make_key(n + uni(rng)));
-        nb::doNotOptimizeAway(v); });
+static void bench_negative_get_vs_size_reorg(nb::Bench &bench, const char *tag, int item_count, MakeStore make) {
+  auto store = make();
+  populate(*store, {static_cast<size_t>(item_count)});
+  store->reorganize();
+  std::mt19937_64 rng(kBenchmarkSeed);
+  ZipfDistribution zipf({item_count, 1.0});
+  std::uniform_int_distribution<int> uniform_index(0, item_count - 1);
+  bench.run(std::string(tag) + "/Zipf", [&] {
+    uint64_t value = store->get(make_key(item_count + zipf(rng)));
+    nb::doNotOptimizeAway(value);
+  });
+  bench.run(std::string(tag) + "/Uniform", [&] {
+    uint64_t value = store->get(make_key(item_count + uniform_index(rng)));
+    nb::doNotOptimizeAway(value);
+  });
 }
 
 template <typename MakeStore>
-static void bench_scan_vs_size(nb::Bench &b, const char *tag,
-                               int total_n, int scan_n, MakeStore make)
-{
-    auto store = make();
-    populate(*store, total_n);
-    std::mt19937_64 rng(42);
-    ZipfDistribution zipf(total_n - scan_n, 1.0);
-    std::uniform_int_distribution<int> uni(0, total_n - scan_n - 1);
-    b.batch(scan_n).run(std::string(tag) + "/Zipf", [&]
-                        {
-        int s = zipf(rng);
-        size_t cnt = store->scan(make_key(s), make_key(s + scan_n - 1),
-                                 [](std::span<const std::byte>, uint64_t v) { nb::doNotOptimizeAway(v); });
-        nb::doNotOptimizeAway(cnt); });
-    b.batch(scan_n).run(std::string(tag) + "/Uniform", [&]
-                        {
-        int s = uni(rng);
-        size_t cnt = store->scan(make_key(s), make_key(s + scan_n - 1),
-                                 [](std::span<const std::byte>, uint64_t v) { nb::doNotOptimizeAway(v); });
-        nb::doNotOptimizeAway(cnt); });
+static void bench_scan_vs_size(
+    nb::Bench &bench, const char *tag, int total_item_count, int scan_count, MakeStore make) {
+  auto store = make();
+  populate(*store, {static_cast<size_t>(total_item_count)});
+  std::mt19937_64 rng(kBenchmarkSeed);
+  ZipfDistribution zipf({total_item_count - scan_count, 1.0});
+  std::uniform_int_distribution<int> uniform_index(0, total_item_count - scan_count - 1);
+  bench.batch(scan_count).run(std::string(tag) + "/Zipf", [&] {
+    int scan_start = zipf(rng);
+    size_t result_count = store->scan(make_key(scan_start),
+                                      make_key(scan_start + scan_count - 1),
+                                      [](std::span<const std::byte>, uint64_t value) { nb::doNotOptimizeAway(value); });
+    nb::doNotOptimizeAway(result_count);
+  });
+  bench.batch(scan_count).run(std::string(tag) + "/Uniform", [&] {
+    int scan_start = uniform_index(rng);
+    size_t result_count = store->scan(make_key(scan_start),
+                                      make_key(scan_start + scan_count - 1),
+                                      [](std::span<const std::byte>, uint64_t value) { nb::doNotOptimizeAway(value); });
+    nb::doNotOptimizeAway(result_count);
+  });
 }
 
 // =============================================================================
 // Multi-threaded throughput benchmarks
 // =============================================================================
 
-static void print_mt_header(const char *title)
-{
-    std::printf("\n| %-44s | threads | M ops/s |\n", title);
-    std::printf("|%s|---------|----------|\n", std::string(46, '-').c_str());
+static void print_mt_header(const char *title) {
+  std::cout << "\n| " << std::left << std::setw(kMtTitleWidth) << title << " | threads | M ops/s |\n";
+  std::cout << "|" << std::string(kMtDividerWidth, '-') << "|---------|----------|\n";
+  std::cout << std::right;
 }
+
+struct MtRunConfig {
+  int thread_count;
+  double duration_sec;
+};
 
 template <typename WorkFn>
-static void run_mt(const char *label, int n_threads, double dur_sec, WorkFn work)
-{
-    std::atomic<bool> stop{false};
-    std::atomic<int64_t> total{0};
-    std::vector<std::thread> threads;
-    threads.reserve(n_threads);
-    for (int t = 0; t < n_threads; ++t)
-        threads.emplace_back([&]
-                             {
-            int64_t local = 0;
-            while (!stop.load(std::memory_order_relaxed)) { work(local); ++local; }
-            total.fetch_add(local, std::memory_order_relaxed); });
-    auto t0 = Clock::now();
-    std::this_thread::sleep_for(std::chrono::duration<double>(dur_sec));
-    stop.store(true, std::memory_order_relaxed);
-    for (auto &th : threads)
-        th.join();
-    double elapsed = std::chrono::duration<double>(Clock::now() - t0).count();
-    std::printf("| %-44s |   %3d   | %8.2f |\n", label, n_threads,
-                (double)total.load() / elapsed / 1e6);
+static void run_mt(const char *label, MtRunConfig cfg, WorkFn work) {
+  std::atomic<bool> stop{false};
+  std::atomic<int64_t> total{0};
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<size_t>(cfg.thread_count));
+  auto start_time = Clock::now();
+  for (int thread_index = 0; thread_index < cfg.thread_count; ++thread_index) {
+    threads.emplace_back([&] {
+      int64_t local_count = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        if (!work(local_count)) {
+          stop.store(true, std::memory_order_relaxed);
+          break;
+        }
+        ++local_count;
+      }
+      total.fetch_add(local_count, std::memory_order_relaxed);
+    });
+  }
+
+  double remaining = cfg.duration_sec;
+  constexpr double interval = 0.01;
+  while (remaining > 0 && !stop.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(std::chrono::duration<double>(interval));
+    remaining -= interval;
+  }
+  stop.store(true, std::memory_order_relaxed);
+
+  for (auto &worker_thread : threads) {
+    worker_thread.join();
+  }
+  double elapsed = std::chrono::duration<double>(Clock::now() - start_time).count();
+  if (elapsed <= 0) {
+    elapsed = kMinimumElapsedSeconds;
+  }
+  const double throughput_mops = static_cast<double>(total.load()) / elapsed / 1e6;
+  std::cout << "| " << std::left << std::setw(kMtTitleWidth) << label << " |   " << std::right << std::setw(3)
+            << cfg.thread_count << "   | " << std::fixed << std::setw(kMtValueWidth) << std::setprecision(2)
+            << throughput_mops << " |\n";
 }
 
 template <typename MakeStore>
-static void bench_mt_get(const char *name, const std::vector<int> &threads,
-                         double dur_sec, MakeStore make)
-{
-    constexpr int N = 10000;
+static void bench_mt_get(const char *name,
+                         const std::vector<int> &thread_counts,
+                         double dur_sec,
+                         MakeStore make,
+                         size_t val_size = kInlineValueBytes) {
+  constexpr int key_count = 10000;
+  auto store = make();
+  populate(*store, {key_count, val_size});
+  print_mt_header(name);
+  for (int thread_count : thread_counts) {
+    run_mt(name, MtRunConfig{thread_count, dur_sec}, [&](int64_t operation_count) -> bool {
+      if (val_size == kInlineValueBytes) {
+        uint64_t value = store->get(make_key(static_cast<int>(operation_count % key_count)));
+        nb::doNotOptimizeAway(value);
+      } else {
+        auto value = store->get_bytes(make_key(static_cast<int>(operation_count % key_count)));
+        nb::doNotOptimizeAway(value);
+      }
+      return true;
+    });
+  }
+}
+
+template <typename MakeStore>
+static void bench_mt_insert(const char *name,
+                            const std::vector<int> &thread_counts,
+                            double dur_sec,
+                            MakeStore make,
+                            size_t val_size = kInlineValueBytes) {
+  print_mt_header(name);
+  for (int thread_count : thread_counts) {
     auto store = make();
-    populate(*store, N);
-    print_mt_header(name);
-    for (int t : threads)
-        run_mt(name, t, dur_sec, [&](int64_t ops)
-               {
-            uint64_t v = store->get(make_key((int)(ops % N)));
-            nb::doNotOptimizeAway(v); });
+    std::atomic<int> global_key_counter{0};
+    std::string dummy(val_size, 'a');
+    run_mt(name, MtRunConfig{thread_count, dur_sec}, [&](int64_t) -> bool {
+      int key_index = global_key_counter.fetch_add(1, std::memory_order_relaxed);
+      if (key_index >= kMaxMtInsertKeys) {
+        return false;
+      }
+      bool inserted = store->insert(make_key(key_index), dummy);
+      nb::doNotOptimizeAway(inserted);
+      return true;
+    });
+  }
 }
 
 template <typename MakeStore>
-static void bench_mt_insert(const char *name, const std::vector<int> &threads,
-                            double dur_sec, MakeStore make)
-{
-    print_mt_header(name);
-    for (int t : threads)
-    {
-        auto store = make();
-        std::atomic<int> gk{0};
-        run_mt(name, t, dur_sec, [&](int64_t)
-               {
-            int k = gk.fetch_add(1, std::memory_order_relaxed);
-            bool ok = store->insert(make_key(k), static_cast<uint64_t>(k));
-            nb::doNotOptimizeAway(ok); });
-    }
-}
-
-template <typename MakeStore>
-static void bench_mt_mixed(const char *name, const std::vector<int> &threads,
-                           double dur_sec, MakeStore make)
-{
-    constexpr int N = 10000;
-    auto store = make();
-    populate(*store, N);
-    print_mt_header(name);
-    for (int t : threads)
-    {
-        std::atomic<int64_t> seq{0};
-        run_mt(name, t, dur_sec, [&](int64_t)
-               {
-            int64_t s = seq.fetch_add(1, std::memory_order_relaxed);
-            if (s % 5 == 0) {
-                bool ok = store->update(make_key((int)(s % N)), static_cast<uint64_t>(s));
-                nb::doNotOptimizeAway(ok);
-            } else {
-                uint64_t v = store->get(make_key((int)(s % N)));
-                nb::doNotOptimizeAway(v);
-            } });
-    }
+static void bench_mt_mixed(const char *name,
+                           const std::vector<int> &thread_counts,
+                           double dur_sec,
+                           MakeStore make,
+                           size_t val_size = kInlineValueBytes) {
+  constexpr int key_count = 10000;
+  auto store = make();
+  populate(*store, {key_count, val_size});
+  print_mt_header(name);
+  for (int thread_count : thread_counts) {
+    std::atomic<int64_t> sequence_number{0};
+    std::string dummy(val_size, 'a');
+    run_mt(name, MtRunConfig{thread_count, dur_sec}, [&](int64_t) -> bool {
+      int64_t operation_number = sequence_number.fetch_add(1, std::memory_order_relaxed);
+      if (operation_number % kScanReorgMinEpochIterations == 0) {
+        bool updated = store->update(make_key(static_cast<int>(operation_number % key_count)), dummy);
+        nb::doNotOptimizeAway(updated);
+      } else {
+        if (val_size == kInlineValueBytes) {
+          uint64_t value = store->get(make_key(static_cast<int>(operation_number % key_count)));
+          nb::doNotOptimizeAway(value);
+        } else {
+          auto value = store->get_bytes(make_key(static_cast<int>(operation_number % key_count)));
+          nb::doNotOptimizeAway(value);
+        }
+      }
+      return true;
+    });
+  }
 }
 
 // =============================================================================
 // main
 // =============================================================================
 
-int main(int argc, char **argv)
-{
-    double mt_dur = 20.0;
-    for (int i = 1; i < argc; ++i)
-    {
-        std::string_view arg(argv[i]);
-        if (arg == "--mt-dur" && i + 1 < argc)
-        {
-            mt_dur = std::atof(argv[++i]);
-            continue;
-        }
-        if (arg == "-h" || arg == "--help")
-        {
-            std::printf("Usage: bench_kv [--mt-dur <seconds>]\n");
-            return 0;
-        }
-        std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
-        return 1;
+auto main(int argc, char **argv) -> int {
+  try {
+    double mt_duration_seconds = kDefaultMtDurationSeconds;
+    for (int i = 1; i < argc; ++i) {
+      std::string_view arg(argv[i]);
+      if (arg == "--mt-dur" && i + 1 < argc) {
+        mt_duration_seconds = std::atof(argv[++i]);
+        continue;
+      }
+      if (arg == "-h" || arg == "--help") {
+        std::cout << "Usage: bench_kv [--mt-dur <seconds>]\n";
+        return 0;
+      }
+      std::cerr << "Unknown option: " << argv[i] << '\n';
+      return 1;
     }
 
-    const int hw = (int)std::thread::hardware_concurrency();
-    const std::vector<int> thread_counts = {1, 4, hw};
+    const int hardware_threads = static_cast<int>(std::thread::hardware_concurrency());
+    const std::vector<int> thread_counts = {1, 4, hardware_threads};
 
     // ---- ST / INSERT ---------------------------------------------------------
     {
-        nb::Bench b;
-        b.title("ST / INSERT").unit("op").warmup(1).relative(true);
-        for_each_store_variant([&](const char *name, auto make)
-                               {
-            std::string label = std::string(name) + "/Insert";
-            bench_insert(b, label.c_str(), make); });
+      nb::Bench bench;
+      bench.title("ST / INSERT").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string label = std::string(name) + "/Insert";
+        bench_insert(bench, label.c_str(), make);
+      });
     }
 
     // ---- ST / GET ------------------------------------------------------------
     {
-        nb::Bench b;
-        b.title("ST / GET").unit("op").warmup(1).relative(true);
-        for_each_store_variant([&](const char *name, auto make)
-                               {
-            std::string hit = std::string(name) + "/Get/Hit";
-            std::string miss = std::string(name) + "/Get/Miss";
-            bench_get_hit(b, hit.c_str(), make);
-            bench_get_miss(b, miss.c_str(), make); });
+      nb::Bench bench;
+      bench.title("ST / GET").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string hit = std::string(name) + "/Get/Hit";
+        std::string miss = std::string(name) + "/Get/Miss";
+        bench_get_hit(bench, hit.c_str(), make);
+        bench_get_miss(bench, miss.c_str(), make);
+      });
     }
 
     // ---- ST / UPDATE ---------------------------------------------------------
     {
-        nb::Bench b;
-        b.title("ST / UPDATE").unit("op").warmup(1).relative(true);
-        for_each_store_variant([&](const char *name, auto make)
-                               {
-            std::string label = std::string(name) + "/Update";
-            bench_update(b, label.c_str(), make); });
+      nb::Bench bench;
+      bench.title("ST / UPDATE").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string label = std::string(name) + "/Update";
+        bench_update(bench, label.c_str(), make);
+      });
     }
 
     // ---- ST / DELETE ---------------------------------------------------------
     {
-        nb::Bench b;
-        b.title("ST / DELETE")
-            .unit("op")
-            .warmup(0)
-            .epochs(1)
-            .epochIterations(100000)
-            .relative(true);
-        for_each_store_variant([&](const char *name, auto make)
-                               {
-            std::string label = std::string(name) + "/Delete";
-            bench_delete(b, label.c_str(), make); });
+      nb::Bench bench;
+      bench.title("ST / DELETE").unit("op").warmup(0).epochs(1).epochIterations(kDeleteEpochIterations).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string label = std::string(name) + "/Delete";
+        bench_delete(bench, label.c_str(), make);
+      });
     }
 
     // ---- ST / SCAN -----------------------------------------------------------
     // Scan vs Scan(reorg) to reveal ap_region overhead.
     // RocksDB/Scan is always sorted (no reorg needed).
-    for (int n : {1000, 5000, 10000})
-    {
-        nb::Bench b;
-        b.title("ST / SCAN/" + std::to_string(n)).unit("op").warmup(1).relative(true);
-        for_each_store_variant([&](const char *name, auto make)
-                               {
-            std::string scan = std::string(name) + "/Scan";
-            bench_scan(b, scan.c_str(), n, make);
+    for (int dataset_size : {1000, 5000, 10000}) {
+      nb::Bench bench;
+      bench.title("ST / SCAN/" + std::to_string(dataset_size)).unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string scan = std::string(name) + "/Scan";
+        bench_scan(bench, scan.c_str(), dataset_size, make);
 
-            if (std::string(name) != "RocksDB")
-            {
-                std::string scan_reorg = std::string(name) + "/Scan(reorg)";
-                bench_scan_reorg(b, scan_reorg.c_str(), n, make);
-            }
-        });
+        if (std::string(name) != "RocksDB") {
+          std::string scan_reorg = std::string(name) + "/Scan(reorg)";
+          bench_scan_reorg(bench, scan_reorg.c_str(), dataset_size, make);
+        }
+      });
     }
 
     // ---- MT ------------------------------------------------------------------
-    std::printf("\n\n=== Multi-threaded throughput (%.1f s per run, hw_concurrency=%d) ===\n",
-                mt_dur, hw);
+    std::cout << "\n\n=== Multi-threaded throughput (" << std::fixed << std::setprecision(1) << mt_duration_seconds
+              << " s per run, hw_concurrency=" << hardware_threads << ") ===\n";
 
-    for_each_store_variant([&](const char *name, auto make)
-                           {
-        std::string get = std::string("MT / GET    ") + name;
-        std::string insert = std::string("MT / INSERT ") + name;
-        std::string mixed = std::string("MT / MIXED  ") + name + " (80R/20W)";
-        bench_mt_get(get.c_str(), thread_counts, mt_dur, make);
-        bench_mt_insert(insert.c_str(), thread_counts, mt_dur, make);
-        bench_mt_mixed(mixed.c_str(), thread_counts, mt_dur, make); });
+    for_each_store_variant([&](const char *name, auto make) {
+      std::string get = std::string("MT / GET    ") + name;
+      std::string insert = std::string("MT / INSERT ") + name;
+      std::string mixed = std::string("MT / MIXED  ") + name + " (80R/20W)";
+      bench_mt_get(get.c_str(), thread_counts, mt_duration_seconds, make);
+      bench_mt_insert(insert.c_str(), thread_counts, mt_duration_seconds, make);
+      bench_mt_mixed(mixed.c_str(), thread_counts, mt_duration_seconds, make);
+    });
 
     // ---- Data-scale: GET latency vs. dataset size ----------------------------
-    std::printf("\n\n=== Data-scale: GET latency vs. dataset size ===\n");
-    for (int n : {1000, 5000, 10000, 20000})
-    {
-        nb::Bench b;
-        b.title("SCALE / GET N=" + std::to_string(n))
-            .unit("op")
-            .warmup(2)
-            .relative(true);
-        for_each_store_variant([&](const char *name, auto make)
-                               { bench_get_vs_size(b, name, n, make); });
+    std::cout << "\n\n=== Data-scale: GET latency vs. dataset size ===\n";
+    for (int dataset_size : {1000, 5000, 10000, 20000}) {
+      nb::Bench bench;
+      bench.title("SCALE / GET N=" + std::to_string(dataset_size)).unit("op").warmup(2).relative(true);
+      for_each_store_variant([&](const char *name, auto make) { bench_get_vs_size(bench, name, dataset_size, make); });
     }
 
     // ---- Data-scale: NEGATIVE GET latency vs. dataset size -------------------
     // Reorganize first so misses are dominated by sorted-region lookup.
     // This makes Bloom filter effects visible instead of append-region scan cost.
-    std::printf("\n\n=== Data-scale: NEGATIVE GET latency vs. dataset size (after reorganize) ===\n");
-    for (int n : {1000, 5000, 10000, 20000})
-    {
-        nb::Bench b;
-        b.title("SCALE / NEGATIVE_GET(reorg) N=" + std::to_string(n))
-            .unit("op")
-            .warmup(2)
-            .relative(true);
-        for_each_store_variant([&](const char *name, auto make)
-                               { bench_negative_get_vs_size_reorg(b, name, n, make); });
+    std::cout << "\n\n=== Data-scale: NEGATIVE GET latency vs. dataset size (after reorganize) ===\n";
+    for (int dataset_size : {1000, 5000, 10000, 20000}) {
+      nb::Bench bench;
+      bench.title("SCALE / NEGATIVE_GET(reorg) N=" + std::to_string(dataset_size)).unit("op").warmup(2).relative(true);
+      for_each_store_variant(
+          [&](const char *name, auto make) { bench_negative_get_vs_size_reorg(bench, name, dataset_size, make); });
     }
 
     // ---- Data-scale: SCAN latency vs. dataset size ---------------------------
-    std::printf("\n\n=== Data-scale: SCAN latency vs. dataset size (window=1000) ===\n");
-    for (int n : {5000, 10000, 20000})
-    {
-        constexpr int WIN = 1000;
-        nb::Bench b;
-        b.title("SCALE / SCAN N=" + std::to_string(n) + " win=" + std::to_string(WIN))
-            .unit("op")
-            .warmup(2)
-            .relative(true);
-        for_each_store_variant([&](const char *name, auto make)
-                               { bench_scan_vs_size(b, name, n, WIN, make); });
+    std::cout << "\n\n=== Data-scale: SCAN latency vs. dataset size (window=1000) ===\n";
+    for (int dataset_size : {5000, 10000, 20000}) {
+      constexpr int scan_window = 1000;
+      nb::Bench bench;
+      bench.title("SCALE / SCAN N=" + std::to_string(dataset_size) + " win=" + std::to_string(scan_window))
+          .unit("op")
+          .warmup(2)
+          .relative(true);
+      for_each_store_variant(
+          [&](const char *name, auto make) { bench_scan_vs_size(bench, name, dataset_size, scan_window, make); });
     }
 
-    std::printf("\n");
+    // ---- MySQL Row Simulation: 256B Value ------------------------------------
+    std::cout << "\n=== MySQL Row Simulation: 256B Value ===\n";
+    {
+      nb::Bench bench;
+      bench.title("ST / INSERT (256B)").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string label = std::string(name) + "/Insert/256B";
+        bench_insert(bench, label.c_str(), make, kHotValueBytes);
+      });
+    }
+    {
+      nb::Bench bench;
+      bench.title("ST / GET (256B)").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string hit = std::string(name) + "/Get/Hit/256B";
+        std::string miss = std::string(name) + "/Get/Miss/256B";
+        bench_get_hit(bench, hit.c_str(), make, kHotValueBytes);
+        bench_get_miss(bench, miss.c_str(), make, kHotValueBytes);
+      });
+    }
+    {
+      nb::Bench bench;
+      bench.title("ST / UPDATE (256B)").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string label = std::string(name) + "/Update/256B";
+        bench_update(bench, label.c_str(), make, kHotValueBytes);
+      });
+    }
+
+    // ---- MySQL Row Simulation: 1KB Value -------------------------------------
+    std::cout << "\n=== MySQL Row Simulation: 1KB Value ===\n";
+    {
+      nb::Bench bench;
+      bench.title("ST / INSERT (1KB)").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string label = std::string(name) + "/Insert/1KB";
+        bench_insert(bench, label.c_str(), make, kWarmValueBytes);
+      });
+    }
+    {
+      nb::Bench bench;
+      bench.title("ST / GET (1KB)").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string hit = std::string(name) + "/Get/Hit/1KB";
+        std::string miss = std::string(name) + "/Get/Miss/1KB";
+        bench_get_hit(bench, hit.c_str(), make, kWarmValueBytes);
+        bench_get_miss(bench, miss.c_str(), make, kWarmValueBytes);
+      });
+    }
+    {
+      nb::Bench bench;
+      bench.title("ST / UPDATE (1KB)").unit("op").warmup(1).relative(true);
+      for_each_store_variant([&](const char *name, auto make) {
+        std::string label = std::string(name) + "/Update/1KB";
+        bench_update(bench, label.c_str(), make, kWarmValueBytes);
+      });
+    }
+
+    std::cout << "\n=== Multi-threaded throughput (MySQL Row Simulation, " << std::fixed << std::setprecision(1)
+              << mt_duration_seconds << " s per run) ===\n";
+    for_each_store_variant([&](const char *name, auto make) {
+      std::string get_256 = std::string("MT / GET (256B)    ") + name;
+      std::string insert_256 = std::string("MT / INSERT (256B) ") + name;
+      std::string mixed_256 = std::string("MT / MIXED (256B)  ") + name + " (80R/20W)";
+      bench_mt_get(get_256.c_str(), thread_counts, mt_duration_seconds, make, kHotValueBytes);
+      bench_mt_insert(insert_256.c_str(), thread_counts, mt_duration_seconds, make, kHotValueBytes);
+      bench_mt_mixed(mixed_256.c_str(), thread_counts, mt_duration_seconds, make, kHotValueBytes);
+
+      std::string get_1k = std::string("MT / GET (1KB)     ") + name;
+      std::string insert_1k = std::string("MT / INSERT (1KB)  ") + name;
+      std::string mixed_1k = std::string("MT / MIXED (1KB)   ") + name + " (80R/20W)";
+      bench_mt_get(get_1k.c_str(), thread_counts, mt_duration_seconds, make, kWarmValueBytes);
+      bench_mt_insert(insert_1k.c_str(), thread_counts, mt_duration_seconds, make, kWarmValueBytes);
+      bench_mt_mixed(mixed_1k.c_str(), thread_counts, mt_duration_seconds, make, kWarmValueBytes);
+    });
+
+    std::cout << '\n';
+    return 0;
+  } catch (const std::exception &ex) {
+    std::cerr << "benchmark failed: " << ex.what() << '\n';
+    return 2;
+  } catch (...) {
+    std::cerr << "benchmark failed: unknown exception\n";
+    return 2;
+  }
 }
