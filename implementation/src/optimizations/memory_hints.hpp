@@ -1,9 +1,11 @@
 #pragma once
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vmemkv/config.hpp>
+
 #include "../api/utils.hpp"
 
 #if __has_include(<sys/mman.h>)
@@ -17,52 +19,55 @@
 namespace t1_detail {
 
 #if VMEMKV_HAS_MMAP_HINTS
-inline std::pair<void *, size_t> page_span(const void *ptr, size_t bytes)
-{
-    const long page_size = ::sysconf(_SC_PAGESIZE);
-    if (page_size <= 0)
-        return {nullptr, 0};
-    const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
-    const uintptr_t page = static_cast<uintptr_t>(page_size);
-    const uintptr_t aligned_start = vmemkv::align_down(start, page);
-    const uintptr_t aligned_end = vmemkv::align_up(start + bytes, page);
-    if (aligned_end <= aligned_start)
-        return {nullptr, 0};
-    return {reinterpret_cast<void *>(aligned_start), aligned_end - aligned_start};
+inline auto page_span(const void *ptr, size_t bytes) -> std::pair<void *, size_t> {
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    return {nullptr, 0};
+  }
+  const auto start = reinterpret_cast<uintptr_t>(ptr);
+  const auto page = static_cast<uintptr_t>(page_size);
+  const uintptr_t aligned_start = vmemkv::align_down(start, page);
+  const uintptr_t aligned_end = vmemkv::align_up(start + bytes, page);
+  if (aligned_end <= aligned_start) {
+    return {nullptr, 0};
+  }
+  return {std::bit_cast<void *>(aligned_start), aligned_end - aligned_start};
 }
 #endif
 
-inline void apply_region_hints(const void *ptr, size_t bytes)
-{
+inline void apply_region_hints(const void *ptr, size_t bytes) {
 #if VMEMKV_HAS_MMAP_HINTS
-    if (ptr == nullptr || bytes == 0)
-        return;
-    auto [base, len] = page_span(ptr, bytes);
-    if (base == nullptr || len == 0)
-        return;
-    (void)mlock(base, len);
+  if (ptr == nullptr || bytes == 0) {
+    return;
+  }
+  auto [base, len] = page_span(ptr, bytes);
+  if (base == nullptr || len == 0) {
+    return;
+  }
+  (void)mlock(base, len);
 #ifdef MADV_HUGEPAGE
-    (void)madvise(base, len, MADV_HUGEPAGE);
+  (void)madvise(base, len, MADV_HUGEPAGE);
 #endif
 #else
-    (void)ptr;
-    (void)bytes;
+  (void)ptr;
+  (void)bytes;
 #endif
 }
 
-inline void set_sequential_hint(const void *ptr, size_t bytes)
-{
+inline void set_sequential_hint(const void *ptr, size_t bytes) {
 #if VMEMKV_HAS_MMAP_HINTS && defined(MADV_SEQUENTIAL)
-    if (ptr == nullptr || bytes == 0)
-        return;
-    auto [base, len] = page_span(ptr, bytes);
-    if (base == nullptr || len == 0)
-        return;
-    (void)madvise(base, len, MADV_SEQUENTIAL);
+  if (ptr == nullptr || bytes == 0) {
+    return;
+  }
+  auto [base, len] = page_span(ptr, bytes);
+  if (base == nullptr || len == 0) {
+    return;
+  }
+  (void)madvise(base, len, MADV_SEQUENTIAL);
 #else
-    (void)ptr;
-    (void)bytes;
+  (void)ptr;
+  (void)bytes;
 #endif
 }
 
-} // namespace t1_detail
+}  // namespace t1_detail

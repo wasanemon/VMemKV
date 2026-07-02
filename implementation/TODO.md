@@ -33,15 +33,15 @@ This document outlines the roadmap to implement the full, robust architecture of
 
 ---
 
-## 3. Code Quality & CI Automation
+## 3. Address Massive Clang-Tidy Warnings (1.2M+ Warnings)
 * **Status**: 🔴 **Not Implemented**
-* **Goal**: Establish automated gates for C++ style consistency, static analysis, and regression testing.
+* **Goal**: Address or suppress the astronomical number of clang-tidy warnings generated during static analysis.
+* **Why this occurs**:
+  - The massive warning count (1.2M+ warnings) is primarily due to standard library expansions inside templated core files (`vmemkv_impl.hpp`, `t1_index.hpp`), and strict, cumulative rules enabled by default in `.clang-tidy`.
 * **Action Items**:
-  - **`clang-format` (Local Pre-commit Hook via CMake)**:
-    - Introduce a `.clang-format` style configuration.
-    - Set up a Git pre-commit hook in `githooks/pre-commit` to automatically run `clang-format -i` and re-stage C++ changes upon `git commit`.
-    - Integrate a git hook configurations script inside `CMakeLists.txt` (using `core.hooksPath`) to automatically and dependency-free install the hook when developers run CMake.
-  - **`clang-tidy` (CI-only Target)**:
-    - Configure a `.clang-tidy` profile to flag memory safety issues, redundant copies, and C++20/C++23 code violations.
-    - Defer static analysis entirely to CI to avoid local commit latency.
-  - **GitHub Actions (CI)**: Set up a workflow (`.github/workflows/ci.yml`) to automatically trigger on push/PR to run format checks, run tidy analysis, compile under Clang/GCC, and verify all tests.
+  - Fine-tune `.clang-tidy` rules to exclude system headers and standard library template expansions correctly (e.g., configure `HeaderFilterRegex` and disable noisy rules like `modernize-use-nodiscard` or `cppcoreguidelines-avoid-magic-numbers`).
+  - Systematically clean up legitimate code-quality issues flagged in VMemKV core src files (e.g., `vmemkv_impl.hpp`, `t1_index.hpp`).
+  - Add explicit `NOLINT` comments on false positives or unavoidable OCC concurrency mutations.
+
+## 4. Introduce Background Reorganize thread
+TBW. 現在はreornigazeが非同期実行されないのでinsertのベンチがappend_regionの限界(200万エントリ）で詰まる。それより細かい頻度でreorganizeするか、append_regionを広げるか、何かしらの措置が必要

@@ -59,3 +59,11 @@ compile_commands.json
 # Markdown tooling cache
 # =============================
 .markdownlintcache
+
+# =============================
+# VMemKV Benchmark & DB Files
+# =============================
+*.bin
+*.db
+benchmark/logs/
+**/benchmark/logs/

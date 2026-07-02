@@ -66,6 +66,22 @@ ctest --test-dir build --output-on-failure
 ./build/tests/test_kv_store   # 各バリアントに対する正確性検証
 ```
 
+### clang-tidy（静的解析）
+
+```bash
+# リポジトリルートから実行
+cmake -S implementation -B build-clang \
+	-DCMAKE_CXX_COMPILER=clang++ \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DCMAKE_WARN_DEPRECATED=OFF \
+	-DENABLE_ROCKSDB=ON
+
+cmake --build build-clang --target clang-tidy-check
+```
+
+現在の `.clang-tidy` は `CheckOptions` を追加せず、デフォルト寄りの設定を維持している。  
+`readability-function-cognitive-complexity` など doctest マクロ起因で過剰に厳しくなる箇所は、テストコード側で局所的に `NOLINTNEXTLINE(...)` を付けて吸収する方針。
+
 ### ベンチマーク
 
 #### 自動実験スクリプト（推奨）
