@@ -7,7 +7,6 @@
 #include <cassert>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <vector>
 
@@ -100,12 +99,13 @@ class T2FlatFile {
 
   // ─── Storage Operations ───
   // Appends a new key-value record to the end of the flat file.
-  // - Thread-safety: Thread-safe (internally serialized via mutex).
-  // - Guarantees: Atomically increments bytes_used_ and returns the start offset of the new record.
+  // - Thread-safety: Thread-safe; the offset is reserved atomically via fetch_add, and each
+  //   thread writes to its own non-overlapping region. No locking required.
+  // - Guarantees: Returns the start offset of the new record.
   auto append(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t;
-  // Updates the value of an existing record in-place if size matches.
-  // - Thread-safety: Thread-safe; writes to mmap base.
-  // - Guarantees: Returns true on successful write; returns false if the new value size is different.
+  // Updates the value of an existing record in-place if the new value fits within alloc_len.
+  // - Thread-safety: Thread-safe for distinct keys (callers hold per-key stripe lock).
+  // - Guarantees: Returns true on success; false if new value exceeds alloc_len.
   auto update_value_at(uint64_t payload, std::span<const std::byte> value) noexcept -> bool;
   // Swaps the active memory-mapped region with a newly mapped file/capacity.
   // - Guarantees: Thread-safely replaces the underlying atomic pointer, allowing readers

@@ -118,6 +118,44 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 #define LONG_KEY_STORE_TYPES STORE_TYPES
 #define LARGE_VALUE_STORE_TYPES STORE_TYPES
 
+struct ReorgEveryWriteConfig : vmemkv::Config<> {
+  // Partial override style: inherit all defaults and only tune reorg aggressiveness.
+  static constexpr size_t T1ReorganizeSoftThresholdPercent = 1;
+  static constexpr size_t T1ReorganizeHardThresholdPercent = 1;
+};
+
+static_assert(ReorgEveryWriteConfig::T1AppendCapacityEntries ==
+              (size_t{1} << ReorgEveryWriteConfig::T1AppendCapacityLog2));
+
+using VMemKV_ReorgEveryWrite = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<ReorgEveryWriteConfig>>;
+
+template <typename StoreHandle>
+static void insert_sequential_u64_values(StoreHandle &store, int key_count) {
+  for (int i = 0; i < key_count; ++i) {
+    CHECK(store->insert("k" + std::to_string(i), static_cast<uint64_t>(i)));
+  }
+}
+
+template <typename StoreHandle>
+static void check_sequential_u64_values(StoreHandle &store, int key_count) {
+  for (int i = 0; i < key_count; ++i) {
+    CHECK(store->get("k" + std::to_string(i)) == static_cast<uint64_t>(i));
+  }
+}
+
+template <typename StoreHandle>
+static void check_hot_key_upgrade_is_visible(StoreHandle &store) {
+  CHECK(store->insert("hot", std::string("a")));
+  const std::string large_value(kValue64Bytes, 'x');
+  CHECK(store->update("hot", large_value));
+  const auto got = store->get_bytes("hot");
+  REQUIRE(got.has_value());
+  if (!got.has_value()) {
+    return;
+  }
+  CHECK(as_string(got.value()) == large_value);
+}
+
 // ─── Test cases (one per scenario) ───────────────────────────────────────────
 
 TEST_CASE_TEMPLATE("get on empty store returns STORE_NOT_FOUND", Store, STORE_TYPES) {
@@ -129,6 +167,26 @@ TEST_CASE_TEMPLATE("insert and get", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   CHECK(store->insert("a", 10));
   CHECK(store->get("a") == 10U);
+}
+
+TEST_CASE("sync reorganize-before-write is transparent") {
+  auto store = StoreFactory<VMemKV_ReorgEveryWrite>::make();
+
+  constexpr int key_count = 25000;
+  insert_sequential_u64_values(store, key_count);
+
+  // This update path requires append and should stay transparent even when
+  // pre-write reorganize triggers very frequently.
+  check_hot_key_upgrade_is_visible(store);
+
+  check_sequential_u64_values(store, key_count);
+}
+
+TEST_CASE("partial config inheritance keeps required append-capacity fields") {
+  auto store = StoreFactory<VMemKV_ReorgEveryWrite>::make();
+  CHECK(ReorgEveryWriteConfig::T1AppendCapacityEntries == vmemkv::Config<>::T1AppendCapacityEntries);
+  CHECK(store->insert("partial_cfg", 1));
+  CHECK(store->get("partial_cfg") == 1U);
 }
 
 TEST_CASE_TEMPLATE("insert duplicate returns false, value unchanged", Store, STORE_TYPES) {
@@ -329,11 +387,11 @@ TEST_CASE("Offset64 + append-map disambiguates long keys sharing a prefix") {
   const std::string key_one = prefix + "-alpha";
   const std::string key_two = prefix + "-bravo";
 
-  CHECK(idx->put(to_span(key_one), 1));
-  CHECK(idx->put(to_span(key_two), 2));
+  CHECK(idx->put(to_span(key_one), 1) == OffsetAppendMapIndex::PutResult::Applied);
+  CHECK(idx->put(to_span(key_two), 2) == OffsetAppendMapIndex::PutResult::Applied);
   CHECK(idx->get(to_span(key_one)) == 1U);
   CHECK(idx->get(to_span(key_two)) == 2U);
-  CHECK(idx->put(to_span(key_one), 9));
+  CHECK(idx->put(to_span(key_one), 9) == OffsetAppendMapIndex::PutResult::Applied);
   CHECK(idx->get(to_span(key_one)) == 9U);
 
   idx->reorganize([](uint64_t physical_offset, uint64_t) { return physical_offset; });

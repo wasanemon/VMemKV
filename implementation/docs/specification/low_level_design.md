@@ -275,10 +275,18 @@ T2 `reorganize` は Tier 1 の offset を更新する必要があるため、`pa
 T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時に旧世代と新世代を持つとメモリ圧迫が大きい。
 そのため、T2 `reorganize` は必ず checkpoint file を介して行い、完成したファイルを `mmap` で読み込む。
 
+
 > [!NOTE]
 > 新世代の T2 ファイル構築時、`mmap(MAP_SHARED)` でマッピングしてアペンド追記する設計ではなく、通常の `write()` システムコールを用いたシーケンシャル書き出しを採用します。
 > ファイルを拡張しながら `mmap` でアペンド書き込みを行うと、ページ境界を越えるたびにカーネル側でマイナーページフォルト（Page Fault）が発生し、メモリ割り当てとページテーブル更新による CPU サイクル浪費が発生します。
-> これに対し、通常の `write()` はカーネルページキャッシュのバッファリングが高度に効き、ページフォルトを伴わずにシーケンシャルデータを高速に流し込めます。また、一時的な mmap 状態を管理する必要がなくなるため、リソース管理のバグが排除され堅牢性が向上します。書き出し完了した新ファイルを、最後に `MAP_PRIVATE` で再オープン（mmap）します。
+> これに対し、通常の `write()` はカーネルページキャッシュのバッファリングが高度に効き、ページフォルトを伴わずにシーケンシャルデータを高速に流し込めます。また、一時的な mmap 状態を管理する必要がなくなるため、リソース管理のバグが排除され堅牢性が向上します。書き出し完了した新ファイルを、最後に `MAP_PRIVATE | MAP_NORESERVE` で再オープン（mmap）します。
+
+> [!NOTE]
+> T2 の mmap には `MAP_PRIVATE | MAP_NORESERVE | PROT_READ | PROT_WRITE` を使用します。
+> `MAP_PRIVATE` により書き込みはプロセス内の COW ページに留まり、ファイルには反映されません（再起動時揮発）。
+> `MAP_NORESERVE` により、カーネルが mmap 時点でスワップ領域を一括予約するのを回避します。これにより、物理 RAM を大幅に超える仮想アドレス空間（例: 64 GB）を確保しても ENOMEM が発生しません。物理ページはアクセス時にオンデマンドで割り当てられ、通常通りスワップアウトされます。
+> この設計により、mprotect による書き込みページ保護の往復（RO → RW → RO）が不要になり、書き込みパスが大幅に簡潔かつ高速になります。
+
 
 ### 5.2 Flow
 
@@ -291,7 +299,8 @@ T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時�
 5. child 側で T2 `reorganize` を実行し、新しい T2 checkpoint file を構築する。
 6. T2 の新 offset を反映済みの T1 を T1 checkpoint file に書き出す。
 7. checkpoint file 完成後、親側で短時間 stop-the-world に入る。
-8. 親側で新 checkpoint file を `mmap(MAP_PRIVATE)` して、新しい T1 / T2 を作る。
+8. 親側で新 checkpoint file を `mmap(MAP_PRIVATE | MAP_NORESERVE)` して、新しい T1 / T2 を作る。
+  T2 は `PROT_READ | PROT_WRITE` で mmap し、書き込みパスに mprotect は使用しない。
 9. T1 file は `mlock` する。
 10. child 側 snapshot LSN の次の WAL record から、親側で stop-the-world 中に確定した最新 LSN までを replay する。
 11. replay 結果を新しい T1 / T2 に反映する。
@@ -332,7 +341,7 @@ point operation は通常時にオンラインで進める。
 - `Allowed with retry/snapshot`: 並行実行してよいが、snapshot 読みまたは retry が必要
 - `Serialized`: 同一 key に対しては直列化が必要
 - `Blocked in final STW`: checkpoint reload の最終 stop-the-world では停止する
-- `Single-flight`: 並行呼び出し時、すでに他スレッドで処理が進行中であれば、待機せずに即座に処理をスキップしてリターンする（直列化による連続した空振りコンパクションとブロッキングを避けるため、アトミックフラグによって制御される）。
+- `Single-flight`: 並行呼び出し時、実行者（leader）を 1 スレッドだけ選出する。follower の挙動は経路で異なり、soft 経路では待機せず継続、hard 経路では leader 完了まで待機する（アトミックフラグで制御）。
 
 | Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize | Checkpoint reload |
 | --- | --- | --- | --- | --- | --- | --- |
