@@ -47,6 +47,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <type_traits>
 
 namespace vmemkv {
@@ -61,20 +62,41 @@ struct T1InlineValue {};
 // ─── Unified System Config Template (Tag-List Pattern) ──────────────────────
 template <typename... Opts>
 struct Config {
-    template <typename Opt>
-    static constexpr bool has_opt = (std::is_same_v<Opt, Opts> || ...);
+  template <typename Opt>
+  static constexpr bool has_opt = (std::is_same_v<Opt, Opts> || ...);
 
-    static constexpr bool UseAppendMap     = has_opt<AppendMap>;
-    static constexpr bool UseBloomFilter   = has_opt<BloomFilter>;
-    static constexpr bool UseSimdScan      = has_opt<SimdScan>;
-    static constexpr bool UseMemoryHints   = has_opt<MemoryHints>;
-    static constexpr bool UseT1InlineValue = has_opt<T1InlineValue>;
+  static constexpr bool UseAppendMap = has_opt<AppendMap>;
+  static constexpr bool UseBloomFilter = has_opt<BloomFilter>;
+  static constexpr bool UseSimdScan = has_opt<SimdScan>;
+  static constexpr bool UseMemoryHints = has_opt<MemoryHints>;
+  static constexpr bool UseT1InlineValue = has_opt<T1InlineValue>;
+
+  // Reorganize thresholds for append-region usage.
+  // These are intentionally conservative defaults to avoid hitting APPEND_CAP.
+  static constexpr size_t kPercentBase = 100;
+  static constexpr size_t kBitsPerByte = 8;
+  static constexpr size_t T1ReorganizeSoftThresholdPercent = 75;
+  static constexpr size_t T1ReorganizeHardThresholdPercent = 90;
+
+  // T1 append region capacity (ablation knob).
+  // Keep this as a power of two to preserve cache-friendly masking behavior.
+  static constexpr size_t T1AppendCapacityLog2 = 21;
+  static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
+
+  static_assert(T1ReorganizeSoftThresholdPercent > 0 && T1ReorganizeSoftThresholdPercent < kPercentBase,
+                "T1ReorganizeSoftThresholdPercent must be in (0, 100)");
+  static_assert(T1ReorganizeHardThresholdPercent > 0 && T1ReorganizeHardThresholdPercent < kPercentBase,
+                "T1ReorganizeHardThresholdPercent must be in (0, 100)");
+  static_assert(T1ReorganizeSoftThresholdPercent <= T1ReorganizeHardThresholdPercent,
+                "Soft threshold must be <= hard threshold");
+  static_assert(T1AppendCapacityLog2 > 0 && T1AppendCapacityLog2 < (sizeof(size_t) * kBitsPerByte),
+                "T1AppendCapacityLog2 must be in (0, bitwidth(size_t))");
 };
 
 namespace detail {
-    using T1_AllOff = Config<>;
-    using T1_AllOn  = Config<AppendMap, BloomFilter, SimdScan, MemoryHints>;
-    using System_AllOn = Config<AppendMap, BloomFilter, SimdScan, MemoryHints, T1InlineValue>;
-}
+using T1_AllOff = Config<>;
+using T1_AllOn = Config<AppendMap, BloomFilter, SimdScan, MemoryHints>;
+using System_AllOn = Config<AppendMap, BloomFilter, SimdScan, MemoryHints, T1InlineValue>;
+}  // namespace detail
 
-} // namespace vmemkv
+}  // namespace vmemkv

@@ -116,8 +116,16 @@ void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capa
     throw std::invalid_argument("T2 file is smaller than capacity");
   }
 
-  void *mapped =
-      ::mmap(nullptr, static_cast<size_t>(bytes_capacity), PROT_READ | PROT_WRITE, MAP_PRIVATE, file_descriptor, 0);
+  // MAP_PRIVATE: changes are not written back to the underlying file (volatile on restart).
+  // MAP_NORESERVE: bypasses the kernel's upfront swap-space reservation check, allowing
+  // virtual address spaces much larger than physical RAM + swap without ENOMEM.
+  // Physical pages are allocated on demand and can be swapped out normally.
+  void *mapped = ::mmap(nullptr,
+                        static_cast<size_t>(bytes_capacity),
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_NORESERVE,
+                        file_descriptor,
+                        0);
   const int mmap_errno = errno;
   ::close(file_descriptor);
   if (mapped == MAP_FAILED) {

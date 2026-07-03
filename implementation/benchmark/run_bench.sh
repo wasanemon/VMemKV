@@ -15,8 +15,8 @@
 #   --no-rocksdb      RocksDB を無効にしてビルド（未インストール環境向け）
 #   --build-type <T>  CMake ビルドタイプ（デフォルト: Release）
 #   --build-dir <D>   ビルドディレクトリ（デフォルト: build）
-#   --mt-dur <S>      multi-thread benchmark の各 run 秒数（デフォルト: 20）
-#   --quick           `--mt-dur 2` の省略形
+#   --iters <N>       ST基準反復回数（MTは N x thread_count）（デフォルト: 10000）
+#   --quick           `--iters 2000` の省略形
 #   --output <F>      結果をファイルにも保存（例: results/$(date +%Y%m%d).txt）
 #   --no-log          benchmark/logs/ への自動保存を無効化
 
@@ -28,7 +28,8 @@ BUILD_TYPE=Release
 BUILD_DIR=build
 OUTPUT_FILE=""
 AUTO_LOG=true
-MT_DUR=20
+ITERS=10000
+QUICK=false
 
 # ── 引数パース ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -36,8 +37,8 @@ while [[ $# -gt 0 ]]; do
     --no-rocksdb)   ENABLE_ROCKSDB=OFF; shift ;;
     --build-type)   BUILD_TYPE="$2";    shift 2 ;;
     --build-dir)    BUILD_DIR="$2";     shift 2 ;;
-    --mt-dur)       MT_DUR="$2";        shift 2 ;;
-    --quick)        MT_DUR=2;           shift ;;
+    --iters)        ITERS="$2";         shift 2 ;;
+    --quick)        ITERS=2000; QUICK=true; shift ;;
     --output)       OUTPUT_FILE="$2";   shift 2 ;;
     --no-log)       AUTO_LOG=false;     shift ;;
     -h|--help)
@@ -66,7 +67,7 @@ echo "  Repo root   : $REPO_ROOT"
 echo "  Build dir   : $BUILD_DIR"
 echo "  Build type  : $BUILD_TYPE"
 echo "  RocksDB     : $ENABLE_ROCKSDB"
-echo "  MT duration : ${MT_DUR}s"
+echo "  Iterations  : ${ITERS} (ST base, MT scales by thread count)"
 [[ -n "$OUTPUT_FILE" ]] && echo "  Output file : $OUTPUT_FILE"
 [[ "$AUTO_LOG" == "true" ]] && echo "  Log file    : $AUTO_LOG_FILE"
 echo ""
@@ -115,10 +116,18 @@ if [[ -n "$OUTPUT_FILE" ]]; then
 fi
 
 if [[ ${#TEE_TARGETS[@]} -gt 0 ]]; then
-  "$BENCH_BIN" --mt-dur "$MT_DUR" 2>&1 | tee "${TEE_TARGETS[@]}" || true
+  if [[ "$QUICK" == "true" ]]; then
+    "$BENCH_BIN" --iters "$ITERS" --quick 2>&1 | tee "${TEE_TARGETS[@]}" || true
+  else
+    "$BENCH_BIN" --iters "$ITERS" 2>&1 | tee "${TEE_TARGETS[@]}" || true
+  fi
   echo ""
   [[ "$AUTO_LOG" == "true" ]] && echo "Log saved to: $AUTO_LOG_FILE"
   [[ -n "$OUTPUT_FILE" ]]     && echo "Results saved to: $OUTPUT_FILE"
 else
-  "$BENCH_BIN" --mt-dur "$MT_DUR" || true
+  if [[ "$QUICK" == "true" ]]; then
+    "$BENCH_BIN" --iters "$ITERS" --quick || true
+  else
+    "$BENCH_BIN" --iters "$ITERS" || true
+  fi
 fi

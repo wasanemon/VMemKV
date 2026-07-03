@@ -48,6 +48,7 @@
 #include <vector>
 #include <vmemkv/config.hpp>
 
+#include "core/reorganize_coordinator.hpp"
 #include "t1_index/t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
 
@@ -188,7 +189,8 @@ class VMemKVImpl {
       }
 
       std::shared_ptr<vmemkv::T2Memory> new_mem = std::make_shared<vmemkv::T2Memory>(
-          static_cast<std::byte *>(::mmap(nullptr, new_capacity, PROT_READ | PROT_WRITE, MAP_SHARED, map_fd, 0)),
+          static_cast<std::byte *>(
+              ::mmap(nullptr, new_capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_NORESERVE, map_fd, 0)),
           new_capacity);
       ::close(map_fd);
 
@@ -222,13 +224,30 @@ class VMemKVImpl {
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
 
   auto write_entry_lockfree(std::span<const std::byte> full_key, std::span<const std::byte> value) -> bool {
-    uint8_t inline_size = 0;
-    if (const auto inline_payload = try_make_inline_payload(full_key, value, inline_size)) {
-      return t1_.put(full_key, *inline_payload, true, inline_size);
-    }
+    while (true) {
+      uint8_t inline_size = 0;
+      if (const auto inline_payload = try_make_inline_payload(full_key, value, inline_size)) {
+        const auto put_result = t1_.put(full_key, *inline_payload, true, inline_size);
+        if (put_result == T1IndexT::PutResult::Applied) {
+          return true;
+        }
+        if (put_result == T1IndexT::PutResult::AppendRegionFull) {
+          maybe_reorganize_if_needed();
+          continue;
+        }
+      }
 
-    const uint64_t offset = t2_.append(full_key, value);
-    return t1_.put(full_key, offset, false, 0);
+      const uint64_t offset = t2_.append(full_key, value);
+      const auto put_result = t1_.put(full_key, offset, false, 0);
+      if (put_result == T1IndexT::PutResult::Applied) {
+        return true;
+      }
+      if (put_result == T1IndexT::PutResult::AppendRegionFull) {
+        // The appended T2 record becomes unreachable garbage and will be reclaimed by reorganize.
+        maybe_reorganize_if_needed();
+        continue;
+      }
+    }
   }
 
   // Inserts a new key-value pair.
@@ -237,6 +256,8 @@ class VMemKVImpl {
   // - Thread-safety: Thread-safe (guarded by slot-level spinlocks for writes).
   auto insert_impl(std::span<const std::byte> full_key, std::span<const std::byte> value) -> bool {
     std::lock_guard<std::mutex> key_lock(key_mutex(full_key));
+
+    maybe_reorganize_if_needed();
 
     if (t1_.get(full_key) != vmemkv::STORE_NOT_FOUND) {
       return false;
@@ -284,6 +305,8 @@ class VMemKVImpl {
       }
     }
 
+    maybe_reorganize_if_needed();
+
     return write_entry_lockfree(full_key, value);
   }
 
@@ -298,7 +321,7 @@ class VMemKVImpl {
       return false;
     }
 
-    return t1_.put(full_key, vmemkv::STORE_NOT_FOUND);
+    return t1_.put(full_key, vmemkv::STORE_NOT_FOUND) == T1IndexT::PutResult::Applied;
   }
 
   // Retrieves the raw variable-length byte value associated with a key.
@@ -481,7 +504,21 @@ class VMemKVImpl {
     return typename vmemkv::T2FlatFile::LookupResult{payload, record};
   }
 
+  auto make_reorganize_hints() const noexcept -> ReorganizeCoordinator::ReorganizeHints {
+    return ReorganizeCoordinator::ReorganizeHints{
+        .append_size = t1_.append_size(),
+        .append_capacity = T1IndexT::append_capacity(),
+        .soft_threshold_percent = ConfigT::T1ReorganizeSoftThresholdPercent,
+        .hard_threshold_percent = ConfigT::T1ReorganizeHardThresholdPercent,
+    };
+  }
+
+  void maybe_reorganize_if_needed() {
+    reorganize_coordinator_.maybe_reorganize_if_needed(make_reorganize_hints(), [&] { reorganize(); });
+  }
+
   mutable std::mutex reorganize_mutex_;
+  ReorganizeCoordinator reorganize_coordinator_;
   // Mutex striping based on key hash. Splitting into 256 stripes prevents lock contention
   // on concurrent writes without the overhead of dynamic allocation for individual key locks.
   // Aligned to cache line size to prevent false sharing.

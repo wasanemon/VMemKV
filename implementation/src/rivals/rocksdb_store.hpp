@@ -144,26 +144,52 @@ class RocksDBStore {
   std::string path_;
 #else
   // Dummy stub implementation when RocksDB is disabled.
-  explicit RocksDBStore(std::string) { throw std::runtime_error("RocksDB not enabled in this build"); }
+  explicit RocksDBStore(const std::string &unused_path) {
+    (void)unused_path;
+    throw std::runtime_error("RocksDB not enabled in this build");
+  }
 
   ~RocksDBStore() = default;
 
   RocksDBStore(const RocksDBStore &) = delete;
-  RocksDBStore &operator=(const RocksDBStore &) = delete;
+  auto operator=(const RocksDBStore &) -> RocksDBStore & = delete;
 
   void reorganize() {}
 
-  [[nodiscard]] auto get_impl(std::span<const std::byte>) const -> uint64_t { return vmemkv::STORE_NOT_FOUND; }
-  auto insert_impl(std::span<const std::byte>, std::span<const std::byte>) -> bool { return false; }
-  auto update_impl(std::span<const std::byte>, std::span<const std::byte>) -> bool { return false; }
-  auto remove_impl(std::span<const std::byte>) -> bool { return false; }
-  [[nodiscard]] auto get_bytes_impl(std::span<const std::byte>) const -> std::optional<std::vector<std::byte>> {
+  // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+  [[nodiscard]] auto get_impl(std::span<const std::byte> key) const -> uint64_t {
+    (void)key;
+    return vmemkv::STORE_NOT_FOUND;
+  }
+  // NOLINTNEXTLINE(readability-convert-member-functions-to-static,bugprone-easily-swappable-parameters)
+  auto insert_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
+    (void)key;
+    (void)value;
+    return false;
+  }
+  // NOLINTNEXTLINE(readability-convert-member-functions-to-static,bugprone-easily-swappable-parameters)
+  auto update_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
+    (void)key;
+    (void)value;
+    return false;
+  }
+  // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+  auto remove_impl(std::span<const std::byte> key) -> bool {
+    (void)key;
+    return false;
+  }
+  // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+  [[nodiscard]] auto get_bytes_impl(std::span<const std::byte> key) const -> std::optional<std::vector<std::byte>> {
+    (void)key;
     return std::nullopt;
   }
 
   template <typename Cb>
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  auto scan_impl(std::span<const std::byte>, std::span<const std::byte>, Cb) const -> size_t {
+  auto scan_impl(std::span<const std::byte> low, std::span<const std::byte> high, Cb callback) const -> size_t {
+    (void)low;
+    (void)high;
+    (void)callback;
     return 0;
   }
 #endif

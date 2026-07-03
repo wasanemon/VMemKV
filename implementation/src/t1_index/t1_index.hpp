@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <vmemkv/config.hpp>
@@ -113,12 +114,11 @@ class T1Index {
   // Capacity of the temporary Lock-Free Append Region (acting like an LSM-tree MemTable).
   // This is NOT the limit for the entire KVS database. When the Append Region fills up,
   // a background/explicit reorganize() merges it into the Sorted Region and resets this to empty.
-  // - Power of two (1 << 21 = 2,097,152): Enables fast bitwise modulo operation (hash & (APPEND_CAP - 1)) in
-  // LockFreeHashTable.
-  // - Memory overhead: 32B per slot * 2M slots = 64MB (plus ~16MB hash index), totaling ~80MB, which fits well in
-  // cache.
-  // - Reorganize Latency: Keeping it at ~2M entries bounds reorganize (merge-sort) latency to milliseconds.
-  static constexpr size_t APPEND_CAP = 1U << 21;  // 2,097,152 entries
+  // - Defaults to 2^21 entries (2,097,152) via Config::T1AppendCapacityEntries.
+  // - Memory overhead at default: 32B per slot * 2M slots = 64MB
+  //   (plus ~16MB hash index), totaling ~80MB.
+  // - Reorganize latency grows roughly with this capacity and should be tuned via ablation.
+  static constexpr size_t APPEND_CAP = Config::T1AppendCapacityEntries;
 
   T1Index() : sorted_region_(std::make_shared<SortedRegion>()) {
     if constexpr (Config::UseAppendMap) {
@@ -137,6 +137,11 @@ class T1Index {
   struct LookupResult {
     Payload payload_bits;
     uint64_t raw_hash;
+  };
+
+  enum class PutResult : uint8_t {
+    Applied,
+    AppendRegionFull,
   };
 
   // Retrieves the 64-bit payload and raw hash associated with a key prefix.
@@ -165,12 +170,19 @@ class T1Index {
   // - Guarantees: Returns the latest visible value or STORE_NOT_FOUND if not found.
   auto get(std::span<const std::byte> key) const -> Payload { return get_with_hash(key).payload_bits; }
 
+  [[nodiscard]] auto append_size() const noexcept -> size_t { return append_region_.size(); }
+
+  [[nodiscard]] static constexpr auto append_capacity() noexcept -> size_t { return APPEND_CAP; }
+
   // Inserts or updates the 64-bit payload for a given key prefix.
   // - Thread-safety: Safe for concurrent writers (guarded internally by slot-level atomic operations or table locks).
   // - Guarantees: Writes to the append region if the key does not exist; updates the slot in-place if it does.
   // - Note on Concurrency: This write method does not require a SeqLock retry loop because
   //   concurrent writes with reorganize are reconciled by the re-check of write_version_ during Phase 2 of reorganize.
-  auto put(std::span<const std::byte> key, Payload value, bool is_inline = false, uint8_t inline_size = 0) -> bool {
+  auto put(std::span<const std::byte> key,
+           Payload value,
+           bool is_inline = false,
+           uint8_t inline_size = 0) -> PutResult {
     const auto [prefix, hash] = prepare_key_and_hash(key);
 
     uint64_t stored_hash = is_inline ? t1_detail::embed_metadata(hash, inline_size) : hash;
@@ -180,18 +192,18 @@ class T1Index {
       slot.store(value);
       slot.store_hash(stored_hash);
       write_version_.fetch_add(1, std::memory_order_release);
-      return true;
+      return PutResult::Applied;
     }
 
     const size_t index = append_region_.reserve();
     if (index >= APPEND_CAP) {
-      throw std::runtime_error("T1 Append Region Full");
+      return PutResult::AppendRegionFull;
     }
 
     append_region_.publish(index, prefix, stored_hash, value);
     publish_append_index(index, prefix, hash);
     write_version_.fetch_add(1, std::memory_order_release);
-    return true;
+    return PutResult::Applied;
   }
 
   // Performs a range scan over keys between lo_bytes and hi_bytes (inclusive).

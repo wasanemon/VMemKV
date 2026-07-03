@@ -68,10 +68,11 @@ if(ENABLE_ROCKSDB)
   endif()
 endif()
 
+include(CTest)
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 option(ENABLE_TESTS "Build tests" ON)
 if(ENABLE_TESTS)
-  include(CTest)
   add_subdirectory(tests)
 endif()
 
@@ -124,4 +125,15 @@ if(CLANG_TIDY_PROGRAM)
     COMMENT "Running clang-tidy static analysis..."
     VERBATIM
   )
+
+  # Compatibility alias used by CI and local scripts.
+  add_custom_target(cmake-tidy-check DEPENDS clang-tidy-check)
+
+  if(BUILD_TESTING)
+    add_test(
+      NAME cmake_tidy_check
+      COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target cmake-tidy-check --config $<CONFIG>
+    )
+    set_tests_properties(cmake_tidy_check PROPERTIES LABELS "lint;tidy")
+  endif()
 endif()
