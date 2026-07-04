@@ -48,5 +48,4 @@ VMemKV 実装方針より古い情報を含んでいる可能性があります�
   fragmentation を修復し、checkpoint / generation update と連携する。
 
 このため、`paper/` 内に残っている `fork`, `mincore`, checkpoint flow,
-評価計画、論文上の主張などは、現在の implementation 方針と照合するまで
-確定情報として扱わないでください。
+評価計画、論文上の主張などは、確定情報として扱わないでください。
