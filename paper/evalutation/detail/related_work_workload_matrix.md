@@ -2,7 +2,7 @@
 
 Status: 計画メモ。ここでは実験結果を主張しない。
 
-このファイルは `paper/evaluation_plan.md` とは意図的に分けた独立メモである。`evaluation_plan.md` は論文本体の評価構成を定義する。一方で、このファイルは `must_read_papers/` と `paper/draft.md` 内の関連研究をもとに、「どの workload を VMemKV で実施すべきか」「どのシステムを直接比較対象にすべきか」を判断するための表である。
+このファイルは `paper/evaluation_plan.md` とは意図的に分けた独立メモである。`evaluation_plan.md` は論文本体の評価構成を定義する。一方で、このファイルは `must_read_papers/` と `paper/obsolete_drafts/draft.md` 内の関連研究をもとに、「どの workload を VMemKV で実施すべきか」「どのシステムを直接比較対象にすべきか」を判断するための表である。
 
 ## 先に結論
 

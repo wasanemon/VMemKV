@@ -417,6 +417,5 @@ must_read_papers 全 14 本の評価設計サマリ。詳細な根拠と引用�
 ### 8.2 既存文書との関係
 
 - `paper/others/reference_evaluation_matrix.md` / `related_work_workload_matrix.md` の結論（YCSB 不十分、BlobDB 必須、vmcache と勝負しない、pread twin 最重要、LMDB main-text 1 図）を PDF 本文精読で**追認**した。本文書はそれらに節・図・表番号の根拠と、実装監査由来の新規制約（reopen 不能、容量 wedge、SimdScan dead code、reorganize race）を加える。
-- `paper/draft/vmemkv_paper_review.md`（先行査読）の P0 3 点（mapping mode、fork 宙吊り、E1 ill-defined）を独立に再検証し**一致**。同レビューの引用数値も PDF 照合で概ね確認。1 点補正: 「~1.5M page-ops/s/CPU」は正しくは **128 threads 合計で 1.51M pages/s**（vmcache Sec 4.1, Fig 3）。
+- `paper/obsolete_drafts/vmemkv_paper_review.md`（先行査読）の P0 3 点（mapping mode、fork 宙吊り、E1 ill-defined）を独立に再検証し**一致**。同レビューの引用数値も PDF 照合で概ね確認。1 点補正: 「~1.5M page-ops/s/CPU」は正しくは **128 threads 合計で 1.51M pages/s**（vmcache Sec 4.1, Fig 3）。
 - 既存 microbenchmark 結果（`microbenchmark/REPORT.md`）は「mmap vs pread+LRU (O_DIRECT)」であり、E5 の「pread + OS page cache」対照が欠けている非対称は各 REPORT 自身が注記済み。
-
