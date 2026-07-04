@@ -6,7 +6,7 @@ VMemKV の評価で答えるべき中心問いは、次です。
 
 > **VMemKV は、OS に larger-than-memory 管理を委譲しつつ、T1/T2 の責務分離によって、単純な実装と実用的な性能を両立できるか。**
 
-VMemKV は `mmap`, `fork`, `mincore`, `madvise` などの OS 仮想メモリ機構に、value 領域の I/O と page residency 管理をできるだけ委譲する larger-than-memory KVS です。
+VMemKV は `mmap`, `madvise` などの OS 仮想メモリ機構に、value 領域の read-side residency 管理をできるだけ委譲する larger-than-memory KVS です。
 
 論文では、VMemKV を以下のように位置づけます。
 
@@ -19,6 +19,8 @@ VMemKV は `mmap`, `fork`, `mincore`, `madvise` などの OS 仮想メモリ機�
 
 in-place update は重要な特徴ですが、評価の中心ではありません。中心は **OS に委譲した larger-than-memory 管理** と **T1/T2 の責務分離** です。in-place update は update-heavy workload における補助的な強みとして扱います。
 
+本計画は、`implementation/TODO.md` の WAL / recovery / no-fork checkpoint が反映された最終状態を評価対象とします。現行 prototype だけで測れない項目は、TODO 反映後の評価として扱います。
+
 ---
 
 ## 2. Evaluation section の構成案
@@ -27,7 +29,7 @@ in-place update は重要な特徴ですが、評価の中心ではありませ�
 8. Evaluation
    8.1 Experimental Setup
        Hardware, filesystem, SSD, cgroup memory limit, RocksDB options,
-       VMemKV durability scope, msync/writeback policy, thread counts,
+       VMemKV durability scope, WAL/checkpoint sync policy, thread counts,
        warmup, repetitions.
 
    8.2 Larger-than-Memory Behavior and Thread Scalability
@@ -52,7 +54,8 @@ in-place update は重要な特徴ですが、評価の中心ではありませ�
 
    8.5 Reorganization and Checkpoint Behavior
        Scan before/during/after, T2 unreachable bytes,
-       copied bytes, reclaimed bytes, fork time, stop-the-world time,
+       copied bytes, reclaimed bytes, checkpoint serialization time,
+       generation switch time,
        WAL replay time, memory high-water mark, TLB shootdowns.
 
    8.6 mmap-only Microbaseline
@@ -139,7 +142,7 @@ VMemKV の中核は、RAM 常駐 T1 index と mmap-backed T2 value region の分
 評価すること:
 
 - T1 が頻繁に参照される metadata と検索・scan の制御を担うか。
-- T2 が OS の page cache で管理される大容量 value 領域として機能するか。
+- T2 の clean read-side value pages が OS page cache / VM によって管理されるか。
 - T1 optimizations が point lookup / scan にどう効くか。
 - T2 access が page fault / SSD I/O とどう結びつくか。
 
@@ -155,8 +158,8 @@ VMemKV は複雑な LSM compaction の代わりに、T1/T2 reorganization と ch
 - bytes copied
 - bytes reclaimed
 - foreground p99 / p99.9 latency during reorganization
-- fork time
-- stop-the-world time
+- checkpoint serialization time
+- generation switch time
 - WAL replay time
 - checkpoint 中の memory high-water mark
 
@@ -195,7 +198,7 @@ VMemKV は WAL と checkpoint による durability を持つ設計です。評�
 
 - すべての比較の前提を明確にする。
 - VMemKV と baselines の memory budget / durability / I/O policy をできるだけ揃える。
-- mmap dirty page writeback と `msync` の方針を固定し、再現性を確保する。
+- T2 `MAP_PRIVATE`、WAL、checkpoint file の同期方針を固定し、再現性を確保する。
 
 記録するもの:
 
@@ -214,10 +217,10 @@ VMemKV は WAL と checkpoint による durability を持つ設計です。評�
 - RocksDB compression setting
 - RocksDB WAL/sync policy
 - VMemKV durability scope
-- VMemKV `msync` policy
+- VMemKV WAL/checkpoint sync policy
 - checkpoint file `fsync` policy
-- T2 mapping mode: `MAP_SHARED` or `MAP_PRIVATE`
-- Linux dirty page settings: `vm.dirty_background_ratio` or bytes, `vm.dirty_ratio` or bytes, `vm.dirty_expire_centisecs`, `vm.dirty_writeback_centisecs`
+- T2 mapping mode: `MAP_PRIVATE`
+- Linux writeback settings for checkpoint files, if relevant
 - warmup duration
 - run duration
 - repetition count
@@ -225,7 +228,7 @@ VMemKV は WAL と checkpoint による durability を持つ設計です。評�
 
 注意:
 
-- VMemKV は OS page cache を使うため、プロセス RSS だけでは memory budget を比較できない。
+- VMemKV は read-side T2 で OS page cache を使い、dirty private pages は RSS / swap 側に現れるため、プロセス RSS だけでは memory budget を比較できない。
 - cgroup などで総物理メモリを制限し、VMemKV と RocksDB を同じ budget で比較する。
 - RocksDB の buffered I/O / direct I/O はどちらかに固定し、設定を明記する。
 - compression は無効を基本とする。有効にする場合は別条件として扱う。
@@ -335,7 +338,7 @@ thread count:
 - instructions/op
 - TLB shootdowns
 
-`engine-written bytes` は、VMemKV では WAL bytes、T2 append / overwrite bytes、reorganization copied bytes を含めます。RocksDB では WAL / memtable flush / compaction / blob write など、engine が発行した書き込みを含めます。device write amplification と engine write amplification は混同しません。
+`engine-written bytes` は、VMemKV では WAL bytes、checkpoint / reorganization output bytes を含めます。T2 `MAP_PRIVATE` への append / overwrite は file writeback ではないため、必要に応じて private dirty bytes として別枠で記録します。RocksDB では WAL / memtable flush / compaction / blob write など、engine が発行した書き込みを含めます。device write amplification と engine write amplification は混同しません。
 
 ---
 
@@ -378,7 +381,7 @@ thread count:
 
 - reorganization が ordering fragmentation / storage fragmentation を修復することを示す。
 - update/delete によって発生した不要な T2 record をどれだけ回収できるかを示す。
-- checkpoint reload の停止時間、replay cost、memory spike を測る。
+- in-process checkpoint / reload の foreground pause、replay cost、memory high-water mark を測る。
 
 workload:
 
@@ -400,12 +403,12 @@ workload:
 - foreground p99 / p99.9 latency during reorganization
 - maximum latency during reorganization
 - major page faults per operation before / after reorganization
-- fork time
-- stop-the-world time
+- checkpoint serialization time
+- generation switch time
 - WAL replay time
-- CoW page faults
-- parent RSS during checkpoint
-- child RSS during checkpoint
+- private dirty page count, if measurable
+- process RSS during checkpoint
+- checkpoint buffer bytes
 - cgroup memory high-water mark during checkpoint
 - cgroup OOM event count
 - TLB shootdowns
@@ -566,8 +569,8 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
 - engine write amplification
 - storage usage
 - T2 bytes_used
-- T2 bytes appended
-- T2 bytes overwritten in place, if measured
+- T2 private bytes appended, if measured
+- T2 private bytes overwritten in place, if measured
 - T1 から参照されない T2 bytes
 - reorganization copied bytes
 - bytes reclaimed by reorganization
@@ -578,13 +581,13 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
 - minor page faults
 - page faults per operation
 - RSS
-- parent / child RSS during checkpoint
+- process RSS during checkpoint
 - cgroup memory usage
 - cgroup memory high-water mark
 - cgroup OOM event count
 - SSD read/write bandwidth
 - SSD read/write bandwidth time-series
-- dirty page writeback statistics
+- checkpoint file writeback / fsync statistics
 - CPU utilization
 - cycles/op
 - instructions/op
@@ -601,10 +604,10 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
 - reclaimed bytes / copied bytes
 - foreground p99 / p99.9 latency during reorganization
 - scan throughput before / during / after reorganization
-- fork time
-- stop-the-world time
+- checkpoint serialization time
+- generation switch time
 - WAL replay time
-- CoW page faults
+- private dirty page count, if measurable
 - TLB shootdowns during checkpoint / reorganization
 
 ### Recovery
@@ -656,7 +659,7 @@ RocksDB BlobDB は 16 KiB value の write amplification 比較では本編に含
 - T2 bytes_used before / after
 - T1 から参照されない T2 bytes
 - bytes copied and bytes reclaimed
-- fork time / stop-the-world time / WAL replay time
+- checkpoint serialization time / generation switch time / WAL replay time
 - checkpoint memory high-water mark
 
 ### Figure 7. Recovery behavior
@@ -702,7 +705,7 @@ VMemKV, RocksDB/LSM, WiscKey-like value-log, Bitcask-like KVS, LMDB, explicit bu
 
 ### checkpoint 中に memory spike が出る場合
 
-適用条件として扱います。checkpoint reload は fork と page cache に依存するため、cgroup memory limit 下では memory high-water mark と OOM risk を明示します。
+適用条件として扱います。in-process checkpoint / reload は一時 buffer、checkpoint file writeback、private dirty pages の影響を受けるため、cgroup memory limit 下では memory high-water mark と OOM risk を明示します。
 
 ### in-place update の効果が限定的な場合
 
