@@ -4,7 +4,7 @@
 
 前提として、本論文は VMemKV がすべての workload で最速であることを主張しない。中心は以下の 2 点である。
 
-1. OS 仮想メモリ機構に larger-than-memory な value residency 管理をできるだけ委譲すること。
+1. OS 仮想メモリ機構に larger-than-memory な read-side value residency 管理をできるだけ委譲すること。
 2. RAM-resident な T1 index と mmap-backed な T2 value layer の責務分離によって、単純な実装と実用的な性能の両立を狙うこと。
 
 in-place update は重要な特徴だが、中心主張ではなく update-heavy workload における補助的な強みとして扱う。
@@ -15,9 +15,9 @@ in-place update は重要な特徴だが、中心主張ではなく update-heavy
 
 ### 何を主張するか
 
-VMemKV は、large value の residency / I/O / eviction の多くを OS の仮想メモリ機構に委譲する standalone KVS である。
+VMemKV は、large value の read-side residency / eviction の多くを OS の仮想メモリ機構に委譲する standalone KVS である。
 
-従来の storage engine が持つ user-space buffer pool、page replacement policy、multi-level compaction を VMemKV の中心機構には置かず、`mmap`, `mincore`, `madvise`, `fork` などの OS 機構を活用して larger-than-memory な value 領域を扱う設計を検討する。
+従来の storage engine が持つ user-space buffer pool、page replacement policy、multi-level compaction を VMemKV の中心機構には置かず、`mmap`, `madvise` などの OS 機構を活用して larger-than-memory な value 領域を扱う設計を検討する。durability は T2 file writeback ではなく、WAL と checkpoint / recovery によって担保する。
 
 ただし、これは「OS page cache が常に DBMS buffer manager を置き換えられる」という主張ではない。正確には、VMemKV は value layer に対象を絞ることで、どの条件で OS 委譲型設計が成立するかを評価する。
 
@@ -43,7 +43,7 @@ VMemKV は、large value の residency / I/O / eviction の多くを OS の仮�
 - RocksDB / LevelDB / Bigtable 系の LSM-tree は、MemTable, SSTable, WAL, compaction によってデータを管理する。
 - WiscKey / BlobDB は key-value separation により large value を LSM compaction から切り離すが、value log と GC を storage engine 側で管理する。
 - LMDB は mmap を使う代表的な KVS だが、VMemKV は RAM-resident T1 と mmap-backed T2 の責務分離を中心に置く。
-- vmcache は仮想メモリを buffer manager に活用するが、page fault / eviction / replacement policy は DBMS 側で制御する。VMemKV は value residency の多くを OS 側に委譲する点で異なる。
+- vmcache は仮想メモリを buffer manager に活用するが、page fault / eviction / replacement policy は DBMS 側で制御する。VMemKV は read-side value residency の多くを OS 側に委譲する点で異なる。
 
 ### 過剰主張になりそうな点
 
@@ -58,7 +58,7 @@ VMemKV は、large value の residency / I/O / eviction の多くを OS の仮�
 
 - 「VMemKV investigates whether ...」
 - 「VMemKV evaluates the conditions under which ...」
-- 「VMemKV delegates value residency, while keeping key metadata under explicit engine control.」
+- 「VMemKV delegates read-side value residency, while keeping key metadata under explicit engine control.」
 
 ---
 
@@ -68,9 +68,9 @@ VMemKV は、large value の residency / I/O / eviction の多くを OS の仮�
 
 VMemKV の中核は、RAM-resident な T1 index と mmap-backed な T2 value layer の責務分離である。
 
-T1 は key metadata、lookup、scan control、T2 offset、最適化 hook を管理する。T2 は large value record を file-backed mmap 上の byte region として保持し、実際の page residency は OS に委譲する。
+T1 は key metadata、lookup、scan control、T2 offset、最適化 hook を管理する。T2 は large value record を file-backed `MAP_PRIVATE` mmap 上の byte region として保持し、clean read-side pages の residency は OS に委譲する。
 
-この分離により、VMemKV は単なる mmap file access ではなく、hot metadata は engine が制御し、large value bytes は OS が管理する control/data split として設計される。
+この分離により、VMemKV は単なる mmap file access ではなく、hot metadata は engine が制御し、clean read-side value pages は OS が管理する control/data split として設計される。
 
 ### どの section で説明するか
 
@@ -103,9 +103,9 @@ T1 は key metadata、lookup、scan control、T2 offset、最適化 hook を管�
 
 安全な表現:
 
-- 「The novelty is not key-value separation alone, but its combination with OS-managed value residency.」
+- 「The novelty is not key-value separation alone, but its combination with OS-managed read-side value residency.」
 - 「T1/T2 split is evaluated against a simple mmap baseline.」
-- 「T1/T2 split is intended to separate metadata control from value residency management.」
+- 「T1/T2 split is intended to separate metadata control from read-side value residency management.」
 
 ### repo で要確認
 
@@ -121,7 +121,7 @@ T1 は key metadata、lookup、scan control、T2 offset、最適化 hook を管�
 
 ### 何を主張するか
 
-VMemKV は、LSM-tree の multi-level compaction を中心機構にせず、T1/T2 reorganization、checkpoint reload、WAL replay によって fragmentation repair と recovery を扱う。
+VMemKV は、LSM-tree の multi-level compaction を中心機構にせず、T1/T2 reorganization、in-process checkpoint / reload、WAL replay によって fragmentation repair と recovery を扱う。
 
 更新や削除により T2 上には T1 から参照されない garbage record が発生する。VMemKV はこれを reorganization によって回収する。また、checkpoint と WAL replay により crash 後の復旧を行う設計を持つ。
 
@@ -146,7 +146,7 @@ VMemKV は、LSM-tree の multi-level compaction を中心機構にせず、T1/T
 - LSM-tree systems は compaction により古い version や tombstone を整理する。
 - WiscKey / BlobDB は value log GC により obsolete value を回収する。
 - Bitcask は merge により古い entry / tombstone を回収する。
-- VMemKV は T1 から到達可能な T2 record を live とみなし、T1/T2 reorganization と checkpoint reload を中心に fragmentation を修復する設計として位置づける。
+- VMemKV は T1 から到達可能な T2 record を live とみなし、T1/T2 reorganization と in-process checkpoint / reload を中心に fragmentation を修復する設計として位置づける。
 
 ### 過剰主張になりそうな点
 
@@ -160,18 +160,18 @@ VMemKV は、LSM-tree の multi-level compaction を中心機構にせず、T1/T
 安全な表現:
 
 - 「VMemKV replaces LSM-style multi-level compaction with reorganization tailored to the T1/T2 split.」
-- 「The evaluation measures foreground interference during reorganization and checkpoint reload.」
+- 「The evaluation measures foreground interference during reorganization and in-process checkpoint / reload.」
 - 「Recovery is evaluated as a sanity check rather than exhaustive crash testing.」
 
 ### repo で要確認
 
 - T1-only reorganization と T2 reorganization の区別。
-- T2 reorganization が checkpoint reload の一部としてのみ実行されるか。
+- T2 reorganization が checkpoint / reload の一部としてのみ実行されるか。
 - checkpoint file の完成判定。
 - atomic rename / commit marker の有無。
 - WAL replay の開始 LSN / 終了 LSN。
 - incomplete checkpoint の扱い。
-- checkpoint 中の `fork` / CoW / stop-the-world 範囲。
+- checkpoint serialization / generation switch / foreground pause の範囲。
 
 ---
 
@@ -181,7 +181,7 @@ VMemKV は、LSM-tree の multi-level compaction を中心機構にせず、T1/T
 
 VMemKV の「実装が単純」という主張は、主観的な印象ではなく、storage engine が担う責務の比較として示す。
 
-比較軸は、user-space buffer pool、page replacement policy、multi-level compaction、value-log GC、mmap-backed value storage、OS-managed value residency、ordered scan support、background repair / reorganization、in-place update、recovery mechanism などである。
+比較軸は、user-space buffer pool、page replacement policy、multi-level compaction、value-log GC、mmap-backed value storage、OS-managed read-side value residency、ordered scan support、background repair / reorganization、in-place update、recovery mechanism などである。
 
 この contribution は主技術ではなく、C1〜C3 の主張を査読者に納得させるための補助的 contribution として扱う。
 
@@ -215,7 +215,7 @@ VMemKV の「実装が単純」という主張は、主観的な印象ではな�
 
 安全な表現:
 
-- 「VMemKV reduces the number of storage-engine responsibilities by delegating value residency to the OS.」
+- 「VMemKV reduces the number of storage-engine responsibilities by delegating read-side value residency to the OS.」
 - 「This simplicity comes with risks, which are evaluated and discussed.」
 - 「The responsibility table is used to make the simplicity claim auditable.」
 
@@ -232,9 +232,9 @@ VMemKV の「実装が単純」という主張は、主観的な印象ではな�
 
 論文本文では、以下の順番で contribution を提示するのがよい。
 
-1. OS-delegated larger-than-memory value residency
+1. OS-delegated larger-than-memory read-side value residency
 2. T1/T2 responsibility split
-3. Reorganization, checkpoint, and recovery tailored to the T1/T2 split
+3. Reorganization, in-process checkpoint, and recovery tailored to the T1/T2 split
 4. Responsibility-based simplicity analysis
 
 C1 と C2 が主 contribution である。C3 は system completeness を示す contribution、C4 は simplicity claim を客観化するための補助 contribution として扱う。
@@ -243,4 +243,4 @@ C1 と C2 が主 contribution である。C3 は system completeness を示す c
 
 ## Contribution paragraph draft in Japanese
 
-本稿の contribution は以下の 4 点である。第一に、VMemKV は large value の residency 管理を user-space buffer pool ではなく OS 仮想メモリ機構に委譲する larger-than-memory KVS 設計を提示する。第二に、RAM-resident な T1 index と mmap-backed な T2 value layer の責務分離により、hot metadata は engine が制御し、large value bytes は OS が管理する構成を取る。第三に、VMemKV は LSM-style multi-level compaction ではなく、T1/T2 reorganization、checkpoint reload、WAL replay によって fragmentation repair と recovery を扱う。第四に、VMemKV の単純性を主観的なコード印象ではなく、storage engine が担う実装責務の比較表として整理する。
+本稿の contribution は以下の 4 点である。第一に、VMemKV は large value の read-side residency 管理を user-space buffer pool ではなく OS 仮想メモリ機構に委譲する larger-than-memory KVS 設計を提示する。第二に、RAM-resident な T1 index と mmap-backed な T2 value layer の責務分離により、hot metadata は engine が制御し、clean read-side value pages は OS が管理する構成を取る。第三に、VMemKV は LSM-style multi-level compaction ではなく、T1/T2 reorganization、in-process checkpoint / reload、WAL replay によって fragmentation repair と recovery を扱う。第四に、VMemKV の単純性を主観的なコード印象ではなく、storage engine が担う実装責務の比較表として整理する。
