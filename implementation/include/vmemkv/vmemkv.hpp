@@ -48,22 +48,21 @@ using VMemKVBaselineStore = StoreAdapter<VMemKVImpl<detail::T1_AllOff>>;
 using VMemKVRocksDB = StoreAdapter<::RocksDBStore>;
 
 namespace variants {
-// ─── Base Store Definitions ──────────────────────────────────────────────
+// ─── A. Base Store & RocksDB ───
 using VMemKV_Baseline = VMemKVBaselineStore;
 using VMemKV_RocksDB = VMemKVRocksDB;
-using VMemKV_T2_InlineAll = VMemKVStore;  // Fully optimized production configuration
 
-// ─── A. T1 Index Optimizations (Cumulative Addition Study) ───────────────
-// Measures performance by enabling T1 optimizations incrementally
-// (AppendMap -> BloomFilter -> SimdScan -> MemoryHints).
+// ─── B. Cumulative Optimization Steps (Baseline -> Step 1 -> ... -> Step 5) ───
 using VMemKV_Cumulative_Step1 = StoreAdapter<VMemKVImpl<Config<AppendMap>>>;
 using VMemKV_Cumulative_Step2 = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter>>>;
 using VMemKV_Cumulative_Step3 = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan>>>;
 using VMemKV_Cumulative_Step4 = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan, MemoryHints>>>;
+using VMemKV_Cumulative_Step5 = VMemKVStore;  // Fully optimized production configuration (Step 4 + T1InlineValue)
 
-// ─── B. T1 Index Optimizations (Ablation/Subtractive Study) ──────────────
-// Measures the individual performance contribution of each T1 feature
-// by disabling it from the fully optimized configuration.
+// ─── C. Backward / Test Compatibility Aliases ───
+using VMemKV_T2_InlineAll = VMemKV_Cumulative_Step5;  // Alias for test compatibility
+
+// ─── D. Ablation Variants (Used ONLY for Unit Testing) ───
 using VMemKV_Ablation_No_AppendMap =
     StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue>>>;
 using VMemKV_Ablation_No_BloomFilter =
@@ -73,23 +72,13 @@ using VMemKV_Ablation_No_SimdScan =
 using VMemKV_Ablation_No_MemoryHints =
     StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan, T1InlineValue>>>;
 
-// ─── C. T2 Storage Value Inlining (Ablation/Subtractive Study) ───────────
-// Measures the performance impact of value-inlining policies.
-using VMemKV_T2_NoInline = VMemKV_Cumulative_Step4;  // No inlining (equivalent to Step 4)
-
-// ─── D. Master List of All Unique Configurations ─────────────────────────
-// The unified collection of all unique configuration variants, ensuring no
 // duplicate evaluations during tests or benchmarks.
 using AllPossibleTypes = std::tuple<VMemKV_Baseline,
                                     VMemKV_Cumulative_Step1,
                                     VMemKV_Cumulative_Step2,
                                     VMemKV_Cumulative_Step3,
                                     VMemKV_Cumulative_Step4,
-                                    VMemKV_Ablation_No_AppendMap,
-                                    VMemKV_Ablation_No_BloomFilter,
-                                    VMemKV_Ablation_No_SimdScan,
-                                    VMemKV_Ablation_No_MemoryHints,
-                                    VMemKV_T2_InlineAll,
+                                    VMemKV_Cumulative_Step5,
                                     VMemKV_RocksDB>;
 }  // namespace variants
 

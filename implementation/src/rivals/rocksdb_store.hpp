@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -37,14 +38,19 @@ class RocksDBStore {
 #endif
 
 #ifdef ENABLE_ROCKSDB
-  // Opens a fresh DB at `path`, destroying any existing data there.
-  explicit RocksDBStore(std::string path) : path_(std::move(path)) {
+  // Opens a fresh DB at a unique subpath, preventing transient lock contention (ENOLCK) across thread sweeps.
+  explicit RocksDBStore(std::string path) {
+    static std::atomic<uint64_t> instance_counter{0};
+    path_ = std::move(path) + "_" + std::to_string(instance_counter.fetch_add(1, std::memory_order_relaxed));
+
     rocksdb::DestroyDB(path_, {});
     rocksdb::Options opts;
     opts.create_if_missing = true;
     rocksdb::DB *db_handle = nullptr;
     auto status = rocksdb::DB::Open(opts, path_, &db_handle);
-    assert(status.ok());
+    if (!status.ok()) {
+      throw std::runtime_error("RocksDB Open failed: " + status.ToString());
+    }
     db_.reset(db_handle);
   }
 
