@@ -121,10 +121,10 @@ class T1Index {
   static constexpr size_t APPEND_CAP = Config::T1AppendCapacityEntries;
 
   T1Index() : sorted_region_(std::make_shared<SortedRegion>()) {
-    if constexpr (Config::UseAppendMap) {
-      append_index_.clear();
+    append_index_.clear();
+    if constexpr (Config::UseMemoryHints) {
+      t1_detail::apply_region_hints(append_region_.data(), append_region_.capacity_bytes());
     }
-    apply_memory_hints_to_append();
   }
 
   T1Index(const T1Index &) = delete;
@@ -152,7 +152,7 @@ class T1Index {
       const auto sorted = sorted_region_.load(std::memory_order_acquire);
 
       // 1. check append region
-      if (const AppendSlot *slot = find_append(prefix, hash)) {
+      if (const AppendSlot *slot = append_region_.find_with_index(append_index_, prefix, hash)) {
         return LookupResult{slot->payload_bits.load(std::memory_order_acquire), slot->hash};
       }
 
@@ -230,7 +230,7 @@ class T1Index {
       size_t match_count = 0;
       for (const auto &entry : merged) {
         if (!(entry.key < lower_bound) && !(upper_bound < entry.key)) {
-          callback(prefix_to_span(entry.key), entry.payload_bits, entry.hash);
+          callback(std::span<const std::byte>(entry.key), entry.payload_bits, entry.hash);
           ++match_count;
         }
       }
@@ -281,7 +281,9 @@ class T1Index {
     }
 
     std::shared_ptr<const SortedRegion> next_sorted = std::make_shared<SortedRegion>(merged);
-    apply_memory_hints_to_sorted(*next_sorted);
+    if constexpr (Config::UseMemoryHints) {
+      t1_detail::apply_region_hints(next_sorted->slots.get(), next_sorted->size * sizeof(SortedSlot));
+    }
 
     sorted_region_.store(std::move(next_sorted), std::memory_order_release);
     reset_append_after_reorganize(current_append_n);
@@ -412,17 +414,16 @@ class T1Index {
       tail_.store(0, std::memory_order_release);
     }
 
-    template <typename Index>
-    auto find_with_index(const Index &index, Key key, uint64_t hash) noexcept -> AppendSlot * {
+    auto find_with_index(const AppendIndex &index, Key key, uint64_t hash) noexcept -> AppendSlot * {
       return const_cast<AppendSlot *>(static_cast<const AppendRegion *>(this)->find_with_index(index, key, hash));
     }
 
-    template <typename Index>
-    [[nodiscard]] [[nodiscard]] [[nodiscard]] [[nodiscard]] [[nodiscard]] [[nodiscard]] [[nodiscard]] [[nodiscard]] auto
-    find_with_index(const Index &index, Key key, uint64_t hash) const noexcept -> const AppendSlot * {
+    [[nodiscard]] auto find_with_index(const AppendIndex &index,
+                                       Key key,
+                                       uint64_t hash) const noexcept -> const AppendSlot * {
       const auto slot_plus_one =
           index.find_slot_index(key, hash, [&](size_t slot_index) -> const AppendSlot & { return slots_[slot_index]; });
-      if (slot_plus_one == Index::kNotFound) {
+      if (slot_plus_one == AppendIndex::kNotFound) {
         return nullptr;
       }
       const AppendSlot &slot = slots_[static_cast<size_t>(slot_plus_one - 1)];
@@ -430,24 +431,6 @@ class T1Index {
         return nullptr;
       }
       return (slot.key == key && slot.clean_hash() == hash) ? &slot : nullptr;
-    }
-
-    auto find_linear(Key key, uint64_t hash) noexcept -> AppendSlot * {
-      return const_cast<AppendSlot *>(static_cast<const AppendRegion *>(this)->find_linear(key, hash));
-    }
-
-    [[nodiscard]] auto find_linear(Key key, uint64_t hash) const noexcept -> const AppendSlot * {
-      const size_t slot_count = size();
-      for (size_t slot_index = slot_count; slot_index > 0; --slot_index) {
-        const AppendSlot &slot = slots_[slot_index - 1];
-        if (!slot.published.load(std::memory_order_acquire)) {
-          continue;
-        }
-        if (slot.clean_hash() == hash && slot.key == key) {
-          return &slot;
-        }
-      }
-      return nullptr;
     }
 
     template <bool UseSimdScan, typename Callback>
@@ -479,27 +462,10 @@ class T1Index {
   // Helper to generate prefix and hash representation of a key span.
   auto prepare_key_and_hash(std::span<const std::byte> key) const noexcept -> std::pair<StoreKey, uint64_t> {
     const StoreKey prefix = t1_detail::prefix_from_bytes(key);
-    return {prefix, key_hash(key, prefix)};
+    return {prefix, t1_detail::hash_full_key(key)};
   }
 
   static auto is_live(Payload value) noexcept -> bool { return value != STORE_NOT_FOUND; }
-
-  static auto key_hash(std::span<const std::byte> key, const StoreKey &prefix) noexcept -> uint64_t {
-    (void)prefix;
-    return t1_detail::hash_full_key(key);
-  }
-
-  static auto prefix_to_span(const Key &key) noexcept -> std::span<const std::byte> {
-    return {key.data(), t1_detail::kPrefixBytes};
-  }
-
-  auto find_append(Key key, uint64_t hash) const noexcept -> const AppendSlot * {
-    if constexpr (Config::UseAppendMap) {
-      return append_region_.find_with_index(append_index_, key, hash);
-    } else {
-      return append_region_.find_linear(key, hash);
-    }
-  }
 
   auto find_sorted(const SortedRegion &sorted, Key key, uint64_t hash) const noexcept -> const SortedSlot * {
     if constexpr (Config::UseBloomFilter) {
@@ -528,14 +494,8 @@ class T1Index {
   }
 
   auto resolve(Key key, uint64_t hash) noexcept -> ResolvedSlot {
-    if constexpr (Config::UseAppendMap) {
-      if (AppendSlot *slot = append_region_.find_with_index(append_index_, key, hash)) {
-        return ResolvedSlot{slot, nullptr};
-      }
-    } else {
-      if (AppendSlot *slot = append_region_.find_linear(key, hash)) {
-        return ResolvedSlot{slot, nullptr};
-      }
+    if (AppendSlot *slot = append_region_.find_with_index(append_index_, key, hash)) {
+      return ResolvedSlot{slot, nullptr};
     }
 
     const auto sorted = sorted_region_.load(std::memory_order_acquire);
@@ -573,18 +533,14 @@ class T1Index {
   }
 
   void publish_append_index(size_t index, Key key, uint64_t hash) noexcept {
-    if constexpr (Config::UseAppendMap) {
-      const auto slot_plus_one = static_cast<typename AppendIndex::slot_index_type>(index + 1);
-      append_index_.publish_slot(key, slot_plus_one, hash, [&](size_t slot_index) -> const AppendSlot & {
-        return append_region_.data()[slot_index];
-      });
-    }
+    const auto slot_plus_one = static_cast<typename AppendIndex::slot_index_type>(index + 1);
+    append_index_.publish_slot(key, slot_plus_one, hash, [&](size_t slot_index) -> const AppendSlot & {
+      return append_region_.data()[slot_index];
+    });
   }
 
   void reset_append_after_reorganize(size_t count) {
-    if constexpr (Config::UseAppendMap) {
-      append_index_.clear();
-    }
+    append_index_.clear();
     append_region_.clear(count);
   }
 
@@ -628,19 +584,6 @@ class T1Index {
     }
   }
 
-  // ─── Helper Methods: Memory Tuning ─────────────────────────────────────
-  void apply_memory_hints_to_append() {
-    if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(append_region_.data(), append_region_.capacity_bytes());
-    }
-  }
-
-  void apply_memory_hints_to_sorted(const SortedRegion &sorted) {
-    if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(sorted.slots.get(), sorted.size * sizeof(SortedSlot));
-    }
-  }
-
   void maybe_set_sequential_hints(size_t append_n) {
     if constexpr (Config::UseMemoryHints) {
       auto sorted = sorted_region_.load(std::memory_order_acquire);
@@ -659,7 +602,7 @@ class T1Index {
 
   std::atomic<std::shared_ptr<const SortedRegion>> sorted_region_;
   AppendRegion append_region_;
-  [[no_unique_address]] std::conditional_t<Config::UseAppendMap, AppendIndex, EmptyOption> append_index_{};
+  AppendIndex append_index_{};
 };
 
 }  // namespace vmemkv

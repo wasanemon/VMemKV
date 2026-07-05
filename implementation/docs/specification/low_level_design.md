@@ -131,7 +131,7 @@ struct VMemKV {
 **Procedure**
 
 1. `key_prefix = prefix(full_key)` と `hash = hash(full_key)` を計算する。
-2. `t1.append_region` を線形走査し、`key_prefix` が一致する候補を探す。
+2. `t1.append_region` に紐づくハッシュインデックス（`append_index`）を検索し、`key_prefix` および `hash` が一致する候補を探す。
 3. append 側で見つからなければ、`t1.sorted_region` を `key_prefix` で二分探索し、候補 range を得る。
 4. 候補 `IndexEntry` について `hash` を照合する。
 5. `payload_bits == TOMBSTONE_OFFSET` なら not found。
@@ -140,8 +140,7 @@ struct VMemKV {
 
 **Complexity**
 
-- base design: `O(|t1.append_region|) + O(log |t1.sorted_region|)`
-- opt-in で `append_region` 用 hashmap を有効化した場合: `O(1) + O(log |t1.sorted_region|)` expected
+- `O(1) + O(log |t1.sorted_region|)` expected
 
 ### 3.2 Insert
 
@@ -189,7 +188,7 @@ struct VMemKV {
 
 **Procedure**
 
-1. Tier 1 `append_region` を線形走査し、範囲内の `IndexEntry` を候補に集める。
+1. Tier 1 `append_region` の全体を走査し、範囲内の `IndexEntry` を候補に集める。
 2. Tier 1 `sorted_region` を `key_prefix` で二分探索し、範囲内候補を列挙する。
 3. 候補ごとに `payload_bits != TOMBSTONE_OFFSET` を確認する。
 4. `payload_bits` から Tier 2 record を取得する。
@@ -233,6 +232,7 @@ T1 `reorganize` は T2 と独立に実行できる。
 4. 必要なら重複 key を解消する。
 5. 新しい `sorted_region` を構築する。
 6. `append_region` を空にする。
+7. `append_region` に紐づくハッシュインデックス（`append_index`）を完全にクリア（空に初期化）する。
 
 **Effect**
 
@@ -307,6 +307,11 @@ T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時�
 12. 新世代へ切り替える。
 13. stop-the-world を解除する。
 14. 不要になった WAL と旧 checkpoint を削除する。
+
+**Hash Index Lifecycle in Checkpoint**
+
+- `reorganize` 直後は `append_region` が空 (size = 0) となるため、T1 checkpoint file には `sorted_region` のデータのみがシーケンシャルに書き出され、`append_index` の状態自体はファイルへシリアライズ（永続化）しない。
+- `reload` 時、親プロセス側で新しくマッピングされた T1 インスタンスは、`append_index` を空に初期化した状態で起動し、その後の WAL リプレイおよび新規クライアント書き込み時に適宜ハッシュインデックスへの登録・更新を行う。
 
 ### 5.3 Correctness Rule
 
@@ -422,48 +427,39 @@ low-level design が要求するのは同期機構の名前ではなく、6.2 �
 
 ### 7.3 SIMD Tier 1 Scan
 
-`IndexEntry` は fixed-size かつ連続配置なので、Tier 1 の append scan や range scan は SIMD 最適化しやすい。
+`IndexEntry` は fixed-size かつ連続配置なので、Tier 1 の append scan や range scan は SIMD 最最適化しやすい。
 
-### 7.4 Tier 1 Append Lookup Index
-
-`append_region` 線形走査を高速化する補助 hash index を追加できる。
-
-- key: `hash(full_key)`
-- value: `append_region` index
-
-有効化時、Get / Update の append 探索を expected `O(1)` に短縮できる。
-
-### 7.5 Index-Level Covering
+### 7.4 Index-Level Covering
 
 index 単位で `payload_mode == Inline64` を選び、Tier 1 payload を 64-bit value として解釈する。
 
 - small fixed-size value workload では Tier 2 アクセスを完全に省略できる
 - WAL / checkpoint では index の payload mode をメタデータとして永続化する
 
-### 7.6 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
+### 7.5 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
 
 エントリーごとに T2 オフセットとインライン 64-bit 値を動的に切り替える最適化である。値が 8バイト（64ビット）以下のときに Tier 2 への書き出しをバイパスして Tier 1 インデックスの payload 領域内に直接バリューをインライン格納する。
 
 本最適化は `vmemkv::Config` のテンプレート引数タグ（`T1InlineValue`）を介して制御される。
 
-#### 7.6.1 メタデータとハッシュのエンコーディング
+#### 7.5.1 メタデータとハッシュのエンコーディング
 T1のインデックススロットに十分な空きビット領域がないため、64ビットのハッシュフィールド（`hash`）の最上位4ビットをメタデータ領域として再利用し、フラグとサイズ情報を格納する。
 
 - **Bit 63 (`is_inline`)**: `1` の場合はインラインデータ、`0` の場合は T2オフセットを表す。
 - **Bits 62-60 (`inline_size`)**: インラインデータのバイトサイズ（1〜8バイト）を表す。サイズ `8` は `0` としてエンコードされる。
 - **Bits 59-0 (`clean_hash`)**: 実際の60ビットFnvハッシュキー。インデックスの検索、Bloom filterの登録・判定、SIMDスキャン等のハッシュ比較時には、上位4ビットをマスクしてこの60ビット部分のみを比較する。
 
-#### 7.6.2 インライン化の動作
+#### 7.5.2 インライン化の動作
 - **T2 オフセットとの識別 (判定)**:
   - 読み出し時、T1から取得したスロットハッシュの最上位ビット（Bit 63）を確認するだけで、T2をフェッチせずにインラインかオフセットかを100%確実に識別できる。
 - **値が 1〜8 バイトの場合**:
   - `payload_bits` に対するビットシフトやビットの埋め込みは行わず、64ビットのビットパターンをそのまま無加工で格納し、デコード時は `inline_size` に従いバイトコピーを行う。これにより、`double`、`time`、連番のサロゲートキー（偶数・奇数を問わず）など、あらゆる64ビット以内のデータ型を完全にインライン化できる。
 
-### 7.7 Sorted Bloom Filter
+### 7.6 Sorted Bloom Filter
 
 `sorted_region` 全体に Bloom filter を付与し、negative lookup を高速化できる。
 
-### 7.8 Tier 2 Prefetch
+### 7.7 Tier 2 Prefetch
 
 Scan 時に Tier 1 から得た offset 群に対して `madvise(MADV_WILLNEED)` を出し、Tier 2 を先読みする。
 

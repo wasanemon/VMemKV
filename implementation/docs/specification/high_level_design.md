@@ -32,7 +32,7 @@ VMemKV の狙いは、buffer pool・ページ置換アルゴリズム・複雑�
 VMemKV の中核となる概念は、`sorted_region` と `append_region` の 2 領域を持ち、定期的な `reorganize` によって `append_region` を `sorted_region` に吸収する `Reorganizing Two-Region` 構造である。
 
 - `sorted_region`: ソート済み領域。検索が O(log N)．
-- `append_region`: unorderedでinsertを受ける領域．検索は O(N) だが書き込みが O(1)．
+- `append_region`: 未整列で insert を受ける領域。ハッシュインデックスを併用するため、検索は O(1) expected、書き込みも O(1)．
 
 ![snaplog](../images/two_region.png)
 
@@ -86,8 +86,7 @@ Tier 1 と Tier 2 の責務分離と、`offset` で両者を接続するレイ�
 
 1. Tier 1 の `sorted_region` / `append_region` を検索し、候補 `IndexEntry` を得る．
 
-- 計算量は `append_region` でヒットした場合は O(N), `sorted_region` からヒットした場合は追加で O(log N)．ミスした場合は O(N) + O(log N)．
-- ただし，`append_region` を map にすることでO(N)を O(1)にできる．これは最適化であるためlow level designに記す．
+- 計算量は `append_region` でヒットした場合は O(1), `sorted_region` からヒットした場合は追加で O(log N)．ミスした場合は O(1) + O(log N)．
 
 2. hash を照合する
 
@@ -200,7 +199,6 @@ TODO: ジャイアントロックでfork後に追加されたエントリの同�
 - Tier 1 `mlock` / `MADV_HUGEPAGE` / 一時的 `MADV_SEQUENTIAL`
 - Group Commit / Early Lock Release / Flush Pipelining
 - SIMD による Tier 1 scan 高速化
-- T1 の `append_region` の hashmap化による Get の O(1) 化
 - index-level covering
 - entry-level adaptive covering
 - `sorted_region` ネガティブルックアップ用 Bloom filter による miss時の O(1)化

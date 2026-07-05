@@ -103,9 +103,9 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 #define VMemKVStores                                                                                   \
   vmemkv::variants::VMemKV_Baseline, vmemkv::variants::VMemKV_Cumulative_Step1,                        \
       vmemkv::variants::VMemKV_Cumulative_Step2, vmemkv::variants::VMemKV_Cumulative_Step3,            \
-      vmemkv::variants::VMemKV_Cumulative_Step4, vmemkv::variants::VMemKV_Ablation_No_AppendMap,       \
-      vmemkv::variants::VMemKV_Ablation_No_BloomFilter, vmemkv::variants::VMemKV_Ablation_No_SimdScan, \
-      vmemkv::variants::VMemKV_Ablation_No_MemoryHints, vmemkv::variants::VMemKV_T2_InlineAll
+      vmemkv::variants::VMemKV_Cumulative_Step4, vmemkv::variants::VMemKV_Ablation_No_BloomFilter,     \
+      vmemkv::variants::VMemKV_Ablation_No_SimdScan, vmemkv::variants::VMemKV_Ablation_No_MemoryHints, \
+      vmemkv::variants::VMemKV_T2_InlineAll
 
 // 競合バックエンドのバリエーション（RocksDBStoreなど）
 #ifdef ENABLE_ROCKSDB
@@ -374,9 +374,9 @@ TEST_CASE_TEMPLATE("long keys sharing a 16-byte prefix: CRUD", Store, LONG_KEY_S
 
 // Offset64 must disambiguate matching prefixes by hash(full_key).
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("Offset64 + append-map disambiguates long keys sharing a prefix") {
-  using OffsetAppendMapIndex = vmemkv::T1Index<vmemkv::Config<vmemkv::AppendMap>>;
-  // Heap-allocate: UseAppendMap embeds a large bucket array unsuited to the stack.
+TEST_CASE("Offset64 + hash-index disambiguates long keys sharing a prefix") {
+  using OffsetAppendMapIndex = vmemkv::T1Index<vmemkv::Config<>>;
+  // Heap-allocate: Hash index embeds a large bucket array unsuited to the stack.
   auto idx = std::make_unique<OffsetAppendMapIndex>();
 
   auto to_span = [](const std::string &key_string) {

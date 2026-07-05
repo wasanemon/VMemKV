@@ -53,7 +53,6 @@
 namespace vmemkv {
 
 // ─── Optimization Tags ───────────────────────────────────────────────────────
-struct AppendMap {};
 struct BloomFilter {};
 struct SimdScan {};
 struct MemoryHints {};
@@ -65,7 +64,6 @@ struct Config {
   template <typename Opt>
   static constexpr bool has_opt = (std::is_same_v<Opt, Opts> || ...);
 
-  static constexpr bool UseAppendMap = has_opt<AppendMap>;
   static constexpr bool UseBloomFilter = has_opt<BloomFilter>;
   static constexpr bool UseSimdScan = has_opt<SimdScan>;
   static constexpr bool UseMemoryHints = has_opt<MemoryHints>;
@@ -95,8 +93,8 @@ struct Config {
 
 namespace detail {
 using T1_AllOff = Config<>;
-using T1_AllOn = Config<AppendMap, BloomFilter, SimdScan, MemoryHints>;
-using System_AllOn = Config<AppendMap, BloomFilter, SimdScan, MemoryHints, T1InlineValue>;
+using T1_AllOn = Config<BloomFilter, SimdScan, MemoryHints>;
+using System_AllOn = Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue>;
 }  // namespace detail
 
 }  // namespace vmemkv

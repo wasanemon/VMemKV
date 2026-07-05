@@ -52,25 +52,19 @@ namespace variants {
 using VMemKV_Baseline = VMemKVBaselineStore;
 using VMemKV_RocksDB = VMemKVRocksDB;
 
-// ─── B. Cumulative Optimization Steps (Baseline -> Step 1 -> ... -> Step 5) ───
-using VMemKV_Cumulative_Step1 = StoreAdapter<VMemKVImpl<Config<AppendMap>>>;
-using VMemKV_Cumulative_Step2 = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter>>>;
-using VMemKV_Cumulative_Step3 = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan>>>;
-using VMemKV_Cumulative_Step4 = StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan, MemoryHints>>>;
-using VMemKV_Cumulative_Step5 = VMemKVStore;  // Fully optimized production configuration (Step 4 + T1InlineValue)
+// ─── B. Cumulative Optimization Steps (Baseline -> Step 1 -> ... -> Step 4) ───
+using VMemKV_Cumulative_Step1 = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
+using VMemKV_Cumulative_Step2 = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan>>>;
+using VMemKV_Cumulative_Step3 = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, MemoryHints>>>;
+using VMemKV_Cumulative_Step4 = VMemKVStore;  // Fully optimized production configuration (Step 3 + T1InlineValue)
 
 // ─── C. Backward / Test Compatibility Aliases ───
-using VMemKV_T2_InlineAll = VMemKV_Cumulative_Step5;  // Alias for test compatibility
+using VMemKV_T2_InlineAll = VMemKV_Cumulative_Step4;  // Alias for test compatibility
 
 // ─── D. Ablation Variants (Used ONLY for Unit Testing) ───
-using VMemKV_Ablation_No_AppendMap =
-    StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue>>>;
-using VMemKV_Ablation_No_BloomFilter =
-    StoreAdapter<VMemKVImpl<Config<AppendMap, SimdScan, MemoryHints, T1InlineValue>>>;
-using VMemKV_Ablation_No_SimdScan =
-    StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, MemoryHints, T1InlineValue>>>;
-using VMemKV_Ablation_No_MemoryHints =
-    StoreAdapter<VMemKVImpl<Config<AppendMap, BloomFilter, SimdScan, T1InlineValue>>>;
+using VMemKV_Ablation_No_BloomFilter = StoreAdapter<VMemKVImpl<Config<SimdScan, MemoryHints, T1InlineValue>>>;
+using VMemKV_Ablation_No_SimdScan = StoreAdapter<VMemKVImpl<Config<BloomFilter, MemoryHints, T1InlineValue>>>;
+using VMemKV_Ablation_No_MemoryHints = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, T1InlineValue>>>;
 
 // duplicate evaluations during tests or benchmarks.
 using AllPossibleTypes = std::tuple<VMemKV_Baseline,
@@ -78,7 +72,6 @@ using AllPossibleTypes = std::tuple<VMemKV_Baseline,
                                     VMemKV_Cumulative_Step2,
                                     VMemKV_Cumulative_Step3,
                                     VMemKV_Cumulative_Step4,
-                                    VMemKV_Cumulative_Step5,
                                     VMemKV_RocksDB>;
 }  // namespace variants
 

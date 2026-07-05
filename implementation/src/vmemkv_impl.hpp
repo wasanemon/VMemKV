@@ -84,9 +84,6 @@ class VMemKVImpl {
 
   static auto name() -> std::string {
     std::vector<std::string> parts;
-    if constexpr (ConfigT::UseAppendMap) {
-      parts.emplace_back("AppendMap");
-    }
     if constexpr (ConfigT::UseBloomFilter) {
       parts.emplace_back("Bloom");
     }

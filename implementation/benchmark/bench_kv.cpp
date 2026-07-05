@@ -143,7 +143,6 @@ using BenchmarkTypes = std::tuple<vmemkv::variants::VMemKV_Baseline,
                                   vmemkv::variants::VMemKV_Cumulative_Step2,
                                   vmemkv::variants::VMemKV_Cumulative_Step3,
                                   vmemkv::variants::VMemKV_Cumulative_Step4,
-                                  vmemkv::variants::VMemKV_Cumulative_Step5,
                                   vmemkv::variants::VMemKV_RocksDB>;
 
 template <typename Visitor>
