@@ -1,14 +1,8 @@
 # VMemKV Evaluation Plan
 
-
-
 あんまり具体的な内容は俺独断で決めない方が良さそう、中園さんと相談して決めた方が良さそう
 
 あと実装方針とか実装も考慮しないといけん
-
-
-
-
 
 このファイルは `evaluation_plan.md` と `additional_experiments.md` を統合した簡潔版である。
 粒度は `additional_experiments.md` に合わせ、査読者が疑いそうな点を切り分ける評価計画としてまとめる。
@@ -43,31 +37,25 @@ VMemKV が全 workload で最速である必要はない。
 
 ---
 
-
-
 ## Core Experiments
 
 
-| Experiment                       | Priority | Role                                            |
-| -------------------------------- | -------- | ----------------------------------------------- |
-| E0. Setup and fairness           | Must     | memory budget、durability、I/O policy を揃える        |
-| E1. Regime protocol              | Must     | dirty/private T2 と clean file-backed T2 を分ける    |
-| E2. LTM behavior and scalability | Must     | OS page cache / page fault / thread scaling を測る |
-| E3. YCSB RocksDB / BlobDB        | Must     | 標準 macrobenchmark と large-value baseline        |
-| E4. mmap / pread / fio           | Must     | mmap、T1/T2 layout、device limit を切り分ける           |
-| E5. T1/T2 breakdown              | Must     | 各 optimization の効果を分ける                          |
-| E6. Reorganization / checkpoint  | Must     | fragmentation repair と foreground cost を測る      |
-| E7. Recovery                     | Must     | checkpoint + WAL replay の成立を示す                  |
-| E8. Responsibility table         | Must     | 実装責務の少なさを比較する                                   |
+| Experiment                       | Summary                                                                       | Role                                            |
+| -------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------- |
+| E0. Setup and fairness           | hardware、build、memory budget、durability、I/O policy など比較条件を統一して記録する            | memory budget、durability、I/O policy を揃える        |
+| E1. Regime protocol              | Load/write、Clean read、Mixed を分け、T2 が dirty/private か clean file-backed かを明示する | dirty/private T2 と clean file-backed T2 を分ける    |
+| E2. LTM behavior and scalability | residency、value size、access distribution、thread count を振って LTM 時の挙動を見る        | OS page cache / page fault / thread scaling を測る |
+| E3. YCSB RocksDB / BlobDB        | YCSB A/B/C/E/F で VMemKV、RocksDB、BlobDB を同一条件で比較する                             | 標準 macrobenchmark と large-value baseline        |
+| E4. mmap / pread / fio           | mmap-only、pread twin、fio を使い、raw access、mmap 差分、device limit を切り分ける           | mmap、T1/T2 layout、device limit を切り分ける           |
+| E5. T1/T2 breakdown              | AppendMap、BloomFilter、SimdScan などを workload ごとに ablation する (今後の実装方針に合わせる)    | 各 optimization の効果を分ける                          |
+| E6. Reorganization / checkpoint  | delete/update/scan workload で回収効果、foreground latency、memory spike を測る         | fragmentation repair と foreground cost を測る      |
+| E7. Recovery                     | WAL size、checkpoint age、crash point を変えて復旧時間と整合性を検証する                         | checkpoint + WAL replay の成立を示す                  |
+| E8. Responsibility table         | VMemKV と代表 engine の buffer pool、compaction、GC、recovery 責務を表で比較する              | 実装責務の少なさを比較する                                   |
 
 
 ---
 
-
-
 ## E0. Setup and Fairness
-
-
 
 ### Question
 
@@ -85,8 +73,6 @@ VMemKV と baselines を、公平な memory budget、durability scope、I/O poli
 - RocksDB: block cache size, compression, WAL/sync policy, direct/buffered I/O
 - BlobDB: blob settings when enabled
 
-
-
 ### Notes
 
 VMemKV の T2 は read-side では OS page cache を使うが、`MAP_PRIVATE` の dirty pages は private COW pages になる。
@@ -96,8 +82,6 @@ RocksDB の compression は基本 off とする。
 有効にする場合は別条件として扱う。
 
 ---
-
-
 
 ## E1. **T2 State Evaluation Protocol**
 
@@ -130,8 +114,6 @@ drop page cache
 measure read workload
 ```
 
-
-
 ### Metrics
 
 - throughput, p50/p95/p99/p99.9 latency
@@ -141,11 +123,7 @@ measure read workload
 
 ---
 
-
-
 ## E2. Larger-than-Memory Behavior and Scalability
-
-
 
 ### Question
 
@@ -165,8 +143,6 @@ DRAM-resident run は T1/T2 実装コストを見るため、larger-than-memory 
 - access distribution: uniform, Zipf alpha 1.2
 - thread count: 1, 4, 8, physical cores, logical cores
 
-
-
 ### Metrics
 
 - throughput and tail latency
@@ -180,11 +156,7 @@ DRAM-resident run は T1/T2 実装コストを見るため、larger-than-memory 
 
 ---
 
-
-
 ## E3. YCSB RocksDB / BlobDB Comparison ←これ大事〜
-
-
 
 ### Question
 
@@ -218,8 +190,6 @@ Workload D は read-latest / insert-heavy の補助 workload として appendix 
 - VMemKV と RocksDB の memory budget を揃える
 - durability scope を揃えた条件を最低 1 本作る
 
-
-
 ### BlobDB Notes
 
 VMemKV は large values を T2 に分離するため、16 KiB value で vanilla RocksDB だけと比較すると不公平になりやすい。
@@ -240,11 +210,7 @@ T2 `MAP_PRIVATE` への append / overwrite は、必要なら private dirty byte
 
 ---
 
-
-
 ## E4. mmap / pread / fio Baselines
-
-
 
 ### Question
 
@@ -280,8 +246,6 @@ VMemKV の性能差は mmap によるものか、T1/T2 layout によるものか
 - queue depth sweep
 - thread / job count sweep
 
-
-
 ### Interpretation
 
 
@@ -291,8 +255,6 @@ VMemKV の性能差は mmap によるものか、T1/T2 layout によるものか
 | fio は速いが mmap-only microbaseline が遅い              | mmap fault path / kernel bottleneck                                     |
 | fio と VMemKV pread twin は速いが VMemKV mmap twin が遅い | mmap-specific bottleneck                                                |
 | mmap-only microbaseline は速いが full VMemKV が遅い      | T1/T2 organization, reorganization, checkpoint, WAL recovery の overhead |
-
-
 
 
 ### Metrics
@@ -305,13 +267,9 @@ VMemKV の性能差は mmap によるものか、T1/T2 layout によるものか
 
 ---
 
-
-
 ## E5. T1/T2 Design Breakdown
 
 これ検討余地あり、オプションのオンオフはそんな難しくないはずなので色々やってみる
-
-
 
 ### Question
 
@@ -321,8 +279,6 @@ T1/T2 分離と各 optimization は、どの workload で効いているか。
 
 すべての組み合わせは網羅しない。
 各 optimization が効く workload だけを示す。
-
-
 
 
 | Variant     | Main workload                       |
@@ -336,8 +292,6 @@ T1/T2 分離と各 optimization は、どの workload で効いているか。
 | Inline64    | small fixed-size value workload     |
 
 
-
-
 ### Metrics
 
 - throughput and latency
@@ -347,11 +301,7 @@ T1/T2 分離と各 optimization は、どの workload で効いているか。
 
 ---
 
-
-
 ## E6. Reorganization and Checkpoint Behavior
-
-
 
 ### Question
 
@@ -367,8 +317,6 @@ workload:
 - scan before / during / after reorganization
 - unreachable T2 record ratio: 0%, 25%, 50%, 75%
 - long run where VMemKV checkpoint reload and RocksDB compaction each occur at least once
-
-
 
 ### Metrics
 
@@ -387,14 +335,10 @@ Checkpoint cost と recovery time の trade-off は E7 と合わせて解釈す�
 
 ---
 
-
-
 ## E7. Recovery and Crash-Consistency
 
-
-
 WiscKey参考？ALICE←古いらしい  
-  
+
 主: RocksDB-style の独自 crash/recovery harness
 
 補助: dm-log-writes または CrashMonkey
@@ -402,8 +346,6 @@ WiscKey参考？ALICE←古いらしい
 発展: mmap/MMIO 経路を強く主張するなら Pathfinder
 
 比較文脈: WiscKey は ALICE を使っていた、と説明
-
-
 
 ### Question
 
@@ -441,11 +383,7 @@ crash point:
 
 ---
 
-
-
 ## E8. Implementation Responsibility Table
-
-
 
 ### Question
 
@@ -482,8 +420,6 @@ benchmark section として大きく扱わない。
 
 ---
 
-
-
 ## Appendix / Optional
 
 
@@ -502,8 +438,6 @@ benchmark section として大きく扱わない。
 
 ---
 
-
-
 ## Paper Outputs
 
 
@@ -521,8 +455,6 @@ benchmark section として大きく扱わない。
 
 
 ---
-
-
 
 ## Negative Results
 
@@ -551,8 +483,6 @@ In-place update の効果が限定的な場合:
 in-place update は補助的な強みであり、中心は OS-managed larger-than-memory と T1/T2 separation である。
 
 ---
-
-
 
 ## Bottom Line
 
