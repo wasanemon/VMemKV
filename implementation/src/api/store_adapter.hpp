@@ -8,6 +8,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <vmemkv/config.hpp>
 
 #include "serializer.hpp"
 
@@ -17,10 +18,23 @@ namespace vmemkv {
 
 inline constexpr std::size_t kInlineScalarValueBytes = 8;
 
+namespace detail {
+template <typename T, typename = void>
+struct get_config_type {
+  using type = vmemkv::Config<>;
+};
+
+template <typename T>
+struct get_config_type<T, std::void_t<typename T::ConfigType>> {
+  using type = typename T::ConfigType;
+};
+}  // namespace detail
+
 template <typename KVSImpl>
 class StoreAdapter {
  public:
   static constexpr bool kIsEnabled = KVSImpl::kIsEnabled;
+  using ConfigType = typename detail::get_config_type<KVSImpl>::type;
 
   static auto name() -> std::string {
     if constexpr (std::is_same_v<KVSImpl, ::RocksDBStore>) {
@@ -111,6 +125,14 @@ class StoreAdapter {
 
   // Delegates to low-level methods if they are exposed
   void reorganize() { impl_.reorganize(); }
+
+  auto get_statistics() const noexcept -> ::vmemkv::VMemKVStatistics {
+    if constexpr (std::is_same_v<KVSImpl, ::RocksDBStore>) {
+      return ::vmemkv::VMemKVStatistics{};
+    } else {
+      return impl_.get_statistics();
+    }
+  }
 
   // Direct access helper for underlying flat file
   auto t2() -> auto & { return impl_.t2(); }

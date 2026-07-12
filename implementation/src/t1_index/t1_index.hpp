@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <execution>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -17,6 +18,7 @@
 
 #include "../api/utils.hpp"
 #include "../core/lock_free_hash_table.hpp"
+#include "../core/reference_tracker.hpp"
 #include "../optimizations/bloom_filter.hpp"
 #include "../optimizations/memory_hints.hpp"
 #include "../optimizations/simd_scan.hpp"
@@ -90,7 +92,7 @@ static constexpr uint64_t STORE_NOT_FOUND = ~0ULL;
 //                    (Cold / Read-Only Region)
 //
 //               +-----------------------------+
-//               |       append_region_        |
+//               |   append_active_ (raw ptr)  |
 //               +--------------+--------------+
 //                              |
 //                              v
@@ -100,11 +102,16 @@ static constexpr uint64_t STORE_NOT_FOUND = ~0ULL;
 //                    O(1) Lock-free Hash Table
 //                    (Hot / Active Write Region)
 //
-// ─── Read Concurrency Protocol (OCC/SeqLock) ──────────────────────────────────
-// 1. Load start_seq = reorg_seq_ (acquire).
-// 2. Search append_region_. If found, validate seq and return payload.
-// 3. Search sorted_region_. If found, validate seq and return payload.
-// 4. If seq changed during search, retry loop (concurrent reorganize in progress).
+//               +-----------------------------+
+//               | append_immutable_ (raw ptr) | -- (Only during reorganize)
+//               +-----------------------------+
+//
+// ─── Read Concurrency Protocol (EBR & Double-Buffering) ──────────────────────
+// 1. Enter epoch: register current reorg_epoch_ in thread-local slot (T1ReadHandle).
+// 2. Search append_active_. If found, return payload.
+// 3. Search append_immutable_ (if exists/not null). If found, return payload.
+// 4. Search sorted_region_. If found, return payload.
+// 5. Exit epoch: clear thread-local slot registration upon handle destruction.
 //
 template <typename Config = vmemkv::Config<>>
 class T1Index {
@@ -120,11 +127,27 @@ class T1Index {
   // - Reorganize latency grows roughly with this capacity and should be tuned via ablation.
   static constexpr size_t APPEND_CAP = Config::T1AppendCapacityEntries;
 
-  T1Index() : sorted_region_(std::make_shared<SortedRegion>()) {
-    append_index_.clear();
+  // RAII handle for Epoch-based Reclamation (EBR) of AppendRegion to prevent atomic shared_ptr load overhead.
+  using T1ReadHandle = typename ThreadReferenceTracker<uint64_t>::Guard;
+
+  T1Index() {
+    auto *active = new AppendRegion();
+    auto *active_index = new AppendIndex();
+    active_index->clear();
     if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(append_region_.data(), append_region_.capacity_bytes());
+      t1_detail::apply_region_hints(active->data(), active->capacity_bytes());
     }
+    append_active_.store(active, std::memory_order_release);
+    append_active_index_.store(active_index, std::memory_order_release);
+    sorted_region_.store(new SortedRegion(), std::memory_order_release);
+  }
+
+  ~T1Index() noexcept {
+    delete append_active_.load(std::memory_order_relaxed);
+    delete append_active_index_.load(std::memory_order_relaxed);
+    delete append_immutable_.load(std::memory_order_relaxed);
+    delete append_immutable_index_.load(std::memory_order_relaxed);
+    delete sorted_region_.load(std::memory_order_relaxed);
   }
 
   T1Index(const T1Index &) = delete;
@@ -148,21 +171,30 @@ class T1Index {
   auto get_with_hash(std::span<const std::byte> key) const -> LookupResult {
     const auto [prefix, hash] = prepare_key_and_hash(key);
 
-    return read_optimistic([&]() -> LookupResult {
-      const auto sorted = sorted_region_.load(std::memory_order_acquire);
+    T1ReadHandle handle(active_epochs_, reorg_epoch_.load(std::memory_order_relaxed));
+    const auto sorted = sorted_region_.load(std::memory_order_acquire);
+    const AppendRegion *active = append_active_.load(std::memory_order_acquire);
+    const AppendIndex *active_idx = append_active_index_.load(std::memory_order_acquire);
 
-      // 1. check append region
-      if (const AppendSlot *slot = append_region_.find_with_index(append_index_, prefix, hash)) {
+    // 1. check active append region
+    if (const AppendSlot *slot = active->find_with_index(*active_idx, prefix, hash)) {
+      return LookupResult{slot->payload_bits.load(std::memory_order_acquire), slot->hash};
+    }
+
+    // 2. check immutable append region if exists
+    if (const AppendRegion *imm = append_immutable_.load(std::memory_order_acquire)) {
+      const AppendIndex *imm_idx = append_immutable_index_.load(std::memory_order_acquire);
+      if (const AppendSlot *slot = imm->find_with_index(*imm_idx, prefix, hash)) {
         return LookupResult{slot->payload_bits.load(std::memory_order_acquire), slot->hash};
       }
+    }
 
-      // 2. check sorted region
-      if (const SortedSlot *slot = find_sorted(*sorted, prefix, hash)) {
-        return LookupResult{slot->payload_bits.load(std::memory_order_acquire), slot->hash};
-      }
+    // 3. check sorted region
+    if (const SortedSlot *slot = find_sorted(*sorted, prefix, hash)) {
+      return LookupResult{slot->payload_bits.load(std::memory_order_acquire), slot->hash};
+    }
 
-      return LookupResult{STORE_NOT_FOUND, 0};
-    });
+    return LookupResult{STORE_NOT_FOUND, 0};
   }
 
   // Retrieves the 64-bit payload associated with a key prefix.
@@ -170,7 +202,45 @@ class T1Index {
   // - Guarantees: Returns the latest visible value or STORE_NOT_FOUND if not found.
   auto get(std::span<const std::byte> key) const -> Payload { return get_with_hash(key).payload_bits; }
 
-  [[nodiscard]] auto append_size() const noexcept -> size_t { return append_region_.size(); }
+  [[nodiscard]] auto append_size() const noexcept -> size_t {
+    return append_active_.load(std::memory_order_acquire)->size();
+  }
+
+  [[nodiscard]] auto sorted_size() const noexcept -> size_t {
+    return sorted_region_.load(std::memory_order_acquire)->size;
+  }
+
+  [[nodiscard]] auto live_bytes() const noexcept -> uint64_t {
+    uint64_t total_blocks = 0;
+    const auto sorted = sorted_region_.load(std::memory_order_acquire);
+    for (size_t i = 0; i < sorted->size; ++i) {
+      const auto &slot = sorted->slots[i];
+      const Payload val = slot.payload_bits.load(std::memory_order_relaxed);
+      if (is_live(val)) {
+        if constexpr (Config::UseT1InlineValue) {
+          if (t1_detail::is_inline(slot.hash)) {
+            continue;
+          }
+        }
+        total_blocks += (val >> 48);
+      }
+    }
+    const AppendRegion *active = append_active_.load(std::memory_order_acquire);
+    size_t active_n = active->size();
+    for (size_t i = 0; i < active_n; ++i) {
+      const auto &slot = active->data()[i];
+      const Payload val = slot.payload_bits.load(std::memory_order_relaxed);
+      if (is_live(val)) {
+        if constexpr (Config::UseT1InlineValue) {
+          if (t1_detail::is_inline(slot.hash)) {
+            continue;
+          }
+        }
+        total_blocks += (val >> 48);
+      }
+    }
+    return total_blocks * 16;
+  }
 
   [[nodiscard]] static constexpr auto append_capacity() noexcept -> size_t { return APPEND_CAP; }
 
@@ -191,18 +261,18 @@ class T1Index {
     if (slot.found()) {
       slot.store(value);
       slot.store_hash(stored_hash);
-      write_version_.fetch_add(1, std::memory_order_release);
       return PutResult::Applied;
     }
 
-    const size_t index = append_region_.reserve();
+    AppendRegion *active = append_active_.load(std::memory_order_acquire);
+    AppendIndex *active_idx = append_active_index_.load(std::memory_order_acquire);
+    const size_t index = active->reserve();
     if (index >= APPEND_CAP) {
       return PutResult::AppendRegionFull;
     }
 
-    append_region_.publish(index, prefix, stored_hash, value);
-    publish_append_index(index, prefix, hash);
-    write_version_.fetch_add(1, std::memory_order_release);
+    active->publish(index, prefix, stored_hash, value);
+    publish_append_index(*active_idx, *active, index, prefix, hash);
     return PutResult::Applied;
   }
 
@@ -218,24 +288,22 @@ class T1Index {
     const StoreKey lower_bound = t1_detail::prefix_from_bytes(lo_bytes);
     const StoreKey upper_bound = t1_detail::prefix_from_bytes(hi_bytes);
 
-    return read_optimistic([&]() -> size_t {
-      const auto sorted = sorted_region_.load(std::memory_order_acquire);
+    T1ReadHandle handle(active_epochs_, reorg_epoch_.load(std::memory_order_relaxed));
+    const auto sorted = sorted_region_.load(std::memory_order_acquire);
+    const AppendRegion *active = append_active_.load(std::memory_order_acquire);
+    const AppendRegion *imm = append_immutable_.load(std::memory_order_acquire);
 
-      // Fetch the atomic size bounds first to validate optimistic concurrency check
-      const size_t append_n = append_region_.size();
+    std::vector<EntrySnapshot> merged = collect_live_entries(sorted, active, imm);
+    sort_and_dedup_entries(merged);
 
-      std::vector<EntrySnapshot> merged = collect_live_entries(sorted, append_n);
-      sort_and_dedup_entries(merged);
-
-      size_t match_count = 0;
-      for (const auto &entry : merged) {
-        if (!(entry.key < lower_bound) && !(upper_bound < entry.key)) {
-          callback(std::span<const std::byte>(entry.key), entry.payload_bits, entry.hash);
-          ++match_count;
-        }
+    size_t match_count = 0;
+    for (const auto &entry : merged) {
+      if (!(entry.key < lower_bound) && !(upper_bound < entry.key)) {
+        callback(std::span<const std::byte>(entry.key), entry.payload_bits, entry.hash);
+        ++match_count;
       }
-      return match_count;
-    });
+    }
+    return match_count;
   }
 
   // Reorganizes the T1 index by merging append_region_ into sorted_region_.
@@ -254,41 +322,97 @@ class T1Index {
       return;
     }
 
-    // 1. Capture snapshots of sorted_region and append_region tail
-    const auto sorted_snapshot = sorted_region_.load(std::memory_order_acquire);
-    const size_t append_n_snapshot = append_region_.size();
-    const uint64_t version_snapshot = write_version_.load(std::memory_order_acquire);
-
-    // Phase 1: rebuild a sorted candidate
-    std::vector<EntrySnapshot> merged = collect_live_entries(sorted_snapshot, append_n_snapshot);
-    maybe_set_sequential_hints(append_n_snapshot);
-
-    // Phase 2: briefly stop writes, validate candidate, and publish.
-    reorg_seq_.fetch_add(1, std::memory_order_release);  // enter odd
-
-    const auto current_sorted = sorted_region_.load(std::memory_order_acquire);
-    const size_t current_append_n = append_region_.size();
-
-    if (write_version_.load(std::memory_order_acquire) != version_snapshot || current_sorted != sorted_snapshot) {
-      merged = collect_live_entries(current_sorted, current_append_n);
-      maybe_set_sequential_hints(current_append_n);
+    // 1. Prepare new active buffers
+    auto *next_active = new AppendRegion();
+    auto *next_active_idx = new AppendIndex();
+    next_active_idx->clear();
+    if constexpr (Config::UseMemoryHints) {
+      t1_detail::apply_region_hints(next_active->data(), next_active->capacity_bytes());
     }
 
-    sort_and_dedup_entries(merged);
+    // 2. Freeze the current active region to immutable
+    AppendRegion *old_active = append_active_.load(std::memory_order_acquire);
+    AppendIndex *old_active_idx = append_active_index_.load(std::memory_order_acquire);
+
+    append_immutable_.store(old_active, std::memory_order_release);
+    append_immutable_index_.store(old_active_idx, std::memory_order_release);
+
+    // Swap writing path immediately to the fresh active buffers
+    append_active_.store(next_active, std::memory_order_release);
+    append_active_index_.store(next_active_idx, std::memory_order_release);
+
+    // 3. Rebuild sorted region from sorted_region and append_immutable
+    const auto sorted = sorted_region_.load(std::memory_order_acquire);
+    const size_t imm_n = old_active->size();
+
+    // Extract sorted entries (already sorted)
+    std::vector<EntrySnapshot> sorted_entries;
+    sorted_entries.reserve(sorted->size);
+    for (size_t i = 0; i < sorted->size; ++i) {
+      const auto &slot = sorted->slots[i];
+      const Payload value = slot.payload_bits.load(std::memory_order_relaxed);
+      if (is_live(value)) {
+        sorted_entries.push_back(EntrySnapshot{slot.key, value, slot.hash});
+      }
+    }
+
+    // Extract append immutable entries (unsorted)
+    std::vector<EntrySnapshot> imm_entries;
+    imm_entries.reserve(imm_n);
+    old_active->collect_live_entries(imm_entries, imm_n);
+
+    auto comp = [](const EntrySnapshot &lhs, const EntrySnapshot &rhs) {
+      if (lhs.key != rhs.key) {
+        return lhs.key < rhs.key;
+      }
+      return lhs.hash < rhs.hash;
+    };
+
+    // Sort the smaller append immutable entries in parallel
+    std::sort(std::execution::par, imm_entries.begin(), imm_entries.end(), comp);
+
+    // Perform a linear 2-Way Merge in parallel
+    std::vector<EntrySnapshot> merged;
+    merged.reserve(sorted_entries.size() + imm_entries.size());
+    std::merge(std::execution::par,
+               sorted_entries.begin(),
+               sorted_entries.end(),
+               imm_entries.begin(),
+               imm_entries.end(),
+               std::back_inserter(merged),
+               comp);
+
+    // Assert no duplicate entries exist in the merge output
+    assert_no_duplicates(merged);
+
+    maybe_set_sequential_hints(old_active, imm_n);
 
     for (auto &entry : merged) {
       entry.payload_bits = offset_mapper(entry.payload_bits, entry.hash);
     }
 
-    std::shared_ptr<const SortedRegion> next_sorted = std::make_shared<SortedRegion>(merged);
+    const SortedRegion *old_sorted = sorted_region_.load(std::memory_order_relaxed);
+
+    auto *next_sorted = new SortedRegion(merged);
     if constexpr (Config::UseMemoryHints) {
       t1_detail::apply_region_hints(next_sorted->slots.get(), next_sorted->size * sizeof(SortedSlot));
     }
 
-    sorted_region_.store(std::move(next_sorted), std::memory_order_release);
-    reset_append_after_reorganize(current_append_n);
+    // Publish the new sorted region
+    sorted_region_.store(next_sorted, std::memory_order_release);
 
-    reorg_seq_.fetch_add(1, std::memory_order_release);  // leave even
+    // 4. Safely retire the old buffers
+    append_immutable_.store(nullptr, std::memory_order_release);
+    append_immutable_index_.store(nullptr, std::memory_order_release);
+
+    // Advance epoch and wait for all epoch readers to exit
+    uint64_t target_epoch = reorg_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    active_epochs_.wait_until_epoch(target_epoch);
+
+    delete old_active;
+    delete old_active_idx;
+    delete old_sorted;
+
     reorg_in_progress_.store(false, std::memory_order_release);
   }
 
@@ -494,8 +618,17 @@ class T1Index {
   }
 
   auto resolve(Key key, uint64_t hash) noexcept -> ResolvedSlot {
-    if (AppendSlot *slot = append_region_.find_with_index(append_index_, key, hash)) {
+    const AppendRegion *active = append_active_.load(std::memory_order_acquire);
+    const AppendIndex *active_idx = append_active_index_.load(std::memory_order_acquire);
+    if (AppendSlot *slot = const_cast<AppendRegion *>(active)->find_with_index(*active_idx, key, hash)) {
       return ResolvedSlot{slot, nullptr};
+    }
+
+    if (const AppendRegion *imm = append_immutable_.load(std::memory_order_acquire)) {
+      const AppendIndex *imm_idx = append_immutable_index_.load(std::memory_order_acquire);
+      if (AppendSlot *slot = const_cast<AppendRegion *>(imm)->find_with_index(*imm_idx, key, hash)) {
+        return ResolvedSlot{slot, nullptr};
+      }
     }
 
     const auto sorted = sorted_region_.load(std::memory_order_acquire);
@@ -506,48 +639,21 @@ class T1Index {
     return ResolvedSlot{};
   }
 
-  // ─── Helper Methods: Reorganize and Synchronization ────────────────────
-  // Optimistic Concurrency Control retry helper (SeqLock pattern).
-  template <typename ReaderFn>
-  auto read_optimistic(ReaderFn &&reader) const {
-    while (true) {
-      const uint64_t start_seq = begin_reorg_read();
-      auto result = reader();
-      if (end_reorg_read(start_seq)) {
-        return result;
-      }
-    }
-  }
-
-  auto begin_reorg_read() const noexcept -> uint64_t {
-    uint64_t seq;
-    do {
-      seq = reorg_seq_.load(std::memory_order_acquire);
-    } while ((seq & 1U) != 0U);
-    return seq;
-  }
-
-  auto end_reorg_read(uint64_t start_seq) const noexcept -> bool {
-    std::atomic_thread_fence(std::memory_order_acquire);
-    return reorg_seq_.load(std::memory_order_acquire) == start_seq;
-  }
-
-  void publish_append_index(size_t index, Key key, uint64_t hash) noexcept {
+  void publish_append_index(
+      AppendIndex &idx, const AppendRegion &region, size_t index, Key key, uint64_t hash) noexcept {
     const auto slot_plus_one = static_cast<typename AppendIndex::slot_index_type>(index + 1);
-    append_index_.publish_slot(key, slot_plus_one, hash, [&](size_t slot_index) -> const AppendSlot & {
-      return append_region_.data()[slot_index];
-    });
+    idx.publish_slot(
+        key, slot_plus_one, hash, [&](size_t slot_index) -> const AppendSlot & { return region.data()[slot_index]; });
   }
 
-  void reset_append_after_reorganize(size_t count) {
-    append_index_.clear();
-    append_region_.clear(count);
-  }
-
-  auto collect_live_entries(const std::shared_ptr<const SortedRegion> &sorted,
-                            size_t append_n) const -> std::vector<EntrySnapshot> {
+  auto collect_live_entries(const SortedRegion *sorted,
+                            const AppendRegion *active,     // NOLINT(bugprone-easily-swappable-parameters)
+                            const AppendRegion *imm) const  // NOLINT(bugprone-easily-swappable-parameters)
+      -> std::vector<EntrySnapshot> {
+    size_t active_n = active ? active->size() : 0;
+    size_t imm_n = imm ? imm->size() : 0;
     std::vector<EntrySnapshot> merged;
-    merged.reserve(sorted->size + append_n);
+    merged.reserve(sorted->size + active_n + imm_n);
 
     for (size_t i = 0; i < sorted->size; ++i) {
       const auto &slot = sorted->slots[i];
@@ -557,7 +663,12 @@ class T1Index {
       }
     }
 
-    append_region_.collect_live_entries(merged, append_n);
+    if (active) {
+      active->collect_live_entries(merged, active_n);
+    }
+    if (imm) {
+      imm->collect_live_entries(merged, imm_n);
+    }
     return merged;
   }
 
@@ -584,25 +695,35 @@ class T1Index {
     }
   }
 
-  void maybe_set_sequential_hints(size_t append_n) {
+  static void assert_no_duplicates(const std::vector<EntrySnapshot> &entries) {
+    if (entries.size() < 2) {
+      return;
+    }
+    for (size_t i = 1; i < entries.size(); ++i) {
+      assert(!(entries[i - 1].key == entries[i].key && entries[i - 1].hash == entries[i].hash) &&
+             "T1Index invariant violated: duplicate key prefix + hash detected in merge output");
+    }
+  }
+
+  void maybe_set_sequential_hints(const AppendRegion *region, size_t append_n) {
     if constexpr (Config::UseMemoryHints) {
       auto sorted = sorted_region_.load(std::memory_order_acquire);
       t1_detail::set_sequential_hint(sorted->slots.get(), sorted->size * sizeof(SortedSlot));
-      t1_detail::set_sequential_hint(append_region_.data(), append_region_.bytes_for(append_n));
+      t1_detail::set_sequential_hint(region->data(), region->bytes_for(append_n));
     }
   }
 
   // ─── Member Variables ──────────────────────────────────────────────────
   mutable std::atomic<bool> reorg_in_progress_{false};
-  mutable std::atomic<uint64_t> reorg_seq_{0};
-  // Incremented on every T1 update. Used during Phase 2 of reorganize to detect
-  // if any concurrent writes occurred while the sorted region was being rebuilt,
-  // ensuring no updates are lost when swapping regions.
-  std::atomic<uint64_t> write_version_{0};
+  std::atomic<uint64_t> reorg_epoch_{1};
 
-  std::atomic<std::shared_ptr<const SortedRegion>> sorted_region_;
-  AppendRegion append_region_;
-  AppendIndex append_index_{};
+  std::atomic<const SortedRegion *> sorted_region_{nullptr};
+  std::atomic<AppendRegion *> append_active_{nullptr};
+  std::atomic<AppendIndex *> append_active_index_{nullptr};
+  std::atomic<AppendRegion *> append_immutable_{nullptr};
+  std::atomic<AppendIndex *> append_immutable_index_{nullptr};
+
+  mutable ThreadReferenceTracker<uint64_t> active_epochs_;
 };
 
 }  // namespace vmemkv

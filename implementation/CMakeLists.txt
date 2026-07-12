@@ -111,11 +111,9 @@ find_program(CLANG_TIDY_PROGRAM clang-tidy)
 if(CLANG_TIDY_PROGRAM)
   set(CLANG_TIDY_HEADER_FILTER "(^|.*/)(src|include/vmemkv)/.*\\.(hpp|cpp)$")
 
-  # Find all C++ files for analysis
+  # Find all C++ source files for library analysis (exclude benchmarks and tests)
   file(GLOB_RECURSE ALL_CXX_FILES 
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp"
   )
   string(JOIN " " ALL_CXX_FILES_JOINED ${ALL_CXX_FILES})
   

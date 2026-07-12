@@ -3,14 +3,17 @@
 
 #include <sys/mman.h>
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include "../api/utils.hpp"
+#include "../core/reference_tracker.hpp"
 
 // ─── T2 Flat Storage Structs ──────────────────────────────────────────────
 
@@ -77,9 +80,12 @@ class T2FlatFile {
     T2RecordView record;
   };
 
+  // RAII handle for lock-free reader thread safety without shared_ptr copy overhead.
+  using T2MemoryHandle = typename ThreadReferenceTracker<const T2Memory *>::Guard;
+
   // Constructor. Creates or maps a T2 flat binary file on disk.
   T2FlatFile(const std::filesystem::path &path, uint64_t bytes_capacity);
-  ~T2FlatFile() noexcept = default;
+  ~T2FlatFile() noexcept;
 
   T2FlatFile(const T2FlatFile &) = delete;
   auto operator=(const T2FlatFile &) -> T2FlatFile & = delete;
@@ -87,22 +93,21 @@ class T2FlatFile {
   // ─── Memory and Record Access ───
   // Acquires a shared reference to the current mapped memory region.
   // - Thread-safety: Thread-safe; returned pointer guards against concurrent file munmap.
-  // - Contract: Callers must hold the returned std::shared_ptr for the duration of record accesses.
-  auto get_memory() const noexcept -> std::shared_ptr<const T2Memory> {
-    return t2_mem_.load(std::memory_order_acquire);
-  }
+  // - Contract: Callers must hold the returned pointer (via T2MemoryHandle) for the duration of record accesses.
+  auto get_memory() const noexcept -> const T2Memory * { return t2_mem_.load(std::memory_order_acquire); }
+
+  auto get_memory_handle() const noexcept -> T2MemoryHandle { return {active_readers_, get_memory()}; }
 
   // Resolves a record at the given payload offset into a structured view.
   // - Contract: The offset must be within bounds. The returned view references the memory base,
-  //   and remains valid as long as the shared 'mem' instance is kept alive.
-  auto at(uint64_t payload, const std::shared_ptr<const T2Memory> &mem) const noexcept -> T2RecordView;
+  //   and remains valid as long as the 'mem' instance is kept alive.
+  auto at(uint64_t payload, const T2Memory *mem) const noexcept -> T2RecordView;
 
   // ─── Storage Operations ───
-  // Appends a new key-value record to the end of the flat file.
-  // - Thread-safety: Thread-safe; the offset is reserved atomically via fetch_add, and each
-  //   thread writes to its own non-overlapping region. No locking required.
-  // - Guarantees: Returns the start offset of the new record.
-  auto append(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t;
+  // Appends a new key-value record to the end of the flat file using standard atomic offset allocation.
+  auto append_default(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t;
+  // Appends a new key-value record using thread-local chunk allocation and pre-faulting optimization.
+  auto append_prefault(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t;
   // Updates the value of an existing record in-place if the new value fits within alloc_len.
   // - Thread-safety: Thread-safe for distinct keys (callers hold per-key stripe lock).
   // - Guarantees: Returns true on success; false if new value exceeds alloc_len.
@@ -110,19 +115,19 @@ class T2FlatFile {
   // Swaps the active memory-mapped region with a newly mapped file/capacity.
   // - Guarantees: Thread-safely replaces the underlying atomic pointer, allowing readers
   //   to transition seamlessly without blocking.
-  void swap_memory(const std::shared_ptr<const T2Memory> &new_mem, uint64_t bytes_used);
+  void swap_memory(std::unique_ptr<T2Memory> new_mem, uint64_t bytes_used);
 
   // ─── Properties ───
   // Returns the number of bytes currently used/allocated in the T2 file.
   auto bytes_used() const noexcept -> uint64_t { return t2_bytes_used_.load(std::memory_order_acquire); }
   // Returns the total virtual memory capacity mapped for the T2 file.
   auto bytes_capacity() const noexcept -> uint64_t { return t2_bytes_capacity_; }
+  auto path() const noexcept -> const std::filesystem::path & { return path_; }
 
  private:
   // ─── Private Helpers ───
   // Helper to resolve a raw payload offset to a memory pointer.
-  static auto resolve_record(uint64_t payload,
-                             const std::shared_ptr<const T2Memory> &mem) noexcept -> const std::byte * {
+  static auto resolve_record(uint64_t payload, const T2Memory *mem) noexcept -> const std::byte * {
     assert(payload < mem->capacity);
     return mem->base + payload;
   }
@@ -132,12 +137,16 @@ class T2FlatFile {
 
   void map_file(const std::filesystem::path &path, uint64_t bytes_capacity);
 
+  void retire_memory(const T2Memory *old_mem);
+
   // ─── Member Variables ───
   std::filesystem::path path_;
   uint64_t t2_bytes_capacity_ = 0;
 
-  std::atomic<std::shared_ptr<const T2Memory>> t2_mem_;
+  std::atomic<const T2Memory *> t2_mem_{nullptr};
   std::atomic<uint64_t> t2_bytes_used_{0};
+
+  mutable ThreadReferenceTracker<const T2Memory *> active_readers_;
 };
 
 }  // namespace vmemkv

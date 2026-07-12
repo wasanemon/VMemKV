@@ -20,8 +20,15 @@ T2FlatFile::T2FlatFile(const std::filesystem::path &path, uint64_t bytes_capacit
   map_file(path, create_empty_file(path, bytes_capacity));
 }
 
+T2FlatFile::~T2FlatFile() noexcept {
+  const T2Memory *mem = t2_mem_.load(std::memory_order_relaxed);
+  if (mem != nullptr) {
+    retire_memory(mem);
+  }
+}
+
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-auto T2FlatFile::at(uint64_t payload, const std::shared_ptr<const T2Memory> &mem) const noexcept -> T2RecordView {
+auto T2FlatFile::at(uint64_t payload, const T2Memory *mem) const noexcept -> T2RecordView {
   const std::byte *record_base = resolve_record(payload, mem);
   const auto *header = reinterpret_cast<const ValueRecordHeader *>(record_base);
   const auto *key_begin = reinterpret_cast<const std::byte *>(header + 1);
@@ -34,7 +41,7 @@ auto T2FlatFile::at(uint64_t payload, const std::shared_ptr<const T2Memory> &mem
   };
 }
 
-auto T2FlatFile::append(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t {
+auto T2FlatFile::append_default(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t {
   const uint64_t raw_required = sizeof(ValueRecordHeader) + key.size() + value.size();
   // Align all record sizes to 8 bytes. This avoids unaligned memory access penalties
   // on modern CPU architectures and allows callers to cast fields safely.
@@ -46,7 +53,7 @@ auto T2FlatFile::append(std::span<const std::byte> key, std::span<const std::byt
     throw std::runtime_error("T2 storage capacity exceeded");
   }
 
-  std::shared_ptr<const T2Memory> mem = get_memory();
+  T2MemoryHandle mem = get_memory_handle();
   std::byte *record_base = mem->base + offset;
 
   auto *header = reinterpret_cast<ValueRecordHeader *>(record_base);
@@ -73,8 +80,73 @@ auto T2FlatFile::append(std::span<const std::byte> key, std::span<const std::byt
   return offset;
 }
 
+struct ThreadChunk {
+  std::byte *base = nullptr;
+  uint64_t offset = 0;
+  uint64_t capacity = 0;
+  const T2Memory *mem = nullptr;
+};
+static thread_local ThreadChunk tl_chunk;
+static constexpr uint64_t OSPageSize = 4096;
+
+auto T2FlatFile::append_prefault(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t {
+  const uint64_t raw_required = sizeof(ValueRecordHeader) + key.size() + value.size();
+  const uint64_t required = vmemkv::align_up(raw_required);
+
+  T2MemoryHandle mem = get_memory_handle();
+
+  if (tl_chunk.capacity < required || tl_chunk.mem != mem) {
+    const uint64_t chunk_alloc_size = 2ULL * 1024 * 1024;  // 2MB
+    const uint64_t global_offset = t2_bytes_used_.fetch_add(chunk_alloc_size, std::memory_order_relaxed);
+
+    if (global_offset + chunk_alloc_size > t2_bytes_capacity_) {
+      throw std::runtime_error("T2 storage capacity exceeded during chunk allocation");
+    }
+
+    tl_chunk.base = const_cast<std::byte *>(mem->base) + global_offset;
+    tl_chunk.offset = 0;
+    tl_chunk.capacity = chunk_alloc_size;
+    tl_chunk.mem = mem;
+
+    // Pre-fault the allocated 2MB chunk by writing to each page (4KB steps)
+    for (uint64_t page = 0; page < chunk_alloc_size; page += OSPageSize) {
+      volatile std::byte *ptr = tl_chunk.base + page;
+      *ptr = std::byte{0};
+    }
+  }
+
+  std::byte *record_base = tl_chunk.base + tl_chunk.offset;
+  uint64_t offset = record_base - mem->base;
+
+  tl_chunk.offset += required;
+  tl_chunk.capacity -= required;
+
+  auto *header = reinterpret_cast<ValueRecordHeader *>(record_base);
+  header->key_len = static_cast<uint32_t>(key.size());
+  header->value_len = static_cast<uint32_t>(value.size());
+  header->alloc_len = static_cast<uint32_t>(value.size());
+  header->flags = 0;
+  header->version = 0;
+
+  auto *cursor = reinterpret_cast<std::byte *>(header + 1);
+  std::memcpy(cursor, key.data(), key.size());
+  cursor += key.size();
+
+  if (!value.empty()) {
+    std::memcpy(cursor, value.data(), value.size());
+    cursor += value.size();
+  }
+
+  const uint64_t padding = required - raw_required;
+  if (padding > 0) {
+    std::memset(cursor, 0, padding);
+  }
+
+  return offset;
+}
+
 auto T2FlatFile::update_value_at(uint64_t payload, std::span<const std::byte> value) noexcept -> bool {
-  std::shared_ptr<const T2Memory> mem = get_memory();
+  T2MemoryHandle mem = get_memory_handle();
   auto *header = reinterpret_cast<ValueRecordHeader *>(const_cast<std::byte *>(resolve_record(payload, mem)));
 
   if (value.size() > header->alloc_len) {
@@ -92,10 +164,19 @@ auto T2FlatFile::update_value_at(uint64_t payload, std::span<const std::byte> va
   return true;
 }
 
-void T2FlatFile::swap_memory(const std::shared_ptr<const T2Memory> &new_mem, uint64_t bytes_used) {
-  t2_mem_.store(new_mem, std::memory_order_release);
+void T2FlatFile::swap_memory(std::unique_ptr<T2Memory> new_mem, uint64_t bytes_used) {
+  const T2Memory *raw_new = new_mem.release();
+  const T2Memory *old_mem = t2_mem_.exchange(raw_new, std::memory_order_acq_rel);
   t2_bytes_used_.store(bytes_used, std::memory_order_release);
-  t2_bytes_capacity_ = new_mem->capacity;
+  t2_bytes_capacity_ = raw_new->capacity;
+  if (old_mem != nullptr) {
+    retire_memory(old_mem);
+  }
+}
+
+void T2FlatFile::retire_memory(const T2Memory *old_mem) {
+  active_readers_.wait_until_retired(old_mem);
+  delete old_mem;
 }
 
 void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capacity) {
@@ -132,8 +213,7 @@ void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capa
     throw std::system_error(mmap_errno, std::generic_category(), "mmap");
   }
 
-  t2_mem_.store(std::make_shared<const T2Memory>(static_cast<std::byte *>(mapped), bytes_capacity),
-                std::memory_order_release);
+  t2_mem_.store(new T2Memory(static_cast<std::byte *>(mapped), bytes_capacity), std::memory_order_release);
   t2_bytes_capacity_ = bytes_capacity;
 }
 

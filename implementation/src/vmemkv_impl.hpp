@@ -38,6 +38,7 @@
 #include <cassert>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -45,10 +46,10 @@
 #include <optional>
 #include <span>
 #include <system_error>
+#include <thread>
 #include <vector>
 #include <vmemkv/config.hpp>
 
-#include "core/reorganize_coordinator.hpp"
 #include "t1_index/t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
 
@@ -56,6 +57,8 @@ inline constexpr std::size_t kCacheLineAlignment = 64;
 
 struct alignas(kCacheLineAlignment) AlignedMutex {
   std::mutex mu;
+  std::atomic<uint64_t> live_count{0};
+  std::atomic<uint64_t> delete_count{0};
 };
 
 namespace vmemkv {
@@ -81,6 +84,7 @@ template <typename ConfigT = vmemkv::Config<>>
 class VMemKVImpl {
  public:
   static constexpr bool kIsEnabled = true;
+  using ConfigType = ConfigT;
 
   static auto name() -> std::string {
     std::vector<std::string> parts;
@@ -95,6 +99,9 @@ class VMemKVImpl {
     }
     if constexpr (ConfigT::UseT1InlineValue) {
       parts.emplace_back("T1InlineValue");
+    }
+    if constexpr (ConfigT::UsePrefaulting) {
+      parts.emplace_back("Prefaulting");
     }
 
     if (parts.empty()) {
@@ -111,9 +118,22 @@ class VMemKVImpl {
   using T1IndexT = vmemkv::T1Index<ConfigT>;
 
   // Constructor. Creates a VMemKV coordination instance.
-  VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity) : t2_(t2_path, t2_bytes_capacity) {}
+  VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity) : t2_(t2_path, t2_bytes_capacity) {
+    reorg_worker_ = std::jthread(&VMemKVImpl::reorg_worker_loop, this);
+  }
 
-  ~VMemKVImpl() noexcept = default;
+  ~VMemKVImpl() noexcept {
+    reorg_worker_.request_stop();
+    reorg_requested_.store(true, std::memory_order_release);
+    reorg_requested_.notify_all();
+    if (reorg_worker_.joinable()) {
+      reorg_worker_.join();
+    }
+  }
+
+  static constexpr uint64_t kSizeEmbeddingShift = 48;
+  static constexpr uint64_t kOffsetMask = (1ULL << kSizeEmbeddingShift) - 1;
+  static constexpr uint64_t kBlockAlignment = 16;
 
   VMemKVImpl(const VMemKVImpl &) = delete;
   auto operator=(const VMemKVImpl &) -> VMemKVImpl & = delete;
@@ -126,89 +146,116 @@ class VMemKVImpl {
   //   2. Writes live records into a temporary T2 file sequentially (garbage collection).
   //   3. Hot-swaps the memory-mapped T2 view and publishes the rebuilt T1 index.
   // - Thread-safety: Thread-safe; synchronized internally via reorganize_mutex_.
-  void reorganize() {
-    std::lock_guard<std::mutex> reorg_lock(reorganize_mutex_);
+  void reorganize(bool force_t2_gc = true) {
+    bool upgrade_to_t2 = force_t2_gc;
 
-    std::filesystem::path temp_path_t2 = "t2_flat.tmp";
+    if (!upgrade_to_t2) {
+      uint64_t live_bytes = t1_.live_bytes();
+      uint64_t t2_used = t2_.bytes_used();
+      double space_amp = 1.0;
+      if (live_bytes > 0) {
+        space_amp = static_cast<double>(t2_used) / static_cast<double>(live_bytes);
+      }
 
-    std::error_code error_code;
-    std::filesystem::remove(temp_path_t2, error_code);
-
-    const int temp_fd = ::open(temp_path_t2.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (temp_fd < 0) {
-      throw std::system_error(errno, std::generic_category(), "open temp file");
+      const double amp_threshold = static_cast<double>(ConfigT::T2StorageFragmentationThresholdPercent) / 100.0 + 1.0;
+      upgrade_to_t2 = (space_amp >= amp_threshold);
     }
 
-    uint64_t next_bytes_used = 0;
-    uint64_t new_capacity = t2_.bytes_capacity();
+    if (upgrade_to_t2) {
+      // T1 + T2 Reorganize (Checkpoint reload & physical storage reclamation)
+      std::filesystem::path temp_path_t2 = t2_.path().parent_path() / "t2_flat.tmp";
 
-    struct FDGuard {
-      int fd;
-      ~FDGuard() {
-        if (fd >= 0) {
-          ::close(fd);
-        }
+      std::error_code error_code;
+      std::filesystem::remove(temp_path_t2, error_code);
+
+      const int temp_fd = ::open(temp_path_t2.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+      if (temp_fd < 0) {
+        throw std::system_error(errno, std::generic_category(), "open temp file");
       }
-    } fd_guard{temp_fd};
 
-    try {
-      t1_.reorganize([&](uint64_t old_payload, uint64_t old_hash) -> uint64_t {
-        if (old_payload == vmemkv::STORE_NOT_FOUND) {
-          return vmemkv::STORE_NOT_FOUND;
-        }
-
-        if constexpr (ConfigT::UseT1InlineValue) {
-          if (t1_detail::is_inline(old_hash)) {
-            return old_payload;
+      uint64_t next_bytes_used = 0;
+      struct FDGuard {
+        int fd;
+        ~FDGuard() {
+          if (fd >= 0) {
+            ::close(fd);
           }
         }
+      } fd_guard{temp_fd};
 
-        std::shared_ptr<const vmemkv::T2Memory> mem = t2_.get_memory();
-        T2RecordView record = t2_.at(old_payload, mem);
-        return write_record_to_temp_fd(fd_guard.fd, record.key, record.value, next_bytes_used);
-      });
+      try {
+        t1_.reorganize([&](uint64_t old_payload, uint64_t old_hash) -> uint64_t {
+          if (old_payload == vmemkv::STORE_NOT_FOUND) {
+            return vmemkv::STORE_NOT_FOUND;
+          }
 
-      ::close(fd_guard.fd);
-      fd_guard.fd = -1;
+          if constexpr (ConfigT::UseT1InlineValue) {
+            if (t1_detail::is_inline(old_hash)) {
+              return old_payload;
+            }
+          }
 
-      new_capacity = t2_.bytes_capacity();
-      if (next_bytes_used > new_capacity) {
-        new_capacity = next_bytes_used;
-      }
+          T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+          uint64_t pure_offset = old_payload & kOffsetMask;
+          T2RecordView record = t2_.at(pure_offset, mem);
+          uint64_t new_offset = write_record_to_temp_fd(fd_guard.fd, record.key, record.value, next_bytes_used);
 
-      if (::truncate(temp_path_t2.c_str(), static_cast<off_t>(new_capacity)) != 0) {
-        throw std::system_error(errno, std::generic_category(), "truncate temp file");
-      }
+          uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + record.key.size() + record.value.size());
+          uint64_t block_count = aligned_len / kBlockAlignment;
+          assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
+          return new_offset | (block_count << kSizeEmbeddingShift);
+        });
 
-      const int map_fd = ::open(temp_path_t2.c_str(), O_RDWR);
-      if (map_fd < 0) {
-        throw std::system_error(errno, std::generic_category(), "open temp file for mmap");
-      }
-
-      std::shared_ptr<vmemkv::T2Memory> new_mem = std::make_shared<vmemkv::T2Memory>(
-          static_cast<std::byte *>(
-              ::mmap(nullptr, new_capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_NORESERVE, map_fd, 0)),
-          new_capacity);
-      ::close(map_fd);
-
-      if (new_mem->base == MAP_FAILED) {
-        throw std::system_error(errno, std::generic_category(), "mmap temp file");
-      }
-
-      t2_.swap_memory(new_mem, next_bytes_used);
-
-      std::filesystem::rename(temp_path_t2, t2_path(), error_code);
-      if (error_code) {
-        throw std::system_error(error_code, "rename temp file");
-      }
-    } catch (...) {
-      if (fd_guard.fd >= 0) {
         ::close(fd_guard.fd);
         fd_guard.fd = -1;
+
+        uint64_t new_capacity = t2_.bytes_capacity();
+        if (next_bytes_used > new_capacity) {
+          new_capacity = next_bytes_used;
+        }
+
+        if (::truncate(temp_path_t2.c_str(), static_cast<off_t>(new_capacity)) != 0) {
+          throw std::system_error(errno, std::generic_category(), "truncate temp file");
+        }
+
+        const int map_fd = ::open(temp_path_t2.c_str(), O_RDWR);
+        if (map_fd < 0) {
+          throw std::system_error(errno, std::generic_category(), "open temp file for mmap");
+        }
+
+        std::unique_ptr<vmemkv::T2Memory> new_mem = std::make_unique<vmemkv::T2Memory>(
+            static_cast<std::byte *>(
+                ::mmap(nullptr, new_capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_NORESERVE, map_fd, 0)),
+            new_capacity);
+        ::close(map_fd);
+
+        if (new_mem->base == MAP_FAILED) {
+          throw std::system_error(errno, std::generic_category(), "mmap temp file");
+        }
+
+        t2_.swap_memory(std::move(new_mem), next_bytes_used);
+
+        std::filesystem::rename(temp_path_t2, t2_path(), error_code);
+        if (error_code) {
+          throw std::system_error(error_code, "rename temp file");
+        }
+        reorg_t2_count_.fetch_add(1, std::memory_order_relaxed);
+      } catch (...) {
+        if (fd_guard.fd >= 0) {
+          ::close(fd_guard.fd);
+          fd_guard.fd = -1;
+        }
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path_t2, remove_ec);
+        throw;
       }
-      std::error_code remove_ec;
-      std::filesystem::remove(temp_path_t2, remove_ec);
-      throw;
+
+      reset_tombstone_counters();
+    } else {
+      // T1-only Reorganize (Zero I/O, fast path)
+      t1_.reorganize([&](uint64_t old_payload, uint64_t /*old_hash*/) -> uint64_t { return old_payload; });
+      reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
+      reset_tombstone_counters();
     }
   }
 
@@ -217,6 +264,11 @@ class VMemKVImpl {
   auto t1() const noexcept -> const T1IndexT & { return t1_; }
   auto t2() noexcept -> vmemkv::T2FlatFile & { return t2_; }
   auto t2() const noexcept -> const vmemkv::T2FlatFile & { return t2_; }
+
+  auto get_statistics() const noexcept -> vmemkv::VMemKVStatistics {
+    return vmemkv::VMemKVStatistics{.t1_reorg_count = reorg_t1_count_.load(std::memory_order_relaxed),
+                                    .t2_reorg_count = reorg_t2_count_.load(std::memory_order_relaxed)};
+  }
 
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
 
@@ -234,8 +286,17 @@ class VMemKVImpl {
         }
       }
 
-      const uint64_t offset = t2_.append(full_key, value);
-      const auto put_result = t1_.put(full_key, offset, false, 0);
+      uint64_t offset;
+      if constexpr (ConfigT::UsePrefaulting) {
+        offset = t2_.append_prefault(full_key, value);
+      } else {
+        offset = t2_.append_default(full_key, value);
+      }
+      uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + full_key.size() + value.size());
+      uint64_t block_count = aligned_len / kBlockAlignment;
+      assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
+      uint64_t encoded_payload = offset | (block_count << kSizeEmbeddingShift);
+      const auto put_result = t1_.put(full_key, encoded_payload, false, 0);
       if (put_result == T1IndexT::PutResult::Applied) {
         return true;
       }
@@ -260,7 +321,11 @@ class VMemKVImpl {
       return false;
     }
 
-    return write_entry_lockfree(full_key, value);
+    if (write_entry_lockfree(full_key, value)) {
+      stripe_state(full_key).live_count.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    return false;
   }
 
   // Retrieves a value associated with the key.
@@ -277,7 +342,7 @@ class VMemKVImpl {
       }
     }
 
-    std::shared_ptr<const vmemkv::T2Memory> mem = t2_.get_memory();
+    T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
     const std::optional<typename vmemkv::T2FlatFile::LookupResult> found = lookup_record(full_key, mem);
     return found.has_value() ? decode_u64(found->record.value) : vmemkv::STORE_NOT_FOUND;
   }
@@ -295,10 +360,10 @@ class VMemKVImpl {
     }
 
     if (!t1_detail::is_inline(res.raw_hash)) {
-      std::shared_ptr<const vmemkv::T2Memory> mem = t2_.get_memory();
+      T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
       const std::optional<typename vmemkv::T2FlatFile::LookupResult> found = lookup_record(full_key, mem);
       if (found.has_value() && value.size() <= found->record.header->alloc_len) {
-        return t2_.update_value_at(found->offset, value);
+        return t2_.update_value_at(found->offset & kOffsetMask, value);
       }
     }
 
@@ -311,14 +376,25 @@ class VMemKVImpl {
   // - Guarantees: Marks the key offset as STORE_NOT_FOUND in T1 (physical space reclamation is deferred to reorganize).
   // - Thread-safety: Thread-safe (guarded by key hash locks).
   auto remove_impl(std::span<const std::byte> full_key) -> bool {
-    std::lock_guard<std::mutex> key_lock(key_mutex(full_key));
+    auto &stripe = stripe_state(full_key);
+    {
+      std::lock_guard<std::mutex> key_lock(stripe.mu);
 
-    uint64_t payload = t1_.get(full_key);
-    if (payload == vmemkv::STORE_NOT_FOUND) {
-      return false;
+      uint64_t payload = t1_.get(full_key);
+      if (payload == vmemkv::STORE_NOT_FOUND) {
+        return false;
+      }
+
+      if (t1_.put(full_key, vmemkv::STORE_NOT_FOUND) == T1IndexT::PutResult::Applied) {
+        stripe.live_count.fetch_sub(1, std::memory_order_relaxed);
+        stripe.delete_count.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        return false;
+      }
     }
 
-    return t1_.put(full_key, vmemkv::STORE_NOT_FOUND) == T1IndexT::PutResult::Applied;
+    maybe_reorganize_if_needed_for_delete(stripe);
+    return true;
   }
 
   // Retrieves the raw variable-length byte value associated with a key.
@@ -335,7 +411,8 @@ class VMemKVImpl {
       }
     }
 
-    return lookup_record(full_key, t2_.get_memory()).transform([](const auto &found) {
+    T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+    return lookup_record(full_key, mem).transform([](const auto &found) {
       return std::vector<std::byte>(found.record.value.begin(), found.record.value.end());
     });
   }
@@ -353,7 +430,7 @@ class VMemKVImpl {
     };
     std::vector<ScanItem> items;
     {
-      std::shared_ptr<const vmemkv::T2Memory> mem = t2_.get_memory();
+      T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
       t1_.scan(
           lower_bound,
           upper_bound,
@@ -384,7 +461,7 @@ class VMemKVImpl {
             }
 
             // T2 record branch
-            const T2RecordView record = t2_.at(payload, mem);
+            const T2RecordView record = t2_.at(payload & kOffsetMask, mem);
             if (!key_in_range(record.key, lower_bound, upper_bound)) {
               return;
             }
@@ -399,7 +476,7 @@ class VMemKVImpl {
   }
 
  private:
-  auto t2_path() const -> std::filesystem::path { return "t2_flat.db"; }
+  auto t2_path() const -> std::filesystem::path { return t2_.path(); }
 
   // Inline optimization is restricted to keys with size <= 16 bytes.
   // Since T1 only stores a 16-byte prefix (StoreKey), we must preserve the full key in T2
@@ -479,8 +556,8 @@ class VMemKVImpl {
     return !byte_span_less(key, lower_bound) && !byte_span_less(upper_bound, key);
   }
 
-  auto lookup_record(std::span<const std::byte> full_key, const std::shared_ptr<const vmemkv::T2Memory> &mem) const
-      -> std::optional<typename vmemkv::T2FlatFile::LookupResult> {
+  auto lookup_record(std::span<const std::byte> full_key,
+                     const T2Memory *mem) const -> std::optional<typename vmemkv::T2FlatFile::LookupResult> {
     const auto res = t1_.get_with_hash(full_key);
     const uint64_t payload = res.payload_bits;
     if (payload == vmemkv::STORE_NOT_FOUND) {
@@ -493,7 +570,7 @@ class VMemKVImpl {
       }
     }
 
-    const T2RecordView record = t2_.at(payload, mem);
+    const T2RecordView record = t2_.at(payload & kOffsetMask, mem);
     if (!byte_span_equal(record.key, full_key)) {
       return std::nullopt;
     }
@@ -501,21 +578,75 @@ class VMemKVImpl {
     return typename vmemkv::T2FlatFile::LookupResult{payload, record};
   }
 
-  auto make_reorganize_hints() const noexcept -> ReorganizeCoordinator::ReorganizeHints {
-    return ReorganizeCoordinator::ReorganizeHints{
-        .append_size = t1_.append_size(),
-        .append_capacity = T1IndexT::append_capacity(),
-        .soft_threshold_percent = ConfigT::T1ReorganizeSoftThresholdPercent,
-        .hard_threshold_percent = ConfigT::T1ReorganizeHardThresholdPercent,
-    };
+  void reorg_worker_loop(std::stop_token stop_token) {
+    while (!stop_token.stop_requested()) {
+      reorg_requested_.wait(false, std::memory_order_acquire);
+      if (stop_token.stop_requested()) {
+        break;
+      }
+      reorg_requested_.store(false, std::memory_order_release);
+
+      reorg_running_.store(true, std::memory_order_release);
+      try {
+        reorganize(false);
+      } catch (...) {
+        // safe recovery in background
+      }
+      reorg_running_.store(false, std::memory_order_release);
+      reorg_running_.notify_all();
+    }
   }
 
   void maybe_reorganize_if_needed() {
-    reorganize_coordinator_.maybe_reorganize_if_needed(make_reorganize_hints(), [&] { reorganize(); });
+    const size_t append_size = t1_.append_size();
+    const size_t append_capacity = T1IndexT::APPEND_CAP;
+    const size_t soft_limit = (append_capacity * ConfigT::T1ReorganizeSoftThresholdPercent) / 100;
+    const size_t hard_limit = (append_capacity * ConfigT::T1ReorganizeHardThresholdPercent) / 100;
+
+    if (append_size >= soft_limit) {
+      if (!reorg_running_.load(std::memory_order_acquire)) {
+        reorg_requested_.store(true, std::memory_order_release);
+        reorg_requested_.notify_all();
+      }
+    }
+
+    if (append_size >= hard_limit || append_size >= append_capacity) {
+      while (reorg_running_.load(std::memory_order_acquire)) {
+        reorg_running_.wait(true, std::memory_order_acquire);
+      }
+    }
   }
 
-  mutable std::mutex reorganize_mutex_;
-  ReorganizeCoordinator reorganize_coordinator_;
+  // Stripe-local delete pressure is only an approximation, not a global tombstone
+  // count. We intentionally keep this heuristic lightweight and read it outside the
+  // critical section so Delete remains short and contention-friendly.
+  // This is still stripe-local and approximate; it does not model a global tombstone
+  // ratio across the whole T1 index.
+  void maybe_reorganize_if_needed_for_delete(const AlignedMutex &stripe) {
+    const uint64_t live_count = stripe.live_count.load(std::memory_order_relaxed);
+    const uint64_t delete_count = stripe.delete_count.load(std::memory_order_relaxed);
+    if (live_count == 0) {
+      return;
+    }
+
+    constexpr uint64_t kMinLiveCount =
+        T1IndexT::APPEND_CAP / kKeyStripeCount / 16;  // Scale-derived lower bound to avoid tiny-sample thrash.
+    if (live_count < kMinLiveCount) {
+      return;
+    }
+
+    if (delete_count >= live_count) {
+      if (!reorg_running_.load(std::memory_order_acquire)) {
+        reorg_requested_.store(true, std::memory_order_release);
+        reorg_requested_.notify_all();
+      }
+    }
+  }
+
+  std::jthread reorg_worker_;
+  std::atomic<bool> reorg_requested_{false};
+  std::atomic<bool> reorg_running_{false};
+
   // Mutex striping based on key hash. Splitting into 256 stripes prevents lock contention
   // on concurrent writes without the overhead of dynamic allocation for individual key locks.
   // Aligned to cache line size to prevent false sharing.
@@ -527,8 +658,22 @@ class VMemKVImpl {
     return write_stripes_[hash & (kKeyStripeCount - 1)].mu;
   }
 
+  auto stripe_state(std::span<const std::byte> key) const noexcept -> AlignedMutex & {
+    const uint64_t hash = t1_detail::hash_full_key(key);
+    return write_stripes_[hash & (kKeyStripeCount - 1)];
+  }
+
+  void reset_tombstone_counters() noexcept {
+    for (auto &stripe : write_stripes_) {
+      stripe.live_count.store(0, std::memory_order_relaxed);
+      stripe.delete_count.store(0, std::memory_order_relaxed);
+    }
+  }
+
   T1IndexT t1_;
   vmemkv::T2FlatFile t2_;
+  std::atomic<uint64_t> reorg_t1_count_{0};
+  std::atomic<uint64_t> reorg_t2_count_{0};
 };
 
 using VMemKV = VMemKVImpl<vmemkv::Config<>>;

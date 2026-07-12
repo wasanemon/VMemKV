@@ -24,3 +24,17 @@ if(ENABLE_ROCKSDB AND RocksDB_FOUND)
   target_compile_definitions(bench_kv PRIVATE ENABLE_ROCKSDB)
   target_link_libraries(bench_kv PRIVATE RocksDB::rocksdb)
 endif()
+
+option(ENABLE_GPERFTOOLS_PROFILER "Enable gperftools CPU profiler support for bench_kv" ON)
+if(ENABLE_GPERFTOOLS_PROFILER)
+  find_library(GPERFTOOLS_PROFILER_LIB
+    NAMES profiler
+    HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib)
+  if(GPERFTOOLS_PROFILER_LIB)
+    target_compile_definitions(bench_kv PRIVATE VMEMKV_HAVE_GPERFTOOLS_PROFILER)
+    target_link_libraries(bench_kv PRIVATE "${GPERFTOOLS_PROFILER_LIB}")
+    message(STATUS "Enabling gperftools CPU profiler: ${GPERFTOOLS_PROFILER_LIB}")
+  else()
+    message(STATUS "gperftools profiler not found; bench_kv will build without CPU profiler support")
+  endif()
+endif()

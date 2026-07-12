@@ -23,7 +23,7 @@
 
 // Verify that all major variants satisfy the C++20 KVStore concept
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_Baseline>);
-static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_T2_InlineAll>);
+static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_LTM_Inline>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDB>);
 
 namespace {
@@ -100,12 +100,10 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 // ─── Store type lists ───────────────────────────────────────────────────────
 
 // VMemKV 自体のバリエーション（Baseline, Cumulative Steps, Ablations, Inlining）
-#define VMemKVStores                                                                                   \
-  vmemkv::variants::VMemKV_Baseline, vmemkv::variants::VMemKV_Cumulative_Step1,                        \
-      vmemkv::variants::VMemKV_Cumulative_Step2, vmemkv::variants::VMemKV_Cumulative_Step3,            \
-      vmemkv::variants::VMemKV_Cumulative_Step4, vmemkv::variants::VMemKV_Ablation_No_BloomFilter,     \
-      vmemkv::variants::VMemKV_Ablation_No_SimdScan, vmemkv::variants::VMemKV_Ablation_No_MemoryHints, \
-      vmemkv::variants::VMemKV_T2_InlineAll
+#define VMemKVStores                                                                                                 \
+  vmemkv::variants::VMemKV_Baseline, vmemkv::variants::VMemKV_InMem_Simd, vmemkv::variants::VMemKV_InMem_Inline,     \
+      vmemkv::variants::VMemKV_LTM_Baseline, vmemkv::variants::VMemKV_LTM_Bloom, vmemkv::variants::VMemKV_LTM_Hints, \
+      vmemkv::variants::VMemKV_LTM_Inline
 
 // 競合バックエンドのバリエーション（RocksDBStoreなど）
 #ifdef ENABLE_ROCKSDB
@@ -334,6 +332,34 @@ TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
   CHECK(store->insert("c", 3));
   const size_t entry_count = store->scan("a", "c", [](std::span<const std::byte>, uint64_t) {});
   CHECK(entry_count == 3U);
+}
+
+TEST_CASE("VMemKV: manual reorganize forces physical storage garbage collection") {
+  auto store = StoreFactory<vmemkv::variants::VMemKV_Baseline>::make();
+
+  const int key_count = 100;
+  for (int i = 0; i < key_count; ++i) {
+    store->insert(std::to_string(i), static_cast<uint64_t>(i + 1000));
+  }
+
+  uint64_t initial_t2_used = store->t2().bytes_used();
+  REQUIRE(initial_t2_used > 0);
+
+  const int remove_count = 15;
+  for (int i = 0; i < remove_count; ++i) {
+    store->remove(std::to_string(i));
+  }
+
+  CHECK(store->t2().bytes_used() == initial_t2_used);
+
+  store->reorganize();
+
+  uint64_t post_reorg_t2_used = store->t2().bytes_used();
+  CHECK(post_reorg_t2_used < initial_t2_used);
+
+  for (int i = remove_count; i < key_count; ++i) {
+    CHECK(store->get(std::to_string(i)) == static_cast<uint64_t>(i + 1000));
+  }
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -574,7 +600,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   constexpr uint64_t kEvenInlineValue = 0x123456789ABCDEF0ULL;
 
   SUBCASE("T1InlineValue behavior (1-8 bytes)") {
-    using InlineStore = vmemkv::variants::VMemKV_T2_InlineAll;
+    using InlineStore = vmemkv::variants::VMemKV_LTM_Inline;
     auto store = std::make_unique<InlineStore>(path, kInlineStoreCapacityBytes);
 
     uint64_t initial_bytes = store->t2().bytes_used();

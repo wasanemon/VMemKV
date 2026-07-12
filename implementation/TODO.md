@@ -33,15 +33,52 @@ This document outlines the roadmap to implement the full, robust architecture of
 
 ---
 
-## 3. Address Massive Clang-Tidy Warnings (1.2M+ Warnings)
+## 3. Startup Swap Validation Check
 * **Status**: 🔴 **Not Implemented**
-* **Goal**: Address or suppress the astronomical number of clang-tidy warnings generated during static analysis.
-* **Why this occurs**:
-  - The massive warning count (1.2M+ warnings) is primarily due to standard library expansions inside templated core files (`vmemkv_impl.hpp`, `t1_index.hpp`), and strict, cumulative rules enabled by default in `.clang-tidy`.
-* **Action Items**:
-  - Fine-tune `.clang-tidy` rules to exclude system headers and standard library template expansions correctly (e.g., configure `HeaderFilterRegex` and disable noisy rules like `modernize-use-nodiscard` or `cppcoreguidelines-avoid-magic-numbers`).
-  - Systematically clean up legitimate code-quality issues flagged in VMemKV core src files (e.g., `vmemkv_impl.hpp`, `t1_index.hpp`).
-  - Add explicit `NOLINT` comments on false positives or unavoidable OCC concurrency mutations.
+* **Objective**:
+  - Implement a startup check in the main application / VMemKV initialization to verify that the system has an active Swap file of sufficient capacity (e.g., at least 64GB / 1TB on production environments) to prevent OOM Killer.
+  - If a Swap file is not configured or fails validation under memory-constrained environments, raise an initialization warning/error or exit gracefully.
 
-## 4. Introduce Background Reorganize thread
-TBW. 現在はreornigazeが非同期実行されないのでinsertのベンチがappend_regionの限界(200万エントリ）で詰まる。それより細かい頻度でreorganizeするか、append_regionを広げるか、何かしらの措置が必要
+---
+
+## 4. GitHub Pages Documentation Site
+* **Status**: 🟡 **Planned**
+* **Goal**:
+  - Keep the public-facing project page as simple as possible.
+  - Use a single Markdown source file (`index.md`) as the main content source.
+  - Render it through GitHub Pages/Jekyll with a CDN-hosted stylesheet only, avoiding hand-written CSS.
+* **Proposed Layout**:
+  - `pages/index.md`: single-page site containing links to the design docs, `must_read_papers`, and experiment results.
+  - `pages/_layouts/default.html`: minimal Jekyll layout that only injects the CDN stylesheet and Markdown body.
+  - `pages/_config.yml`: enable Jekyll and keep Markdown rendering explicit.
+  - `.github/workflows/pages.yml`: build and deploy the static site artifact to GitHub Pages.
+* **Style Policy**:
+  - Prefer a CDN-only stylesheet such as `water.css` for the simplest possible presentation.
+  - Avoid custom CSS unless a specific layout problem appears.
+  - Keep the site to a single page unless future documentation growth makes splitting unavoidable.
+
+## 5. GitHub Pages Experiments View
+* **Status**: 🟡 **Planned**
+* **Goal**:
+  - Provide a lightweight browser-side visualization page for benchmark results.
+  - Avoid GitHub Actions-based data transformation; keep the pipeline static and simple.
+* **Proposed Layout**:
+  - `pages/experiments/index.html`: dedicated experiments page.
+  - `pages/results/*.json`: raw Google Benchmark JSON artifacts published as static files.
+* **Visualization Plan**:
+  - Load Chart.js from a CDN.
+  - Use browser-side JavaScript to parse benchmark JSON and extract throughput (`items_per_second`).
+  - Render throughput only at first; defer richer charts until the data model stabilizes.
+* **Rationale**:
+  - Splitting experiments into its own page keeps the main documentation page clean.
+  - Browser-side parsing is sufficient for the initial use case and avoids extra build logic.
+
+## 6. Get(Hit) Borrowed Read Path with Versioned Validation
+* **Status**: 🟡 **Planned**
+* **Goal**:
+  - Add a zero-copy `Get(Hit)` read path for large values by returning a borrowed view into T2 instead of always materializing `std::vector<std::byte>`.
+  - Use a version-based validation loop (seqlock-style retry) to ensure the borrowed view is not observed across an in-place update boundary.
+* **Action Items**:
+  - Introduce a borrowed read API that can carry the T2 memory lifetime guard together with the value span.
+  - Validate the record version before and after value access; retry if an update is observed in flight.
+  - Restrict the borrowed path to read-only consumers so the existing copy-returning API can remain available when materialization is required.

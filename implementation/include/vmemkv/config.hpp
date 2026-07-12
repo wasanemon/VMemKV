@@ -57,6 +57,7 @@ struct BloomFilter {};
 struct SimdScan {};
 struct MemoryHints {};
 struct T1InlineValue {};
+struct Prefaulting {};
 
 // ─── Unified System Config Template (Tag-List Pattern) ──────────────────────
 template <typename... Opts>
@@ -68,18 +69,24 @@ struct Config {
   static constexpr bool UseSimdScan = has_opt<SimdScan>;
   static constexpr bool UseMemoryHints = has_opt<MemoryHints>;
   static constexpr bool UseT1InlineValue = has_opt<T1InlineValue>;
+  static constexpr bool UsePrefaulting = has_opt<Prefaulting>;
 
   // Reorganize thresholds for append-region usage.
   // These are intentionally conservative defaults to avoid hitting APPEND_CAP.
   static constexpr size_t kPercentBase = 100;
   static constexpr size_t kBitsPerByte = 8;
-  static constexpr size_t T1ReorganizeSoftThresholdPercent = 75;
-  static constexpr size_t T1ReorganizeHardThresholdPercent = 90;
+  static constexpr size_t T1ReorganizeSoftThresholdPercent = 50;
+  static constexpr size_t T1ReorganizeHardThresholdPercent = 95;
+  static constexpr size_t T2StorageFragmentationThresholdPercent = 30;
+  static constexpr size_t T2OrderingFragmentationThresholdPercent = 50;
 
   // T1 append region capacity (ablation knob).
   // Keep this as a power of two to preserve cache-friendly masking behavior.
-  static constexpr size_t T1AppendCapacityLog2 = 21;
+  static constexpr size_t T1AppendCapacityLog2 = 22;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
+
+  // Default Tier 2 (T2) file storage capacity: 256 GiB.
+  static constexpr size_t DefaultT2CapacityBytes = 256ULL << 30;
 
   static_assert(T1ReorganizeSoftThresholdPercent > 0 && T1ReorganizeSoftThresholdPercent < kPercentBase,
                 "T1ReorganizeSoftThresholdPercent must be in (0, 100)");
@@ -96,5 +103,10 @@ using T1_AllOff = Config<>;
 using T1_AllOn = Config<BloomFilter, SimdScan, MemoryHints>;
 using System_AllOn = Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue>;
 }  // namespace detail
+
+struct VMemKVStatistics {
+  uint64_t t1_reorg_count = 0;
+  uint64_t t2_reorg_count = 0;
+};
 
 }  // namespace vmemkv

@@ -244,6 +244,22 @@ T1 `reorganize` は T2 と独立に実行できる。
 
 T2 `reorganize` は Tier 1 の offset を更新する必要があるため、`payload_mode == Offset64` の index に対してのみ T1 `reorganize` とセットで実行する。
 
+### 4.4 Reorganize Trigger & Promotion (空間増幅率と自動トリガーの制御)
+
+`reorganize` が実行される際、空間効率（Space Efficiency）を保証しつつ無駄なディスク I/O を最小化するため、空間増幅率（Space Amplification Ratio） $A$ に基づく動的プロモーション（昇格）を定義する。
+
+#### 空間増幅率 $A$ の定義
+空間増幅率 $A$ は、有効（Live）なデータの実サイズ `T1_Live_Bytes` に対する現在の T2 物理ファイルサイズ `T2_Used_Bytes` の比として定義される。
+$$A = \frac{\text{T2\_Used\_Bytes}}{\text{T1\_Live\_Bytes}}$$
+
+#### T2 Reorganize (GC) への昇格判定式
+マージ実行時、以下の条件を満たす場合のみ、ディスクの物理デフラグ・GC を伴う T2 Reorganize を実行し、それ以外は T1-only (インメモリマージ) で処理を完了とする。
+
+$$\text{T2\_GC\_Trigger} = A \ge A_{\text{limit}}$$
+
+* **$A_{\text{limit}}$ (空間増幅率上限):** `1.3` (Storage Fragmentation $\ge 30\%$ 相当。RocksDB 等の標準である空間増幅率上限に基づき定義される)。
+* **初期挿入 (Insert-only) ワークロード:** ゴミデータが一切発生しないため空間増幅率は常に $A = 1.0 < 1.3$ に保たれる。これにより、Insert 性能測定中は重い T2 Reorganize が一切トリガーされず、T1-only インメモリ並列マージソートのみで極めて高速に処理される。
+
 **Input**
 
 - T1 の `reorganize` 後 `sorted_region`
@@ -455,13 +471,38 @@ T1のインデックススロットに十分な空きビット領域がないた
 - **値が 1〜8 バイトの場合**:
   - `payload_bits` に対するビットシフトやビットの埋め込みは行わず、64ビットのビットパターンをそのまま無加工で格納し、デコード時は `inline_size` に従いバイトコピーを行う。これにより、`double`、`time`、連番のサロゲートキー（偶数・奇数を問わず）など、あらゆる64ビット以内のデータ型を完全にインライン化できる。
 
-### 7.6 Sorted Bloom Filter
+### 7.6 Chunk Allocation / Pre-faulting (T2 Lock Mitigation)
+
+マルチコア高並列書き込み環境における Linux カーネルの仮想メモリページフォールトおよび `mmap_lock`（VMAロック）の競合によるオーバーヘッド（Cache Line Bouncing）を緩和するための最適化である。
+
+* **スレッドローカル Chunk アロケーション**: 
+  各書き込みスレッドが T2 領域へ `append` する際、アトミックカウンタから個別に領域をアロケートするのではなく、スレッドごとに大きなブロック（例: 2MB）を一括予約する。
+* **一括 Pre-faulting**:
+  Chunk 確保直後に、その 2MB 領域を 4KB ページ単位（標準ページサイズ）でダミーライトし、カーネルに物理メモリページを一括で割り当てさせる。
+  これにより、その後の個々の `insert`（`memcpy`）においてはページフォールトの発生が **1/500** に激減し、OS カーネルの `mmap_lock` に入ることなく完全に並行して超高速にメモリコピーを実行できるようになる。
+* **コンパイル時解決の徹底**:
+  最適化のオーバーヘッドをゼロにするため、`vmemkv::Config` のテンプレート引数タグ（`Prefaulting`）を介して `constexpr if` によってコンパイル時に分岐とコード生成が制御される。
+
+### 7.7 Sorted Bloom Filter
 
 `sorted_region` 全体に Bloom filter を付与し、negative lookup を高速化できる。
 
-### 7.7 Tier 2 Prefetch
+### 7.8 Tier 2 Prefetch
 
 Scan 時に Tier 1 から得た offset 群に対して `madvise(MADV_WILLNEED)` を出し、Tier 2 を先読みする。
+
+### 7.9 Index-Entry Size Embedding (サイズ情報のインデックス内ビット埋め込み)
+
+T2 へのランダムメモリアクセスを伴わずに $O(1)$ で `T1_Live_Bytes` を集計するため、T1 インデックスエントリー of `payload_bits`（T2 オフセットポインタ）の未使用上位ビットにレコードサイズをエンコードして格納する。
+
+#### ビットエンコーディングレイアウト (64ビット)
+* **Bits 0-47 (48-bit):** `T2 Offset` (物理ファイル内のレコードのオフセットポインタ。最大 256 TiB の仮想アドレス空間をマップ可能)。
+* **Bits 48-63 (16-bit):** `Embedded Block Count` (16バイトアライメントされたレコード占有サイズブロック数 `aligned_len / 16`)。
+  * 最大表現サイズ: $(2^{16} - 1) \times 16 \text{ バイト} \approx \mathbf{1.04 \text{ MB}}$
+
+#### デコード手順
+* **物理オフセット:** `payload_bits & 0xFFFFFFFFFFFFULL`
+* **レコードサイズ:** `(payload_bits >> 48) << 4`
 
 ## 8. Parameters
 

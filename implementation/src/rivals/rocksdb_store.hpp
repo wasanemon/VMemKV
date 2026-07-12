@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -20,6 +21,7 @@
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
 #include <rocksdb/slice.h>
+#include <rocksdb/write_batch.h>
 #endif
 
 #include "../t1_index/t1_index.hpp"  // For STORE_NOT_FOUND definition
@@ -44,8 +46,7 @@ class RocksDBStore {
     path_ = std::move(path) + "_" + std::to_string(instance_counter.fetch_add(1, std::memory_order_relaxed));
 
     rocksdb::DestroyDB(path_, {});
-    rocksdb::Options opts;
-    opts.create_if_missing = true;
+    rocksdb::Options opts = make_benchmark_db_options();
     rocksdb::DB *db_handle = nullptr;
     auto status = rocksdb::DB::Open(opts, path_, &db_handle);
     if (!status.ok()) {
@@ -103,6 +104,44 @@ class RocksDBStore {
     return db_->Delete({}, to_slice(key)).ok();
   }
 
+  template <typename KeyFn>
+  auto bulk_load_impl(std::size_t key_count,
+                      KeyFn &&make_key,
+                      std::span<const std::byte> value,
+                      std::string *error_out = nullptr) -> bool {
+    if (key_count == 0) {
+      return true;
+    }
+    // Keep each WriteBatch within a fixed byte budget so 8B values can be
+    // grouped much more aggressively than 64KB values without changing the
+    // benchmark workload semantics.
+    constexpr std::size_t kBatchBytes = 64ULL * 1024ULL * 1024ULL;
+    rocksdb::WriteOptions write_opts = make_bulk_load_write_options();
+    const auto value_slice = to_slice(value);
+    const std::size_t batch_keys = std::max<std::size_t>(1, kBatchBytes / std::max<std::size_t>(1, value.size()));
+
+    std::size_t next_index = 0;
+    while (next_index < key_count) {
+      rocksdb::WriteBatch batch;
+      const std::size_t chunk_end = std::min(key_count, next_index + batch_keys);
+      for (std::size_t index = next_index; index < chunk_end; ++index) {
+        const std::string key = make_key(index);
+        batch.Put(key, value_slice);
+      }
+
+      auto status = db_->Write(write_opts, &batch);
+      if (!status.ok()) {
+        if (error_out != nullptr) {
+          *error_out = "RocksDB WriteBatch failed: " + status.ToString();
+        }
+        return false;
+      }
+
+      next_index = chunk_end;
+    }
+    return true;
+  }
+
   [[nodiscard]] auto get_bytes_impl(std::span<const std::byte> key) const -> std::optional<std::vector<std::byte>> {
     std::string val;
     auto status = db_->Get({}, to_slice(key), &val);
@@ -138,6 +177,32 @@ class RocksDBStore {
   }
 
  private:
+  static auto make_benchmark_db_options() -> rocksdb::Options {
+    rocksdb::Options opts;
+    opts.create_if_missing = true;
+    // Benchmark tuning lives here so the wrapper API stays separate from the
+    // current population policy.
+    opts.compression = rocksdb::kNoCompression;
+    opts.write_buffer_size = 256ULL * 1024ULL * 1024ULL;
+    opts.max_write_buffer_number = 16;
+    opts.min_write_buffer_number_to_merge = 4;
+    opts.target_file_size_base = 256ULL * 1024ULL * 1024ULL;
+    opts.level_compaction_dynamic_level_bytes = true;
+    opts.level0_file_num_compaction_trigger = 16;
+    opts.level0_slowdown_writes_trigger = 128;
+    opts.level0_stop_writes_trigger = 256;
+    opts.max_background_jobs = 8;
+    opts.max_subcompactions = 4;
+    opts.max_open_files = 256;
+    return opts;
+  }
+
+  static auto make_bulk_load_write_options() -> rocksdb::WriteOptions {
+    rocksdb::WriteOptions opts;
+    opts.disableWAL = true;
+    return opts;
+  }
+
   static auto to_slice(std::span<const std::byte> key_bytes) noexcept -> rocksdb::Slice {
     return {reinterpret_cast<const char *>(key_bytes.data()), key_bytes.size()};
   }
@@ -182,6 +247,19 @@ class RocksDBStore {
   // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
   auto remove_impl(std::span<const std::byte> key) -> bool {
     (void)key;
+    return false;
+  }
+  template <typename KeyFn>
+  auto bulk_load_impl(std::size_t key_count,
+                      KeyFn &&make_key,
+                      std::span<const std::byte> value,
+                      std::string *error_out = nullptr) -> bool {
+    (void)key_count;
+    (void)make_key;
+    (void)value;
+    if (error_out != nullptr) {
+      *error_out = "RocksDB not enabled in this build";
+    }
     return false;
   }
   // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
