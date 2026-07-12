@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VMemKV Performance Charts</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+          }
+        }
+      }
+    }
+  </script>
+  
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  
+  <style>
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .tab-btn.active {
+      border-color: #4f46e5;
+      color: #4f46e5;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body class="bg-white text-slate-900 font-sans min-h-screen antialiased selection:bg-slate-100">
+
+  <!-- Navigation Bar -->
+  <nav class="border-b border-slate-200 bg-white sticky top-0 z-50">
+    <div class="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between">
+      <a href="index.html" class="flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-indigo-600 transition-colors">
+        <i data-lucide="arrow-left" class="w-4 h-4"></i>
+        Back to Portal
+      </a>
+      <div class="text-xs font-bold text-slate-400 uppercase tracking-widest">
+        vmemkv
+      </div>
+    </div>
+  </nav>
+
+  <main class="max-w-4xl mx-auto px-6 py-12 space-y-12">
+    
+    <!-- Header -->
+    <header class="space-y-4 border-b border-slate-200 pb-6">
+      <div class="flex items-center justify-between">
+        <h1 class="text-3xl font-bold tracking-tight text-slate-900">
+          AWS c6id Benchmark Charts
+        </h1>
+        <div class="flex gap-2">
+          <a href="logs/2026071218/results_in_memory.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (In-memory)
+          </a>
+          <a href="logs/2026071218/results_ltm.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (Larger-than-memory)
+          </a>
+        </div>
+      </div>
+      <p class="text-slate-500 text-sm max-w-3xl">
+        AWS 32コア物理環境における VMemKV と RocksDB の包括的な性能ベンチマーク結果。各グラフの下部アコーディオンから、個別ディスカッション（Giscus）が行えます。
+      </p>
+      
+      <!-- Project Links -->
+      <div class="flex flex-wrap gap-x-6 gap-y-2 text-xs">
+        <a href="https://github.com/LineairDB/VMemKV" target="_blank" rel="noopener" class="text-indigo-600 hover:underline">
+          GitHub Repository &rarr;
+        </a>
+        <a href="https://github.com/LineairDB/VMemKV/tree/main/implementation/docs/specification" target="_blank" rel="noopener"
+          class="text-indigo-600 hover:underline">
+          Design Document &rarr;
+        </a>
+      </div>
+    </header>
+
+    <!-- Variant Quick Reference & System Context -->
+    <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
+      
+      <!-- Variant List -->
+      <div class="space-y-2 border-r border-slate-200 pr-0 md:pr-6">
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="git-branch" class="w-3.5 h-3.5"></i> Variants
+        </h2>
+        <ul class="space-y-1.5 text-slate-500 list-disc pl-4">
+          <li><strong>RocksDB</strong></li>
+          <li><strong>Baseline</strong>: すべての最適化機能をオフにしたベースラインの vmemkv。</li>
+          <li><strong>Simd</strong>: T1 レンジスキャンに AVX2/AVX-512 ベクトル並列走査を適用。</li>
+          <li><strong>Bloom</strong>: 存在しないキーの Get を O(1) で弾く T1 ブルームフィルタを有効化。</li>
+          <li><strong>Hints</strong>: Larger-than-memory環境でスワップによるストールを防ぐ madvise メモリヒントを有効化。</li>
+          <li><strong>T1InlineValue</strong>: 8B以下のValueを T1 インデックススロットへ埋め込み T2 の処理をバイパス。</li>
+          <li><strong>Prefaulting</strong>: 2MB Chunk Alloc & Pre-faulting による mmap_lock ロック衝突の緩和。</li>
+        </ul>
+      </div>
+
+      <!-- System Context -->
+      <div class="space-y-2 pl-0 md:pl-2">
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="cpu" class="w-3.5 h-3.5"></i> Environment
+        </h2>
+        <ul class="space-y-1 text-slate-500">
+          <li><strong>CPU</strong>: Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz (32 Cores / 64 Threads)</li>
+          <li><strong>Cache</strong>: L1D 48KB, L1I 32KB, L2 1.25MB (per 2 cpus) | L3 54MB (per 32 cpus)</li>
+          <li><strong>RAM</strong>: Total 66.3 GB (In LTM runs, RAM is constrained to 1GiB)</li>
+          <li><strong>OS / Kernel</strong>: Ubuntu 22.04 LTS (Linux 6.17.0-1019-aws)</li>
+          <li><strong>Compiler</strong>: GCC / CMake Release Build</li>
+          <li><strong>Disk</strong>: Local NVMe SSD (AWS Instance Store, Swap Media)</li>
+        </ul>
+      </div>
+
+    </section>
+
+    <!-- Overall Notes Section -->
+    <section class="border border-slate-200 rounded-xl p-5 bg-slate-50/50 space-y-3">
+      <h2 class="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+        <i data-lucide="notebook" class="w-3.5 h-3.5 text-indigo-500"></i> Overall Notes & Annotations
+      </h2>
+      <p class="text-[11px] text-slate-400">
+        このベンチマーク実験全体に対する考察やアノテーションメモをローカルに保存できます（ブラウザの localStorage に自動保存されます）。
+      </p>
+      <textarea id="memo-overall" oninput="saveMemo('overall', this.value)" placeholder="実験全体の総括メモを入力..." class="w-full text-xs p-3 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-white resize-y h-24"></textarea>
+    </section>
+
+    <!-- Tab Buttons (Floating Sticky) -->
+    <div class="border-b border-slate-200 sticky top-16 z-40 bg-white shadow-sm py-2 px-1">
+      <nav class="flex gap-x-8 text-sm" aria-label="Tabs">
+        <button onclick="switchTab('tab-8b')" id="btn-tab-8b" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium active">
+          In-Memory (Value 8B)
+        </button>
+        <button onclick="switchTab('tab-1kb')" id="btn-tab-1kb" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium">
+          Larger-than-memory (Value 1KB)
+        </button>
+        <button onclick="switchTab('tab-64kb')" id="btn-tab-64kb" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium">
+          Larger-than-memory (Value 64KB)
+        </button>
+      </nav>
+    </div>
+
+    <!-- ==================== TAB 1: In-Memory (Value 8B) ==================== -->
+    <div id="tab-8b" class="tab-content active space-y-12">
+      <div class="space-y-16">
+        
+        <!-- Insert -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-8b-Insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b-Insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures incremental database insertions starting from a fresh store.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b-Insert" oninput="saveMemo('8b-Insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Update -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update Workload</h3>
+            <span id="badge-8b-Update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b-Update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Replaces values of randomly selected existing keys in-place.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b-Update" oninput="saveMemo('8b-Update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Delete -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete Workload</h3>
+            <span id="badge-8b-Delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b-Delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Removes existing keys, triggering index node deallocation and space reclamation.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b-Delete" oninput="saveMemo('8b-Delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Get Hit -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get (Hit) Workload</h3>
+            <span id="badge-8b-Get_Hit" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b-Get_Hit"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Retrieves existing keys using Zipfian distribution (locality of access).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b-Get_Hit" oninput="saveMemo('8b-Get_Hit', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Get Miss -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get (Miss) Workload</h3>
+            <span id="badge-8b-Get_Miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b-Get_Miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Queries non-existent keys to evaluate T1 Bloom Filter filtering efficiency.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b-Get_Miss" oninput="saveMemo('8b-Get_Miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Scan No Reorg -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg) Workload</h3>
+            <span id="badge-8b-Scan_NoReorg" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b-Scan_NoReorg"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Performs range queries of 100 consecutive keys under stable database state. <span class="text-rose-600 font-semibold">(⚠️ 注意: 現在のSCAN実装には設計と異なるバグがあり、リクエストごとにインデックス全体を全件コピーしてO(N log N)ソートするため、データ数Nが膨大になるスモールバリュー環境で極端に性能が低下しています。次回修正予定。)</span>
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b-Scan_NoReorg" oninput="saveMemo('8b-Scan_NoReorg', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Scan With Reorg -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg) Workload</h3>
+            <span id="badge-8b-Scan_WithReorg" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b-Scan_WithReorg"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries concurrently while background T1 reorganization is running. <span class="text-rose-600 font-semibold">(⚠️ 注意: 現在のSCAN実装には設計と異なるバグがあり、リクエストごとにインデックス全体を全件コピーしてO(N log N)ソートするため、データ数Nが膨大になるスモールバリュー環境で極端に性能が低下しています。次回修正予定。)</span>
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b-Scan_WithReorg" oninput="saveMemo('8b-Scan_WithReorg', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ==================== TAB 2: Larger-than-memory (Value 1KB) ==================== -->
+    <div id="tab-1kb" class="tab-content space-y-12">
+      <div class="space-y-16">
+        
+        <!-- Insert -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-1kb-Insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb-Insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures incremental database insertions starting from a pre-populated LTM store.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb-Insert" oninput="saveMemo('1kb-Insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Update -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update Workload</h3>
+            <span id="badge-1kb-Update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb-Update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Replaces values of randomly selected existing keys in-place under cgroup limit.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb-Update" oninput="saveMemo('1kb-Update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Delete -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete Workload</h3>
+            <span id="badge-1kb-Delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb-Delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Removes existing keys, triggering index node deallocation and space reclamation in LTM.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb-Delete" oninput="saveMemo('1kb-Delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Get Hit -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get (Hit) Workload</h3>
+            <span id="badge-1kb-Get_Hit" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb-Get_Hit"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Retrieves existing keys using Zipfian distribution, validating active page swap hit rate.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb-Get_Hit" oninput="saveMemo('1kb-Get_Hit', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Get Miss -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get (Miss) Workload</h3>
+            <span id="badge-1kb-Get_Miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb-Get_Miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Queries non-existent keys to evaluate T1 Bloom Filter filtering efficiency in memory-constrained environment.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb-Get_Miss" oninput="saveMemo('1kb-Get_Miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Scan No Reorg -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg) Workload</h3>
+            <span id="badge-1kb-Scan_NoReorg" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb-Scan_NoReorg"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Performs range queries of 100 consecutive keys under stable database state with SSD swappings. <span class="text-rose-600 font-semibold">(⚠️ 注意: 現在のSCAN実装には設計と異なるバグがあり、リクエストごとにインデックス全体を全件コピーしてO(N log N)ソートするため、データ数Nが膨大になるスモールバリュー環境で極端に性能が低下しています。次回修正予定。)</span>
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb-Scan_NoReorg" oninput="saveMemo('1kb-Scan_NoReorg', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Scan With Reorg -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg) Workload</h3>
+            <span id="badge-1kb-Scan_WithReorg" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb-Scan_WithReorg"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries concurrently while background T1 reorganization is running under memory limit. <span class="text-rose-600 font-semibold">(⚠️ 注意: 現在のSCAN実装には設計と異なるバグがあり、リクエストごとにインデックス全体を全件コピーしてO(N log N)ソートするため、データ数Nが膨大になるスモールバリュー環境で極端に性能が低下しています。次回修正予定。)</span>
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb-Scan_WithReorg" oninput="saveMemo('1kb-Scan_WithReorg', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ==================== TAB 3: Larger-than-memory (Value 64KB) ==================== -->
+    <div id="tab-64kb" class="tab-content space-y-12">
+      <div class="space-y-16">
+        
+        <!-- Insert -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-64kb-Insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb-Insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures incremental database insertions starting from a pre-populated LTM store (Large Values).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb-Insert" oninput="saveMemo('64kb-Insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Update -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update Workload</h3>
+            <span id="badge-64kb-Update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb-Update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Replaces values of randomly selected existing keys in-place under cgroup limit (Large Values).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb-Update" oninput="saveMemo('64kb-Update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Delete -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete Workload</h3>
+            <span id="badge-64kb-Delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb-Delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Removes existing keys, triggering index node deallocation and space reclamation in LTM (Large Values).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb-Delete" oninput="saveMemo('64kb-Delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Get Hit -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get (Hit) Workload</h3>
+            <span id="badge-64kb-Get_Hit" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb-Get_Hit"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Retrieves existing keys using Zipfian distribution, validating active page swap hit rate (Large Values).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb-Get_Hit" oninput="saveMemo('64kb-Get_Hit', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Get Miss -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get (Miss) Workload</h3>
+            <span id="badge-64kb-Get_Miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb-Get_Miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Queries non-existent keys to evaluate T1 Bloom Filter filtering efficiency in memory-constrained environment (Large Values).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb-Get_Miss" oninput="saveMemo('64kb-Get_Miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Scan No Reorg -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg) Workload</h3>
+            <span id="badge-64kb-Scan_NoReorg" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb-Scan_NoReorg"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Performs range queries of 100 consecutive keys under stable database state with SSD swappings (Large Values). <span class="text-rose-600 font-semibold">(⚠️ 注意: 現在のSCAN実装には設計と異なるバグがあり、リクエストごとにインデックス全体を全件コピーしてO(N log N)ソートするため、データ数Nが膨大になるスモールバリュー環境で極端に性能が低下しています。次回修正予定。)</span>
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb-Scan_NoReorg" oninput="saveMemo('64kb-Scan_NoReorg', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+        <!-- Scan With Reorg -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg) Workload</h3>
+            <span id="badge-64kb-Scan_WithReorg" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb-Scan_WithReorg"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries concurrently while background T1 reorganization is running under memory limit (Large Values). <span class="text-rose-600 font-semibold">(⚠️ 注意: 現在のSCAN実装には設計と異なるバグがあり、リクエストごとにインデックス全体を全件コピーしてO(N log N)ソートするため、データ数Nが膨大になるスモールバリュー環境で極端に性能が低下しています。次回修正予定。)</span>
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb-Scan_WithReorg" oninput="saveMemo('64kb-Scan_WithReorg', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="border-t border-slate-200 bg-white py-12 px-6 text-center text-xs text-slate-400 mt-24">
+    <div class="max-w-4xl mx-auto">
+      <div>© 2026 VMemKV Project.</div>
+      <div>Designed with Sleek Minimal Light theme. Powered by Tailwind CSS & Chart.js.</div>
+    </div>
+  </footer>
+
+  <script>
+    // Initialize Lucide Icons
+    lucide.createIcons();
+
+    // Raw Experiment Data Inlined
+    const rawData = {
+      "8B": {
+        "Insert": {
+          "RocksDB": [279200.4, 407325.5, 946985.0, 975177.6],
+          "Baseline": [2873526.3, 4651286.4, 7228011.9, 6766908.8],
+          "Bloom-Simd": [3076601.0, 4852118.3, 7302571.6, 6873896.8],
+          "Bloom-Simd-T1InlineValue": [3545659.5, 7304878.2, 9333716.7, 9421850.1],
+          "Bloom-Simd-T1InlineValue-Prefaulting": [3575074.3, 7385384.5, 8856672.9, 9439703.2]
+        },
+        "Get_Hit": {
+          "RocksDB": [553432.6, 2330148.2, 9555588.7, 10234826.3],
+          "Baseline": [1433246.1, 5714142.4, 22725881.5, 34719611.9],
+          "Bloom-Simd": [1468232.8, 6012301.6, 24057344.5, 35456658.1],
+          "Bloom-Simd-T1InlineValue": [1552924.6, 6477014.8, 27460834.9, 36424331.0],
+          "Bloom-Simd-T1InlineValue-Prefaulting": [1490716.8, 6354461.8, 27366981.7, 39354994.0]
+        },
+        "Get_Miss": {
+          "RocksDB": [276693.0, 1101631.8, 4396506.5, 3719926.3],
+          "Baseline": [3037229.0, 13113820.8, 54945242.7, 67076045.8],
+          "Bloom-Simd": [4401190.1, 19565108.6, 82453804.4, 107504518.5],
+          "Bloom-Simd-T1InlineValue": [3461501.5, 14402464.4, 59887764.9, 80727196.9],
+          "Bloom-Simd-T1InlineValue-Prefaulting": [4308777.1, 18558661.3, 79128635.2, 93473743.0]
+        },
+        "Update": {
+          "RocksDB": [141955.6, 336708.6, 928477.5, 920682.0],
+          "Baseline": [675101.5, 2636040.9, 8758496.7, 12177789.4],
+          "Bloom-Simd": [633571.2, 2422553.0, 8109980.3, 11336583.4],
+          "Bloom-Simd-T1InlineValue": [740986.8, 2750769.8, 8935561.8, 12142220.7],
+          "Bloom-Simd-T1InlineValue-Prefaulting": [732627.8, 2727063.3, 8928650.5, 12088571.2]
+        },
+        "Scan_NoReorg": {
+          "RocksDB": [4466279.9, 18220571.1, 73922738.1, 71521273.9],
+          "Baseline": [27.5, 100.6, 248.4, 275.4],
+          "Bloom-Simd": [28.2, 104.4, 259.7, 285.8],
+          "Bloom-Simd-T1InlineValue": [28.7, 105.9, 258.8, 286.8],
+          "Bloom-Simd-T1InlineValue-Prefaulting": [28.7, 105.0, 258.4, 287.5]
+        },
+        "Delete": {
+          "RocksDB": [172522.6, 366989.5, 922224.1, 856090.3],
+          "Baseline": [2407449.3, 8086854.2, 22591840.3, 23644864.0],
+          "Bloom-Simd": [1976512.8, 7445391.5, 21185061.9, 21945473.3],
+          "Bloom-Simd-T1InlineValue": [1983954.5, 6476597.3, 17727204.9, 19466173.8],
+          "Bloom-Simd-T1InlineValue-Prefaulting": [2007916.5, 6294321.7, 17958184.9, 20152801.5]
+        },
+        "Scan_WithReorg": {
+          "Baseline": [28.7, 106.4, 257.8, 285.3],
+          "Bloom-Simd": [29.0, 105.7, 257.8, 285.3],
+          "Bloom-Simd-T1InlineValue": [26.6, 101.9, 253.4, 281.3],
+          "Bloom-Simd-T1InlineValue-Prefaulting": [26.1, 100.4, 249.8, 277.1]
+        }
+      },
+      "1KB": {
+        "Insert": {
+          "RocksDB": [51824.0, 128898.3, 123406.8, 64311.4],
+          "Simd": [336435.7, 340817.6, 407647.8, 496325.6],
+          "Bloom-Simd": [298899.5, 309956.0, 441982.6, 482448.5],
+          "Bloom-Simd-Hints": [402811.8, 373555.0, 470484.1, 552721.0],
+          "Bloom-Simd-Hints-T1InlineValue": [400515.9, 380574.2, 515950.8, 419327.9],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [384390.8, 336949.0, 322028.1, 335336.5]
+        },
+        "Get_Hit": {
+          "RocksDB": [13073.5, 117489.9, 676668.6, 1223127.1],
+          "Simd": [36263.2, 251385.3, 971058.0, 1719811.4],
+          "Bloom-Simd": [40742.6, 231623.7, 998401.5, 1685607.8],
+          "Bloom-Simd-Hints": [37220.7, 244431.7, 944372.6, 1563248.2],
+          "Bloom-Simd-Hints-T1InlineValue": [40713.9, 233208.8, 946196.9, 1568900.8],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [55884.1, 343221.7, 1364750.4, 2255978.0]
+        },
+        "Get_Miss": {
+          "RocksDB": [222119.9, 896160.8, 3551910.7, 3161901.3],
+          "Simd": [4940796.6, 20431983.7, 96362752.4, 115797607.1],
+          "Bloom-Simd": [4994554.9, 22236908.4, 89553861.4, 92165676.7],
+          "Bloom-Simd-Hints": [5084197.8, 21796651.0, 97702103.1, 118576855.3],
+          "Bloom-Simd-Hints-T1InlineValue": [4637885.1, 19749229.6, 70024829.3, 89332092.9],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [4661160.1, 20461462.6, 88097224.5, 99450395.2]
+        },
+        "Update": {
+          "RocksDB": [3281.8, 36394.3, 68558.1, 69725.2],
+          "Simd": [34376.8, 117324.6, 256638.2, 182271.7],
+          "Bloom-Simd": [50281.7, 115568.9, 245118.4, 192441.5],
+          "Bloom-Simd-Hints": [41070.6, 112759.5, 245014.5, 183036.2],
+          "Bloom-Simd-Hints-T1InlineValue": [41322.8, 111154.2, 220652.0, 166305.6],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [44467.1, 111360.7, 239668.7, 155288.6]
+        },
+        "Scan_NoReorg": {
+          "RocksDB": [423618.0, 1366586.6, 8788756.3, 13283579.0],
+          "Simd": [258.6, 942.5, 374.4, 60.6],
+          "Bloom-Simd": [255.3, 942.0, 399.6, 60.2],
+          "Bloom-Simd-Hints": [252.8, 926.8, 217.2, 60.8],
+          "Bloom-Simd-Hints-T1InlineValue": [251.9, 381.7, 208.0, 60.6],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [258.7, 950.7, 298.1, 61.0]
+        },
+        "Delete": {
+          "RocksDB": [37995.8, 54376.6, 92148.5, 155795.8],
+          "Simd": [2261337.9, 4068007.8, 8618945.2, 13026439.0],
+          "Bloom-Simd": [2410051.9, 4157261.2, 8515156.9, 12813242.2],
+          "Bloom-Simd-Hints": [3410411.5, 11034149.4, 29769074.8, 36935367.8],
+          "Bloom-Simd-Hints-T1InlineValue": [3181303.6, 8704080.0, 34811178.3, 39568307.8],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [3250487.8, 10661960.8, 33548501.4, 39107346.3]
+        },
+        "Scan_WithReorg": {
+          "Simd": [347.7, 1175.7, 517.4, 62.4],
+          "Bloom-Simd": [344.7, 1186.9, 401.1, 62.6],
+          "Bloom-Simd-Hints": [348.3, 1174.9, 245.2, 62.6],
+          "Bloom-Simd-Hints-T1InlineValue": [350.2, 1188.8, 235.7, 62.5],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [346.2, 1173.8, 319.2, 62.7]
+        }
+      },
+      "64KB": {
+        "Insert": {
+          "RocksDB": [4237.2, 4571.9, 2799.2, 2433.1],
+          "Simd": [10767.4, 11203.0, 20228.0, 22044.3],
+          "Bloom-Simd": [9517.9, 9925.4, 20137.1, 22139.9],
+          "Bloom-Simd-Hints": [10044.1, 12583.7, 19708.0, 23182.8],
+          "Bloom-Simd-Hints-T1InlineValue": [10413.6, 9524.2, 22503.2, 23828.9],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [6919.4, 14115.0, 18512.0, 18868.7]
+        },
+        "Get_Hit": {
+          "RocksDB": [5907.6, 44873.6, 173184.1, 284598.0],
+          "Simd": [31487.2, 94501.4, 219081.4, 307127.2],
+          "Bloom-Simd": [31070.0, 86322.6, 219673.7, 310119.9],
+          "Bloom-Simd-Hints": [33293.0, 87713.1, 178227.0, 261883.3],
+          "Bloom-Simd-Hints-T1InlineValue": [22460.8, 68232.4, 176766.8, 261306.3],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [32759.6, 64430.2, 181753.9, 263005.3]
+        },
+        "Get_Miss": {
+          "RocksDB": [418533.8, 1668118.4, 6722406.8, 5936534.6],
+          "Simd": [9466030.2, 28207420.8, 129926496.4, 133842769.4],
+          "Bloom-Simd": [9386571.4, 32300667.3, 139784187.0, 135407866.4],
+          "Bloom-Simd-Hints": [9339410.0, 37249181.8, 147486916.7, 135334703.7],
+          "Bloom-Simd-Hints-T1InlineValue": [7228403.1, 28824164.4, 117484193.6, 107169698.5],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [7471491.7, 25341004.0, 120779336.8, 111178668.9]
+        },
+        "Update": {
+          "RocksDB": [1466.6, 3341.0, 1542.9, 2288.8],
+          "Simd": [5033.1, 16572.7, 33407.7, 26296.0],
+          "Bloom-Simd": [4938.9, 17716.8, 29870.2, 27802.6],
+          "Bloom-Simd-Hints": [4644.0, 13269.6, 20713.5, 26433.6],
+          "Bloom-Simd-Hints-T1InlineValue": [4494.4, 14840.7, 20754.8, 25435.6],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [4578.6, 14126.9, 21603.7, 25287.5]
+        },
+        "Scan_NoReorg": {
+          "RocksDB": [14025.5, 77193.2, 242209.1, 243165.6],
+          "Simd": [21782.4, 93475.7, 381524.7, 432542.8],
+          "Bloom-Simd": [19294.2, 92434.9, 381017.0, 434466.4],
+          "Bloom-Simd-Hints": [21278.1, 92782.5, 376268.5, 432593.2],
+          "Bloom-Simd-Hints-T1InlineValue": [18349.0, 91668.3, 378448.5, 434844.5],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [23062.1, 102963.9, 423193.8, 468502.8]
+        },
+        "Delete": {
+          "RocksDB": [3279.1, 7277.6, 13320.0, 18276.8],
+          "Simd": [278764.8, 289417.2, 730781.4, 947930.1],
+          "Bloom-Simd": [282169.4, 291016.0, 645895.2, 882909.6],
+          "Bloom-Simd-Hints": [220570.0, 293649.7, 667707.5, 936565.7],
+          "Bloom-Simd-Hints-T1InlineValue": [289096.6, 294695.9, 745206.1, 930547.7],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [313368.2, 372358.3, 738410.5, 1552080.1]
+        },
+        "Scan_WithReorg": {
+          "Simd": [41508.1, 165756.9, 663877.9, 668044.8],
+          "Bloom-Simd": [41267.6, 166024.8, 659048.3, 665974.1],
+          "Bloom-Simd-Hints": [41223.1, 166896.3, 664928.2, 656519.9],
+          "Bloom-Simd-Hints-T1InlineValue": [40911.0, 165515.0, 655368.1, 664571.2],
+          "Bloom-Simd-Hints-T1InlineValue-Prefaulting": [40687.0, 163931.2, 656404.2, 653422.5]
+        }
+      }
+    };
+
+
+
+    const workloads = ["Insert", "Update", "Delete", "Get_Hit", "Get_Miss", "Scan_NoReorg", "Scan_WithReorg"];
+    const valSizes = ["8B", "1KB", "64KB"];
+
+    const colors = {
+      'RocksDB': '#64748b', // Slate Gray
+      'Baseline': '#94a3b8',
+      'Simd': '#38bdf8',
+      'Bloom-Simd': '#0ea5e9',
+      'Bloom-Simd-Hints': '#059669',
+      'Bloom-Simd-T1InlineValue': '#6366f1',
+      'Bloom-Simd-Hints-T1InlineValue': '#6366f1',
+      'Bloom-Simd-T1InlineValue-Prefaulting': '#ec4899',
+      'Bloom-Simd-Hints-T1InlineValue-Prefaulting': '#ec4899'
+    };
+
+    const threadLabels = ['1 Thread', '4 Threads', '16 Threads', '32 Threads'];
+
+    // Helper to generate Chart.js Config
+    function makeChartConfig(valSize, op) {
+      const opData = rawData[valSize][op];
+      if (!opData) return null;
+      
+      const datasets = Object.keys(opData).map(variantName => {
+        const isRocks = variantName === 'RocksDB';
+        return {
+          label: variantName,
+          data: opData[variantName],
+          borderColor: colors[variantName] || '#6366f1',
+          // Rich Gradient Area Fill
+          backgroundColor: function(context) {
+            const chart = context.chart;
+            const {ctx, chartArea} = chart;
+            if (!chartArea) return null;
+            const color = colors[variantName] || '#6366f1';
+            const gradient = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+            gradient.addColorStop(0, color + '25'); // 14% Opacity at top
+            gradient.addColorStop(1, color + '00'); // 0% Opacity at bottom
+            return gradient;
+          },
+          borderWidth: isRocks ? 2.5 : 2,
+          borderDash: isRocks ? [6, 6] : [], // RocksDB is dashed line
+          tension: 0.15,
+          fill: true,
+          pointStyle: isRocks ? 'triangle' : 'circle', // RocksDB is triangle point
+          pointRadius: isRocks ? 5 : 3.5,
+          pointHoverRadius: isRocks ? 7 : 5.5,
+          hoverBorderWidth: 3
+        };
+      });
+
+      return {
+        type: 'line',
+        data: {
+          labels: threadLabels,
+          datasets: datasets
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          // Custom Easing
+          animation: {
+            duration: 900,
+            easing: 'easeInOutQuart'
+          },
+          hover: {
+            mode: 'dataset',
+            intersect: false
+          },
+          // Interactive Hover Focus Highlight
+          onHover: function(event, activeElements, chart) {
+            const datasets = chart.data.datasets;
+            if (activeElements.length > 0) {
+              const activeDatasetIndex = activeElements[0].datasetIndex;
+              datasets.forEach((dataset, index) => {
+                const isRocks = dataset.label === 'RocksDB';
+                const baseColor = colors[dataset.label] || '#6366f1';
+                
+                if (index === activeDatasetIndex) {
+                  dataset.borderColor = baseColor;
+                  dataset.borderWidth = isRocks ? 3.5 : 3.0;
+                } else {
+                  dataset.borderColor = baseColor + '18'; // Dim inactive lines to 9% opacity
+                  dataset.borderWidth = isRocks ? 1.5 : 1.0;
+                }
+              });
+            } else {
+              // Revert to original styling when not hovering
+              datasets.forEach((dataset) => {
+                const isRocks = dataset.label === 'RocksDB';
+                const baseColor = colors[dataset.label] || '#6366f1';
+                dataset.borderColor = baseColor;
+                dataset.borderWidth = isRocks ? 2.5 : 2.0;
+              });
+            }
+            chart.update('none'); // Fast update without re-triggering animations
+          },
+          plugins: {
+            legend: {
+              position: 'bottom',
+              labels: { 
+                boxWidth: 12, 
+                font: { size: 12, family: 'Inter', weight: '500' },
+                usePointStyle: true
+              }
+            },
+            // Custom Rich Tooltip showing speedup % vs RocksDB on index hover
+            tooltip: {
+              mode: 'index',
+              intersect: false,
+              backgroundColor: 'rgba(15, 23, 42, 0.95)', // Slate 900
+              titleFont: { size: 12, family: 'Inter', weight: 'bold' },
+              bodyFont: { size: 11, family: 'Inter' },
+              padding: 10,
+              cornerRadius: 8,
+              boxWidth: 8,
+              boxHeight: 8,
+              usePointStyle: true,
+              callbacks: {
+                label: function(context) {
+                  const label = context.dataset.label || '';
+                  const value = context.raw || 0;
+                  const formattedValue = value.toLocaleString();
+                  
+                  const rocksDataset = context.chart.data.datasets.find(d => d.label === 'RocksDB');
+                  if (rocksDataset && label !== 'RocksDB') {
+                    const rocksValue = rocksDataset.data[context.dataIndex];
+                    if (rocksValue > 0) {
+                      const speedup = value / rocksValue;
+                      const pct = ((speedup - 1) * 100).toFixed(0);
+                      const sign = pct >= 0 ? '+' : '';
+                      return ` ${label}: ${formattedValue} ops/s (${sign}${pct}% vs RocksDB)`;
+                    }
+                  }
+                  return ` ${label}: ${formattedValue} ops/s`;
+                }
+              }
+            }
+          },
+          scales: {
+            y: {
+              ticks: { 
+                font: { family: 'Inter', size: 11 },
+                grid: { color: '#f1f5f9' },
+                callback: function(value) {
+                  if (value >= 1e9) {
+                    return (value / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+                  }
+                  if (value >= 1e6) {
+                    return (value / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+                  }
+                  if (value >= 1e3) {
+                    return (value / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+                  }
+                  return value;
+                }
+              },
+              title: { display: true, text: 'Throughput (ops/s)', font: { size: 12, weight: 'bold', family: 'Inter' } }
+            },
+            x: {
+              ticks: { font: { family: 'Inter', size: 11 } },
+              grid: { display: false }
+            }
+          }
+        }
+      };
+    }
+
+    // Function to calculate and render Max Speedup / Slowdown badges
+    function updateSpeedupBadge(valSize, op) {
+      const opData = rawData[valSize][op];
+      const badge = document.getElementById(`badge-${valSize.toLowerCase()}-${op}`);
+      if (!opData || !badge) return;
+      
+      const rocksData = opData['RocksDB'];
+      if (!rocksData) return;
+      
+      const threads = [1, 4, 16, 32];
+      let ratios = [];
+      
+      for (let i = 0; i < 4; i++) {
+        const rVal = rocksData[i];
+        if (rVal <= 0) continue;
+        
+        let maxVVal = 0;
+        Object.keys(opData).forEach(variantName => {
+          if (variantName === 'RocksDB') return;
+          const val = opData[variantName][i];
+          if (val > maxVVal) {
+            maxVVal = val;
+          }
+        });
+        
+        if (maxVVal > 0) {
+          ratios.push({
+            thread: threads[i],
+            ratio: maxVVal / rVal
+          });
+        }
+      }
+      
+      if (ratios.length === 0) return;
+      
+      // Check for any slowdown (VMemKV max < 0.95x RocksDB)
+      const slowdowns = ratios.filter(r => r.ratio < 0.95);
+      
+      if (slowdowns.length > 0) {
+        // Find the worst slowdown
+        slowdowns.sort((a, b) => a.ratio - b.ratio);
+        const worst = slowdowns[0];
+        
+        badge.innerHTML = `⚠️ Slowdown: <strong>${worst.ratio.toFixed(1)}x</strong> (${worst.thread} Thr)`;
+        badge.className = "text-[11px] font-semibold bg-rose-50 text-rose-700 border border-rose-100 rounded-full px-2.5 py-0.5";
+        badge.classList.remove('hidden');
+      } else {
+        // Otherwise show the best speedup
+        ratios.sort((a, b) => b.ratio - a.ratio);
+        const best = ratios[0];
+        
+        if (best.ratio > 1.05) {
+          badge.innerHTML = `⚡ Max Speedup: <strong>${best.ratio.toFixed(1)}x</strong> (${best.thread} Thr)`;
+          badge.className = "text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5";
+          badge.classList.remove('hidden');
+        }
+      }
+    }
+
+    // Save Memo to localStorage
+    window.saveMemo = function(key, val) {
+      localStorage.setItem('vmemkv-memo-' + key, val);
+    };
+
+    // Load Memos on page load
+    function initMemos() {
+      document.querySelectorAll('textarea[id^="memo-"]').forEach(textarea => {
+        const key = textarea.id.replace('memo-', '');
+        textarea.value = localStorage.getItem('vmemkv-memo-' + key) || '';
+      });
+    }
+
+    // Initialize all charts on load (Race-condition safe)
+    function initCharts() {
+      valSizes.forEach(size => {
+        workloads.forEach(op => {
+          // Fix: Convert size to lowercase to match the HTML element IDs (e.g. chart-8b-Insert)
+          const canvasId = `chart-${size.toLowerCase()}-${op}`;
+          const canvas = document.getElementById(canvasId);
+          if (canvas) {
+            const config = makeChartConfig(size, op);
+            if (config) {
+              new Chart(canvas, config);
+            }
+            updateSpeedupBadge(size, op);
+          }
+        });
+      });
+      initMemos();
+    }
+
+    if (document.readyState === 'loading') {
+      window.addEventListener('DOMContentLoaded', initCharts);
+    } else {
+      initCharts();
+    }
+
+    // Tab Switch Logic
+    window.switchTab = function(tabId) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+      
+      document.getElementById(tabId).classList.add('active');
+      document.getElementById('btn-' + tabId).classList.add('active');
+    };
+  </script>
+</body>
+</html>
