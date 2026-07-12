@@ -293,16 +293,81 @@ class T1Index {
     const AppendRegion *active = append_active_.load(std::memory_order_acquire);
     const AppendRegion *imm = append_immutable_.load(std::memory_order_acquire);
 
-    std::vector<EntrySnapshot> merged = collect_live_entries(sorted, active, imm);
-    sort_and_dedup_entries(merged);
+    struct ScanCandidate {
+      Key key;
+      Payload payload_bits;
+      uint64_t hash;
+      int gen;  // 0: sorted, 1: imm, 2: active (newest)
+    };
+    std::vector<ScanCandidate> candidates;
 
-    size_t match_count = 0;
-    for (const auto &entry : merged) {
-      if (!(entry.key < lower_bound) && !(upper_bound < entry.key)) {
-        callback(std::span<const std::byte>(entry.key), entry.payload_bits, entry.hash);
-        ++match_count;
+    // 1. Extract from sorted_region using binary search (O(log S))
+    if (sorted && sorted->size > 0) {
+      const SortedSlot *slots_begin = sorted->slots.get();
+      const SortedSlot *slots_end = slots_begin + sorted->size;
+      const SortedSlot *it_start =
+          std::lower_bound(slots_begin, slots_end, lower_bound, [](const SortedSlot &slot, const StoreKey &bound) {
+            return slot.key < bound;
+          });
+      for (const SortedSlot *it = it_start; it < slots_end; ++it) {
+        if (upper_bound < it->key) {
+          break;
+        }
+        Payload val = it->payload_bits.load(std::memory_order_relaxed);
+        if (val != vmemkv::STORE_NOT_FOUND) {
+          candidates.push_back({it->key, val, it->hash, 0});
+        }
       }
     }
+
+    // 2. Extract from append active/immutable regions (manual scan to access slot.hash directly)
+    auto extract_append = [&](const AppendRegion *region, int gen) {
+      if (!region) return;
+      size_t count = region->size();
+      for (size_t i = 0; i < count; ++i) {
+        const AppendSlot &slot = region->data()[i];
+        if (!slot.published.load(std::memory_order_acquire)) {
+          continue;
+        }
+        const Payload value = slot.payload_bits.load(std::memory_order_acquire);
+        if (value == vmemkv::STORE_NOT_FOUND) {
+          continue;
+        }
+        if (!(slot.key < lower_bound) && !(upper_bound < slot.key)) {
+          candidates.push_back({slot.key, value, slot.hash, gen});
+        }
+      }
+    };
+
+    extract_append(active, 2);  // active is generation 2 (newest)
+    extract_append(imm, 1);     // imm is generation 1
+
+    if (candidates.empty()) return 0;
+
+    // 3. Sort candidates by Key ASC, then Generation DESC (newest first)
+    std::sort(candidates.begin(), candidates.end(), [](const ScanCandidate &a, const ScanCandidate &b) {
+      if (a.key != b.key) {
+        return a.key < b.key;
+      }
+      return a.gen > b.gen;
+    });
+
+    // 4. Deduplicate (keep only the newest generation) and run callbacks
+    size_t match_count = 0;
+    bool first = true;
+    Key prev_key{};
+
+    for (const auto &cand : candidates) {
+      if (first || cand.key != prev_key) {
+        first = false;
+        prev_key = cand.key;
+        if (cand.payload_bits != vmemkv::STORE_NOT_FOUND) {
+          callback(std::span<const std::byte>(cand.key), cand.payload_bits, cand.hash);
+          ++match_count;
+        }
+      }
+    }
+
     return match_count;
   }
 
@@ -624,10 +689,15 @@ class T1Index {
       return ResolvedSlot{slot, nullptr};
     }
 
+    // Defensive: If the key exists in append_immutable_, we must not update it in-place
+    // because append_immutable_ is currently being merged/sorted by reorganize.
+    // Overwriting it in-place leads to Lost Updates. Instead, we bypass and let the write
+    // append a new entry to the active region.
     if (const AppendRegion *imm = append_immutable_.load(std::memory_order_acquire)) {
       const AppendIndex *imm_idx = append_immutable_index_.load(std::memory_order_acquire);
-      if (AppendSlot *slot = const_cast<AppendRegion *>(imm)->find_with_index(*imm_idx, key, hash)) {
-        return ResolvedSlot{slot, nullptr};
+      if (const AppendSlot *slot = const_cast<AppendRegion *>(imm)->find_with_index(*imm_idx, key, hash)) {
+        std::ignore = slot;
+        return ResolvedSlot{};
       }
     }
 

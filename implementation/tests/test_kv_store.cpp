@@ -665,3 +665,42 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
     std::filesystem::remove(path);
   }
 }
+
+TEST_CASE("VMemKV: reorganize lost update race condition (Deterministic)") {
+  const std::string path = "test_lost_update_det.bin";
+  constexpr uint64_t kStoreCapacityBytes = 1024ULL * 1024ULL;
+
+  using TestStore = vmemkv::variants::VMemKV_LTM_Inline;
+  auto store = std::make_unique<TestStore>(path, kStoreCapacityBytes);
+
+  // 1. Insert key with initial value (this sits in append_active)
+  std::vector<std::byte> v1 = {std::byte{1}};
+  store->insert("lost_key", v1);
+
+  // 2. Trigger T1 reorganize. In the mapper callback (run during rebuild),
+  // we concurrently update the same key "lost_key" to a new value.
+  std::vector<std::byte> v2 = {std::byte{9}};
+  bool update_executed = false;
+
+  store->impl().t1().reorganize([&](uint64_t payload, uint64_t /*hash*/) -> uint64_t {
+    if (!update_executed) {
+      update_executed = true;
+      // This update will look up and find the key in append_immutable_
+      // and update it in-place. But since reorganize has already copied the key,
+      // the new value 9 will be overwritten by the old value 1.
+      bool ok = store->update("lost_key", v2);
+      CHECK(ok == true);
+    }
+    return payload;
+  });
+
+  // 3. Read back the value
+  auto res = store->get_bytes("lost_key");
+  REQUIRE(res.has_value() == true);
+
+  // 4. Assert that the update to 9 is preserved.
+  // This CHECK will FAIL because the value rolled back to 1 (Lost Update).
+  CHECK((*res)[0] == std::byte{9});
+
+  std::filesystem::remove(path);
+}
