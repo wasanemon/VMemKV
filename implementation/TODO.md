@@ -41,37 +41,17 @@ This document outlines the roadmap to implement the full, robust architecture of
 
 ---
 
-## 4. GitHub Pages Documentation Site
-* **Status**: 🟡 **Planned**
-* **Goal**:
-  - Keep the public-facing project page as simple as possible.
-  - Use a single Markdown source file (`index.md`) as the main content source.
-  - Render it through GitHub Pages/Jekyll with a CDN-hosted stylesheet only, avoiding hand-written CSS.
-* **Proposed Layout**:
-  - `pages/index.md`: single-page site containing links to the design docs, `must_read_papers`, and experiment results.
-  - `pages/_layouts/default.html`: minimal Jekyll layout that only injects the CDN stylesheet and Markdown body.
-  - `pages/_config.yml`: enable Jekyll and keep Markdown rendering explicit.
-  - `.github/workflows/pages.yml`: build and deploy the static site artifact to GitHub Pages.
-* **Style Policy**:
-  - Prefer a CDN-only stylesheet such as `water.css` for the simplest possible presentation.
-  - Avoid custom CSS unless a specific layout problem appears.
-  - Keep the site to a single page unless future documentation growth makes splitting unavoidable.
-
-## 5. GitHub Pages Experiments View
-* **Status**: 🟡 **Planned**
-* **Goal**:
-  - Provide a lightweight browser-side visualization page for benchmark results.
-  - Avoid GitHub Actions-based data transformation; keep the pipeline static and simple.
-* **Proposed Layout**:
-  - `pages/experiments/index.html`: dedicated experiments page.
-  - `pages/results/*.json`: raw Google Benchmark JSON artifacts published as static files.
-* **Visualization Plan**:
-  - Load Chart.js from a CDN.
-  - Use browser-side JavaScript to parse benchmark JSON and extract throughput (`items_per_second`).
-  - Render throughput only at first; defer richer charts until the data model stabilizes.
-* **Rationale**:
-  - Splitting experiments into its own page keeps the main documentation page clean.
-  - Browser-side parsing is sufficient for the initial use case and avoids extra build logic.
+## 4. Fix T1Index Scan Algorithmic Bottleneck (Full-sort Bug)
+* **Status**: 🔴 **Not Implemented**
+* **Issue**:
+  - The current implementation of `T1Index::scan` copies the entire `sorted_region` into a temporary vector, merges it with the `append_region`, and performs a full `std::sort` ($O(N \log N)$) on every scan request.
+  - This results in a massive CPU/memory bottleneck, dropping throughput to <100 ops/s when the total record count $N$ is large (e.g. Value=8B/1KB).
+* **Action Items**:
+  - Refactor `T1Index::scan` to conform to the Low-Level Design (LLD 3.5):
+    1. Binary-search (`std::lower_bound`) the already-sorted `sorted_region` to extract only the range of entries between `lo` and `hi` ($O(\log S)$).
+    2. Scan the small `append_region` to gather range candidates.
+    3. Merge and deduplicate the two small candidate sets, achieving $O(\log S + A \log A)$ complexity.
+  - Fix the performance drop in Scan benchmarks for 8B and 1KB value sizes.
 
 ## 6. Get(Hit) Borrowed Read Path with Versioned Validation
 * **Status**: 🟡 **Planned**

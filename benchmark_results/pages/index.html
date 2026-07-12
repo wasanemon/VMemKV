@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VMemKV Benchmark Logs</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+          }
+        }
+      }
+    }
+  </script>
+  
+  <!-- Google Fonts (Inter) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="bg-white text-slate-900 font-sans min-h-screen antialiased selection:bg-slate-100">
+
+  <div class="max-w-4xl mx-auto px-6 py-16 space-y-12">
+    
+    <!-- Title Section -->
+    <header class="space-y-4">
+      <h1 class="text-3xl font-bold tracking-tight text-slate-900">
+        vmemkv Benchmark Logs
+      </h1>
+      <p class="text-slate-500 text-sm max-w-2xl">
+        Larger-than-memory Key-Value ストア <strong>vmemkv</strong> の性能評価データおよび検証実験ログのインデックス。
+      </p>
+      
+      <!-- Project Resource Links -->
+      <div class="flex flex-wrap gap-x-6 gap-y-2 pt-2 text-sm">
+        <a href="https://github.com/LineairDB/VMemKV" target="_blank" rel="noopener" class="text-indigo-600 hover:text-indigo-800 hover:underline flex items-center gap-1">
+          GitHub Repository &rarr;
+        </a>
+        <a href=https://github.com/LineairDB/VMemKV/tree/main/implementation/docs/specification" target="_blank" rel="noopener"
+          class="text-indigo-600 hover:text-indigo-800 hover:underline flex items-center gap-1">
+          Design Document &rarr;
+        </a>
+      </div>
+    </header>
+
+    <!-- Main Table -->
+    <section class="space-y-4">
+      <h2 class="text-xs font-bold uppercase tracking-widest text-slate-400">
+        Experiment Results & Logs
+      </h2>
+      
+      <div class="border-t border-b border-slate-200 overflow-x-auto">
+        <table class="w-full text-left text-sm border-collapse">
+          <thead>
+            <tr class="border-b border-slate-100">
+              <th class="py-3.5 pr-4 font-semibold text-slate-500 w-24">Date</th>
+              <th class="py-3.5 px-4 font-semibold text-slate-500 w-64">Link</th>
+              <th class="py-3.5 pl-4 font-semibold text-slate-500">Description</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            
+            <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-07-12</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="ltm_in_memory_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS c6id ベンチマーク
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                初期実装の全 CRUD / Scan 性能のグラフ。WAL / Checkpoint 未実装につき書き込み性能は高めに出ていることに注意。
+              </td>
+            </tr>
+
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+</body>
+</html>
