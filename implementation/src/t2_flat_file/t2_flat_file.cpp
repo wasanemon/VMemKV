@@ -157,8 +157,8 @@ auto T2FlatFile::update_value_at(uint64_t payload, std::span<const std::byte> va
 
   // SeqLock Write Begin: Increment version to odd to block parallel readers
   auto atomic_version = std::atomic_ref<uint64_t>(header->version);
-  uint64_t v = atomic_version.load(std::memory_order_relaxed);
-  atomic_version.store(v + 1, std::memory_order_release);
+  uint64_t ver = atomic_version.load(std::memory_order_relaxed);
+  atomic_version.store(ver + 1, std::memory_order_release);
   std::atomic_thread_fence(std::memory_order_release);
 
   if (!value.empty()) {
@@ -169,7 +169,7 @@ auto T2FlatFile::update_value_at(uint64_t payload, std::span<const std::byte> va
 
   // SeqLock Write End: Increment version to even to signal complete write
   std::atomic_thread_fence(std::memory_order_release);
-  atomic_version.store(v + 2, std::memory_order_release);
+  atomic_version.store(ver + 2, std::memory_order_release);
   return true;
 }
 

@@ -727,8 +727,8 @@ void register_all_benchmarks() {
               std::uniform_int_distribution<std::size_t> uniform_index(0, corpus_size - 1);
               for (auto _ : state) {
                 std::size_t key_index = (std::string(dist) == "Zipf") ? zipf(rng) : uniform_index(rng);
-                auto value = store.get_bytes(make_key(key_index));
-                benchmark::DoNotOptimize(value);
+                store.get(make_key(key_index),
+                          [](std::span<const std::byte> value) { benchmark::DoNotOptimize(value); });
               }
               state.SetItemsProcessed(state.iterations());
             },
@@ -751,8 +751,7 @@ void register_all_benchmarks() {
             ZipfDistribution zipf({corpus_size, 1.0});
             for (auto _ : state) {
               std::size_t key_index = corpus_size + zipf(rng);
-              auto value = store.get_bytes(make_key(key_index));
-              benchmark::DoNotOptimize(value);
+              store.get(make_key(key_index), [](std::span<const std::byte> value) { benchmark::DoNotOptimize(value); });
             }
             state.SetItemsProcessed(state.iterations());
           },

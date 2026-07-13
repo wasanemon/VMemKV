@@ -21,22 +21,14 @@ namespace vmemkv {
 // This Concept serves as the formal interface contract of VMemKV.
 // Any KVStore implementation must satisfy this constraint.
 template <typename Store>
-concept KVStore = requires(Store store,
-                           std::span<const std::byte> key,
-                           std::span<const std::byte> value,
-                           std::string_view key_str,
-                           uint64_t value_u64) {
+concept KVStore = requires(Store store, std::span<const std::byte> key, std::span<const std::byte> value) {
   // Core byte-span interfaces
   { store.insert(key, value) } -> std::same_as<bool>;
-  { store.get(key) } -> std::same_as<uint64_t>;
   { store.update(key, value) } -> std::same_as<bool>;
   { store.remove(key) } -> std::same_as<bool>;
-  { store.get_bytes(key) } -> std::same_as<std::optional<std::vector<std::byte>>>;
 
-  // Serialization helper interfaces (syntactic sugar)
-  { store.insert(key_str, value_u64) } -> std::same_as<bool>;
-  { store.get(key_str) } -> std::same_as<uint64_t>;
-  { store.update(key_str, value_u64) } -> std::same_as<bool>;
+  // get is now a callback-based API accepting a callable that processes std::span<const std::byte>
+  store.get(key, [](std::span<const std::byte>) {});
 };
 
 // ─── Production Recommended Store ──────────────────────────────────────────

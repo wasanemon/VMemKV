@@ -69,15 +69,16 @@ class RocksDBStore {
 
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
 
-  [[nodiscard]] auto get_impl(std::span<const std::byte> key) const -> uint64_t {
+  template <typename Callback>
+  auto get_impl(std::span<const std::byte> key, Callback callback) const -> bool {
     rocksdb::PinnableSlice pinned_value;
     auto status = db_->Get({}, db_->DefaultColumnFamily(), to_slice(key), &pinned_value);
-    if (!status.ok() || pinned_value.size() != kEncodedScalarValueBytes) {
-      return vmemkv::STORE_NOT_FOUND;
+    if (!status.ok()) {
+      return false;
     }
-    uint64_t value;
-    std::memcpy(&value, pinned_value.data(), kEncodedScalarValueBytes);
-    return value;
+    std::span<const std::byte> val_span(reinterpret_cast<const std::byte *>(pinned_value.data()), pinned_value.size());
+    callback(val_span);
+    return true;
   }
 
   auto insert_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
@@ -140,16 +141,6 @@ class RocksDBStore {
       next_index = chunk_end;
     }
     return true;
-  }
-
-  [[nodiscard]] auto get_bytes_impl(std::span<const std::byte> key) const -> std::optional<std::vector<std::byte>> {
-    std::string val;
-    auto status = db_->Get({}, to_slice(key), &val);
-    if (!status.ok()) {
-      return std::nullopt;
-    }
-    return std::vector<std::byte>(reinterpret_cast<const std::byte *>(val.data()),
-                                  reinterpret_cast<const std::byte *>(val.data()) + val.size());
   }
 
   template <typename Cb>
@@ -227,10 +218,11 @@ class RocksDBStore {
 
   void reorganize() {}
 
-  // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-  [[nodiscard]] auto get_impl(std::span<const std::byte> key) const -> uint64_t {
+  template <typename Callback>
+  auto get_impl(std::span<const std::byte> key, Callback callback) const -> bool {
     (void)key;
-    return vmemkv::STORE_NOT_FOUND;
+    (void)callback;
+    return false;
   }
   // NOLINTNEXTLINE(readability-convert-member-functions-to-static,bugprone-easily-swappable-parameters)
   auto insert_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
@@ -261,11 +253,6 @@ class RocksDBStore {
       *error_out = "RocksDB not enabled in this build";
     }
     return false;
-  }
-  // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-  [[nodiscard]] auto get_bytes_impl(std::span<const std::byte> key) const -> std::optional<std::vector<std::byte>> {
-    (void)key;
-    return std::nullopt;
   }
 
   template <typename Cb>

@@ -54,10 +54,11 @@ class StoreAdapter {
   StoreAdapter(StoreAdapter &&) = delete;
   auto operator=(StoreAdapter &&) -> StoreAdapter & = delete;
 
-  template <typename Key>
-  [[nodiscard]] auto get(const Key &key) const -> uint64_t {
-    return kvs_detail::with_key_serialized(
-        key, [this](std::span<const std::byte> key_bytes) -> uint64_t { return impl_.get_impl(key_bytes); });
+  template <typename Key, typename Callback>
+  auto get(const Key &key, Callback callback) const -> bool {
+    return kvs_detail::with_key_serialized(key, [this, &callback](std::span<const std::byte> key_bytes) -> bool {
+      return impl_.get_impl(key_bytes, std::move(callback));
+    });
   }
 
   template <typename Key, typename Value>
@@ -109,14 +110,6 @@ class StoreAdapter {
               [this, lower_bound_bytes, &callback](std::span<const std::byte> upper_bound_bytes) -> size_t {
                 return impl_.scan_impl(lower_bound_bytes, upper_bound_bytes, std::move(callback));
               });
-        });
-  }
-
-  template <typename Key>
-  [[nodiscard]] auto get_bytes(const Key &key) const -> std::optional<std::vector<std::byte>> {
-    return kvs_detail::with_key_serialized(
-        key, [this](std::span<const std::byte> key_bytes) -> std::optional<std::vector<std::byte>> {
-          return impl_.get_bytes_impl(key_bytes);
         });
   }
 

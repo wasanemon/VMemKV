@@ -26,6 +26,29 @@ static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_Baseline>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_LTM_Inline>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDB>);
 
+namespace test_util {
+template <typename StorePtr, typename Key>
+auto get_sync(const StorePtr &store, const Key &key) -> uint64_t {
+  uint64_t res = vmemkv::STORE_NOT_FOUND;
+  store->get(key, [&](std::span<const std::byte> val) {
+    res = 0;
+    std::memcpy(&res, val.data(), std::min(val.size(), sizeof(uint64_t)));
+  });
+  return res;
+}
+
+template <typename StorePtr, typename Key>
+auto get_bytes_sync(const StorePtr &store, const Key &key) -> std::optional<std::vector<std::byte>> {
+  std::optional<std::vector<std::byte>> res;
+  bool found =
+      store->get(key, [&](std::span<const std::byte> val) { res = std::vector<std::byte>(val.begin(), val.end()); });
+  if (found) {
+    return res;
+  }
+  return std::nullopt;
+}
+}  // namespace test_util
+
 namespace {
 constexpr uint32_t kTestByteMask = 0xffU;
 constexpr int kCustomKeyId = 42;
@@ -137,7 +160,7 @@ static void insert_sequential_u64_values(StoreHandle &store, int key_count) {
 template <typename StoreHandle>
 static void check_sequential_u64_values(StoreHandle &store, int key_count) {
   for (int i = 0; i < key_count; ++i) {
-    CHECK(store->get("k" + std::to_string(i)) == static_cast<uint64_t>(i));
+    CHECK(test_util::get_sync(store, "k" + std::to_string(i)) == static_cast<uint64_t>(i));
   }
 }
 
@@ -146,7 +169,7 @@ static void check_hot_key_upgrade_is_visible(StoreHandle &store) {
   CHECK(store->insert("hot", std::string("a")));
   const std::string large_value(kValue64Bytes, 'x');
   CHECK(store->update("hot", large_value));
-  const auto got = store->get_bytes("hot");
+  const auto got = test_util::get_bytes_sync(store, "hot");
   REQUIRE(got.has_value());
   if (!got.has_value()) {
     return;
@@ -158,13 +181,13 @@ static void check_hot_key_upgrade_is_visible(StoreHandle &store) {
 
 TEST_CASE_TEMPLATE("get on empty store returns STORE_NOT_FOUND", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
-  CHECK(store->get("x") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_sync(store, "x") == vmemkv::STORE_NOT_FOUND);
 }
 
 TEST_CASE_TEMPLATE("insert and get", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   CHECK(store->insert("a", 10));
-  CHECK(store->get("a") == 10U);
+  CHECK(test_util::get_sync(store, "a") == 10U);
 }
 
 TEST_CASE("sync reorganize-before-write is transparent") {
@@ -184,14 +207,14 @@ TEST_CASE("partial config inheritance keeps required append-capacity fields") {
   auto store = StoreFactory<VMemKV_ReorgEveryWrite>::make();
   CHECK(ReorgEveryWriteConfig::T1AppendCapacityEntries == vmemkv::Config<>::T1AppendCapacityEntries);
   CHECK(store->insert("partial_cfg", 1));
-  CHECK(store->get("partial_cfg") == 1U);
+  CHECK(test_util::get_sync(store, "partial_cfg") == 1U);
 }
 
 TEST_CASE_TEMPLATE("insert duplicate returns false, value unchanged", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   CHECK(store->insert("a", 10));
   CHECK_FALSE(store->insert("a", 99));
-  CHECK(store->get("a") == 10U);
+  CHECK(test_util::get_sync(store, "a") == 10U);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -200,11 +223,11 @@ TEST_CASE_TEMPLATE("integral keys use the templated convenience API", Store, STO
   constexpr int key = 42;
 
   CHECK(store->insert(key, 10));
-  CHECK(store->get(key) == 10U);
+  CHECK(test_util::get_sync(store, key) == 10U);
   CHECK(store->update(key, 11));
-  CHECK(store->get(key) == 11U);
+  CHECK(test_util::get_sync(store, key) == 11U);
   CHECK(store->remove(key));
-  CHECK(store->get(key) == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_sync(store, key) == vmemkv::STORE_NOT_FOUND);
 }
 
 namespace test_adl {
@@ -235,8 +258,8 @@ TEST_CASE_TEMPLATE("custom serializers (ADL) for user-defined types", Store, STO
   CHECK(store->insert(key_one, kSmallValue));
   CHECK(store->insert(key_two, kLargeValue));
 
-  CHECK(store->get(key_one) == kSmallValue);
-  CHECK(store->get(key_two) == kLargeValue);
+  CHECK(test_util::get_sync(store, key_one) == kSmallValue);
+  CHECK(test_util::get_sync(store, key_two) == kLargeValue);
 
   std::vector<uint64_t> results;
   const size_t scan_count =
@@ -250,14 +273,14 @@ TEST_CASE_TEMPLATE("custom serializers (ADL) for user-defined types", Store, STO
 TEST_CASE_TEMPLATE("insert rejects STORE_NOT_FOUND payload in T1", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   CHECK_FALSE(store->insert("a", vmemkv::STORE_NOT_FOUND));
-  CHECK(store->get("a") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
 }
 
 TEST_CASE_TEMPLATE("update existing key", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);
   CHECK(store->update("a", 2));
-  CHECK(store->get("a") == 2U);
+  CHECK(test_util::get_sync(store, "a") == 2U);
 }
 
 TEST_CASE_TEMPLATE("update missing key returns false", Store, STORE_TYPES) {
@@ -269,14 +292,14 @@ TEST_CASE_TEMPLATE("update rejects STORE_NOT_FOUND payload in T1", Store, STORE_
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);
   CHECK_FALSE(store->update("a", vmemkv::STORE_NOT_FOUND));
-  CHECK(store->get("a") == 1U);
+  CHECK(test_util::get_sync(store, "a") == 1U);
 }
 
 TEST_CASE_TEMPLATE("remove existing key", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", kRemovedValue);
   CHECK(store->remove("a"));
-  CHECK(store->get("a") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
 }
 
 TEST_CASE_TEMPLATE("remove missing key returns false", Store, STORE_TYPES) {
@@ -289,7 +312,7 @@ TEST_CASE_TEMPLATE("re-insert after remove", Store, STORE_TYPES) {
   store->insert("a", 1);
   store->remove("a");
   CHECK(store->insert("a", 2));
-  CHECK(store->get("a") == 2U);
+  CHECK(test_util::get_sync(store, "a") == 2U);
 }
 
 TEST_CASE_TEMPLATE("scan empty range returns 0", Store, STORE_TYPES) {
@@ -327,8 +350,8 @@ TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
   store->insert("a", 1);
   store->insert("b", 2);
   store->reorganize();
-  CHECK(store->get("a") == 1U);
-  CHECK(store->get("b") == 2U);
+  CHECK(test_util::get_sync(store, "a") == 1U);
+  CHECK(test_util::get_sync(store, "b") == 2U);
   CHECK(store->insert("c", 3));
   const size_t entry_count = store->scan("a", "c", [](std::span<const std::byte>, uint64_t) {});
   CHECK(entry_count == 3U);
@@ -358,7 +381,7 @@ TEST_CASE("VMemKV: manual reorganize forces physical storage garbage collection"
   CHECK(post_reorg_t2_used < initial_t2_used);
 
   for (int i = remove_count; i < key_count; ++i) {
-    CHECK(store->get(std::to_string(i)) == static_cast<uint64_t>(i + 1000));
+    CHECK(test_util::get_sync(store, std::to_string(i)) == static_cast<uint64_t>(i + 1000));
   }
 }
 
@@ -375,27 +398,27 @@ TEST_CASE_TEMPLATE("long keys sharing a 16-byte prefix: CRUD", Store, LONG_KEY_S
   CHECK(store->insert(key_two, 2));
   CHECK(store->insert(key_three, 3));
 
-  CHECK(store->get(key_one) == 1U);
-  CHECK(store->get(key_two) == 2U);
-  CHECK(store->get(key_three) == 3U);
+  CHECK(test_util::get_sync(store, key_one) == 1U);
+  CHECK(test_util::get_sync(store, key_two) == 2U);
+  CHECK(test_util::get_sync(store, key_three) == 3U);
 
-  CHECK(store->get(prefix) == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_sync(store, prefix) == vmemkv::STORE_NOT_FOUND);
 
   CHECK_FALSE(store->insert(key_two, 99));
-  CHECK(store->get(key_two) == 2U);
+  CHECK(test_util::get_sync(store, key_two) == 2U);
 
   CHECK(store->update(key_two, 22));
-  CHECK(store->get(key_one) == 1U);
-  CHECK(store->get(key_two) == 22U);
-  CHECK(store->get(key_three) == 3U);
+  CHECK(test_util::get_sync(store, key_one) == 1U);
+  CHECK(test_util::get_sync(store, key_two) == 22U);
+  CHECK(test_util::get_sync(store, key_three) == 3U);
 
   CHECK(store->remove(key_one));
-  CHECK(store->get(key_one) == vmemkv::STORE_NOT_FOUND);
-  CHECK(store->get(key_two) == 22U);
-  CHECK(store->get(key_three) == 3U);
+  CHECK(test_util::get_sync(store, key_one) == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_sync(store, key_two) == 22U);
+  CHECK(test_util::get_sync(store, key_three) == 3U);
 
   CHECK(store->insert(key_one, 111));
-  CHECK(store->get(key_one) == 111U);
+  CHECK(test_util::get_sync(store, key_one) == 111U);
 }
 
 // Offset64 must disambiguate matching prefixes by hash(full_key).
@@ -434,21 +457,21 @@ TEST_CASE_TEMPLATE("large value (>= 64B): CRUD still works", Store, LARGE_VALUE_
   const std::string v200(kValue200Bytes, 'b');
 
   CHECK(store->insert("key1", v64));
-  auto got = store->get_bytes("key1");
+  auto got = test_util::get_bytes_sync(store, "key1");
   if (!got.has_value()) {
     FAIL("missing key1 after insert");
   }
   CHECK(as_string(*got) == v64);  // NOLINT(bugprone-unchecked-optional-access)
 
   CHECK_FALSE(store->insert("key1", v200));
-  got = store->get_bytes("key1");
+  got = test_util::get_bytes_sync(store, "key1");
   if (!got.has_value()) {
     FAIL("missing key1 after duplicate insert");
   }
   CHECK(as_string(*got) == v64);  // NOLINT(bugprone-unchecked-optional-access)
 
   CHECK(store->update("key1", v200));
-  got = store->get_bytes("key1");
+  got = test_util::get_bytes_sync(store, "key1");
   if (!got.has_value()) {
     FAIL("missing key1 after grow update");
   }
@@ -458,22 +481,22 @@ TEST_CASE_TEMPLATE("large value (>= 64B): CRUD still works", Store, LARGE_VALUE_
   const std::string v16(kShrinkValueBytes, 'c');
 
   CHECK(store->update("key1", v16));
-  got = store->get_bytes("key1");
+  got = test_util::get_bytes_sync(store, "key1");
   if (!got.has_value()) {
     FAIL("missing key1 after shrink update");
   }
   CHECK(as_string(*got) == v16);  // NOLINT(bugprone-unchecked-optional-access)
 
   CHECK(store->insert("key2", v64));
-  auto got_key2 = store->get_bytes("key2");
+  auto got_key2 = test_util::get_bytes_sync(store, "key2");
   if (!got_key2.has_value()) {
     FAIL("missing key2 after insert");
   }
   CHECK(as_string(*got_key2) == v64);  // NOLINT(bugprone-unchecked-optional-access)
 
   CHECK(store->remove("key2"));
-  CHECK_FALSE(store->get_bytes("key2").has_value());
-  auto got_key1 = store->get_bytes("key1");
+  CHECK_FALSE(test_util::get_bytes_sync(store, "key2").has_value());
+  auto got_key1 = test_util::get_bytes_sync(store, "key1");
   if (!got_key1.has_value()) {
     FAIL("missing key1 after key2 removal");
   }
@@ -487,7 +510,7 @@ TEST_CASE_TEMPLATE("large N: all keys retrievable", Store, STORE_TYPES) {
     store->insert("k" + std::to_string(i), static_cast<uint64_t>(i));
   }
   for (int i = 0; i < key_count; ++i) {
-    CHECK(store->get("k" + std::to_string(i)) == static_cast<uint64_t>(i));
+    CHECK(test_util::get_sync(store, "k" + std::to_string(i)) == static_cast<uint64_t>(i));
   }
 }
 
@@ -505,7 +528,7 @@ TEST_CASE_TEMPLATE("[mt] concurrent reads are consistent", Store, STORE_TYPES) {
   for (int thread_index = 0; thread_index < kReaderThreadCount; ++thread_index) {
     threads.emplace_back([&] {
       for (int i = 0; i < key_count; ++i) {
-        uint64_t value = store->get("k" + std::to_string(i));
+        uint64_t value = test_util::get_sync(store, "k" + std::to_string(i));
         if (value != static_cast<uint64_t>(i)) {
           all_ok.store(false);
         }
@@ -549,8 +572,8 @@ TEST_CASE("VMemKV reorganize resolves storage fragmentation") {
   CHECK(bytes_used_after_reorg < bytes_used_after_update);
 
   // Check that key1 is gone and key2 is retrievable
-  CHECK_FALSE(store->get_bytes("k1").has_value());
-  auto got = store->get_bytes("k2");
+  CHECK_FALSE(test_util::get_bytes_sync(store, "k1").has_value());
+  auto got = test_util::get_bytes_sync(store, "k2");
   if (!got.has_value()) {
     FAIL("missing k2 after reorganize");
   }
@@ -614,7 +637,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
     CHECK(store->t2().bytes_used() == 0);
 
     // Verify read back
-    auto res = store->get_bytes("key1");
+    auto res = test_util::get_bytes_sync(store, "key1");
     if (!res.has_value()) {
       FAIL("missing key1 inline payload");
     }
@@ -630,7 +653,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
     store->insert("key_odd", val_odd_bytes);
     CHECK(store->t2().bytes_used() == 0);
 
-    auto res_odd = store->get_bytes("key_odd");
+    auto res_odd = test_util::get_bytes_sync(store, "key_odd");
     if (!res_odd.has_value()) {
       FAIL("missing key_odd inline payload");
     }
@@ -647,7 +670,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
     store->insert("key_even", val_even_bytes);
     CHECK(store->t2().bytes_used() == 0);  // Correctly inlined now!
 
-    auto res_even = store->get_bytes("key_even");
+    auto res_even = test_util::get_bytes_sync(store, "key_even");
     if (!res_even.has_value()) {
       FAIL("missing key_even inline payload");
     }
@@ -695,7 +718,7 @@ TEST_CASE("VMemKV: reorganize lost update race condition (Deterministic)") {
   });
 
   // 3. Read back the value
-  auto res = store->get_bytes("lost_key");
+  auto res = test_util::get_bytes_sync(store, "lost_key");
   REQUIRE(res.has_value() == true);
 
   // 4. Assert that the update to 9 is preserved.

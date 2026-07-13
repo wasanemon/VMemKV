@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <execution>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <span>
 #include <type_traits>
@@ -299,7 +300,11 @@ class T1Index {
       uint64_t hash;
       int gen;  // 0: sorted, 1: imm, 2: active (newest)
     };
-    std::vector<ScanCandidate> candidates;
+
+    // Use a stack buffer of 16KB to hold up to ~500 scan candidates without any heap allocations
+    std::array<std::byte, 16384> stack_buf;
+    std::pmr::monotonic_buffer_resource mem_res(stack_buf.data(), stack_buf.size());
+    std::pmr::vector<ScanCandidate> candidates(&mem_res);
 
     // 1. Extract from sorted_region using binary search (O(log S))
     if (sorted && sorted->size > 0) {

@@ -379,37 +379,40 @@ class VMemKVImpl {
     return false;
   }
 
-  // Retrieves a value associated with the key.
+  // Retrieves a value associated with the key and invokes the callback with its raw bytes.
   // - Thread-safety: Lock-free (concurrently readable during index reorganization).
   // - Guarantees: Resolves inline value directly, otherwise reads T2 record at the T1 offset.
-  auto get_impl(std::span<const std::byte> full_key) const -> uint64_t {
+  template <typename Callback>
+  auto get_impl(std::span<const std::byte> full_key, Callback callback) const -> bool {
     const auto res = t1_.get_with_hash(full_key);
     if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
-      return vmemkv::STORE_NOT_FOUND;
+      return false;
     }
 
     if constexpr (ConfigT::UseT1InlineValue) {
       if (t1_detail::is_inline(res.raw_hash)) {
         size_t size = t1_detail::decode_size(res.raw_hash);
-        uint64_t val_u64 = 0;
-        std::memcpy(&val_u64, &res.payload_bits, size);
-        return val_u64;
+        std::array<std::byte, kInlineScalarValueBytes> stack_buf;
+        std::memcpy(stack_buf.data(), &res.payload_bits, size);
+        callback(std::span<const std::byte>(stack_buf.data(), size));
+        return true;
       }
     }
 
     T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
     const T2RecordView record = t2_.at(res.payload_bits & kOffsetMask, mem);
 
-    bool match = false;
-    uint64_t val = read_t2_record_seqlock(record, [&]() -> uint64_t {
-      match = byte_span_equal(record.key, full_key);
-      if (!match) {
-        return vmemkv::STORE_NOT_FOUND;
+    bool success = false;
+    read_t2_record_seqlock(record, [&]() -> bool {
+      if (!byte_span_equal(record.key, full_key)) {
+        return false;
       }
-      return decode_u64(record.value);
+      callback(record.value);
+      success = true;
+      return true;
     });
 
-    return match ? val : vmemkv::STORE_NOT_FOUND;
+    return success;
   }
 
   // Updates the value of an existing key.
@@ -462,42 +465,6 @@ class VMemKVImpl {
     return true;
   }
 
-  // Retrieves the raw variable-length byte value associated with a key.
-  // - Thread-safety: Lock-free (concurrently readable).
-  // - Contract: Resolves inline value directly, otherwise fetches raw T2 record.
-  auto get_bytes_impl(std::span<const std::byte> full_key) const -> std::optional<std::vector<std::byte>> {
-    const auto res = t1_.get_with_hash(full_key);
-    if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
-      return std::nullopt;
-    }
-
-    if constexpr (ConfigT::UseT1InlineValue) {
-      if (t1_detail::is_inline(res.raw_hash)) {
-        size_t size = t1_detail::decode_size(res.raw_hash);
-        std::vector<std::byte> val_bytes(size);
-        std::memcpy(val_bytes.data(), &res.payload_bits, size);
-        return val_bytes;
-      }
-    }
-
-    T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-    const T2RecordView record = t2_.at(res.payload_bits & kOffsetMask, mem);
-
-    bool match = false;
-    std::vector<std::byte> val = read_t2_record_seqlock(record, [&]() -> std::vector<std::byte> {
-      match = byte_span_equal(record.key, full_key);
-      if (!match) {
-        return {};
-      }
-      return std::vector<std::byte>(record.value.begin(), record.value.end());
-    });
-
-    if (match) {
-      return val;
-    }
-    return std::nullopt;
-  }
-
   // Performs a range scan, returning key-value pairs decoded via the callback.
   // - Thread-safety: Thread-safe and concurrently readable.
   // - Guarantees: Invokes Callback(key, val) for each matching live entry in sorted range.
@@ -505,11 +472,7 @@ class VMemKVImpl {
   auto scan_impl(std::span<const std::byte> lower_bound,
                  std::span<const std::byte> upper_bound,
                  Callback callback) const -> size_t {
-    struct ScanItem {
-      std::vector<std::byte> key;
-      uint64_t value;
-    };
-    std::vector<ScanItem> items;
+    size_t count = 0;
     {
       T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
       t1_.scan(lower_bound,
@@ -526,40 +489,35 @@ class VMemKVImpl {
                      uint64_t val_u64 = 0;
                      std::memcpy(&val_u64, &payload, size);
 
+                     std::array<std::byte, kStoreKeyBytes> stack_key;
                      size_t len = kStoreKeyBytes;
                      while (len > 0 && index_key[len - 1] == std::byte{0}) {
                        --len;
                      }
-                     const auto len_diff = static_cast<std::ptrdiff_t>(len);
-                     std::vector<std::byte> key(index_key.begin(), std::next(index_key.begin(), len_diff));
-                     if (!key_in_range(key, lower_bound, upper_bound)) {
+                     std::memcpy(stack_key.data(), index_key.data(), len);
+                     std::span<const std::byte> key_view(stack_key.data(), len);
+                     if (!key_in_range(key_view, lower_bound, upper_bound)) {
                        return;
                      }
-                     items.push_back({key, val_u64});
+                     callback(key_view, val_u64);
+                     ++count;
                      return;
                    }
                  }
 
-                 // T2 record branch
+                 // T2 record branch (direct callback under SeqLock loop)
                  const T2RecordView record = t2_.at(payload & kOffsetMask, mem);
-                 bool in_range = false;
-                 ScanItem item = read_t2_record_seqlock(record, [&]() -> ScanItem {
-                   in_range = key_in_range(record.key, lower_bound, upper_bound);
-                   if (!in_range) {
-                     return {};
+                 read_t2_record_seqlock(record, [&]() -> bool {
+                   if (!key_in_range(record.key, lower_bound, upper_bound)) {
+                     return false;
                    }
-                   return {std::vector<std::byte>(record.key.begin(), record.key.end()), decode_u64(record.value)};
+                   callback(record.key, decode_u64(record.value));
+                   return true;
                  });
-                 if (in_range) {
-                   items.push_back(std::move(item));
-                 }
+                 ++count;
                });
     }
-
-    for (const auto &item : items) {
-      callback(item.key, item.value);
-    }
-    return items.size();
+    return count;
   }
 
  private:
@@ -634,7 +592,7 @@ class VMemKVImpl {
   }
 
   static auto byte_span_less(std::span<const std::byte> lhs, std::span<const std::byte> rhs) noexcept -> bool {
-    return std::ranges::lexicographical_compare(lhs, rhs);
+    return std::lexicographical_compare(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
   }
 
   static auto key_in_range(std::span<const std::byte> key,
