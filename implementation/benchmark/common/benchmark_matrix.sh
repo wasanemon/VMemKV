@@ -21,7 +21,7 @@ vmemkv_matrix::scenario_filter() {
 vmemkv_matrix::scenario_env_prefix() {
   case "$1" in
     in_memory) printf '%s\n' "VMEMKV_BENCH_TARGET_RATIO=0.5" ;;
-    ltm) printf '%s\n' "VMEMKV_BENCH_LTM=1 VMEMKV_BENCH_TARGET_RATIO=2.0" ;;
+    ltm) printf '%s\n' "VMEMKV_BENCH_LTM=1 VMEMKV_BENCH_TARGET_RATIO=8.0" ;;
     *) return 1 ;;
   esac
 }
@@ -48,7 +48,11 @@ vmemkv_matrix::scenario_value_order_keys_from_flag() {
 
   case "$scenario_key" in
     in_memory)
-      printf '%s\n' "8b"
+      case "$large_value_first" in
+        true|1) printf '%s\n' "1kb 8b" ;;
+        false|0|"") printf '%s\n' "8b 1kb" ;;
+        *) return 1 ;;
+      esac
       ;;
     ltm)
       case "$large_value_first" in

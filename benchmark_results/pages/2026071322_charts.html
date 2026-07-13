@@ -1,0 +1,1875 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VMemKV Performance Charts (2026071322)</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+          }
+        }
+      }
+    }
+  </script>
+  
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  
+  <style>
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .tab-btn.active {
+      border-color: #4f46e5;
+      color: #4f46e5;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body class="bg-white text-slate-900 font-sans min-h-screen antialiased selection:bg-slate-100">
+
+  <!-- Navigation Bar -->
+  <nav class="border-b border-slate-200 bg-white sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+      <a href="index.html" class="flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-indigo-600 transition-colors">
+        <i data-lucide="arrow-left" class="w-4 h-4"></i>
+        Back to Portal
+      </a>
+      <div class="text-xs font-bold text-slate-400 uppercase tracking-widest">
+        vmemkv
+      </div>
+    </div>
+  </nav>
+
+  <main class="max-w-6xl mx-auto px-6 py-12 space-y-12">
+    
+    <!-- Header -->
+    <header class="space-y-4 border-b border-slate-200 pb-6">
+      <div class="flex items-center justify-between">
+        <h1 class="text-3xl font-bold tracking-tight text-slate-900">
+          AWS c6id Benchmark Charts (2026071322)
+        </h1>
+        <div class="flex gap-2">
+          <a href="logs/2026071322/results_in_memory.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (In-memory)
+          </a>
+          <a href="logs/2026071322/results_ltm.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (Larger-than-memory)
+          </a>
+        </div>
+      </div>
+      <p class="text-slate-500 text-sm max-w-3xl">
+        AWS 32コア物理環境における VMemKV と RocksDB の包括的な性能ベンチマーク結果。各グラフの下部アコーディオンから、個別ディスカッション（Giscus）が行えます。
+      </p>
+      
+      <!-- Project Links -->
+      <div class="flex flex-wrap gap-x-6 gap-y-2 text-xs">
+        <a href="https://github.com/LineairDB/VMemKV" target="_blank" rel="noopener" class="text-indigo-600 hover:underline">
+          GitHub Repository &rarr;
+        </a>
+        <a href="https://github.com/LineairDB/VMemKV/tree/main/implementation/docs/specification" target="_blank" rel="noopener"
+          class="text-indigo-600 hover:underline">
+          Design Document &rarr;
+        </a>
+      </div>
+    </header>
+
+    <!-- Variant Quick Reference & System Context -->
+    <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
+      
+      <!-- Variant List -->
+      <div class="space-y-2 border-r border-slate-200 pr-0 md:pr-6">
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="git-branch" class="w-3.5 h-3.5"></i> Stacking Variants
+        </h2>
+        <ul class="space-y-1.5 text-slate-500 list-disc pl-4">
+          <li><strong>RocksDB</strong>: 競合比較対象の LSM-Tree</li>
+          <li><strong>Baseline</strong>: 最適化なし状態の VMemKV</li>
+          <li><strong>+BF</strong>: Baseline + T1 Bloom Filter (空振りGet高速化)</li>
+          <li><strong>+Simd</strong>: + Bloom Filter + SIMD Scan (レンジスキャン線形走査高速化)</li>
+          <li><strong>+Hint</strong>: + SIMD + T2 Memory Hints (Compaction/Reorg時のI/Oストール緩和)</li>
+          <li><strong>+Inline</strong>: + Hints + T1 Inline Value (8B以下インメモリ値をT1スロットへ直接保存)</li>
+          <li><strong>+Prefault</strong>: + Inline + T2 Async Prefaulting (全部盛り / 最適化オールオン)</li>
+        </ul>
+      </div>
+
+      <!-- System Context -->
+      <div class="space-y-2 pl-0 md:pl-2">
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="cpu" class="w-3.5 h-3.5"></i> Environment
+        </h2>
+        <ul class="space-y-1 text-slate-500">
+          <li><strong>CPU</strong>: Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz (32 Cores / 64 Threads)</li>
+          <li><strong>Cache</strong>: L1D 48KB, L1I 32KB, L2 1.25MB (per 2 cpus) | L3 54MB (per 32 cpus)</li>
+          <li><strong>RAM</strong>: Total 66.3 GB (In LTM runs, RAM is constrained to 1GiB cgroup)</li>
+          <li><strong>OS / Kernel</strong>: Ubuntu 22.04 LTS (Linux 6.17.0-1019-aws)</li>
+          <li><strong>Compiler</strong>: GCC / CMake Release Build</li>
+          <li><strong>Disk</strong>: Local NVMe SSD (AWS Instance Store, Swap Media)</li>
+        </ul>
+      </div>
+
+    </section>
+
+    <!-- Overall Notes Section -->
+    <section class="border border-slate-200 rounded-xl p-5 bg-slate-50/50 space-y-3">
+      <h2 class="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+        <i data-lucide="notebook" class="w-3.5 h-3.5 text-indigo-500"></i> Overall Notes & Annotations
+      </h2>
+      <p class="text-[11px] text-slate-400">
+        このベンチマーク実験全体に対する考察やアノテーションメモをローカルに保存できます（ブラウザの localStorage に自動保存されます）。
+      </p>
+      <textarea id="memo-overall" oninput="saveMemo('overall', this.value)" placeholder="実験全体の総括メモを入力..." class="w-full text-xs p-3 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-white resize-y h-24"></textarea>
+    </section>
+
+    <!-- Tab Buttons (Floating Sticky) -->
+    <div class="border-b border-slate-200 sticky top-16 z-40 bg-white shadow-sm py-2 px-1">
+      <nav class="flex gap-x-8 text-sm" aria-label="Tabs">
+        
+        <button onclick="switchTab('tab-8b-inmem')" id="btn-tab-8b-inmem" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium active">
+          8B In-Memory
+        </button>
+        <button onclick="switchTab('tab-1kb-ltm')" id="btn-tab-1kb-ltm" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium ">
+          1KB LTM (Memory Bound)
+        </button>
+        <button onclick="switchTab('tab-64kb-ltm')" id="btn-tab-64kb-ltm" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium ">
+          64KB LTM (Memory Bound)
+        </button>
+      </nav>
+    </div>
+
+    <!-- Charts Layout Content -->
+    
+    <div id="tab-8b-inmem" class="tab-content active space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <!-- Insert Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-8b_in-memory-Insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures write throughput when inserting unique keys sequentially into empty/pre-populated store.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Insert" oninput="saveMemo('8b_in-memory-Insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Update (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-8b_in-memory-Update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures update throughput under Zipf access distribution (stateful updates).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Update" oninput="saveMemo('8b_in-memory-Update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Delete (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-8b_in-memory-Delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures concurrent delete throughput (T1 index removals).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Delete" oninput="saveMemo('8b_in-memory-Delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Miss (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-8b_in-memory-Get_Miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Get_Miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Evaluates read throughput for non-existent keys (tests Bloom Filter efficiency).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Get_Miss" oninput="saveMemo('8b_in-memory-Get_Miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Hit (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-8b_in-memory-Get_Hit_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Get_Hit_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures point lookups for existing keys under Zipf distribution (cache-friendly).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Get_Hit_Zipf" oninput="saveMemo('8b_in-memory-Get_Hit_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Hit (Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-8b_in-memory-Get_Hit_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Get_Hit_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures point lookups for existing keys under Uniform distribution (extreme cache misses).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Get_Hit_Uniform" oninput="saveMemo('8b_in-memory-Get_Hit_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (No Reorg - Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg - Zipf) Workload</h3>
+            <span id="badge-8b_in-memory-Scan_NoReorg_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Scan_NoReorg_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes 100-key range queries under Zipf distribution with active append region.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Scan_NoReorg_Zipf" oninput="saveMemo('8b_in-memory-Scan_NoReorg_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (No Reorg - Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg - Uniform) Workload</h3>
+            <span id="badge-8b_in-memory-Scan_NoReorg_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Scan_NoReorg_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes 100-key range queries under Uniform distribution (strict sequential prefetching).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Scan_NoReorg_Uniform" oninput="saveMemo('8b_in-memory-Scan_NoReorg_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (With Reorg - Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg - Zipf) Workload</h3>
+            <span id="badge-8b_in-memory-Scan_WithReorg_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Scan_WithReorg_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries after reorganize, pointing to a fully sorted in-memory region (Zipf).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Scan_WithReorg_Zipf" oninput="saveMemo('8b_in-memory-Scan_WithReorg_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (With Reorg - Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg - Uniform) Workload</h3>
+            <span id="badge-8b_in-memory-Scan_WithReorg_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in-memory-Scan_WithReorg_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries after reorganize, pointing to a fully sorted in-memory region (Uniform).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in-memory-Scan_WithReorg_Uniform" oninput="saveMemo('8b_in-memory-Scan_WithReorg_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="tab-1kb-ltm" class="tab-content  space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <!-- Insert Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-1kb_ltm-Insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures write throughput when inserting unique keys sequentially into empty/pre-populated store.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Insert" oninput="saveMemo('1kb_ltm-Insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Update (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-Update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures update throughput under Zipf access distribution (stateful updates).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Update" oninput="saveMemo('1kb_ltm-Update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Delete (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-Delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures concurrent delete throughput (T1 index removals).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Delete" oninput="saveMemo('1kb_ltm-Delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Miss (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-Get_Miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Get_Miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Evaluates read throughput for non-existent keys (tests Bloom Filter efficiency).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Get_Miss" oninput="saveMemo('1kb_ltm-Get_Miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Hit (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-Get_Hit_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Get_Hit_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures point lookups for existing keys under Zipf distribution (cache-friendly).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Get_Hit_Zipf" oninput="saveMemo('1kb_ltm-Get_Hit_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Hit (Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-1kb_ltm-Get_Hit_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Get_Hit_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures point lookups for existing keys under Uniform distribution (extreme cache misses).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Get_Hit_Uniform" oninput="saveMemo('1kb_ltm-Get_Hit_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (No Reorg - Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg - Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-Scan_NoReorg_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Scan_NoReorg_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes 100-key range queries under Zipf distribution with active append region.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Scan_NoReorg_Zipf" oninput="saveMemo('1kb_ltm-Scan_NoReorg_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (No Reorg - Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg - Uniform) Workload</h3>
+            <span id="badge-1kb_ltm-Scan_NoReorg_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Scan_NoReorg_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes 100-key range queries under Uniform distribution (strict sequential prefetching).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Scan_NoReorg_Uniform" oninput="saveMemo('1kb_ltm-Scan_NoReorg_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (With Reorg - Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg - Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-Scan_WithReorg_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Scan_WithReorg_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries after reorganize, pointing to a fully sorted in-memory region (Zipf).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Scan_WithReorg_Zipf" oninput="saveMemo('1kb_ltm-Scan_WithReorg_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (With Reorg - Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg - Uniform) Workload</h3>
+            <span id="badge-1kb_ltm-Scan_WithReorg_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-Scan_WithReorg_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries after reorganize, pointing to a fully sorted in-memory region (Uniform).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-Scan_WithReorg_Uniform" oninput="saveMemo('1kb_ltm-Scan_WithReorg_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="tab-64kb-ltm" class="tab-content  space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <!-- Insert Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-64kb_ltm-Insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures write throughput when inserting unique keys sequentially into empty/pre-populated store.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Insert" oninput="saveMemo('64kb_ltm-Insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Update (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-Update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures update throughput under Zipf access distribution (stateful updates).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Update" oninput="saveMemo('64kb_ltm-Update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Delete (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-Delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures concurrent delete throughput (T1 index removals).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Delete" oninput="saveMemo('64kb_ltm-Delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Miss (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-Get_Miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Get_Miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Evaluates read throughput for non-existent keys (tests Bloom Filter efficiency).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Get_Miss" oninput="saveMemo('64kb_ltm-Get_Miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Hit (Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-Get_Hit_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Get_Hit_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures point lookups for existing keys under Zipf distribution (cache-friendly).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Get_Hit_Zipf" oninput="saveMemo('64kb_ltm-Get_Hit_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Get Hit (Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-64kb_ltm-Get_Hit_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Get_Hit_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Measures point lookups for existing keys under Uniform distribution (extreme cache misses).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Get_Hit_Uniform" oninput="saveMemo('64kb_ltm-Get_Hit_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (No Reorg - Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg - Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-Scan_NoReorg_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Scan_NoReorg_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes 100-key range queries under Zipf distribution with active append region.
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Scan_NoReorg_Zipf" oninput="saveMemo('64kb_ltm-Scan_NoReorg_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (No Reorg - Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (No Reorg - Uniform) Workload</h3>
+            <span id="badge-64kb_ltm-Scan_NoReorg_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Scan_NoReorg_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes 100-key range queries under Uniform distribution (strict sequential prefetching).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Scan_NoReorg_Uniform" oninput="saveMemo('64kb_ltm-Scan_NoReorg_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (With Reorg - Zipf) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg - Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-Scan_WithReorg_Zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Scan_WithReorg_Zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries after reorganize, pointing to a fully sorted in-memory region (Zipf).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Scan_WithReorg_Zipf" oninput="saveMemo('64kb_ltm-Scan_WithReorg_Zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <!-- Scan (With Reorg - Uniform) Workload -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (With Reorg - Uniform) Workload</h3>
+            <span id="badge-64kb_ltm-Scan_WithReorg_Uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-Scan_WithReorg_Uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Executes range queries after reorganize, pointing to a fully sorted in-memory region (Uniform).
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-Scan_WithReorg_Uniform" oninput="saveMemo('64kb_ltm-Scan_WithReorg_Uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="border-t border-slate-200 bg-white py-12 px-6 text-center text-xs text-slate-400 mt-24">
+    <div class="max-w-6xl mx-auto">
+      <div>© 2026 VMemKV Project.</div>
+      <div>Designed with Sleek Minimal Light theme. Powered by Tailwind CSS & Chart.js.</div>
+    </div>
+  </footer>
+
+  <script>
+    // Initialize Lucide Icons
+    lucide.createIcons();
+
+    // Raw Experiment Data Inlined
+    const rawData = {
+  "8B_In-Memory": {
+    "Insert": {
+      "RocksDB": [
+        284175.6,
+        414831.7,
+        946028.3,
+        974628.5
+      ],
+      "Baseline": [
+        2813994.2,
+        4528103.8,
+        7042127.6,
+        6888921.0
+      ],
+      "+Simd": [
+        3099373.9,
+        4668949.9,
+        7192660.2,
+        6717058.8
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        3527704.7,
+        7383696.5,
+        9734767.8,
+        9710746.8
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        3609654.4,
+        7297500.2,
+        9196906.4,
+        8575247.6
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "RocksDB": [
+        573538.3,
+        2379449.9,
+        9828145.0,
+        10574704.2
+      ],
+      "Baseline": [
+        1528165.7,
+        6070873.2,
+        24809257.4,
+        37140007.7
+      ],
+      "+Simd": [
+        1402965.2,
+        5730458.0,
+        22598393.1,
+        34387408.5
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        1622054.8,
+        6845739.0,
+        27163687.7,
+        38738580.0
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        1635553.4,
+        6738678.4,
+        26907017.9,
+        39095009.9
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "RocksDB": [
+        314541.2,
+        1311461.7,
+        5395569.2,
+        6959196.0
+      ],
+      "Baseline": [
+        786124.7,
+        3140458.5,
+        12142613.4,
+        21232462.1
+      ],
+      "+Simd": [
+        807375.6,
+        3263729.2,
+        12517715.4,
+        21203615.1
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        956541.3,
+        3794545.1,
+        14634406.7,
+        24495431.4
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        939486.1,
+        3843253.6,
+        14627573.9,
+        24637683.2
+      ]
+    },
+    "Get_Miss": {
+      "RocksDB": [
+        403171.8,
+        1613100.5,
+        6428828.2,
+        5497136.5
+      ],
+      "Baseline": [
+        4409275.5,
+        15921468.8,
+        77705900.3,
+        72456176.9
+      ],
+      "+Simd": [
+        4238179.2,
+        18077891.1,
+        74298721.6,
+        88222314.8
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        4145095.1,
+        17449155.5,
+        72308283.4,
+        81179193.2
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        3888540.4,
+        16452793.3,
+        67880092.7,
+        78051230.0
+      ]
+    },
+    "Update": {
+      "RocksDB": [
+        150297.7,
+        341072.5,
+        868595.9,
+        909115.1
+      ],
+      "Baseline": [
+        1217104.7,
+        4362307.1,
+        13215727.0,
+        15243369.5
+      ],
+      "+Simd": [
+        1101099.2,
+        4021596.6,
+        12721821.7,
+        14272525.4
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        1266779.1,
+        4506706.0,
+        13128991.7,
+        14261308.2
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        1261188.2,
+        4517901.4,
+        13296768.8,
+        14334016.2
+      ]
+    },
+    "Scan_NoReorg_Zipf": {
+      "RocksDB": [
+        149460.2,
+        641397.6,
+        2630710.7,
+        3094411.2
+      ],
+      "Baseline": [
+        68082.3,
+        271458.6,
+        1083441.5,
+        987756.4
+      ],
+      "+Simd": [
+        3768.5,
+        14764.5,
+        56015.6,
+        58403.5
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        308417.2,
+        1226595.4,
+        4899023.2,
+        4675959.7
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        291753.0,
+        1158996.5,
+        4628818.0,
+        4309973.0
+      ]
+    },
+    "Scan_NoReorg_Uniform": {
+      "RocksDB": [
+        1949947.3,
+        7897781.1,
+        31791458.6,
+        35174910.0
+      ],
+      "Baseline": [
+        63822.6,
+        252773.6,
+        1006911.2,
+        1168268.8
+      ],
+      "+Simd": [
+        2837.4,
+        11300.4,
+        44682.3,
+        62579.0
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        277225.5,
+        1067151.5,
+        4228429.3,
+        5711001.4
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        258169.4,
+        991016.7,
+        3927742.3,
+        5252041.0
+      ]
+    },
+    "Delete": {
+      "RocksDB": [
+        170210.8,
+        370986.8,
+        930701.0,
+        836890.2
+      ],
+      "Baseline": [
+        2287491.0,
+        7947832.0,
+        22975550.4,
+        19571060.5
+      ],
+      "+Simd": [
+        1938431.2,
+        7256930.4,
+        21205989.5,
+        18575347.7
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        1956678.3,
+        6120112.2,
+        16195219.4,
+        17056202.1
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        1944845.1,
+        6227691.4,
+        16373421.0,
+        17742940.1
+      ]
+    },
+    "Scan_WithReorg_Zipf": {
+      "Baseline": [
+        7456269.4,
+        30756068.2,
+        123562898.5,
+        131246014.1
+      ],
+      "+Simd": [
+        7605702.7,
+        31418245.6,
+        125913897.0,
+        131461010.4
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        4370.8,
+        17301.0,
+        66211.9,
+        67954.0
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        4608.9,
+        18061.0,
+        69255.8,
+        71200.6
+      ],
+      "RocksDB": [
+        149460.2,
+        641397.6,
+        2630710.7,
+        3094411.2
+      ]
+    },
+    "Scan_WithReorg_Uniform": {
+      "Baseline": [
+        7002882.2,
+        28414665.3,
+        114812826.3,
+        127358327.2
+      ],
+      "+Simd": [
+        7096167.2,
+        29077019.1,
+        116223034.8,
+        127705935.2
+      ],
+      "Bloom-Simd-T1InlineValue": [
+        3309.8,
+        13206.9,
+        52538.0,
+        73994.6
+      ],
+      "Bloom-Simd-T1InlineValue-Prefaulting": [
+        3441.7,
+        13873.4,
+        55347.4,
+        77284.5
+      ],
+      "RocksDB": [
+        1949947.3,
+        7897781.1,
+        31791458.6,
+        35174910.0
+      ]
+    }
+  },
+  "1KB_LTM": {
+    "Insert": {
+      "RocksDB": [
+        55209.4,
+        122564.2,
+        132935.4,
+        55393.0
+      ],
+      "+Simd": [
+        326839.3,
+        311341.1,
+        394902.0,
+        467078.2
+      ],
+      "Simd": [
+        336356.0,
+        295762.0,
+        399199.6,
+        466861.0
+      ],
+      "+Hint": [
+        412958.3,
+        366717.9,
+        488874.2,
+        535254.5
+      ],
+      "+Prefault": [
+        400819.0,
+        408030.4,
+        300640.1,
+        351896.1
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "RocksDB": [
+        45425.0,
+        230326.4,
+        653321.1,
+        1121167.3
+      ],
+      "+Simd": [
+        78015.3,
+        341039.8,
+        943582.3,
+        1503606.2
+      ],
+      "Simd": [
+        94537.6,
+        305818.2,
+        938516.7,
+        1490080.7
+      ],
+      "+Hint": [
+        92864.8,
+        318160.0,
+        835155.7,
+        1338203.0
+      ],
+      "+Prefault": [
+        133465.1,
+        421924.0,
+        1249742.2,
+        2006599.4
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "RocksDB": [
+        15276.8,
+        59831.9,
+        202865.2,
+        310051.4
+      ],
+      "+Simd": [
+        16986.5,
+        68927.4,
+        213823.4,
+        313747.8
+      ],
+      "Simd": [
+        17034.7,
+        68261.1,
+        213342.7,
+        313065.4
+      ],
+      "+Hint": [
+        16106.7,
+        65958.1,
+        202684.9,
+        294914.7
+      ],
+      "+Prefault": [
+        16066.6,
+        62203.6,
+        198183.0,
+        295706.7
+      ]
+    },
+    "Get_Miss": {
+      "RocksDB": [
+        251548.7,
+        1003631.8,
+        4029669.7,
+        3354666.2
+      ],
+      "+Simd": [
+        6214034.4,
+        22506617.5,
+        110000659.1,
+        106774221.3
+      ],
+      "Simd": [
+        6270095.2,
+        24905636.6,
+        65322777.7,
+        90493012.1
+      ],
+      "+Hint": [
+        6466548.3,
+        27159254.1,
+        114473934.2,
+        109058416.0
+      ],
+      "+Prefault": [
+        5278457.0,
+        18421342.1,
+        92647129.7,
+        87763203.8
+      ]
+    },
+    "Update": {
+      "RocksDB": [
+        29438.9,
+        51955.6,
+        71651.8,
+        68000.8
+      ],
+      "+Simd": [
+        138575.6,
+        271627.7,
+        471144.9,
+        573123.4
+      ],
+      "Simd": [
+        136535.6,
+        278243.6,
+        426822.1,
+        550038.4
+      ],
+      "+Hint": [
+        132027.1,
+        270181.4,
+        396752.1,
+        477095.0
+      ],
+      "+Prefault": [
+        165496.6,
+        349287.5,
+        575897.3,
+        697974.5
+      ]
+    },
+    "Scan_NoReorg_Zipf": {
+      "RocksDB": [
+        1752.6,
+        10699.0,
+        41117.9,
+        404631.3
+      ],
+      "+Simd": [
+        6716.2,
+        27323.4,
+        107578.9,
+        112996.4
+      ],
+      "Simd": [
+        6677.2,
+        27237.9,
+        107225.0,
+        112961.7
+      ],
+      "+Hint": [
+        6874.1,
+        28083.6,
+        108031.6,
+        112805.7
+      ],
+      "+Prefault": [
+        7085.8,
+        28493.0,
+        112120.8,
+        113292.4
+      ]
+    },
+    "Scan_NoReorg_Uniform": {
+      "RocksDB": [
+        40643.4,
+        343140.9,
+        1313031.2,
+        1919633.5
+      ],
+      "+Simd": [
+        5207.2,
+        21372.7,
+        85576.6,
+        121528.2
+      ],
+      "Simd": [
+        5122.2,
+        21238.5,
+        84016.3,
+        121133.5
+      ],
+      "+Hint": [
+        5116.2,
+        21013.5,
+        82490.3,
+        116887.2
+      ],
+      "+Prefault": [
+        5819.4,
+        23483.1,
+        93445.8,
+        128888.1
+      ]
+    },
+    "Delete": {
+      "RocksDB": [
+        37534.9,
+        156898.3,
+        138098.7,
+        150121.9
+      ],
+      "+Simd": [
+        2459740.9,
+        3942217.4,
+        9096310.1,
+        16520731.8
+      ],
+      "Simd": [
+        2591524.0,
+        3578244.7,
+        7976317.9,
+        16153533.1
+      ],
+      "+Hint": [
+        2947892.2,
+        10753241.6,
+        35893067.9,
+        36851249.1
+      ],
+      "+Prefault": [
+        3327759.0,
+        10790895.7,
+        35345392.6,
+        38608654.7
+      ]
+    },
+    "Scan_WithReorg_Zipf": {
+      "+Simd": [
+        7820876.3,
+        31405036.2,
+        126420759.9,
+        131879445.9
+      ],
+      "Simd": [
+        7720173.7,
+        31332951.1,
+        126654717.8,
+        131353922.5
+      ],
+      "+Hint": [
+        7694451.5,
+        31684668.7,
+        127537589.7,
+        132190154.5
+      ],
+      "+Prefault": [
+        6866065.1,
+        27918097.7,
+        112893937.0,
+        114484513.5
+      ],
+      "RocksDB": [
+        1752.6,
+        10699.0,
+        41117.9,
+        404631.3
+      ]
+    },
+    "Scan_WithReorg_Uniform": {
+      "+Simd": [
+        7384793.6,
+        30121428.8,
+        119939467.1,
+        129686576.6
+      ],
+      "Simd": [
+        7327162.7,
+        29877205.9,
+        120372052.9,
+        128584342.9
+      ],
+      "+Hint": [
+        7343200.4,
+        30004092.8,
+        120943624.7,
+        126403573.8
+      ],
+      "+Prefault": [
+        6671484.6,
+        27350051.5,
+        110531341.3,
+        113486163.7
+      ],
+      "RocksDB": [
+        40643.4,
+        343140.9,
+        1313031.2,
+        1919633.5
+      ]
+    }
+  },
+  "64KB_LTM": {
+    "Insert": {
+      "RocksDB": [
+        4880.6,
+        4931.9,
+        3327.6,
+        2667.5
+      ],
+      "+Simd": [
+        10110.2,
+        12258.2,
+        21831.0,
+        21762.0
+      ],
+      "Simd": [
+        5538.6,
+        10497.3,
+        17991.2,
+        21444.1
+      ],
+      "+Hint": [
+        10065.9,
+        12456.3,
+        18485.4,
+        21443.0
+      ],
+      "+Prefault": [
+        8950.7,
+        11656.1,
+        17025.8,
+        18083.5
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "RocksDB": [
+        29515.0,
+        92916.4,
+        267423.0,
+        288314.8
+      ],
+      "+Simd": [
+        18421.3,
+        77498.3,
+        221024.8,
+        308109.3
+      ],
+      "Simd": [
+        19236.7,
+        77516.1,
+        221588.6,
+        307730.9
+      ],
+      "+Hint": [
+        15725.9,
+        66870.9,
+        177051.8,
+        245742.3
+      ],
+      "+Prefault": [
+        16823.8,
+        65629.0,
+        174849.1,
+        241146.7
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "RocksDB": [
+        9380.8,
+        33648.5,
+        78024.6,
+        70848.7
+      ],
+      "+Simd": [
+        5800.8,
+        16344.8,
+        42736.7,
+        59394.8
+      ],
+      "Simd": [
+        5811.3,
+        16276.3,
+        42557.9,
+        59592.5
+      ],
+      "+Hint": [
+        5361.3,
+        13947.0,
+        36722.7,
+        50829.6
+      ],
+      "+Prefault": [
+        5289.2,
+        13629.8,
+        36292.8,
+        50295.5
+      ]
+    },
+    "Get_Miss": {
+      "RocksDB": [
+        400186.0,
+        1584581.9,
+        6423431.0,
+        5551583.2
+      ],
+      "+Simd": [
+        8444888.2,
+        33852267.9,
+        124804972.7,
+        113268968.6
+      ],
+      "Simd": [
+        8473382.7,
+        25484057.2,
+        118196510.9,
+        115792438.5
+      ],
+      "+Hint": [
+        8662039.7,
+        34516863.7,
+        138962455.6,
+        115765321.0
+      ],
+      "+Prefault": [
+        6603746.5,
+        26628783.4,
+        106497038.2,
+        92379303.3
+      ]
+    },
+    "Update": {
+      "RocksDB": [
+        1666.2,
+        2002.4,
+        2933.4,
+        1863.7
+      ],
+      "+Simd": [
+        18405.8,
+        49736.7,
+        74607.1,
+        84485.3
+      ],
+      "Simd": [
+        17252.6,
+        50481.0,
+        86945.7,
+        86196.4
+      ],
+      "+Hint": [
+        14986.0,
+        40773.9,
+        73344.9,
+        89096.7
+      ],
+      "+Prefault": [
+        15855.9,
+        38397.6,
+        61680.4,
+        81473.9
+      ]
+    },
+    "Scan_NoReorg_Zipf": {
+      "RocksDB": [
+        29963.3,
+        93992.4,
+        283665.4,
+        213152.5
+      ],
+      "+Simd": [
+        449831.9,
+        1822855.4,
+        7362186.9,
+        6863778.4
+      ],
+      "Simd": [
+        430530.3,
+        1748711.8,
+        7057442.2,
+        6866572.7
+      ],
+      "+Hint": [
+        430646.3,
+        1749323.8,
+        7039795.0,
+        6818022.4
+      ],
+      "+Prefault": [
+        448453.9,
+        1816647.0,
+        7283941.4,
+        6930968.1
+      ]
+    },
+    "Scan_NoReorg_Uniform": {
+      "RocksDB": [
+        7551.5,
+        23245.9,
+        41985.5,
+        41529.1
+      ],
+      "+Simd": [
+        372282.2,
+        1530859.5,
+        6199189.6,
+        7852282.8
+      ],
+      "Simd": [
+        359533.7,
+        1486958.2,
+        6013630.0,
+        7839717.9
+      ],
+      "+Hint": [
+        359839.2,
+        1481523.3,
+        5993834.1,
+        7756629.5
+      ],
+      "+Prefault": [
+        421983.8,
+        1721628.5,
+        6952086.0,
+        8229596.7
+      ]
+    },
+    "Delete": {
+      "RocksDB": [
+        2274.7,
+        6748.9,
+        12984.3,
+        18535.6
+      ],
+      "+Simd": [
+        169199.2,
+        313461.6,
+        692843.5,
+        938009.7
+      ],
+      "Simd": [
+        182787.3,
+        272967.9,
+        836923.6,
+        933557.3
+      ],
+      "+Hint": [
+        188909.0,
+        288947.2,
+        859265.1,
+        1068259.6
+      ],
+      "+Prefault": [
+        211372.5,
+        317175.5,
+        715406.0,
+        1531330.2
+      ]
+    },
+    "Scan_WithReorg_Zipf": {
+      "+Simd": [
+        7937957.8,
+        32463719.1,
+        128081692.5,
+        132736581.2
+      ],
+      "Simd": [
+        7902326.2,
+        32004326.7,
+        129183105.7,
+        132482106.8
+      ],
+      "+Hint": [
+        7871670.4,
+        32334470.1,
+        129833204.6,
+        133596031.7
+      ],
+      "+Prefault": [
+        6976811.8,
+        28358217.1,
+        113615135.8,
+        115029524.5
+      ],
+      "RocksDB": [
+        29963.3,
+        93992.4,
+        283665.4,
+        213152.5
+      ]
+    },
+    "Scan_WithReorg_Uniform": {
+      "+Simd": [
+        7840877.0,
+        31904837.7,
+        125706812.6,
+        132845498.4
+      ],
+      "Simd": [
+        7865053.8,
+        31233263.6,
+        126714216.0,
+        132533160.0
+      ],
+      "+Hint": [
+        7850662.5,
+        32104037.4,
+        127765072.8,
+        132967560.8
+      ],
+      "+Prefault": [
+        6950144.6,
+        28230950.5,
+        113044945.8,
+        114889220.6
+      ],
+      "RocksDB": [
+        7551.5,
+        23245.9,
+        41985.5,
+        41529.1
+      ]
+    }
+  }
+};
+
+    const workloads = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_NoReorg_Zipf", "Scan_NoReorg_Uniform", "Scan_WithReorg_Zipf", "Scan_WithReorg_Uniform"];
+    const valSizes = ["8B_In-Memory", "1KB_LTM", "64KB_LTM"];
+
+    const colors = {
+      'RocksDB': '#64748b', // Slate Gray
+      'Baseline': '#94a3b8',
+      '+BF': '#f59e0b', // Amber
+      '+Simd': '#38bdf8', // Light Blue
+      '+Hint': '#059669', // Emerald Green
+      '+Inline': '#6366f1', // Indigo
+      '+Prefault': '#ec4899' // Pink (System_AllOn)
+    };
+
+    const threadLabels = ['1 Thread', '4 Threads', '16 Threads', '32 Threads'];
+
+    // Helper to generate Chart.js Config
+    function makeChartConfig(valSize, op) {
+      const sizeData = rawData[valSize];
+      if (!sizeData) return null;
+      const opData = sizeData[op];
+      if (!opData) return null;
+      
+      const datasets = Object.keys(opData).map(variantName => {
+        const isRocks = variantName === 'RocksDB';
+        return {
+          label: variantName,
+          data: opData[variantName],
+          borderColor: colors[variantName] || '#6366f1',
+          backgroundColor: function(context) {
+            const chart = context.chart;
+            const {ctx, chartArea} = chart;
+            if (!chartArea) return null;
+            const color = colors[variantName] || '#6366f1';
+            const gradient = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+            gradient.addColorStop(0, color + '25'); // 14% Opacity at top
+            gradient.addColorStop(1, color + '00'); // 0% Opacity at bottom
+            return gradient;
+          },
+          borderWidth: isRocks ? 2.5 : 2,
+          borderDash: isRocks ? [6, 6] : [],
+          tension: 0.15,
+          fill: true,
+          pointStyle: isRocks ? 'triangle' : 'circle',
+          pointRadius: isRocks ? 5 : 3.5,
+          pointHoverRadius: isRocks ? 7 : 5.5,
+          hoverBorderWidth: 3
+        };
+      });
+
+      return {
+        type: 'line',
+        data: {
+          labels: threadLabels,
+          datasets: datasets
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: {
+            duration: 900,
+            easing: 'easeInOutQuart'
+          },
+          hover: {
+            mode: 'dataset',
+            intersect: false
+          },
+          onHover: function(event, activeElements, chart) {
+            const datasets = chart.data.datasets;
+            if (activeElements.length > 0) {
+              const activeDatasetIndex = activeElements[0].datasetIndex;
+              datasets.forEach((dataset, index) => {
+                const isRocks = dataset.label === 'RocksDB';
+                const baseColor = colors[dataset.label] || '#6366f1';
+                
+                if (index === activeDatasetIndex) {
+                  dataset.borderColor = baseColor;
+                  dataset.borderWidth = isRocks ? 3.5 : 3.0;
+                } else {
+                  dataset.borderColor = baseColor + '18';
+                  dataset.borderWidth = isRocks ? 1.5 : 1.0;
+                }
+              });
+            } else {
+              datasets.forEach((dataset) => {
+                const isRocks = dataset.label === 'RocksDB';
+                const baseColor = colors[dataset.label] || '#6366f1';
+                dataset.borderColor = baseColor;
+                dataset.borderWidth = isRocks ? 2.5 : 2.0;
+              });
+            }
+            chart.update('none');
+          },
+          plugins: {
+            legend: {
+              position: 'bottom',
+              labels: { 
+                boxWidth: 12, 
+                font: { size: 12, family: 'Inter', weight: '500' },
+                usePointStyle: true
+              }
+            },
+            tooltip: {
+              mode: 'index',
+              intersect: false,
+              backgroundColor: 'rgba(15, 23, 42, 0.95)',
+              titleFont: { size: 12, family: 'Inter', weight: 'bold' },
+              bodyFont: { size: 11, family: 'Inter' },
+              padding: 10,
+              cornerRadius: 8,
+              boxWidth: 8,
+              boxHeight: 8,
+              usePointStyle: true,
+              callbacks: {
+                label: function(context) {
+                  const label = context.dataset.label || '';
+                  const value = context.raw || 0;
+                  const formattedValue = value.toLocaleString();
+                  
+                  const rocksDataset = context.chart.data.datasets.find(d => d.label === 'RocksDB');
+                  if (rocksDataset && label !== 'RocksDB') {
+                    const rocksValue = rocksDataset.data[context.dataIndex];
+                    if (rocksValue > 0) {
+                      const speedup = value / rocksValue;
+                      const pct = ((speedup - 1) * 100).toFixed(0);
+                      const sign = pct >= 0 ? '+' : '';
+                      return ` ${label}: ${formattedValue} ops/s (${sign}${pct}% vs RocksDB)`;
+                    }
+                  }
+                  return ` ${label}: ${formattedValue} ops/s`;
+                }
+              }
+            }
+          },
+          scales: {
+            y: {
+              ticks: { 
+                font: { family: 'Inter', size: 11 },
+                grid: { color: '#f1f5f9' },
+                callback: function(value) {
+                  if (value >= 1e9) {
+                    return (value / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+                  }
+                  if (value >= 1e6) {
+                    return (value / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+                  }
+                  if (value >= 1e3) {
+                    return (value / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+                  }
+                  return value;
+                }
+              },
+              title: { display: true, text: 'Throughput (ops/s)', font: { size: 12, weight: 'bold', family: 'Inter' } }
+            },
+            x: {
+              ticks: { font: { family: 'Inter', size: 11 } },
+              grid: { display: false }
+            }
+          }
+        }
+      };
+    }
+
+    function updateSpeedupBadge(valSize, op) {
+      const sizeData = rawData[valSize];
+      if (!sizeData) return;
+      const opData = sizeData[op];
+      const elementId = valSize.toLowerCase() + '-' + op;
+      const badge = document.getElementById('badge-' + elementId);
+      if (!opData || !badge) return;
+      
+      const rocksData = opData['RocksDB'];
+      if (!rocksData) return;
+      
+      const threads = [1, 4, 16, 32];
+      let ratios = [];
+      
+      for (let i = 0; i < 4; i++) {
+        const rVal = rocksData[i];
+        if (rVal <= 0) continue;
+        
+        let maxVVal = 0;
+        Object.keys(opData).forEach(variantName => {
+          if (variantName === 'RocksDB') return;
+          const val = opData[variantName][i];
+          if (val > maxVVal) {
+            maxVVal = val;
+          }
+        });
+        
+        if (maxVVal > 0) {
+          ratios.push({
+            thread: threads[i],
+            ratio: maxVVal / rVal
+          });
+        }
+      }
+      
+      if (ratios.length === 0) return;
+      
+      const slowdowns = ratios.filter(r => r.ratio < 0.95);
+      
+      if (slowdowns.length > 0) {
+        slowdowns.sort((a, b) => a.ratio - b.ratio);
+        const worst = slowdowns[0];
+        badge.innerHTML = `⚠️ Slowdown: <strong>${worst.ratio.toFixed(1)}x</strong> (${worst.thread} Thr)`;
+        badge.className = "text-[11px] font-semibold bg-rose-50 text-rose-700 border border-rose-100 rounded-full px-2.5 py-0.5";
+        badge.classList.remove('hidden');
+      } else {
+        ratios.sort((a, b) => b.ratio - a.ratio);
+        const best = ratios[0];
+        if (best.ratio > 1.05) {
+          badge.innerHTML = `⚡ Max Speedup: <strong>${best.ratio.toFixed(1)}x</strong> (${best.thread} Thr)`;
+          badge.className = "text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5";
+          badge.classList.remove('hidden');
+        }
+      }
+    }
+
+    window.saveMemo = function(key, val) {
+      localStorage.setItem('vmemkv-memo-' + key, val);
+    };
+
+    function initMemos() {
+      document.querySelectorAll('textarea[id^="memo-"]').forEach(textarea => {
+        const key = textarea.id.replace('memo-', '');
+        textarea.value = localStorage.getItem('vmemkv-memo-' + key) || '';
+      });
+    }
+
+    function initCharts() {
+      valSizes.forEach(size => {
+        workloads.forEach(op => {
+          const elementId = size.toLowerCase() + '-' + op;
+          const canvas = document.getElementById('chart-' + elementId);
+          if (canvas) {
+            const config = makeChartConfig(size, op);
+            if (config) {
+              const chart = new Chart(canvas, config);
+              
+              // Clear focus highlight when mouse leaves the canvas
+              canvas.addEventListener('mouseout', () => {
+                chart.data.datasets.forEach((dataset) => {
+                  const isRocks = dataset.label === 'RocksDB';
+                  const baseColor = colors[dataset.label] || '#6366f1';
+                  dataset.borderColor = baseColor;
+                  dataset.borderWidth = isRocks ? 2.5 : 2.0;
+                });
+                chart.update('none');
+              });
+            }
+            updateSpeedupBadge(size, op);
+          }
+        });
+      });
+      initMemos();
+    }
+
+    if (document.readyState === 'loading') {
+      window.addEventListener('DOMContentLoaded', initCharts);
+    } else {
+      initCharts();
+    }
+
+    window.switchTab = function(tabId) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+      
+      document.getElementById(tabId).classList.add('active');
+      document.getElementById('btn-' + tabId).classList.add('active');
+    };
+  </script>
+</body>
+</html>

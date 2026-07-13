@@ -447,6 +447,20 @@ class T1Index {
                std::back_inserter(merged),
                comp);
 
+    // Deduplicate merged output (keeping the newest snapshot from imm_entries)
+    // std::merge is stable: elements from imm_entries (newest) will be merged after sorted_entries (oldest).
+    if (!merged.empty()) {
+      auto write_it = merged.begin();
+      for (auto read_it = std::next(merged.begin()); read_it != merged.end(); ++read_it) {
+        if (write_it->key == read_it->key && write_it->hash == read_it->hash) {
+          *write_it = *read_it;  // Overwrite older with newer
+        } else {
+          *(++write_it) = *read_it;
+        }
+      }
+      merged.erase(write_it + 1, merged.end());
+    }
+
     // Assert no duplicate entries exist in the merge output
     assert_no_duplicates(merged);
 

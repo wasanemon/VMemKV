@@ -81,7 +81,7 @@ struct VMemKVDeleter {
 
 template <typename Impl>
 struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
-  static constexpr uint64_t kCapacityBytes = 1U << 20;  // 1 MiB
+  static constexpr uint64_t kCapacityBytes = 8U << 20;  // 8 MiB
 
   static auto make() -> std::unique_ptr<vmemkv::StoreAdapter<Impl>, VMemKVDeleter<Impl>> {
     std::filesystem::path path = reserve_temp_path();
@@ -592,8 +592,8 @@ TEST_CASE_TEMPLATE("scan with integral keys verifies lexicographical ordering", 
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write paths") {
-  const std::string path = "test_inlining.bin";
-  constexpr uint64_t kInlineStoreCapacityBytes = 1024ULL * 1024ULL;
+  const std::string path = reserve_temp_path().string();
+  constexpr uint64_t kInlineStoreCapacityBytes = 8ULL * 1024ULL * 1024ULL;
   constexpr std::byte kShortFillByte{0xAB};
   constexpr std::byte kLongFillByte{0xCD};
   constexpr uint64_t kOddInlineValue = 0x003456789ABCDEF1ULL;
@@ -667,7 +667,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
 }
 
 TEST_CASE("VMemKV: reorganize lost update race condition (Deterministic)") {
-  const std::string path = "test_lost_update_det.bin";
+  const std::string path = reserve_temp_path().string();
   constexpr uint64_t kStoreCapacityBytes = 1024ULL * 1024ULL;
 
   using TestStore = vmemkv::variants::VMemKV_LTM_Inline;

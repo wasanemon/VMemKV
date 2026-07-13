@@ -41,19 +41,7 @@ This document outlines the roadmap to implement the full, robust architecture of
 
 ---
 
-## 4. Fix T1Index Scan Algorithmic Bottleneck (Full-sort Bug)
-* **Status**: 🔴 **Not Implemented**
-* **Issue**:
-  - The current implementation of `T1Index::scan` copies the entire `sorted_region` into a temporary vector, merges it with the `append_region`, and performs a full `std::sort` ($O(N \log N)$) on every scan request.
-  - This results in a massive CPU/memory bottleneck, dropping throughput to <100 ops/s when the total record count $N$ is large (e.g. Value=8B/1KB).
-* **Action Items**:
-  - Refactor `T1Index::scan` to conform to the Low-Level Design (LLD 3.5):
-    1. Binary-search (`std::lower_bound`) the already-sorted `sorted_region` to extract only the range of entries between `lo` and `hi` ($O(\log S)$).
-    2. Scan the small `append_region` to gather range candidates.
-    3. Merge and deduplicate the two small candidate sets, achieving $O(\log S + A \log A)$ complexity.
-  - Fix the performance drop in Scan benchmarks for 8B and 1KB value sizes.
-
-## 6. Get(Hit) Borrowed Read Path with Versioned Validation
+## 5. Get(Hit) Borrowed Read Path with Versioned Validation
 * **Status**: 🟡 **Planned**
 * **Goal**:
   - Add a zero-copy `Get(Hit)` read path for large values by returning a borrowed view into T2 instead of always materializing `std::vector<std::byte>`.
@@ -62,3 +50,18 @@ This document outlines the roadmap to implement the full, robust architecture of
   - Introduce a borrowed read API that can carry the T2 memory lifetime guard together with the value span.
   - Validate the record version before and after value access; retry if an update is observed in flight.
   - Restrict the borrowed path to read-only consumers so the existing copy-returning API can remain available when materialization is required.
+
+---
+
+## 6. Investigate ScanReorg Performance Degradation & Re-evaluate T1 Reorganize
+* **Status**: 🔴 **Under Investigation**
+* **Context**:
+  - In 8B In-Memory runs, `Scan` (with active append records) achieves **~53,000 ops/s**, whereas `ScanReorg` (after merging all entries into `SortedRegion`) drops to **~700 ops/s** (a ~75x to 1,100x performance drop).
+  - While $O(\log S)$ search should theoretically outperform $O(A)$ scan when $A$ is large, the physical memory latency and software lock contention present a severe bottleneck.
+* **Academic Hypothesis**:
+  - **Sequential vs. Random Prefetching**: Linearly scanning the flat `AppendRegion` benefits 100% from the CPU's **Stream Prefetcher** (hiding DRAM latency), while binary-searching the 640MB `SortedRegion` defeats the prefetcher, causing CPU pipeline stalls on every DRAM random fetch (60ns).
+  - **Memory Allocator Lock Contention**: `scan_impl` materializes key instances (`std::vector<std::byte>`). Under 16/32 thread concurrency, 20M entries cause millions of mallocs, saturating the allocator's internal arena spinlocks.
+  - **Reorganize Re-evaluation**: If sequential $O(A)$ scanning is physically faster than random $O(\log S)$ binary search due to hardware prefetching, **reorganizing the T1 index might be counter-productive for in-memory operations.**
+* **Action Items**:
+  - Profile `bench_kv` runs using `gperftools` / `pprof` CPU profilers to quantify CPU stall cycles (DRAM latency) vs allocator lock spin times.
+  - Re-evaluate the architectural necessity of `T1Index::reorganize()`. Investigate if VMemKV should selectively skip T1 compaction or adopt cache-conscious layout structures (e.g., B+ Trees or Cache-sensitive Search Trees) to preserve prefetching.

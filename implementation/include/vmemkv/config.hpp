@@ -86,7 +86,7 @@ struct Config {
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
   // Default Tier 2 (T2) file storage capacity: 256 GiB.
-  static constexpr size_t DefaultT2CapacityBytes = 256ULL << 30;
+  static constexpr size_t DefaultT2CapacityBytes = 1ULL << 40;
 
   static_assert(T1ReorganizeSoftThresholdPercent > 0 && T1ReorganizeSoftThresholdPercent < kPercentBase,
                 "T1ReorganizeSoftThresholdPercent must be in (0, 100)");
@@ -101,7 +101,7 @@ struct Config {
 namespace detail {
 using T1_AllOff = Config<>;
 using T1_AllOn = Config<BloomFilter, SimdScan, MemoryHints>;
-using System_AllOn = Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue>;
+using System_AllOn = Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue, Prefaulting>;
 }  // namespace detail
 
 struct VMemKVStatistics {

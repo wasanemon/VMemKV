@@ -69,7 +69,7 @@ fi
 # ── Configuration Parameters ──────────────────────────────────────────────
 AWS_REGION="ap-northeast-1"
 INSTANCE_TYPE="c6id.8xlarge"
-MIN_TIME="1.0s"
+MIN_TIME="5.0s"
 LTM_MEMORY_BUDGET_BYTES=$((1 * 1024 * 1024 * 1024))
 LTM_SWAP_BUDGET_BYTES=$((1024 * 1024 * 1024 * 1024))
 KEY_NAME="vmemkv-c6id-key-$$"
@@ -298,7 +298,7 @@ prepare_remote_storage() {
 
 sync_repo_to_remote() {
   echo "Syncing codebase..."
-  git --git-dir="$REPO_ROOT/.git" --work-tree="$REPO_ROOT" ls-files | rsync -az -e "ssh $SSH_OPTS" --files-from=- "$REPO_ROOT/" "ubuntu@$PUBLIC_IP:~/faultkv/"
+  git -C "$REPO_ROOT" ls-files | rsync -az -e "ssh $SSH_OPTS" --files-from=- "$REPO_ROOT/" "ubuntu@$PUBLIC_IP:~/faultkv/"
 }
 
 build_remote_benchmark() {

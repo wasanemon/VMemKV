@@ -663,7 +663,7 @@ void register_all_benchmarks() {
     // Keep the benchmark matrix aligned with the scenario model:
     // 8B for in-memory, 1KB/64KB for LTM.
     std::vector<size_t> value_sizes =
-        is_ltm_mode() ? std::vector<size_t>{1024ULL, 64ULL * 1024ULL} : std::vector<size_t>{kInlineValueBytes};
+        is_ltm_mode() ? std::vector<size_t>{1024ULL, 64ULL * 1024ULL} : std::vector<size_t>{kInlineValueBytes, 1024ULL};
     if (prefer_large_value_first()) {
       std::reverse(value_sizes.begin(), value_sizes.end());
     }
@@ -742,14 +742,15 @@ void register_all_benchmarks() {
       auto get_miss_meta = make_metadata(corpus_size, val_size);
       register_bench(
           crud_holder,
-          benchmark_name(sname, "Get", "Miss", std::nullopt, value_name),
+          benchmark_name(sname, "Get", "Miss", "Zipf", value_name),
           get_miss_meta,
           make,
           [corpus_size, val_size](auto &store) { populate(store, {corpus_size, val_size}); },
           [corpus_size](benchmark::State &state, auto &store) {
             std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
+            ZipfDistribution zipf({corpus_size, 1.0});
             for (auto _ : state) {
-              std::size_t key_index = corpus_size + static_cast<std::size_t>(rng() % corpus_size);
+              std::size_t key_index = corpus_size + zipf(rng);
               auto value = store.get_bytes(make_key(key_index));
               benchmark::DoNotOptimize(value);
             }
@@ -764,15 +765,16 @@ void register_all_benchmarks() {
       auto update_meta = make_metadata(corpus_size, val_size);
       register_bench(
           crud_holder,
-          benchmark_name(sname, "Update", std::nullopt, std::nullopt, value_name),
+          benchmark_name(sname, "Update", std::nullopt, "Zipf", value_name),
           update_meta,
           make,
           [corpus_size, val_size](auto &store) { populate(store, {corpus_size, val_size}); },
           [corpus_size, val_size](benchmark::State &state, auto &store) {
             std::string dummy(val_size, 'a');
             std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
+            ZipfDistribution zipf({corpus_size, 1.0});
             for (auto _ : state) {
-              std::size_t key_index = static_cast<std::size_t>(rng() % corpus_size);
+              std::size_t key_index = zipf(rng);
               bool updated = store.update(make_key(key_index), dummy);
               benchmark::DoNotOptimize(updated);
             }
