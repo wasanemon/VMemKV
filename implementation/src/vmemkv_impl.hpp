@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <filesystem>
@@ -62,6 +63,26 @@ struct alignas(kCacheLineAlignment) AlignedMutex {
 };
 
 namespace vmemkv {
+
+template <typename CopyFunc>
+inline auto read_t2_record_seqlock(const T2RecordView &record, CopyFunc copy_func) {
+  auto atomic_version = std::atomic_ref<const uint64_t>(record.header->version);
+  while (true) {
+    uint64_t v1 = atomic_version.load(std::memory_order_acquire);
+    if (v1 % 2 != 0) {
+      std::this_thread::yield();
+      continue;
+    }
+
+    auto result = copy_func();
+
+    std::atomic_thread_fence(std::memory_order_acquire);
+    uint64_t v2 = atomic_version.load(std::memory_order_acquire);
+    if (v1 == v2) {
+      return result;
+    }
+  }
+}
 
 // ─── VMemKVImpl Layer Coordination Overview ──────────────────────────────────
 //
@@ -146,7 +167,8 @@ class VMemKVImpl {
   //   2. Writes live records into a temporary T2 file sequentially (garbage collection).
   //   3. Hot-swaps the memory-mapped T2 view and publishes the rebuilt T1 index.
   // - Thread-safety: Thread-safe; synchronized internally via reorganize_mutex_.
-  void reorganize(bool force_t2_gc = true) {
+  // Pure, non-blocking internal reorganize logic (used under acquired reorg_running_ lock)
+  void reorganize_internal(bool force_t2_gc) {
     bool upgrade_to_t2 = force_t2_gc;
 
     if (!upgrade_to_t2) {
@@ -259,6 +281,35 @@ class VMemKVImpl {
     }
   }
 
+  // Public, blocking-guaranteed synchronize method
+  void reorganize(bool force_t2_gc = true) {
+    while (true) {
+      // 1. Wait for any concurrent background/manual reorganize to complete
+      while (reorg_running_.load(std::memory_order_acquire)) {
+        reorg_running_.wait(true, std::memory_order_acquire);
+      }
+
+      // 2. Check if we actually need to run reorganize (is append region empty?)
+      if (t1_.append_size() == 0) {
+        break;  // Empty, success!
+      }
+
+      // 3. Try to acquire the execution lock
+      bool expected_running = false;
+      if (reorg_running_.compare_exchange_strong(expected_running, true, std::memory_order_acq_rel)) {
+        try {
+          reorganize_internal(force_t2_gc);
+        } catch (...) {
+          reorg_running_.store(false, std::memory_order_release);
+          reorg_running_.notify_all();
+          throw;
+        }
+        reorg_running_.store(false, std::memory_order_release);
+        reorg_running_.notify_all();
+      }
+    }
+  }
+
   // Accessors for T1 (Index) and T2 (Flat File) layers (mainly for testing).
   auto t1() noexcept -> T1IndexT & { return t1_; }
   auto t1() const noexcept -> const T1IndexT & { return t1_; }
@@ -332,9 +383,13 @@ class VMemKVImpl {
   // - Thread-safety: Lock-free (concurrently readable during index reorganization).
   // - Guarantees: Resolves inline value directly, otherwise reads T2 record at the T1 offset.
   auto get_impl(std::span<const std::byte> full_key) const -> uint64_t {
+    const auto res = t1_.get_with_hash(full_key);
+    if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
+      return vmemkv::STORE_NOT_FOUND;
+    }
+
     if constexpr (ConfigT::UseT1InlineValue) {
-      const auto res = t1_.get_with_hash(full_key);
-      if (res.payload_bits != vmemkv::STORE_NOT_FOUND && t1_detail::is_inline(res.raw_hash)) {
+      if (t1_detail::is_inline(res.raw_hash)) {
         size_t size = t1_detail::decode_size(res.raw_hash);
         uint64_t val_u64 = 0;
         std::memcpy(&val_u64, &res.payload_bits, size);
@@ -343,8 +398,18 @@ class VMemKVImpl {
     }
 
     T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-    const std::optional<typename vmemkv::T2FlatFile::LookupResult> found = lookup_record(full_key, mem);
-    return found.has_value() ? decode_u64(found->record.value) : vmemkv::STORE_NOT_FOUND;
+    const T2RecordView record = t2_.at(res.payload_bits & kOffsetMask, mem);
+
+    bool match = false;
+    uint64_t val = read_t2_record_seqlock(record, [&]() -> uint64_t {
+      match = byte_span_equal(record.key, full_key);
+      if (!match) {
+        return vmemkv::STORE_NOT_FOUND;
+      }
+      return decode_u64(record.value);
+    });
+
+    return match ? val : vmemkv::STORE_NOT_FOUND;
   }
 
   // Updates the value of an existing key.
@@ -361,9 +426,9 @@ class VMemKVImpl {
 
     if (!t1_detail::is_inline(res.raw_hash)) {
       T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-      const std::optional<typename vmemkv::T2FlatFile::LookupResult> found = lookup_record(full_key, mem);
-      if (found.has_value() && value.size() <= found->record.header->alloc_len) {
-        return t2_.update_value_at(found->offset & kOffsetMask, value);
+      const T2RecordView record = t2_.at(res.payload_bits & kOffsetMask, mem);
+      if (byte_span_equal(record.key, full_key) && value.size() <= record.header->alloc_len) {
+        return t2_.update_value_at(res.payload_bits & kOffsetMask, value);
       }
     }
 
@@ -401,9 +466,13 @@ class VMemKVImpl {
   // - Thread-safety: Lock-free (concurrently readable).
   // - Contract: Resolves inline value directly, otherwise fetches raw T2 record.
   auto get_bytes_impl(std::span<const std::byte> full_key) const -> std::optional<std::vector<std::byte>> {
+    const auto res = t1_.get_with_hash(full_key);
+    if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
+      return std::nullopt;
+    }
+
     if constexpr (ConfigT::UseT1InlineValue) {
-      const auto res = t1_.get_with_hash(full_key);
-      if (res.payload_bits != vmemkv::STORE_NOT_FOUND && t1_detail::is_inline(res.raw_hash)) {
+      if (t1_detail::is_inline(res.raw_hash)) {
         size_t size = t1_detail::decode_size(res.raw_hash);
         std::vector<std::byte> val_bytes(size);
         std::memcpy(val_bytes.data(), &res.payload_bits, size);
@@ -412,9 +481,21 @@ class VMemKVImpl {
     }
 
     T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-    return lookup_record(full_key, mem).transform([](const auto &found) {
-      return std::vector<std::byte>(found.record.value.begin(), found.record.value.end());
+    const T2RecordView record = t2_.at(res.payload_bits & kOffsetMask, mem);
+
+    bool match = false;
+    std::vector<std::byte> val = read_t2_record_seqlock(record, [&]() -> std::vector<std::byte> {
+      match = byte_span_equal(record.key, full_key);
+      if (!match) {
+        return {};
+      }
+      return std::vector<std::byte>(record.value.begin(), record.value.end());
     });
+
+    if (match) {
+      return val;
+    }
+    return std::nullopt;
   }
 
   // Performs a range scan, returning key-value pairs decoded via the callback.
@@ -431,42 +512,48 @@ class VMemKVImpl {
     std::vector<ScanItem> items;
     {
       T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-      t1_.scan(
-          lower_bound,
-          upper_bound,
-          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash) {
-            if (payload == vmemkv::STORE_NOT_FOUND) {
-              return;
-            }
+      t1_.scan(lower_bound,
+               upper_bound,
+               // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+               [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash) {
+                 if (payload == vmemkv::STORE_NOT_FOUND) {
+                   return;
+                 }
 
-            if constexpr (ConfigT::UseT1InlineValue) {
-              if (t1_detail::is_inline(hash)) {
-                size_t size = t1_detail::decode_size(hash);
-                uint64_t val_u64 = 0;
-                std::memcpy(&val_u64, &payload, size);
+                 if constexpr (ConfigT::UseT1InlineValue) {
+                   if (t1_detail::is_inline(hash)) {
+                     size_t size = t1_detail::decode_size(hash);
+                     uint64_t val_u64 = 0;
+                     std::memcpy(&val_u64, &payload, size);
 
-                size_t len = kStoreKeyBytes;
-                while (len > 0 && index_key[len - 1] == std::byte{0}) {
-                  --len;
-                }
-                const auto len_diff = static_cast<std::ptrdiff_t>(len);
-                std::vector<std::byte> key(index_key.begin(), std::next(index_key.begin(), len_diff));
-                if (!key_in_range(key, lower_bound, upper_bound)) {
-                  return;
-                }
-                items.push_back({key, val_u64});
-                return;
-              }
-            }
+                     size_t len = kStoreKeyBytes;
+                     while (len > 0 && index_key[len - 1] == std::byte{0}) {
+                       --len;
+                     }
+                     const auto len_diff = static_cast<std::ptrdiff_t>(len);
+                     std::vector<std::byte> key(index_key.begin(), std::next(index_key.begin(), len_diff));
+                     if (!key_in_range(key, lower_bound, upper_bound)) {
+                       return;
+                     }
+                     items.push_back({key, val_u64});
+                     return;
+                   }
+                 }
 
-            // T2 record branch
-            const T2RecordView record = t2_.at(payload & kOffsetMask, mem);
-            if (!key_in_range(record.key, lower_bound, upper_bound)) {
-              return;
-            }
-            items.push_back({std::vector<std::byte>(record.key.begin(), record.key.end()), decode_u64(record.value)});
-          });
+                 // T2 record branch
+                 const T2RecordView record = t2_.at(payload & kOffsetMask, mem);
+                 bool in_range = false;
+                 ScanItem item = read_t2_record_seqlock(record, [&]() -> ScanItem {
+                   in_range = key_in_range(record.key, lower_bound, upper_bound);
+                   if (!in_range) {
+                     return {};
+                   }
+                   return {std::vector<std::byte>(record.key.begin(), record.key.end()), decode_u64(record.value)};
+                 });
+                 if (in_range) {
+                   items.push_back(std::move(item));
+                 }
+               });
     }
 
     for (const auto &item : items) {
@@ -556,28 +643,6 @@ class VMemKVImpl {
     return !byte_span_less(key, lower_bound) && !byte_span_less(upper_bound, key);
   }
 
-  auto lookup_record(std::span<const std::byte> full_key,
-                     const T2Memory *mem) const -> std::optional<typename vmemkv::T2FlatFile::LookupResult> {
-    const auto res = t1_.get_with_hash(full_key);
-    const uint64_t payload = res.payload_bits;
-    if (payload == vmemkv::STORE_NOT_FOUND) {
-      return std::nullopt;
-    }
-
-    if constexpr (ConfigT::UseT1InlineValue) {
-      if (t1_detail::is_inline(res.raw_hash)) {
-        return std::nullopt;
-      }
-    }
-
-    const T2RecordView record = t2_.at(payload & kOffsetMask, mem);
-    if (!byte_span_equal(record.key, full_key)) {
-      return std::nullopt;
-    }
-
-    return typename vmemkv::T2FlatFile::LookupResult{payload, record};
-  }
-
   void reorg_worker_loop(std::stop_token stop_token) {
     while (!stop_token.stop_requested()) {
       reorg_requested_.wait(false, std::memory_order_acquire);
@@ -588,7 +653,7 @@ class VMemKVImpl {
 
       reorg_running_.store(true, std::memory_order_release);
       try {
-        reorganize(false);
+        reorganize_internal(false);
       } catch (...) {
         // safe recovery in background
       }
@@ -604,10 +669,8 @@ class VMemKVImpl {
     const size_t hard_limit = (append_capacity * ConfigT::T1ReorganizeHardThresholdPercent) / 100;
 
     if (append_size >= soft_limit) {
-      if (!reorg_running_.load(std::memory_order_acquire)) {
-        reorg_requested_.store(true, std::memory_order_release);
-        reorg_requested_.notify_all();
-      }
+      reorg_requested_.store(true, std::memory_order_release);
+      reorg_requested_.notify_all();
     }
 
     if (append_size >= hard_limit || append_size >= append_capacity) {
