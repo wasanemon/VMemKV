@@ -48,11 +48,20 @@ class YCSBTimelineCollector {
   };
 
   std::vector<ThreadCounter> counters;
+  std::array<std::atomic<uint64_t>, kDurationSeconds> t1_reorg_counts{};
+  std::array<std::atomic<uint64_t>, kDurationSeconds> t2_reorg_counts{};
+  std::atomic<uint64_t> last_recorded_t1{0};
+  std::atomic<uint64_t> last_recorded_t2{0};
   std::atomic<uint64_t> next_key_index;
   std::chrono::steady_clock::time_point start_time;
 
   YCSBTimelineCollector(size_t num_threads, uint64_t initial_keys)
-      : counters(num_threads), next_key_index(initial_keys) {}
+      : counters(num_threads), next_key_index(initial_keys) {
+    for (int i = 0; i < kDurationSeconds; ++i) {
+      t1_reorg_counts[i].store(0, std::memory_order_relaxed);
+      t2_reorg_counts[i].store(0, std::memory_order_relaxed);
+    }
+  }
 
   void start() { start_time = std::chrono::steady_clock::now(); }
 
@@ -68,15 +77,30 @@ class YCSBTimelineCollector {
     }
   }
 
-  void dump_json(const std::string &store_name, const std::string &variant_name, const std::string &val_name) {
+  void dump_json(std::string store_name, std::string variant_name, std::string val_name) {
     std::vector<uint64_t> total_scan(kDurationSeconds, 0);
     std::vector<uint64_t> total_insert(kDurationSeconds, 0);
+    std::vector<uint64_t> total_reorg_t1(kDurationSeconds, 0);
+    std::vector<uint64_t> total_reorg_t2(kDurationSeconds, 0);
 
     for (const auto &tc : counters) {
       for (int i = 0; i < kDurationSeconds; ++i) {
         total_scan[i] += tc.scan_counts[i].load(std::memory_order_relaxed);
         total_insert[i] += tc.insert_counts[i].load(std::memory_order_relaxed);
       }
+    }
+    for (int i = 0; i < kDurationSeconds; ++i) {
+      total_reorg_t1[i] = t1_reorg_counts[i].load(std::memory_order_relaxed);
+      total_reorg_t2[i] = t2_reorg_counts[i].load(std::memory_order_relaxed);
+    }
+
+    // Sanitize parameters to prevent slash / from breaking folder path
+    for (auto *s : {&store_name, &variant_name, &val_name}) {
+      std::replace(s->begin(), s->end(), '/', '-');
+      std::replace(s->begin(), s->end(), ' ', '_');
+      std::replace(s->begin(), s->end(), '(', '_');
+      std::replace(s->begin(), s->end(), ')', '_');
+      std::replace(s->begin(), s->end(), '%', '_');
     }
 
     std::string filename = "/tmp/ycsb_e_timeline_" + store_name + "_" + variant_name + "_" + val_name + ".json";
@@ -89,7 +113,8 @@ class YCSBTimelineCollector {
       out << "  \"timeline\": [\n";
       for (int i = 0; i < kDurationSeconds; ++i) {
         out << "    {\"sec\": " << (i + 1) << ", \"scan_ops\": " << total_scan[i]
-            << ", \"insert_ops\": " << total_insert[i] << "}";
+            << ", \"insert_ops\": " << total_insert[i] << ", \"t1_reorg_ops\": " << total_reorg_t1[i]
+            << ", \"t2_reorg_ops\": " << total_reorg_t2[i] << "}";
         if (i < kDurationSeconds - 1) out << ",";
         out << "\n";
       }
@@ -256,6 +281,16 @@ static void register_benchmark_context() {
   add_custom_context_from_env("instance_type", "VMEMKV_CONTEXT_instance_type");
   add_custom_context_from_env("aws_region", "VMEMKV_CONTEXT_aws_region");
   add_custom_context_from_env("memo", "VMEMKV_CONTEXT_memo");
+  benchmark::AddCustomContext("t1_append_capacity_log2", std::to_string(vmemkv::Config<>::T1AppendCapacityLog2));
+  benchmark::AddCustomContext("t1_append_capacity_entries", std::to_string(vmemkv::Config<>::T1AppendCapacityEntries));
+  benchmark::AddCustomContext("t1_reorganize_soft_threshold_percent",
+                              std::to_string(vmemkv::Config<>::T1ReorganizeSoftThresholdPercent));
+  benchmark::AddCustomContext("t1_reorganize_hard_threshold_percent",
+                              std::to_string(vmemkv::Config<>::T1ReorganizeHardThresholdPercent));
+  benchmark::AddCustomContext("t2_storage_fragmentation_threshold_percent",
+                              std::to_string(vmemkv::Config<>::T2StorageFragmentationThresholdPercent));
+  benchmark::AddCustomContext("t2_ordering_fragmentation_threshold_percent",
+                              std::to_string(vmemkv::Config<>::T2OrderingFragmentationThresholdPercent));
 }
 
 class BenchmarkContextRegistrar {
@@ -594,6 +629,8 @@ static void record_store_statistics(benchmark::State &state, StoreHolder<StorePt
       benchmark::Counter(static_cast<double>(stats.t1_reorg_count), benchmark::Counter::kDefaults);
   state.counters["Reorgs_T2"] =
       benchmark::Counter(static_cast<double>(stats.t2_reorg_count), benchmark::Counter::kDefaults);
+  state.counters["Hard_Stalls"] =
+      benchmark::Counter(static_cast<double>(stats.hard_stall_count), benchmark::Counter::kDefaults);
 }
 
 template <typename StorePtr>
@@ -685,7 +722,9 @@ static void register_bench(std::shared_ptr<StoreHolder<StorePtr>> holder,
     };
 
     auto *reg = benchmark::RegisterBenchmark(name.c_str(), bench_func)->Threads(threads)->UseRealTime();
-    if (fixed_iterations > 0) {
+    if (name.find("/Op=YCSB-E/") != std::string::npos) {
+      reg->MinTime(30.0);
+    } else if (fixed_iterations > 0) {
       reg->Iterations(fixed_iterations / threads);
     }
   }
@@ -863,45 +902,146 @@ void register_all_benchmarks() {
           -1,
           false);
 
-      // 5. YCSB-E Benchmark (Short Range Scans, 30s mixed workload, 32 threads max)
+      // 5. YCSB-E Benchmark (Short Range Scans, 30s mixed workload, hw_threads threads max)
       {
         auto ycsb_meta = make_metadata(corpus_size, val_size);
-        std::vector<int> ycsb_threads = {32};
+        std::vector<int> ycsb_threads = {hw_threads};
 
         struct YCSBState {
           std::unique_ptr<YCSBTimelineCollector> collector;
           std::mutex init_mutex;
+          std::atomic<bool> stop_reorg{false};
+          std::thread reorg_thread;
+          std::atomic<uint64_t> current_epoch{0};
+          std::atomic<uint64_t> init_done_epoch{0};
+          std::atomic<uint64_t> start_done_epoch{0};
+          std::atomic<int> ready_threads{0};
+          // Track last seen epoch per thread locally to this benchmark registration
+          std::array<std::atomic<uint64_t>, 128> thread_last_epochs{};
         };
         auto ycsb_state = std::make_shared<YCSBState>();
+
+        // YCSB-E populate size: respect YCSB_E_POPULATE env var, else use corpus_size (same scale as other benchmarks)
+        const size_t ycsb_populate_size = [&]() -> size_t {
+          const char *env = std::getenv("YCSB_E_POPULATE");
+          if (env) return static_cast<size_t>(std::stoull(env));
+          return corpus_size;  // same as GetHit/Insert benchmarks for fair comparison
+        }();
 
         register_bench(
             crud_holder,
             benchmark_name(sname, "YCSB-E", std::nullopt, "Zipf", value_name),
             ycsb_meta,
             make,
-            [ycsb_state, val_size](auto &store) {
-              populate(store, {1000, val_size});
-              std::lock_guard<std::mutex> lock(ycsb_state->init_mutex);
-              ycsb_state->collector = std::make_unique<YCSBTimelineCollector>(32, 1000);
-              ycsb_state->collector->start();
+            [ycsb_state, val_size, ycsb_populate_size](auto &store) {
+              populate(store, {ycsb_populate_size, val_size});
+              // Perform initial reorganize to ensure a fully sorted index before benchmark starts
+              store.reorganize();
+
+              // NOTE: collector setup and background reorg thread are launched per-run inside the
+              // benchmark body (via epoch synchronization) to handle multiple trial/warmup runs correctly.
             },
-            [ycsb_state, sname, variant_label = variant_label(sname), value_name, val_size](benchmark::State &state,
-                                                                                            auto &store) {
+            [ycsb_state, ycsb_populate_size, sname, variant_label = variant_label(sname), value_name, val_size](
+                benchmark::State &state, auto &store) {
               std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
               std::uniform_int_distribution<int> op_dist(0, 99);
 
               const size_t thread_idx = state.thread_index();
-              auto *col = ycsb_state->collector.get();
+              uint64_t my_last_epoch =
+                  (thread_idx < 128) ? ycsb_state->thread_last_epochs[thread_idx].load(std::memory_order_relaxed) : 0;
 
+              uint64_t local_epoch = 0;
+              if (thread_idx == 0) {
+                local_epoch = ycsb_state->current_epoch.load(std::memory_order_relaxed) + 1;
+
+                // Stop any background thread from a previous warmup/run epoch
+                ycsb_state->stop_reorg.store(true, std::memory_order_release);
+                if (ycsb_state->reorg_thread.joinable()) {
+                  ycsb_state->reorg_thread.join();
+                }
+
+                // Setup fresh collector with the actual thread count
+                ycsb_state->collector = std::make_unique<YCSBTimelineCollector>(state.threads(), ycsb_populate_size);
+                ycsb_state->stop_reorg.store(false, std::memory_order_release);
+                ycsb_state->ready_threads.store(0, std::memory_order_release);
+
+                // Publish epoch
+                ycsb_state->current_epoch.store(local_epoch, std::memory_order_release);
+                ycsb_state->init_done_epoch.store(local_epoch, std::memory_order_release);
+              } else {
+                // Wait for Thread 0 to finish initializing the current epoch
+                while (ycsb_state->init_done_epoch.load(std::memory_order_acquire) <= my_last_epoch) {
+                  std::this_thread::yield();
+                }
+                local_epoch = ycsb_state->init_done_epoch.load(std::memory_order_relaxed);
+              }
+              if (thread_idx < 128) {
+                ycsb_state->thread_last_epochs[thread_idx].store(local_epoch, std::memory_order_relaxed);
+              }
+
+              auto *col = ycsb_state->collector.get();
               std::string dummy_large(val_size, 'a');
               std::string dummy_8b(8, 'a');
 
+              ycsb_state->ready_threads.fetch_add(1, std::memory_order_acq_rel);
               for (auto _ : state) {
+                // Inside the loop: start the timeline on the very first iteration of this run epoch
+                if (thread_idx == 0) {
+                  if (ycsb_state->start_done_epoch.load(std::memory_order_relaxed) < local_epoch) {
+                    while (ycsb_state->ready_threads.load(std::memory_order_acquire) < state.threads()) {
+                      std::this_thread::yield();
+                    }
+                    col->start();
+                    auto stats = store.get_statistics();
+                    col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
+                    col->last_recorded_t2.store(stats.t2_reorg_count, std::memory_order_relaxed);
+                    ycsb_state->reorg_thread = std::thread([state_ptr = ycsb_state.get(), &store]() {
+                      while (!state_ptr->stop_reorg.load(std::memory_order_acquire)) {
+                        std::this_thread::sleep_for(std::chrono::seconds(10));
+                        if (state_ptr->stop_reorg.load(std::memory_order_acquire)) break;
+                        store.reorganize();
+                      }
+                    });
+                    ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
+                  }
+                } else {
+                  while (ycsb_state->start_done_epoch.load(std::memory_order_acquire) < local_epoch) {
+                    std::this_thread::yield();
+                  }
+                }
+
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - col->start_time).count();
                 if (elapsed >= 30) {
                   state.SkipWithError("30 seconds duration elapsed");
                   break;
+                }
+
+                // Thread 0: poll and record Reorg stats (background thread handles actual triggering)
+                if (thread_idx == 0) {
+                  auto stats = store.get_statistics();
+
+                  // Track T1 Reorg
+                  uint64_t current_t1 = stats.t1_reorg_count;
+                  uint64_t prev_t1 = col->last_recorded_t1.load(std::memory_order_relaxed);
+                  if (current_t1 > prev_t1) {
+                    uint64_t diff = current_t1 - prev_t1;
+                    if (elapsed >= 0 && elapsed < YCSBTimelineCollector::kDurationSeconds) {
+                      col->t1_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
+                    }
+                    col->last_recorded_t1.store(current_t1, std::memory_order_relaxed);
+                  }
+
+                  // Track T2 Reorg
+                  uint64_t current_t2 = stats.t2_reorg_count;
+                  uint64_t prev_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
+                  if (current_t2 > prev_t2) {
+                    uint64_t diff = current_t2 - prev_t2;
+                    if (elapsed >= 0 && elapsed < YCSBTimelineCollector::kDurationSeconds) {
+                      col->t2_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
+                    }
+                    col->last_recorded_t2.store(current_t2, std::memory_order_relaxed);
+                  }
                 }
 
                 int op_choice = op_dist(rng);
@@ -932,6 +1072,11 @@ void register_all_benchmarks() {
               }
 
               if (state.thread_index() == 0) {
+                // Stop background reorg thread and wait for it to exit
+                ycsb_state->stop_reorg.store(true, std::memory_order_release);
+                if (ycsb_state->reorg_thread.joinable()) {
+                  ycsb_state->reorg_thread.join();
+                }
                 col->dump_json(sname, variant_label, value_name);
               }
             },

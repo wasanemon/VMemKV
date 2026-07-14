@@ -259,6 +259,7 @@ class VMemKVImpl {
         if (error_code) {
           throw std::system_error(error_code, "rename temp file");
         }
+        reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
         reorg_t2_count_.fetch_add(1, std::memory_order_relaxed);
       } catch (...) {
         if (fd_guard.fd >= 0) {
@@ -316,7 +317,8 @@ class VMemKVImpl {
 
   auto get_statistics() const noexcept -> vmemkv::VMemKVStatistics {
     return vmemkv::VMemKVStatistics{.t1_reorg_count = reorg_t1_count_.load(std::memory_order_relaxed),
-                                    .t2_reorg_count = reorg_t2_count_.load(std::memory_order_relaxed)};
+                                    .t2_reorg_count = reorg_t2_count_.load(std::memory_order_relaxed),
+                                    .hard_stall_count = hard_stall_count_.load(std::memory_order_relaxed)};
   }
 
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
@@ -630,6 +632,9 @@ class VMemKVImpl {
     }
 
     if (append_size >= hard_limit || append_size >= append_capacity) {
+      if (reorg_running_.load(std::memory_order_acquire)) {
+        hard_stall_count_.fetch_add(1, std::memory_order_relaxed);
+      }
       while (reorg_running_.load(std::memory_order_acquire)) {
         reorg_running_.wait(true, std::memory_order_acquire);
       }
@@ -693,6 +698,7 @@ class VMemKVImpl {
   vmemkv::T2FlatFile t2_;
   std::atomic<uint64_t> reorg_t1_count_{0};
   std::atomic<uint64_t> reorg_t2_count_{0};
+  std::atomic<uint64_t> hard_stall_count_{0};
 };
 
 using VMemKV = VMemKVImpl<vmemkv::Config<>>;

@@ -488,7 +488,11 @@ ${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env
 
 inmem_filter=""
 ltm_filter=""
-if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+if [[ "${YCSB_ONLY:-0}" == "1" ]]; then
+  inmem_filter="Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-Simd-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf"
+  ltm_filter="Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-Simd-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf"
+  MIN_TIME="30s"
+elif [[ -n "$VALUE_SIZE_LIMIT" ]]; then
   inmem_filter="$(vmemkv_matrix::benchmark_filter_for_case in_memory "${VALUE_SIZE_LIMIT,,}")"
   ltm_filter="$(vmemkv_matrix::benchmark_filter_for_case ltm "${VALUE_SIZE_LIMIT,,}")"
 else
