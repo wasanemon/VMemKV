@@ -409,16 +409,25 @@ run_scenario() {
   local scenario_env_prefix
   local scenario_context_prefix
   local scenario_runtime_env_prefix=""
+  local ycsb_populate_env_prefix=""
   local scenario_result_path
   local scenario_stdout_log
   local scenario_stderr_log
   local scenario_total
   local scenario_run_filter
+  local scenario_ycsb_only_filter=""
   local remote_cmd
   local remote_cmd_quoted
 
   read -r -a scenario_value_order_keys <<<"$(vmemkv_matrix::scenario_value_order_keys_from_flag "$scenario_key" "$LARGE_VALUE_FIRST")"
-  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+  if [[ "${YCSB_ONLY:-0}" == "1" ]]; then
+    if [[ "$scenario_key" == "in_memory" ]]; then
+      scenario_ycsb_only_filter="$inmem_filter"
+    else
+      scenario_ycsb_only_filter="$ltm_filter"
+    fi
+    scenario_run_filter="$scenario_ycsb_only_filter"
+  elif [[ -n "$VALUE_SIZE_LIMIT" ]]; then
     scenario_run_filter="$(vmemkv_matrix::benchmark_filter_for_case "$scenario_key" "${VALUE_SIZE_LIMIT,,}")"
   else
     scenario_run_filter="$(vmemkv_matrix::scenario_effective_filter "$scenario_key" "$LARGE_VALUE_FIRST" "$QUICK")"
@@ -437,6 +446,10 @@ run_scenario() {
     scenario_runtime_env_prefix="VMEMKV_BENCH_FORCE_HOST_MEMORY=1"
   fi
 
+  if [[ -n "${YCSB_E_POPULATE:-}" ]]; then
+    ycsb_populate_env_prefix="YCSB_E_POPULATE=${YCSB_E_POPULATE}"
+  fi
+
 
 
   local large_value_first_env=""
@@ -447,6 +460,7 @@ run_scenario() {
   remote_cmd="
 cd /home/ubuntu/faultkv/implementation &&
 ${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} } \
+${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 ./benchmark/common/aws_remote_runner.sh \
   '$scenario_run_filter' \
   '$MIN_TIME' \

@@ -73,14 +73,14 @@ struct Config {
   // These are intentionally conservative defaults to avoid hitting APPEND_CAP.
   static constexpr size_t kPercentBase = 100;
   static constexpr size_t kBitsPerByte = 8;
-  static constexpr size_t T1ReorganizeSoftThresholdPercent = 1;
+  static constexpr size_t T1ReorganizeSoftThresholdPercent = 50;
   static constexpr size_t T1ReorganizeHardThresholdPercent = 95;
   static constexpr size_t T2StorageFragmentationThresholdPercent = 30;
   static constexpr size_t T2OrderingFragmentationThresholdPercent = 50;
 
   // T1 append region capacity (ablation knob).
   // Keep this as a power of two to preserve cache-friendly masking behavior.
-  static constexpr size_t T1AppendCapacityLog2 = 24;
+  static constexpr size_t T1AppendCapacityLog2 = 22;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
   // Default Tier 2 (T2) file storage capacity: 256 GiB.
