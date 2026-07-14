@@ -80,11 +80,41 @@ class ThreadReferenceTracker {
 
  private:
   auto get_thread_id() const noexcept -> size_t {
-    thread_local static size_t thread_id = []() {
-      static std::atomic<size_t> next_id{0};
-      return next_id.fetch_add(1) % MaxThreads;
-    }();
-    return thread_id;
+    struct SlotRegistration {
+      const ThreadReferenceTracker *tracker;
+      size_t slot_id;
+
+      SlotRegistration() noexcept : tracker(nullptr), slot_id(static_cast<size_t>(-1)) {}
+
+      void register_slot(const ThreadReferenceTracker *trt) noexcept {
+        tracker = trt;
+        static std::atomic<size_t> search_start{0};
+        size_t start = search_start.fetch_add(1) % MaxThreads;
+
+        for (size_t i = 0; i < MaxThreads; ++i) {
+          size_t idx = (start + i) % MaxThreads;
+          T expected = T{};
+          if (trt->slots_[idx].value.compare_exchange_strong(expected, T(1), std::memory_order_acq_rel)) {
+            trt->slots_[idx].value.store(T{}, std::memory_order_release);
+            slot_id = idx;
+            return;
+          }
+        }
+        slot_id = start;
+      }
+
+      ~SlotRegistration() {
+        if (tracker && slot_id != static_cast<size_t>(-1)) {
+          tracker->slots_[slot_id].value.store(T{}, std::memory_order_release);
+        }
+      }
+    };
+
+    thread_local static SlotRegistration reg;
+    if (reg.slot_id == static_cast<size_t>(-1)) {
+      reg.register_slot(this);
+    }
+    return reg.slot_id;
   }
 
   struct alignas(kCacheLineSize) AlignedSlot {

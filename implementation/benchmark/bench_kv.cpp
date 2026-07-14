@@ -243,12 +243,12 @@ static auto value_label(size_t value_size) -> std::string {
     return "8B";
   }
   if (value_size == 1024ULL) {
-    return "1KB";
+    return "1KB(20% 8B)";
   }
   if (value_size == 64ULL * 1024ULL) {
-    return "64KB";
+    return "64KB(20% 8B)";
   }
-  return std::to_string(value_size) + "B";
+  return std::to_string(value_size) + "B(20% 8B)";
 }
 
 static auto benchmark_name(std::string_view store_name,
@@ -308,6 +308,20 @@ static auto ikey(std::size_t index) -> std::string {
 
 static auto make_key(std::size_t index) -> std::string { return ikey(index); }
 
+static auto get_value_size_for_key(std::size_t index, std::size_t target_size) -> std::size_t {
+  if (target_size == kInlineValueBytes) {
+    return kInlineValueBytes;
+  }
+  if (index % 5 == 0) {
+    return kInlineValueBytes;
+  }
+  return target_size;
+}
+
+static auto make_value_for_key(std::size_t index, std::size_t target_size) -> std::string {
+  return std::string(get_value_size_for_key(index, target_size), 'a');
+}
+
 struct PopulateOptions {
   size_t key_count;
   size_t value_size = kInlineValueBytes;
@@ -315,20 +329,18 @@ struct PopulateOptions {
 
 template <typename Store>
 static void populate(Store &store, PopulateOptions options) {
-  std::string dummy(options.value_size, 'a');
   using Impl = std::remove_reference_t<decltype(store.impl())>;
   if constexpr (std::is_same_v<Impl, ::RocksDBStore>) {
-    auto value_bytes = std::as_bytes(std::span<const char>(dummy.data(), dummy.size()));
     std::string error_message;
     if (!store.impl().bulk_load_impl(
-            options.key_count, [](std::size_t index) { return make_key(index); }, value_bytes, &error_message)) {
+            options.key_count, [](std::size_t index) { return make_key(index); }, options.value_size, &error_message)) {
       throw std::runtime_error(error_message.empty() ? "RocksDB bulk populate failed" : error_message);
     }
   } else {
     const size_t max_concurrency = std::min<size_t>(8, std::thread::hardware_concurrency());
     if (options.key_count < 10000 || max_concurrency <= 1) {
       for (std::size_t i = 0; i < options.key_count; ++i) {
-        store.insert(make_key(i), dummy);
+        store.insert(make_key(i), make_value_for_key(i, options.value_size));
       }
     } else {
       const size_t num_threads = max_concurrency;
@@ -336,11 +348,11 @@ static void populate(Store &store, PopulateOptions options) {
       size_t chunk_size = (options.key_count + num_threads - 1) / num_threads;
 
       for (size_t t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&store, dummy, t, chunk_size, options]() {
+        workers.emplace_back([&store, t, chunk_size, options]() {
           size_t start = t * chunk_size;
           size_t end = std::min(options.key_count, start + chunk_size);
           for (size_t i = start; i < end; ++i) {
-            store.insert(make_key(i), dummy);
+            store.insert(make_key(i), make_value_for_key(i, options.value_size));
           }
         });
       }
@@ -663,7 +675,7 @@ void register_all_benchmarks() {
     // Keep the benchmark matrix aligned with the scenario model:
     // 8B for in-memory, 1KB/64KB for LTM.
     std::vector<size_t> value_sizes =
-        is_ltm_mode() ? std::vector<size_t>{1024ULL, 64ULL * 1024ULL} : std::vector<size_t>{kInlineValueBytes, 1024ULL};
+        is_ltm_mode() ? std::vector<size_t>{1024ULL, 64ULL * 1024ULL} : std::vector<size_t>{1024ULL};
     if (prefer_large_value_first()) {
       std::reverse(value_sizes.begin(), value_sizes.end());
     }
@@ -693,7 +705,8 @@ void register_all_benchmarks() {
             }
           },
           [corpus_size, val_size](benchmark::State &state, auto &store) {
-            std::string dummy(val_size, 'a');
+            std::string dummy_large(val_size, 'a');
+            std::string dummy_8b(8, 'a');
             const std::size_t insert_start = is_ltm_mode() ? corpus_size : 0;
             int threads = state.threads();
             int thread_idx = state.thread_index();
@@ -701,7 +714,12 @@ void register_all_benchmarks() {
             for (auto _ : state) {
               std::size_t key_index = insert_start + static_cast<std::size_t>(thread_idx) +
                                       static_cast<std::size_t>(i) * static_cast<std::size_t>(threads);
-              bool inserted = store.insert(make_key(key_index), dummy);
+              bool inserted;
+              if (val_size != 8 && key_index % 5 == 0) {
+                inserted = store.insert(make_key(key_index), dummy_8b);
+              } else {
+                inserted = store.insert(make_key(key_index), dummy_large);
+              }
               benchmark::DoNotOptimize(inserted);
               i++;
             }
