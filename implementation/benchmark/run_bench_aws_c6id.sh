@@ -27,6 +27,9 @@ show_help() {
   exit 0
 }
 
+SCENARIO_LIMIT="all"
+VALUE_SIZE_LIMIT=""
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
@@ -44,6 +47,14 @@ while [[ $# -gt 0 ]]; do
       QUICK=true
       MIN_TIME="0.1s"
       shift
+      ;;
+    --scenario)
+      SCENARIO_LIMIT="$2"
+      shift 2
+      ;;
+    --value-size)
+      VALUE_SIZE_LIMIT="$2"
+      shift 2
       ;;
     *)
       echo "[ERROR] Unknown option: $1" >&2
@@ -399,7 +410,11 @@ run_scenario() {
   local remote_cmd_quoted
 
   read -r -a scenario_value_order_keys <<<"$(vmemkv_matrix::scenario_value_order_keys_from_flag "$scenario_key" "$LARGE_VALUE_FIRST")"
-  scenario_run_filter="$(vmemkv_matrix::scenario_effective_filter "$scenario_key" "$LARGE_VALUE_FIRST" "$QUICK")"
+  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+    scenario_run_filter="$(vmemkv_matrix::benchmark_filter_for_case "$scenario_key" "${VALUE_SIZE_LIMIT,,}")"
+  else
+    scenario_run_filter="$(vmemkv_matrix::scenario_effective_filter "$scenario_key" "$LARGE_VALUE_FIRST" "$QUICK")"
+  fi
   scenario_env_prefix="$(vmemkv_matrix::scenario_env_prefix "$scenario_key")"
   scenario_context_prefix="$(scenario_context_env_prefix "$scenario_key")"
   scenario_result_path="$(vmemkv_matrix::scenario_result_path "$scenario_key")"
@@ -463,36 +478,82 @@ ${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env
 
 
 
+local inmem_filter
+local ltm_filter
+if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+  inmem_filter="$(vmemkv_matrix::benchmark_filter_for_case in_memory "${VALUE_SIZE_LIMIT,,}")"
+  ltm_filter="$(vmemkv_matrix::benchmark_filter_for_case ltm "${VALUE_SIZE_LIMIT,,}")"
+else
+  inmem_filter="$(vmemkv_matrix::scenario_effective_filter in_memory "$LARGE_VALUE_FIRST" "$QUICK")"
+  ltm_filter="$(vmemkv_matrix::scenario_effective_filter ltm "$LARGE_VALUE_FIRST" "$QUICK")"
+fi
+
 echo "Counting remote benchmarks concurrently..."
-count_remote_benchmarks "$(vmemkv_matrix::scenario_effective_filter in_memory "$LARGE_VALUE_FIRST" "$QUICK")" "$(vmemkv_matrix::scenario_env_prefix in_memory)" "$([[ "$LARGE_VALUE_FIRST" == "true" ]] && printf 'VMEMKV_BENCH_LARGE_VALUE_FIRST=1')" > /tmp/vmemkv_inmem_count.txt &
-pid1=$!
+if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+  count_remote_benchmarks "$inmem_filter" "$(vmemkv_matrix::scenario_env_prefix in_memory)" "$([[ "$LARGE_VALUE_FIRST" == "true" ]] && printf 'VMEMKV_BENCH_LARGE_VALUE_FIRST=1')" > "/tmp/vmemkv_inmem_count_${KEY_NAME}.txt" &
+  pid1=$!
+else
+  pid1=""
+fi
 
-count_remote_benchmarks "$(vmemkv_matrix::scenario_effective_filter ltm "$LARGE_VALUE_FIRST" "$QUICK")" "$(vmemkv_matrix::scenario_env_prefix ltm)" "$([[ "$LARGE_VALUE_FIRST" == "true" ]] && printf 'VMEMKV_BENCH_LARGE_VALUE_FIRST=1')" > /tmp/vmemkv_ltm_count.txt &
-pid2=$!
+if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+  count_remote_benchmarks "$ltm_filter" "$(vmemkv_matrix::scenario_env_prefix ltm)" "$([[ "$LARGE_VALUE_FIRST" == "true" ]] && printf 'VMEMKV_BENCH_LARGE_VALUE_FIRST=1')" > "/tmp/vmemkv_ltm_count_${KEY_NAME}.txt" &
+  pid2=$!
+else
+  pid2=""
+fi
 
-wait $pid1 $pid2
+if [[ -n "$pid1" ]]; then wait "$pid1"; fi
+if [[ -n "$pid2" ]]; then wait "$pid2"; fi
 
-total_inmem=$(cat /tmp/vmemkv_inmem_count.txt)
-total_ltm=$(cat /tmp/vmemkv_ltm_count.txt)
-rm -f /tmp/vmemkv_inmem_count.txt /tmp/vmemkv_ltm_count.txt
+total_inmem=0
+total_ltm=0
+if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+  total_inmem=$(cat "/tmp/vmemkv_inmem_count_${KEY_NAME}.txt")
+  rm -f "/tmp/vmemkv_inmem_count_${KEY_NAME}.txt"
+fi
+if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+  total_ltm=$(cat "/tmp/vmemkv_ltm_count_${KEY_NAME}.txt")
+  rm -f "/tmp/vmemkv_ltm_count_${KEY_NAME}.txt"
+fi
 
 GLOBAL_TOTAL=$((total_inmem + total_ltm))
 write_progress_state "$GLOBAL_TOTAL"
 echo "Total benchmarks to run: $GLOBAL_TOTAL"
 
-if [[ "$ORDER" == "B_FIRST" ]]; then
-  run_scenario ltm
+if [[ "$SCENARIO_LIMIT" == "in_memory" ]]; then
   run_scenario in_memory
+elif [[ "$SCENARIO_LIMIT" == "ltm" ]]; then
+  run_scenario ltm
 else
-  run_scenario in_memory
-  run_scenario ltm
+  if [[ "$ORDER" == "B_FIRST" ]]; then
+    run_scenario ltm
+    run_scenario in_memory
+  else
+    run_scenario in_memory
+    run_scenario ltm
+  fi
 fi
 
 # ── Retrieve Results & Save ───────────────────────────────────────────────
 echo "Downloading results..."
 RESULTS_DIR="${REPO_ROOT}/implementation/benchmark/logs"
 mkdir -p "$RESULTS_DIR"
-scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path in_memory)" "${RESULTS_DIR}/$(vmemkv_matrix::scenario_json_filename in_memory)"
-scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path ltm)" "${RESULTS_DIR}/$(vmemkv_matrix::scenario_json_filename ltm)"
+
+if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+  dst_name="results_in_memory.json"
+  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+    dst_name="results_in_memory_${VALUE_SIZE_LIMIT}.json"
+  fi
+  scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path in_memory)" "${RESULTS_DIR}/${dst_name}"
+fi
+
+if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+  dst_name="results_ltm.json"
+  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+    dst_name="results_ltm_${VALUE_SIZE_LIMIT}.json"
+  fi
+  scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path ltm)" "${RESULTS_DIR}/${dst_name}"
+fi
 
 echo "All tasks finished."
