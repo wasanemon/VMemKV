@@ -38,6 +38,67 @@
 #endif
 
 namespace {
+class YCSBTimelineCollector {
+ public:
+  static constexpr int kDurationSeconds = 30;
+
+  struct ThreadCounter {
+    alignas(64) std::array<std::atomic<uint64_t>, kDurationSeconds> scan_counts{};
+    alignas(64) std::array<std::atomic<uint64_t>, kDurationSeconds> insert_counts{};
+  };
+
+  std::vector<ThreadCounter> counters;
+  std::atomic<uint64_t> next_key_index;
+  std::chrono::steady_clock::time_point start_time;
+
+  YCSBTimelineCollector(size_t num_threads, uint64_t initial_keys)
+      : counters(num_threads), next_key_index(initial_keys) {}
+
+  void start() { start_time = std::chrono::steady_clock::now(); }
+
+  void record_op(size_t thread_idx, bool is_scan) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+    if (elapsed >= 0 && elapsed < kDurationSeconds) {
+      if (is_scan) {
+        counters[thread_idx].scan_counts[elapsed].fetch_add(1, std::memory_order_relaxed);
+      } else {
+        counters[thread_idx].insert_counts[elapsed].fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  void dump_json(const std::string &store_name, const std::string &variant_name, const std::string &val_name) {
+    std::vector<uint64_t> total_scan(kDurationSeconds, 0);
+    std::vector<uint64_t> total_insert(kDurationSeconds, 0);
+
+    for (const auto &tc : counters) {
+      for (int i = 0; i < kDurationSeconds; ++i) {
+        total_scan[i] += tc.scan_counts[i].load(std::memory_order_relaxed);
+        total_insert[i] += tc.insert_counts[i].load(std::memory_order_relaxed);
+      }
+    }
+
+    std::string filename = "/tmp/ycsb_e_timeline_" + store_name + "_" + variant_name + "_" + val_name + ".json";
+    std::ofstream out(filename);
+    if (out.is_open()) {
+      out << "{\n";
+      out << "  \"store\": \"" << store_name << "\",\n";
+      out << "  \"variant\": \"" << variant_name << "\",\n";
+      out << "  \"value_size\": \"" << val_name << "\",\n";
+      out << "  \"timeline\": [\n";
+      for (int i = 0; i < kDurationSeconds; ++i) {
+        out << "    {\"sec\": " << (i + 1) << ", \"scan_ops\": " << total_scan[i]
+            << ", \"insert_ops\": " << total_insert[i] << "}";
+        if (i < kDurationSeconds - 1) out << ",";
+        out << "\n";
+      }
+      out << "  ]\n";
+      out << "}\n";
+    }
+  }
+};
+
 constexpr std::size_t kIndexKeyBufferBytes = 32;
 constexpr std::size_t kIndexKeyBytes = 16;
 constexpr std::size_t kInlineValueBytes = 8;
@@ -802,35 +863,80 @@ void register_all_benchmarks() {
           -1,
           false);
 
-      // 5. Scan (shared corpus, no dataset sweep)
-      constexpr int scan_count = 100;
-      for (const char *dist : {"Zipf", "Uniform"}) {
-        auto scan_meta = make_metadata(corpus_size, val_size);
+      // 5. YCSB-E Benchmark (Short Range Scans, 30s mixed workload, 32 threads max)
+      {
+        auto ycsb_meta = make_metadata(corpus_size, val_size);
+        std::vector<int> ycsb_threads = {32};
+
+        struct YCSBState {
+          std::unique_ptr<YCSBTimelineCollector> collector;
+          std::mutex init_mutex;
+        };
+        auto ycsb_state = std::make_shared<YCSBState>();
+
         register_bench(
             crud_holder,
-            benchmark_name(sname, "Scan", std::nullopt, dist, value_name),
-            scan_meta,
+            benchmark_name(sname, "YCSB-E", std::nullopt, "Zipf", value_name),
+            ycsb_meta,
             make,
-            [corpus_size, val_size](auto &store) { populate(store, {corpus_size, val_size}); },
-            [corpus_size, dist](benchmark::State &state, auto &store) {
-              std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
-              const std::size_t scan_span = corpus_size > static_cast<std::size_t>(scan_count)
-                                                ? corpus_size - static_cast<std::size_t>(scan_count)
-                                                : 1;
-              ZipfDistribution zipf({scan_span, 1.0});
-              std::uniform_int_distribution<std::size_t> uniform_index(0, scan_span - 1);
-              for (auto _ : state) {
-                std::size_t scan_start = (std::string(dist) == "Zipf") ? zipf(rng) : uniform_index(rng);
-                size_t result_count =
-                    store.scan(make_key(scan_start),
-                               make_key(scan_start + scan_count - 1),
-                               [](std::span<const std::byte>, uint64_t value) { benchmark::DoNotOptimize(value); });
-                benchmark::DoNotOptimize(result_count);
-              }
-              state.SetItemsProcessed(state.iterations());
+            [ycsb_state, val_size](auto &store) {
+              populate(store, {1000, val_size});
+              std::lock_guard<std::mutex> lock(ycsb_state->init_mutex);
+              ycsb_state->collector = std::make_unique<YCSBTimelineCollector>(32, 1000);
+              ycsb_state->collector->start();
             },
-            thread_counts,
-            true,
+            [ycsb_state, sname, variant_label = variant_label(sname), value_name, val_size](benchmark::State &state,
+                                                                                            auto &store) {
+              std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
+              std::uniform_int_distribution<int> op_dist(0, 99);
+
+              const size_t thread_idx = state.thread_index();
+              auto *col = ycsb_state->collector.get();
+
+              std::string dummy_large(val_size, 'a');
+              std::string dummy_8b(8, 'a');
+
+              for (auto _ : state) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - col->start_time).count();
+                if (elapsed >= 30) {
+                  state.SkipWithError("30 seconds duration elapsed");
+                  break;
+                }
+
+                int op_choice = op_dist(rng);
+                if (op_choice < 95) {
+                  // 95% Scan (100 items)
+                  uint64_t max_keys = col->next_key_index.load(std::memory_order_relaxed);
+                  ZipfDistribution dynamic_zipf({max_keys > 100 ? max_keys - 100 : 1, 1.0});
+                  uint64_t scan_start = dynamic_zipf(rng);
+
+                  size_t result_count = store.scan(
+                      make_key(scan_start), make_key(scan_start + 99), [](std::span<const std::byte>, uint64_t value) {
+                        benchmark::DoNotOptimize(value);
+                      });
+                  benchmark::DoNotOptimize(result_count);
+                  col->record_op(thread_idx, true);
+                } else {
+                  // 5% Insert (with 20% 8B ratio for non-8B workloads)
+                  uint64_t next_idx = col->next_key_index.fetch_add(1, std::memory_order_relaxed);
+                  bool inserted;
+                  if (val_size != 8 && next_idx % 5 == 0) {
+                    inserted = store.insert(make_key(next_idx), dummy_8b);
+                  } else {
+                    inserted = store.insert(make_key(next_idx), dummy_large);
+                  }
+                  benchmark::DoNotOptimize(inserted);
+                  col->record_op(thread_idx, false);
+                }
+              }
+
+              if (state.thread_index() == 0) {
+                col->dump_json(sname, variant_label, value_name);
+              }
+            },
+            ycsb_threads,
+            false,
             -1,
             false);
       }

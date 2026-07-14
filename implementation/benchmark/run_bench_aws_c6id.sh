@@ -564,4 +564,8 @@ if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
   scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path ltm)" "${RESULTS_DIR}/${dst_name}"
 fi
 
+# Retrieve YCSB-E timeline results if they exist
+echo "Downloading YCSB-E timeline logs..."
+scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/ycsb_e_timeline_*.json" "${RESULTS_DIR}/" || true
+
 echo "All tasks finished."
