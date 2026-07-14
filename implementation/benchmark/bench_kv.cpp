@@ -723,7 +723,10 @@ static void register_bench(std::shared_ptr<StoreHolder<StorePtr>> holder,
 
     auto *reg = benchmark::RegisterBenchmark(name.c_str(), bench_func)->Threads(threads)->UseRealTime();
     if (name.find("/Op=YCSB-E/") != std::string::npos) {
-      reg->MinTime(30.0);
+      // YCSB-E already enforces a 30-second wall-clock window internally.
+      // Keep Google Benchmark to a single execution so it does not add another
+      // adaptive MinTime pass on top of the benchmark's own timing.
+      reg->Iterations(1);
     } else if (fixed_iterations > 0) {
       reg->Iterations(fixed_iterations / threads);
     }
@@ -916,6 +919,7 @@ void register_all_benchmarks() {
           std::atomic<uint64_t> init_done_epoch{0};
           std::atomic<uint64_t> start_done_epoch{0};
           std::atomic<int> ready_threads{0};
+          std::atomic<uint64_t> total_ops{0};
           // Track last seen epoch per thread locally to this benchmark registration
           std::array<std::atomic<uint64_t>, 128> thread_last_epochs{};
         };
@@ -982,38 +986,38 @@ void register_all_benchmarks() {
               auto *col = ycsb_state->collector.get();
               std::string dummy_large(val_size, 'a');
               std::string dummy_8b(8, 'a');
+              uint64_t local_ops = 0;
 
               ycsb_state->ready_threads.fetch_add(1, std::memory_order_acq_rel);
-              for (auto _ : state) {
-                // Inside the loop: start the timeline on the very first iteration of this run epoch
-                if (thread_idx == 0) {
-                  if (ycsb_state->start_done_epoch.load(std::memory_order_relaxed) < local_epoch) {
-                    while (ycsb_state->ready_threads.load(std::memory_order_acquire) < state.threads()) {
-                      std::this_thread::yield();
-                    }
-                    col->start();
-                    auto stats = store.get_statistics();
-                    col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
-                    col->last_recorded_t2.store(stats.t2_reorg_count, std::memory_order_relaxed);
-                    ycsb_state->reorg_thread = std::thread([state_ptr = ycsb_state.get(), &store]() {
-                      while (!state_ptr->stop_reorg.load(std::memory_order_acquire)) {
-                        std::this_thread::sleep_for(std::chrono::seconds(10));
-                        if (state_ptr->stop_reorg.load(std::memory_order_acquire)) break;
-                        store.reorganize();
-                      }
-                    });
-                    ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
-                  }
-                } else {
-                  while (ycsb_state->start_done_epoch.load(std::memory_order_acquire) < local_epoch) {
+              // Inside the loop: start the timeline on the very first iteration of this run epoch
+              if (thread_idx == 0) {
+                if (ycsb_state->start_done_epoch.load(std::memory_order_relaxed) < local_epoch) {
+                  while (ycsb_state->ready_threads.load(std::memory_order_acquire) < state.threads()) {
                     std::this_thread::yield();
                   }
+                  col->start();
+                  auto stats = store.get_statistics();
+                  col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
+                  col->last_recorded_t2.store(stats.t2_reorg_count, std::memory_order_relaxed);
+                  ycsb_state->reorg_thread = std::thread([state_ptr = ycsb_state.get(), &store]() {
+                    while (!state_ptr->stop_reorg.load(std::memory_order_acquire)) {
+                      std::this_thread::sleep_for(std::chrono::seconds(10));
+                      if (state_ptr->stop_reorg.load(std::memory_order_acquire)) break;
+                      store.reorganize();
+                    }
+                  });
+                  ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
                 }
+              } else {
+                while (ycsb_state->start_done_epoch.load(std::memory_order_acquire) < local_epoch) {
+                  std::this_thread::yield();
+                }
+              }
 
+              while (true) {
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - col->start_time).count();
-                if (elapsed >= 30) {
-                  state.SkipWithError("30 seconds duration elapsed");
+                if (elapsed >= YCSBTimelineCollector::kDurationSeconds) {
                   break;
                 }
 
@@ -1026,9 +1030,7 @@ void register_all_benchmarks() {
                   uint64_t prev_t1 = col->last_recorded_t1.load(std::memory_order_relaxed);
                   if (current_t1 > prev_t1) {
                     uint64_t diff = current_t1 - prev_t1;
-                    if (elapsed >= 0 && elapsed < YCSBTimelineCollector::kDurationSeconds) {
-                      col->t1_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
-                    }
+                    col->t1_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
                     col->last_recorded_t1.store(current_t1, std::memory_order_relaxed);
                   }
 
@@ -1037,9 +1039,7 @@ void register_all_benchmarks() {
                   uint64_t prev_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
                   if (current_t2 > prev_t2) {
                     uint64_t diff = current_t2 - prev_t2;
-                    if (elapsed >= 0 && elapsed < YCSBTimelineCollector::kDurationSeconds) {
-                      col->t2_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
-                    }
+                    col->t2_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
                     col->last_recorded_t2.store(current_t2, std::memory_order_relaxed);
                   }
                 }
@@ -1069,6 +1069,7 @@ void register_all_benchmarks() {
                   benchmark::DoNotOptimize(inserted);
                   col->record_op(thread_idx, false);
                 }
+                ++local_ops;
               }
 
               if (state.thread_index() == 0) {
@@ -1079,6 +1080,7 @@ void register_all_benchmarks() {
                 }
                 col->dump_json(sname, variant_label, value_name);
               }
+              state.SetItemsProcessed(local_ops);
             },
             ycsb_threads,
             false,
