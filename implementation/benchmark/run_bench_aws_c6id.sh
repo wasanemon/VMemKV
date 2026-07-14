@@ -132,7 +132,7 @@ run_aws_cleanup() {
       "$SCRIPT_DIR/aws/aws_clean.sh" "$KEY_NAME" || true
     else
       local cleanup_log="/tmp/vmemkv_aws_clean_${KEY_NAME}.log"
-      nohup "$SCRIPT_DIR/aws/aws_clean.sh" "$KEY_NAME" >"$cleanup_log" 2>&1 < /dev/null &
+      nohup "$SCRIPT_DIR/aws/aws_clean.sh" >"$cleanup_log" 2>&1 < /dev/null &
       local cleanup_pid=$!
       signal_log "cleanup continued in background pid=$cleanup_pid log=$cleanup_log"
       wait "$cleanup_pid" || true
@@ -201,12 +201,16 @@ create_security_group() {
 
 launch_spot_instance() {
   echo "Requesting EC2 Spot Instance ($INSTANCE_TYPE)..."
+  local user_data_script="#!/bin/bash
+nohup bash -c 'sleep 14400 && sudo poweroff' >/dev/null 2>&1 &"
+
   INSTANCE_JSON=$(aws ec2 run-instances \
     --image-id "$AMI_ID" \
     --instance-type "$INSTANCE_TYPE" \
     --key-name "$KEY_NAME" \
     --security-group-ids "$SG_ID" \
     --instance-market-options "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}" \
+    --user-data "$user_data_script" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=VMemKV-c6id-Bench},{Key=VMemKV-Temp-Spot,Value=$KEY_NAME}]" \
     --query "Instances[0]" \
     --output json)
@@ -482,8 +486,8 @@ ${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env
 
 
 
-local inmem_filter
-local ltm_filter
+inmem_filter=""
+ltm_filter=""
 if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
   inmem_filter="$(vmemkv_matrix::benchmark_filter_for_case in_memory "${VALUE_SIZE_LIMIT,,}")"
   ltm_filter="$(vmemkv_matrix::benchmark_filter_for_case ltm "${VALUE_SIZE_LIMIT,,}")"

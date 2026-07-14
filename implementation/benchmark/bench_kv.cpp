@@ -827,7 +827,7 @@ void register_all_benchmarks() {
                                [](std::span<const std::byte>, uint64_t value) { benchmark::DoNotOptimize(value); });
                 benchmark::DoNotOptimize(result_count);
               }
-              state.SetItemsProcessed(state.iterations() * scan_count);
+              state.SetItemsProcessed(state.iterations());
             },
             thread_counts,
             true,
@@ -895,7 +895,7 @@ void register_all_benchmarks() {
                                  [](std::span<const std::byte>, uint64_t value) { benchmark::DoNotOptimize(value); });
                   benchmark::DoNotOptimize(result_count);
                 }
-                state.SetItemsProcessed(state.iterations() * scan_count_reorg);
+                state.SetItemsProcessed(state.iterations());
               },
               thread_counts,
               true,

@@ -5,17 +5,7 @@
 # duplicating filter strings.
 
 vmemkv_matrix::scenario_filter() {
-  case "$1" in
-    in_memory)
-      printf '%s\n' '(^Store=VMemKV/Variant=Baseline/|^Store=VMemKV/Variant=Bloom-Simd/|^Store=VMemKV/Variant=Bloom-Simd-T1InlineValue/|^Store=VMemKV/Variant=Bloom-Simd-T1InlineValue-Prefaulting/|^Store=RocksDB/Variant=RocksDB/)'
-      ;;
-    ltm)
-      printf '%s\n' '(^Store=VMemKV/Variant=Simd/|^Store=VMemKV/Variant=Bloom-Simd/|^Store=VMemKV/Variant=Bloom-Simd-Hints/|^Store=VMemKV/Variant=Bloom-Simd-Hints-T1InlineValue/|^Store=VMemKV/Variant=Bloom-Simd-Hints-T1InlineValue-Prefaulting/|^Store=RocksDB/Variant=RocksDB/)'
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  printf '%s\n' '(^Store=VMemKV/|^Store=RocksDB/)'
 }
 
 vmemkv_matrix::scenario_env_prefix() {
