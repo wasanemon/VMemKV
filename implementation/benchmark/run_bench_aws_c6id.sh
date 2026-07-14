@@ -129,10 +129,10 @@ run_aws_cleanup() {
     AWS_CLEANUP_RAN=true
     signal_log "starting aws_clean.sh signal=$signal_name pid=$$ bashtid=$BASHPID"
     if [[ "$signal_name" == "EXIT" ]]; then
-      "$SCRIPT_DIR/aws/aws_clean.sh" || true
+      "$SCRIPT_DIR/aws/aws_clean.sh" "$KEY_NAME" || true
     else
       local cleanup_log="/tmp/vmemkv_aws_clean_${KEY_NAME}.log"
-      nohup "$SCRIPT_DIR/aws/aws_clean.sh" >"$cleanup_log" 2>&1 < /dev/null &
+      nohup "$SCRIPT_DIR/aws/aws_clean.sh" "$KEY_NAME" >"$cleanup_log" 2>&1 < /dev/null &
       local cleanup_pid=$!
       signal_log "cleanup continued in background pid=$cleanup_pid log=$cleanup_log"
       wait "$cleanup_pid" || true
@@ -262,10 +262,14 @@ prepare_remote_storage() {
 
     sudo mkdir -p /mnt/nvme
     MOUNT_TARGET=\$(findmnt -rn -S \"\$DEV\" -o TARGET 2>/dev/null | head -n 1 || true)
+    if [ -z \"\$MOUNT_TARGET\" ]; then
+      MOUNT_TARGET=\$(grep -E "^[^ ]*nvme[1-9]n1" /proc/mounts | awk '{print \$2}' | head -n 1 || true)
+    fi
+
     if [ -n \"\$MOUNT_TARGET\" ]; then
       echo \"NVMe SSD \$DEV is already mounted at \$MOUNT_TARGET\"
       if [ \"\$MOUNT_TARGET\" != \"/mnt/nvme\" ]; then
-        sudo mount --bind \"\$MOUNT_TARGET\" /mnt/nvme
+        sudo mount --bind \"\$MOUNT_TARGET\" /mnt/nvme || true
         echo \"Bind-mounted \$MOUNT_TARGET to /mnt/nvme\"
       fi
     else
@@ -275,7 +279,7 @@ prepare_remote_storage() {
       else
         echo \"NVMe SSD \$DEV already has a filesystem; mounting without reformatting...\"
       fi
-      sudo mount \"\$DEV\" /mnt/nvme
+      sudo mount \"\$DEV\" /mnt/nvme || true
     fi
     if ! findmnt -rn /mnt/nvme >/dev/null 2>&1; then
       echo \"[ERROR] Failed to mount NVMe SSD to /mnt/nvme\" >&2
