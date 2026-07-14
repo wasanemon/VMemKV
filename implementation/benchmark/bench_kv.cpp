@@ -675,7 +675,7 @@ void register_all_benchmarks() {
     // Keep the benchmark matrix aligned with the scenario model:
     // 8B for in-memory, 1KB/64KB for LTM.
     std::vector<size_t> value_sizes =
-        is_ltm_mode() ? std::vector<size_t>{1024ULL, 64ULL * 1024ULL} : std::vector<size_t>{1024ULL};
+        is_ltm_mode() ? std::vector<size_t>{1024ULL, 64ULL * 1024ULL} : std::vector<size_t>{kInlineValueBytes, 1024ULL};
     if (prefer_large_value_first()) {
       std::reverse(value_sizes.begin(), value_sizes.end());
     }
