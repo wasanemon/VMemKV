@@ -33,12 +33,15 @@
 </head>
 <body class="bg-white text-slate-900 font-sans min-h-screen antialiased selection:bg-slate-100">
 
+  <!-- Navigation Bar -->
   <nav class="border-b border-slate-200 bg-white sticky top-0 z-50">
     <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
-      <div class="text-sm font-semibold text-slate-600">
-        VMemKV Benchmark Report Portal
-      </div>
-      <div class="text-xs font-bold text-slate-400 uppercase tracking-widest">
+      <a href="index.html"
+        class="flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-indigo-600 transition-colors">
+        <i data-lucide="arrow-left" class="w-4 h-4"></i>
+        Back to Portal
+      </a>
+      <div class="text-xs font-bold text-slate-400 tracking-widest">
         vmemkv
       </div>
     </div>
@@ -92,25 +95,24 @@
       </div>
       <div class="space-y-2 pl-0 md:pl-2">
         <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="briefcase" class="w-3.5 h-3.5"></i> Workloads
+        </h2>
+        <ul class="space-y-1 text-slate-500">
+          <li><strong>Key</strong>: 16 bytes</li>
+          <li><strong>Value</strong>: 8 bytes / 1KB / 64KB</li>
+          <li><strong>Scan</strong>: 指定したキー範囲内で100件の読み取りを行う。事前にReorganizeも実施する</li>
+          <li><strong>8B In-Memory</strong>: Value 8 bytes.数百万件程度のInsertを事前に行う</li>
+          <li><strong>1KB In-Memory</strong>: Value 1KB. 数百万件程度のInsertを事前に行う</li>
+          <li><strong>1KB Larger-than-memory (LTM)</strong>: Value 1KB. cgroupでメモリ量を1GiBに制限し、4GiBぶんのInsertを事前に行う</li>
+        </ul>
+        ---
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
           <i data-lucide="cpu" class="w-3.5 h-3.5"></i> Environment
         </h2>
         <ul class="space-y-1 text-slate-500">
           <li><strong>CPU</strong>: Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz (32 Cores / 64 Threads)</li>
           <li><strong>RAM</strong>: 66.3 GB (LTM実行時は cgroup 1GiB 制限)</li>
           <li><strong>Disk</strong>: Local NVMe SSD (AWS Instance Store, Swap Media)</li>
-        </ul>
-        ---
-        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
-          <i data-lucide="briefcase" class="w-3.5 h-3.5"></i> Workloads
-        </h2>
-        <ul class="space-y-1 text-slate-500">
-          <li><strong>Key</strong>: 16 bytes</li>
-          <li><strong>Value</strong>: 8 bytes / 1KB / 64KB</li>
-          <li><strong>Scan</strong>: 指定したキー範囲内で100件の読み取りを行う</li>
-          <li><strong>8B In-Memory</strong>: Value を 8 bytes にして、数百万件程度のInsertを事前に行う</li>
-          <li><strong>1KB In-Memory</strong>: Value を 1KB にして、数百万件程度のInsertを事前に行う</li>
-          <li><strong>1KB Larger-than-memory (LTM)</strong>: Value を 1KB にして、cgroupでメモリ量を1GiBに制限し、4GiBぶんのInsertを事前に行う</li>
-          
         </ul>
       </div>
     </section>

@@ -115,9 +115,7 @@ class VMemKVImpl {
     if constexpr (ConfigT::UseSimdScan) {
       parts.emplace_back("Simd");
     }
-    if constexpr (ConfigT::UseMemoryHints) {
-      parts.emplace_back("Hints");
-    }
+
     if constexpr (ConfigT::UseT1InlineValue) {
       parts.emplace_back("T1InlineValue");
     }

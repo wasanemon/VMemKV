@@ -23,7 +23,7 @@
 
 // Verify that all major variants satisfy the C++20 KVStore concept
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_Baseline>);
-static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_LTM_Inline>);
+static_assert(vmemkv::KVStore<vmemkv::variants::VMemKVStore>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDB>);
 
 namespace test_util {
@@ -123,10 +123,9 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 // ─── Store type lists ───────────────────────────────────────────────────────
 
 // VMemKV 自体のバリエーション（Baseline, Cumulative Steps, Ablations, Inlining）
-#define VMemKVStores                                                                                                 \
-  vmemkv::variants::VMemKV_Baseline, vmemkv::variants::VMemKV_InMem_Simd, vmemkv::variants::VMemKV_InMem_Inline,     \
-      vmemkv::variants::VMemKV_LTM_Baseline, vmemkv::variants::VMemKV_LTM_Bloom, vmemkv::variants::VMemKV_LTM_Hints, \
-      vmemkv::variants::VMemKV_LTM_Inline
+#define VMemKVStores                                                                                               \
+  vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Simd, \
+      vmemkv::variants::VMemKV_Var3_Inline, vmemkv::variants::VMemKV_Var4_Prefault
 
 // 競合バックエンドのバリエーション（RocksDBStoreなど）
 #ifdef ENABLE_ROCKSDB
@@ -623,7 +622,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   constexpr uint64_t kEvenInlineValue = 0x123456789ABCDEF0ULL;
 
   SUBCASE("T1InlineValue behavior (1-8 bytes)") {
-    using InlineStore = vmemkv::variants::VMemKV_LTM_Inline;
+    using InlineStore = vmemkv::variants::VMemKV_Var3_Inline;
     auto store = std::make_unique<InlineStore>(path, kInlineStoreCapacityBytes);
 
     uint64_t initial_bytes = store->t2().bytes_used();
@@ -693,7 +692,7 @@ TEST_CASE("VMemKV: reorganize lost update race condition (Deterministic)") {
   const std::string path = reserve_temp_path().string();
   constexpr uint64_t kStoreCapacityBytes = 1024ULL * 1024ULL;
 
-  using TestStore = vmemkv::variants::VMemKV_LTM_Inline;
+  using TestStore = vmemkv::variants::VMemKVStore;
   auto store = std::make_unique<TestStore>(path, kStoreCapacityBytes);
 
   // 1. Insert key with initial value (this sits in append_active)

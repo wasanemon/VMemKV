@@ -21,7 +21,6 @@
 #include "../core/lock_free_hash_table.hpp"
 #include "../core/reference_tracker.hpp"
 #include "../optimizations/bloom_filter.hpp"
-#include "../optimizations/memory_hints.hpp"
 #include "../optimizations/simd_scan.hpp"
 
 inline constexpr std::size_t kStoreKeyBytes = 16;
@@ -135,9 +134,6 @@ class T1Index {
     auto *active = new AppendRegion();
     auto *active_index = new AppendIndex();
     active_index->clear();
-    if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(active->data(), active->capacity_bytes());
-    }
     append_active_.store(active, std::memory_order_release);
     append_active_index_.store(active_index, std::memory_order_release);
     sorted_region_.store(new SortedRegion(), std::memory_order_release);
@@ -396,9 +392,6 @@ class T1Index {
     auto *next_active = new AppendRegion();
     auto *next_active_idx = new AppendIndex();
     next_active_idx->clear();
-    if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(next_active->data(), next_active->capacity_bytes());
-    }
 
     // 2. Freeze the current active region to immutable
     AppendRegion *old_active = append_active_.load(std::memory_order_acquire);
@@ -469,8 +462,6 @@ class T1Index {
     // Assert no duplicate entries exist in the merge output
     assert_no_duplicates(merged);
 
-    maybe_set_sequential_hints(old_active, imm_n);
-
     for (auto &entry : merged) {
       entry.payload_bits = offset_mapper(entry.payload_bits, entry.hash);
     }
@@ -478,9 +469,6 @@ class T1Index {
     const SortedRegion *old_sorted = sorted_region_.load(std::memory_order_relaxed);
 
     auto *next_sorted = new SortedRegion(merged);
-    if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(next_sorted->slots.get(), next_sorted->size * sizeof(SortedSlot));
-    }
 
     // Publish the new sorted region
     sorted_region_.store(next_sorted, std::memory_order_release);
@@ -791,14 +779,6 @@ class T1Index {
     for (size_t i = 1; i < entries.size(); ++i) {
       assert(!(entries[i - 1].key == entries[i].key && entries[i - 1].hash == entries[i].hash) &&
              "T1Index invariant violated: duplicate key prefix + hash detected in merge output");
-    }
-  }
-
-  void maybe_set_sequential_hints(const AppendRegion *region, size_t append_n) {
-    if constexpr (Config::UseMemoryHints) {
-      auto sorted = sorted_region_.load(std::memory_order_acquire);
-      t1_detail::set_sequential_hint(sorted->slots.get(), sorted->size * sizeof(SortedSlot));
-      t1_detail::set_sequential_hint(region->data(), region->bytes_for(append_n));
     }
   }
 

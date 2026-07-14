@@ -34,19 +34,20 @@ concept KVStore = requires(Store store, std::span<const std::byte> key, std::spa
 // ─── Production Recommended Store ──────────────────────────────────────────
 using VMemKVStore = StoreAdapter<VMemKVImpl<detail::System_AllOn>>;
 
+namespace variants {
+
 // ─── Baseline Plain Store ──────────────────────────────────────────────────
-using VMemKVBaselineStore = StoreAdapter<VMemKVImpl<detail::T1_AllOff>>;
+using VMemKV_Baseline = StoreAdapter<VMemKVImpl<detail::T1_AllOff>>;
 
 using VMemKVRocksDB = StoreAdapter<::RocksDBStore>;
 
-namespace variants {
 // ─── 1. Core Stacked Ablation Variants ───
-using VMemKV_Var0_Baseline = VMemKVBaselineStore;
+using VMemKV_Var0_Baseline = VMemKV_Baseline;
 using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
 using VMemKV_Var2_Simd = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan>>>;
-using VMemKV_Var3_Hints = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, MemoryHints>>>;
-using VMemKV_Var4_Inline = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue>>>;
-using VMemKV_Var5_Prefault = VMemKVStore;  // Fully optimized production configuration
+using VMemKV_Var3_Inline = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, T1InlineValue>>>;
+using VMemKV_Var4_Prefault = VMemKVStore;  // Fully optimized production configuration
+using VMemKVStore = VMemKVStore;
 
 using VMemKV_RocksDB = VMemKVRocksDB;
 
@@ -54,9 +55,8 @@ using VMemKV_RocksDB = VMemKVRocksDB;
 using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
                                     VMemKV_Var1_Bloom,
                                     VMemKV_Var2_Simd,
-                                    VMemKV_Var3_Hints,
-                                    VMemKV_Var4_Inline,
-                                    VMemKV_Var5_Prefault,
+                                    VMemKV_Var3_Inline,
+                                    VMemKV_Var4_Prefault,
                                     VMemKV_RocksDB>;
 }  // namespace variants
 

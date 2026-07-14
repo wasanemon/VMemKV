@@ -55,7 +55,6 @@ namespace vmemkv {
 // ─── Optimization Tags ───────────────────────────────────────────────────────
 struct BloomFilter {};
 struct SimdScan {};
-struct MemoryHints {};
 struct T1InlineValue {};
 struct Prefaulting {};
 
@@ -67,7 +66,6 @@ struct Config {
 
   static constexpr bool UseBloomFilter = has_opt<BloomFilter>;
   static constexpr bool UseSimdScan = has_opt<SimdScan>;
-  static constexpr bool UseMemoryHints = has_opt<MemoryHints>;
   static constexpr bool UseT1InlineValue = has_opt<T1InlineValue>;
   static constexpr bool UsePrefaulting = has_opt<Prefaulting>;
 
@@ -100,8 +98,8 @@ struct Config {
 
 namespace detail {
 using T1_AllOff = Config<>;
-using T1_AllOn = Config<BloomFilter, SimdScan, MemoryHints>;
-using System_AllOn = Config<BloomFilter, SimdScan, MemoryHints, T1InlineValue, Prefaulting>;
+using T1_AllOn = Config<BloomFilter, SimdScan>;
+using System_AllOn = Config<BloomFilter, SimdScan, T1InlineValue, Prefaulting>;
 }  // namespace detail
 
 struct VMemKVStatistics {

@@ -424,16 +424,7 @@ low-level design が要求するのは同期機構の名前ではなく、6.2 �
 
 本節の最適化はすべて opt-in であり、無効でも正しく動作する。
 
-### 7.1 Tier 1 Memory Hints
-
-- `mlock(t1, size)`:
-  Tier 1 を物理 RAM に固定し、Tier 2 圧迫下でもスワップアウトを防ぐ。
-- `madvise(t1, size, MADV_HUGEPAGE)`:
-  TLB 圧力を下げる。
-- `MADV_SEQUENTIAL`:
-  T1 full scan の直前に適用し、先読みを促す。
-
-### 7.2 Group Commit / Early Lock Release / Flush Pipelining
+### 7.1 Group Commit / Early Lock Release / Flush Pipelining
 
 詳細は [Aether](https://dl.acm.org/doi/10.14778/1920841.1920928) を参照。
 
@@ -441,37 +432,37 @@ low-level design が要求するのは同期機構の名前ではなく、6.2 �
 - エントリロック解放を WAL flush 完了前に前倒しする。
 - 読み取りも waiter を介して未 flush データの整合を取る。
 
-### 7.3 SIMD Tier 1 Scan
+### 7.2 SIMD Tier 1 Scan
 
 `IndexEntry` は fixed-size かつ連続配置なので、Tier 1 の append scan や range scan は SIMD 最最適化しやすい。
 
-### 7.4 Index-Level Covering
+### 7.3 Index-Level Covering
 
 index 単位で `payload_mode == Inline64` を選び、Tier 1 payload を 64-bit value として解釈する。
 
 - small fixed-size value workload では Tier 2 アクセスを完全に省略できる
 - WAL / checkpoint では index の payload mode をメタデータとして永続化する
 
-### 7.5 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
+### 7.4 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
 
 エントリーごとに T2 オフセットとインライン 64-bit 値を動的に切り替える最適化である。値が 8バイト（64ビット）以下のときに Tier 2 への書き出しをバイパスして Tier 1 インデックスの payload 領域内に直接バリューをインライン格納する。
 
 本最適化は `vmemkv::Config` のテンプレート引数タグ（`T1InlineValue`）を介して制御される。
 
-#### 7.5.1 メタデータとハッシュのエンコーディング
+#### 7.4.1 メタデータとハッシュのエンコーディング
 T1のインデックススロットに十分な空きビット領域がないため、64ビットのハッシュフィールド（`hash`）の最上位4ビットをメタデータ領域として再利用し、フラグとサイズ情報を格納する。
 
 - **Bit 63 (`is_inline`)**: `1` の場合はインラインデータ、`0` の場合は T2オフセットを表す。
 - **Bits 62-60 (`inline_size`)**: インラインデータのバイトサイズ（1〜8バイト）を表す。サイズ `8` は `0` としてエンコードされる。
 - **Bits 59-0 (`clean_hash`)**: 実際の60ビットFnvハッシュキー。インデックスの検索、Bloom filterの登録・判定、SIMDスキャン等のハッシュ比較時には、上位4ビットをマスクしてこの60ビット部分のみを比較する。
 
-#### 7.5.2 インライン化の動作
+#### 7.4.2 インライン化の動作
 - **T2 オフセットとの識別 (判定)**:
   - 読み出し時、T1から取得したスロットハッシュの最上位ビット（Bit 63）を確認するだけで、T2をフェッチせずにインラインかオフセットかを100%確実に識別できる。
 - **値が 1〜8 バイトの場合**:
   - `payload_bits` に対するビットシフトやビットの埋め込みは行わず、64ビットのビットパターンをそのまま無加工で格納し、デコード時は `inline_size` に従いバイトコピーを行う。これにより、`double`、`time`、連番のサロゲートキー（偶数・奇数を問わず）など、あらゆる64ビット以内のデータ型を完全にインライン化できる。
 
-### 7.6 Chunk Allocation / Pre-faulting (T2 Lock Mitigation)
+### 7.5 Chunk Allocation / Pre-faulting (T2 Lock Mitigation)
 
 マルチコア高並列書き込み環境における Linux カーネルの仮想メモリページフォールトおよび `mmap_lock`（VMAロック）の競合によるオーバーヘッド（Cache Line Bouncing）を緩和するための最適化である。
 
@@ -483,15 +474,11 @@ T1のインデックススロットに十分な空きビット領域がないた
 * **コンパイル時解決の徹底**:
   最適化のオーバーヘッドをゼロにするため、`vmemkv::Config` のテンプレート引数タグ（`Prefaulting`）を介して `constexpr if` によってコンパイル時に分岐とコード生成が制御される。
 
-### 7.7 Sorted Bloom Filter
+### 7.6 Sorted Bloom Filter
 
 `sorted_region` 全体に Bloom filter を付与し、negative lookup を高速化できる。
 
-### 7.8 Tier 2 Prefetch
-
-Scan 時に Tier 1 から得た offset 群に対して `madvise(MADV_WILLNEED)` を出し、Tier 2 を先読みする。
-
-### 7.9 Index-Entry Size Embedding (サイズ情報のインデックス内ビット埋め込み)
+### 7.7 Index-Entry Size Embedding (サイズ情報のインデックス内ビット埋め込み)
 
 T2 へのランダムメモリアクセスを伴わずに $O(1)$ で `T1_Live_Bytes` を集計するため、T1 インデックスエントリー of `payload_bits`（T2 オフセットポインタ）の未使用上位ビットにレコードサイズをエンコードして格納する。
 
