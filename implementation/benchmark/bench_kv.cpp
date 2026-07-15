@@ -1097,7 +1097,7 @@ void register_all_benchmarks() {
           delete_fixed_iterations);
 
       auto scan_reorg_holder = std::make_shared<StoreHolder<decltype(make())>>();
-      if (sname != "RocksDB") {
+      {
         constexpr int scan_count_reorg = 100;
         const size_t reorg_dataset_size = corpus_size;
         for (int dist_idx = 0; dist_idx < 2; ++dist_idx) {
@@ -1108,9 +1108,13 @@ void register_all_benchmarks() {
               benchmark_name(sname, "ScanReorg", std::nullopt, dist, value_name),
               scan_reorg_meta,
               make,
-              [reorg_dataset_size](auto &store) {
+              [reorg_dataset_size, sname](auto &store) {
                 populate(store, {reorg_dataset_size, kInlineValueBytes});
-                store.reorganize();
+                // VMemKV: explicitly reorganize T1 so sorted_region is fully sorted.
+                // RocksDB: skip (no manual reorganize concept; compaction runs automatically).
+                if (sname != "RocksDB") {
+                  store.reorganize();
+                }
               },
               [reorg_dataset_size, dist](benchmark::State &state, auto &store) {
                 std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());

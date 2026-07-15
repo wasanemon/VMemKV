@@ -34,6 +34,9 @@ for task in "${TASKS[@]}"; do
     --value-size "$val_size" \
     > "$log_file" 2>&1 &
   pids+=($!)
+  
+  # Stagger instance launches to prevent AWS OAuth/token 429 Rate Limit Errors
+  sleep 12
 done
 
 echo "--------------------------------------------------------"

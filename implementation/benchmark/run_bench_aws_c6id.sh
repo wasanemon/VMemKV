@@ -500,18 +500,18 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 
 
 
-inmem_filter=""
-ltm_filter=""
+inmem_filter="${inmem_filter:-}"
+ltm_filter="${ltm_filter:-}"
 if [[ "${YCSB_ONLY:-0}" == "1" ]]; then
-  inmem_filter="Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-Simd-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf"
-  ltm_filter="Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-Simd-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf"
-  MIN_TIME="30s"
+  inmem_filter="${inmem_filter:-Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-Simd-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf}"
+  ltm_filter="${ltm_filter:-Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-Simd-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf}"
+  MIN_TIME="${MIN_TIME:-30s}"
 elif [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-  inmem_filter="$(vmemkv_matrix::benchmark_filter_for_case in_memory "${VALUE_SIZE_LIMIT,,}")"
-  ltm_filter="$(vmemkv_matrix::benchmark_filter_for_case ltm "${VALUE_SIZE_LIMIT,,}")"
+  inmem_filter="${inmem_filter:-$(vmemkv_matrix::benchmark_filter_for_case in_memory "${VALUE_SIZE_LIMIT,,}")}"
+  ltm_filter="${ltm_filter:-$(vmemkv_matrix::benchmark_filter_for_case ltm "${VALUE_SIZE_LIMIT,,}")}"
 else
-  inmem_filter="$(vmemkv_matrix::scenario_effective_filter in_memory "$LARGE_VALUE_FIRST" "$QUICK")"
-  ltm_filter="$(vmemkv_matrix::scenario_effective_filter ltm "$LARGE_VALUE_FIRST" "$QUICK")"
+  inmem_filter="${inmem_filter:-$(vmemkv_matrix::scenario_effective_filter in_memory "$LARGE_VALUE_FIRST" "$QUICK")}"
+  ltm_filter="${ltm_filter:-$(vmemkv_matrix::scenario_effective_filter ltm "$LARGE_VALUE_FIRST" "$QUICK")}"
 fi
 
 echo "Counting remote benchmarks concurrently..."
