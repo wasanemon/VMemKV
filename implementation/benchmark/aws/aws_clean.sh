@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
-# aws_clean.sh - Clean up all temporary AWS resources created by vmemkv benchmark scripts
+# aws_clean.sh - Clean up temporary AWS resources created by vmemkv benchmark scripts
 
 set -euo pipefail
 
+TARGET_KEY="${1:-}"
+KEY_PREFIX="vmemkv-c6id-key-"
+
 echo "==========================================================="
 echo "   Cleaning up VMemKV Temporary AWS Benchmark Resources"
+if [[ -n "$TARGET_KEY" ]]; then
+  echo "   Target Key: $TARGET_KEY"
+else
+  echo "   Target Key: ALL temporary keys"
+fi
 echo "==========================================================="
 
 # 1. Terminate EC2 instances associated with the benchmark keypair
-KEY_PREFIX="vmemkv-c6id-key-"
-INSTANCES=$(aws ec2 describe-instances \
-  --filters "Name=key-name,Values=${KEY_PREFIX}*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-  --query "Reservations[*].Instances[*].InstanceId" \
-  --output text)
+if [[ -n "$TARGET_KEY" ]]; then
+  INSTANCES=$(aws ec2 describe-instances \
+    --filters "Name=key-name,Values=${TARGET_KEY}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query "Reservations[*].Instances[*].InstanceId" \
+    --output text)
+else
+  INSTANCES=$(aws ec2 describe-instances \
+    --filters "Name=key-name,Values=${KEY_PREFIX}*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query "Reservations[*].Instances[*].InstanceId" \
+    --output text)
+fi
 
 if [ -n "$INSTANCES" ]; then
   echo "Found running benchmark instances: $INSTANCES"
@@ -26,10 +40,17 @@ else
 fi
 
 # 2. Delete temporary security groups
-SGS=$(aws ec2 describe-security-groups \
-  --filters "Name=group-name,Values=vmemkv-c6id-sg-*" \
-  --query "SecurityGroups[*].GroupId" \
-  --output text)
+if [[ -n "$TARGET_KEY" ]]; then
+  SGS=$(aws ec2 describe-security-groups \
+    --filters "Name=tag:VMemKV-Temp-Spot,Values=${TARGET_KEY}" \
+    --query "SecurityGroups[*].GroupId" \
+    --output text)
+else
+  SGS=$(aws ec2 describe-security-groups \
+    --filters "Name=group-name,Values=vmemkv-c6id-sg-*" \
+    --query "SecurityGroups[*].GroupId" \
+    --output text)
+fi
 
 if [ -n "$SGS" ]; then
   echo "Found temporary security groups: $SGS"
@@ -50,9 +71,16 @@ else
 fi
 
 # 3. Delete key pairs
-KEY_PAIRS=$(aws ec2 describe-key-pairs \
-  --query "KeyPairs[?starts_with(KeyName, '${KEY_PREFIX}')].KeyName" \
-  --output text)
+if [[ -n "$TARGET_KEY" ]]; then
+  KEY_PAIRS=""
+  if aws ec2 describe-key-pairs --key-names "$TARGET_KEY" >/dev/null 2>&1; then
+    KEY_PAIRS="$TARGET_KEY"
+  fi
+else
+  KEY_PAIRS=$(aws ec2 describe-key-pairs \
+    --query "KeyPairs[?starts_with(KeyName, '${KEY_PREFIX}')].KeyName" \
+    --output text)
+fi
 
 if [ -n "$KEY_PAIRS" ]; then
   echo "Found temporary key pairs: $KEY_PAIRS"
@@ -66,7 +94,11 @@ fi
 
 # 4. Clean up local key files in /tmp
 echo "Cleaning up local temporary key files..."
-rm -f /tmp/vmemkv-c6id-key-*.pem
+if [[ -n "$TARGET_KEY" ]]; then
+  rm -f "/tmp/${TARGET_KEY}.pem"
+else
+  rm -f /tmp/vmemkv-c6id-key-*.pem
+fi
 
 echo "==========================================================="
 echo "   AWS Clean Up Completed Successfully!"

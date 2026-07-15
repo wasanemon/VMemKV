@@ -1,0 +1,7310 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VMemKV Performance Charts (2026071600)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['Inter','sans-serif'] } } }
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .tab-btn.active { border-color: #4f46e5; color: #4f46e5; font-weight: 600; }
+    code { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+  </style>
+</head>
+<body class="bg-white text-slate-900 font-sans min-h-screen antialiased selection:bg-slate-100">
+
+  <nav class="border-b border-slate-200 bg-white sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+      <a href="index.html" class="flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-indigo-600 transition-colors">
+        <i data-lucide="arrow-left" class="w-4 h-4"></i>
+        Back to Portal
+      </a>
+      <div class="text-xs font-bold text-slate-400 tracking-widest">vmemkv</div>
+    </div>
+  </nav>
+
+  <main class="max-w-6xl mx-auto px-6 py-12 space-y-12">
+
+    <header class="space-y-4 border-b border-slate-200 pb-6">
+      <div class="flex items-center justify-between">
+        <h1 class="text-3xl font-bold tracking-tight text-slate-900">Benchmark Results (2026071600)</h1>
+        <div class="flex flex-wrap gap-2">
+          <a href="../2026071600/results_in_memory_8B.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (In-mem 8B)
+          </a>
+          <a href="../2026071600/results_in_memory_1KB.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (In-mem 1KB)
+          </a>
+          <a href="../2026071600/results_ltm_1KB.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (LTM 1KB)
+          </a>
+          <a href="../2026071600/results_ltm_64KB.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">
+            <i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (LTM 64KB)
+          </a>
+        </div>
+      </div>
+      <p class="text-slate-500 text-sm max-w-3xl">
+        AWS 32コア物理環境における vmemkv と RocksDB の性能比較ベンチマーク。
+      </p>
+    </header>
+
+    <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
+      <div class="space-y-2 border-r border-slate-200 pr-0 md:pr-6">
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="git-branch" class="w-3.5 h-3.5"></i> Stacking Variants
+        </h2>
+        <p class="text-slate-500">
+          各最適化の詳細は <a href="https://github.com/LineairDB/VMemKV/tree/main/implementation/docs/specification/low_level_design.md" target="_blank" rel="noopener" class="text-indigo-600 hover:underline">Design Document</a> を参照。
+        </p>
+        <ul class="space-y-1.5 text-slate-500 list-disc pl-4">
+          <li><strong>RocksDB</strong>: LSM-Tree のベースライン比較</li>
+          <li><strong>Baseline</strong>: vmemkv 最適化なし</li>
+          <li><strong>+BF</strong>: + T1 Bloom Filter</li>
+          <li><strong>+Simd</strong>: +BF + SIMD Scan（T1 sorted_region の SIMD 線形探索）</li>
+          <li><strong>+Inline</strong>: +Simd + T1 Inline Value （<8B のValueをT1のみで処理）</li>
+          <li><strong>+Prefault</strong>: +Inline + T2 Async Prefaulting（全部盛り）</li>
+        </ul>
+      </div>
+      <div class="space-y-2 pl-0 md:pl-2">
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="cpu" class="w-3.5 h-3.5"></i> Environment
+        </h2>
+        <ul class="space-y-1 text-slate-500">
+          <li><strong>Instance</strong>: AWS c6id.8xlarge (ap-northeast-1)</li>
+          <li><strong>CPU</strong>: Intel Xeon Platinum 8375C @ 2.90GHz (32 cores)</li>
+          <li><strong>L2 Cache</strong>: 1,280 KiB × 16 (per-core private)</li>
+          <li><strong>RAM</strong>: 66.3 GB</li>
+          <li><strong>RAM (Larger-Than-Memory)</strong>: cgroup で DRAM を 1GiB に制限し予めデータ量を4GiBぶん挿入した状態で開始</li>
+          <li><strong>Disk</strong>: Local NVMe SSD (Swap Media for LTM)</li>
+          <li><strong>Kernel</strong>: 6.17.0-1019-aws</li>
+          <li><strong>Git Rev</strong>: 9bde41e6fb78</li>
+        </ul>
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5 mt-3">
+          <i data-lucide="briefcase" class="w-3.5 h-3.5"></i> Workloads
+        </h2>
+        <ul class="space-y-1 text-slate-500">
+          <li><strong>Insert</strong>: 順次挿入（1/4/16/32 スレッド）</li>
+          <li><strong>Get Hit/Miss (Zipf/Uniform)</strong>: ポイントルックアップ</li>
+          <li><strong>Update / Delete</strong>: Zipf 分布での更新・削除</li>
+          <li><strong>Scan After Reorg (Zipf/Uniform)</strong>: T1 reorganize 後のレンジスキャン</li>
+          <li><strong>YCSB-E</strong>: 95% Scan + 5% Insert 混合（32スレッド / 30秒タイムライン）</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="border border-slate-200 rounded-xl p-5 bg-slate-50/50 space-y-3">
+      <h2 class="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+        <i data-lucide="notebook" class="w-3.5 h-3.5 text-indigo-500"></i> Overall Notes &amp; Annotations
+      </h2>
+      <textarea id="memo-overall" oninput="saveMemo('overall', this.value)" placeholder="実験全体の総括メモを入力..." class="w-full text-xs p-3 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-white resize-y h-24"></textarea>
+    </section>
+
+    <div class="border-b border-slate-200 sticky top-16 z-40 bg-white shadow-sm py-2 px-1">
+      <nav class="flex gap-x-8 text-sm" aria-label="Tabs">
+        
+        <button onclick="switchTab('tab-8b-inmem')" id="btn-tab-8b-inmem" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium active">8B In-Memory</button>
+        <button onclick="switchTab('tab-1kb-inmem')" id="btn-tab-1kb-inmem" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium ">1KB(20% 8B) In-Memory</button>
+        <button onclick="switchTab('tab-1kb-ltm')" id="btn-tab-1kb-ltm" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium ">1KB(20% 8B) Larger Than Memory</button>
+        <button onclick="switchTab('tab-64kb-ltm')" id="btn-tab-64kb-ltm" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium ">64KB(20% 8B) Larger Than Memory</button>
+      </nav>
+    </div>
+
+    
+    <div id="tab-8b-inmem" class="tab-content active space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-8b_in_memory-insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> ユニークキーを空のストアに順次挿入する際の書き込みスループット。Scan 非アクティブ時は Soft Limit = APPEND_CAP の 50% で動作。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-insert" oninput="saveMemo('8b_in_memory-insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーに対する更新スループット（ステートフルな上書き）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-update" oninput="saveMemo('8b_in_memory-update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 Tombstone 付与による並行削除スループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-delete" oninput="saveMemo('8b_in_memory-delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-get-miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-get-miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 存在しないキーへの読み取り。Bloom Filter の偽陽性回避効果を評価。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-get-miss" oninput="saveMemo('8b_in_memory-get-miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-get-hit-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-get-hit-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーへのポイントルックアップ（キャッシュフレンドリー）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-get-hit-zipf" oninput="saveMemo('8b_in_memory-get-hit-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-8b_in_memory-get-hit-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-get-hit-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Uniform 分布での既存キーへのポイントルックアップ（極端なキャッシュミス）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-get-hit-uniform" oninput="saveMemo('8b_in_memory-get-hit-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan After Reorg (Zipf)</h3>
+            <span id="badge-8b_in_memory-scan-withreorg-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-scan-withreorg-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 reorganize 完了後（sorted_region のみ）での Zipf 分布 100 件レンジスキャンの上限値。VMemKV: reorganize() 完了後に計測。RocksDB: 同一データロード後，自動 compaction 中の状態で計測（次回ベンチマーク実行後に追加予定）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-scan-withreorg-zipf" oninput="saveMemo('8b_in_memory-scan-withreorg-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan After Reorg (Uniform)</h3>
+            <span id="badge-8b_in_memory-scan-withreorg-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-scan-withreorg-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 reorganize 完了後（sorted_region のみ）での Uniform 分布 100 件レンジスキャン。RocksDB データは次回ベンチマーク実行後に追加予定。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-scan-withreorg-uniform" oninput="saveMemo('8b_in_memory-scan-withreorg-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- YCSB-E Timeline -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-indigo-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">YCSB-E — Scan + Insert 混合スループット（30秒タイムライン）</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          YCSB-E ワークロード: 95% Scan（100件レンジスキャン）+ 5% Insert を 32スレッドで 30秒間実行。
+          <strong class="text-indigo-600">縦点線は T1 Reorganize 発生タイミング</strong>を示す。
+          Workload-Adaptive Soft Limit により、スキャン検出時に <code class="bg-slate-100 px-1 rounded text-xs">append_region</code> を
+          L2キャッシュ容量（~26,000件 / 1MB ÷ 40B）以下に保つ。Reorg 直後に走査対象が
+          <code class="bg-slate-100 px-1 rounded text-xs">sorted_region</code> のみになりスキャン QPS が V字回復する。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan QPS タイムライン</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">32 threads / 30 seconds</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-8b_in_memory-ycsb-e-scan"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-8b_in_memory-ycsb-e" oninput="saveMemo('8b_in_memory-ycsb-e', this.value)" placeholder="YCSB-E 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="tab-1kb-inmem" class="tab-content  space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-1kb_in_memory-insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> ユニークキーを空のストアに順次挿入する際の書き込みスループット。Scan 非アクティブ時は Soft Limit = APPEND_CAP の 50% で動作。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-insert" oninput="saveMemo('1kb_in_memory-insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーに対する更新スループット（ステートフルな上書き）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-update" oninput="saveMemo('1kb_in_memory-update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 Tombstone 付与による並行削除スループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-delete" oninput="saveMemo('1kb_in_memory-delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-get-miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-get-miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 存在しないキーへの読み取り。Bloom Filter の偽陽性回避効果を評価。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-get-miss" oninput="saveMemo('1kb_in_memory-get-miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-get-hit-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-get-hit-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーへのポイントルックアップ（キャッシュフレンドリー）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-get-hit-zipf" oninput="saveMemo('1kb_in_memory-get-hit-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-1kb_in_memory-get-hit-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-get-hit-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Uniform 分布での既存キーへのポイントルックアップ（極端なキャッシュミス）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-get-hit-uniform" oninput="saveMemo('1kb_in_memory-get-hit-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan After Reorg (Zipf)</h3>
+            <span id="badge-1kb_in_memory-scan-withreorg-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-scan-withreorg-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 reorganize 完了後（sorted_region のみ）での Zipf 分布 100 件レンジスキャンの上限値。VMemKV: reorganize() 完了後に計測。RocksDB: 同一データロード後，自動 compaction 中の状態で計測（次回ベンチマーク実行後に追加予定）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-scan-withreorg-zipf" oninput="saveMemo('1kb_in_memory-scan-withreorg-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan After Reorg (Uniform)</h3>
+            <span id="badge-1kb_in_memory-scan-withreorg-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-scan-withreorg-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 reorganize 完了後（sorted_region のみ）での Uniform 分布 100 件レンジスキャン。RocksDB データは次回ベンチマーク実行後に追加予定。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-scan-withreorg-uniform" oninput="saveMemo('1kb_in_memory-scan-withreorg-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- YCSB-E Timeline -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-indigo-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">YCSB-E — Scan + Insert 混合スループット（30秒タイムライン）</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          YCSB-E ワークロード: 95% Scan（100件レンジスキャン）+ 5% Insert を 32スレッドで 30秒間実行。
+          <strong class="text-indigo-600">縦点線は T1 Reorganize 発生タイミング</strong>を示す。
+          Workload-Adaptive Soft Limit により、スキャン検出時に <code class="bg-slate-100 px-1 rounded text-xs">append_region</code> を
+          L2キャッシュ容量（~26,000件 / 1MB ÷ 40B）以下に保つ。Reorg 直後に走査対象が
+          <code class="bg-slate-100 px-1 rounded text-xs">sorted_region</code> のみになりスキャン QPS が V字回復する。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan QPS タイムライン</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">32 threads / 30 seconds</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_in_memory-ycsb-e-scan"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_in_memory-ycsb-e" oninput="saveMemo('1kb_in_memory-ycsb-e', this.value)" placeholder="YCSB-E 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="tab-1kb-ltm" class="tab-content  space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-1kb_ltm-insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> ユニークキーを空のストアに順次挿入する際の書き込みスループット。Scan 非アクティブ時は Soft Limit = APPEND_CAP の 50% で動作。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-insert" oninput="saveMemo('1kb_ltm-insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーに対する更新スループット（ステートフルな上書き）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-update" oninput="saveMemo('1kb_ltm-update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 Tombstone 付与による並行削除スループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-delete" oninput="saveMemo('1kb_ltm-delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-get-miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-get-miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 存在しないキーへの読み取り。Bloom Filter の偽陽性回避効果を評価。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-get-miss" oninput="saveMemo('1kb_ltm-get-miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-get-hit-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-get-hit-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーへのポイントルックアップ（キャッシュフレンドリー）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-get-hit-zipf" oninput="saveMemo('1kb_ltm-get-hit-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-1kb_ltm-get-hit-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-get-hit-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Uniform 分布での既存キーへのポイントルックアップ（極端なキャッシュミス）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-get-hit-uniform" oninput="saveMemo('1kb_ltm-get-hit-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan After Reorg (Zipf)</h3>
+            <span id="badge-1kb_ltm-scan-withreorg-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-scan-withreorg-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 reorganize 完了後（sorted_region のみ）での Zipf 分布 100 件レンジスキャンの上限値。VMemKV: reorganize() 完了後に計測。RocksDB: 同一データロード後，自動 compaction 中の状態で計測（次回ベンチマーク実行後に追加予定）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-scan-withreorg-zipf" oninput="saveMemo('1kb_ltm-scan-withreorg-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan After Reorg (Uniform)</h3>
+            <span id="badge-1kb_ltm-scan-withreorg-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-scan-withreorg-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 reorganize 完了後（sorted_region のみ）での Uniform 分布 100 件レンジスキャン。RocksDB データは次回ベンチマーク実行後に追加予定。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-scan-withreorg-uniform" oninput="saveMemo('1kb_ltm-scan-withreorg-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- YCSB-E Timeline -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-indigo-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">YCSB-E — Scan + Insert 混合スループット（30秒タイムライン）</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          YCSB-E ワークロード: 95% Scan（100件レンジスキャン）+ 5% Insert を 32スレッドで 30秒間実行。
+          <strong class="text-indigo-600">縦点線は T1 Reorganize 発生タイミング</strong>を示す。
+          Workload-Adaptive Soft Limit により、スキャン検出時に <code class="bg-slate-100 px-1 rounded text-xs">append_region</code> を
+          L2キャッシュ容量（~26,000件 / 1MB ÷ 40B）以下に保つ。Reorg 直後に走査対象が
+          <code class="bg-slate-100 px-1 rounded text-xs">sorted_region</code> のみになりスキャン QPS が V字回復する。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan QPS タイムライン</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">32 threads / 30 seconds</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_ltm-ycsb-e-scan"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_ltm-ycsb-e" oninput="saveMemo('1kb_ltm-ycsb-e', this.value)" placeholder="YCSB-E 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="tab-64kb-ltm" class="tab-content  space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-64kb_ltm-insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> ユニークキーを空のストアに順次挿入する際の書き込みスループット。Scan 非アクティブ時は Soft Limit = APPEND_CAP の 50% で動作。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-insert" oninput="saveMemo('64kb_ltm-insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーに対する更新スループット（ステートフルな上書き）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-update" oninput="saveMemo('64kb_ltm-update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 Tombstone 付与による並行削除スループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-delete" oninput="saveMemo('64kb_ltm-delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-get-miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-get-miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 存在しないキーへの読み取り。Bloom Filter の偽陽性回避効果を評価。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-get-miss" oninput="saveMemo('64kb_ltm-get-miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-get-hit-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-get-hit-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーへのポイントルックアップ（キャッシュフレンドリー）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-get-hit-zipf" oninput="saveMemo('64kb_ltm-get-hit-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-64kb_ltm-get-hit-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-get-hit-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Uniform 分布での既存キーへのポイントルックアップ（極端なキャッシュミス）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-get-hit-uniform" oninput="saveMemo('64kb_ltm-get-hit-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan After Reorg (Zipf)</h3>
+            <span id="badge-64kb_ltm-scan-withreorg-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-scan-withreorg-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 reorganize 完了後（sorted_region のみ）での Zipf 分布 100 件レンジスキャンの上限値。VMemKV: reorganize() 完了後に計測。RocksDB: 同一データロード後，自動 compaction 中の状態で計測（次回ベンチマーク実行後に追加予定）。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-scan-withreorg-zipf" oninput="saveMemo('64kb_ltm-scan-withreorg-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan After Reorg (Uniform)</h3>
+            <span id="badge-64kb_ltm-scan-withreorg-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-scan-withreorg-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 reorganize 完了後（sorted_region のみ）での Uniform 分布 100 件レンジスキャン。RocksDB データは次回ベンチマーク実行後に追加予定。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-scan-withreorg-uniform" oninput="saveMemo('64kb_ltm-scan-withreorg-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- YCSB-E Timeline -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-indigo-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">YCSB-E — Scan + Insert 混合スループット（30秒タイムライン）</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          YCSB-E ワークロード: 95% Scan（100件レンジスキャン）+ 5% Insert を 32スレッドで 30秒間実行。
+          <strong class="text-indigo-600">縦点線は T1 Reorganize 発生タイミング</strong>を示す。
+          Workload-Adaptive Soft Limit により、スキャン検出時に <code class="bg-slate-100 px-1 rounded text-xs">append_region</code> を
+          L2キャッシュ容量（~26,000件 / 1MB ÷ 40B）以下に保つ。Reorg 直後に走査対象が
+          <code class="bg-slate-100 px-1 rounded text-xs">sorted_region</code> のみになりスキャン QPS が V字回復する。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan QPS タイムライン</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">32 threads / 30 seconds</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-64kb_ltm-ycsb-e-scan"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-64kb_ltm-ycsb-e" oninput="saveMemo('64kb_ltm-ycsb-e', this.value)" placeholder="YCSB-E 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <footer class="border-t border-slate-200 bg-white py-12 px-6 text-center text-xs text-slate-400 mt-24">
+    <div class="max-w-6xl mx-auto">© 2026 VMemKV Project. Benchmark run: 2026-07-15 (git: 9bde41e6fb78)</div>
+  </footer>
+
+  <script>
+    lucide.createIcons();
+
+    const rawData = {
+  "8B_In-Memory": {
+    "Insert": {
+      "RocksDB": [
+        276410.3,
+        413192.8,
+        997914.2,
+        1007354.5
+      ],
+      "Baseline": [
+        2996600.8,
+        4534887.3,
+        7343815.7,
+        6762581.8
+      ],
+      "+BF": [
+        3277382.9,
+        4665067.6,
+        7463290.1,
+        6743490.9
+      ],
+      "+Simd": [
+        3235424.9,
+        4679092.1,
+        7375047.3,
+        6698032.2
+      ],
+      "+Inline": [
+        3820170.9,
+        7521060.4,
+        9458371.0,
+        9761628.1
+      ],
+      "+Prefault": [
+        3826192.9,
+        7478298.2,
+        9246310.4,
+        9168477.9
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "RocksDB": [
+        623192.1,
+        2494467.9,
+        9943640.7,
+        10674610.0
+      ],
+      "Baseline": [
+        1636788.8,
+        6626094.7,
+        25970389.1,
+        38908066.5
+      ],
+      "+BF": [
+        1506941.8,
+        6326958.7,
+        24922657.0,
+        37044838.4
+      ],
+      "+Simd": [
+        1577055.3,
+        6328095.3,
+        24829812.5,
+        37054091.7
+      ],
+      "+Inline": [
+        1748796.0,
+        7419215.2,
+        29403986.5,
+        42394491.6
+      ],
+      "+Prefault": [
+        1752316.0,
+        7527738.0,
+        29459780.9,
+        40123157.3
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "RocksDB": [
+        348886.6,
+        1397400.9,
+        5558056.3,
+        7133335.4
+      ],
+      "Baseline": [
+        855356.0,
+        3354004.6,
+        12633896.2,
+        21953339.1
+      ],
+      "+BF": [
+        844224.0,
+        3276032.2,
+        12350755.2,
+        20932768.1
+      ],
+      "+Simd": [
+        823604.0,
+        3229544.2,
+        12293107.9,
+        20904782.7
+      ],
+      "+Inline": [
+        992569.2,
+        3883935.6,
+        14519394.8,
+        24408011.9
+      ],
+      "+Prefault": [
+        999428.1,
+        3839919.0,
+        14477342.4,
+        24204964.9
+      ]
+    },
+    "Get_Miss": {
+      "RocksDB": [
+        305902.9,
+        1216665.1,
+        4875663.9,
+        4265103.2
+      ],
+      "Baseline": [
+        4952911.5,
+        19879160.5,
+        79485603.7,
+        75789526.3
+      ],
+      "+BF": [
+        6916708.9,
+        22272326.1,
+        111126255.3,
+        109414084.4
+      ],
+      "+Simd": [
+        6729972.0,
+        27081474.9,
+        108262152.6,
+        108856398.2
+      ],
+      "+Inline": [
+        6862476.9,
+        27731155.4,
+        110555599.2,
+        110540223.8
+      ],
+      "+Prefault": [
+        6811733.9,
+        27181486.9,
+        109072817.2,
+        108028517.8
+      ]
+    },
+    "Update": {
+      "RocksDB": [
+        159148.0,
+        344571.0,
+        845040.7,
+        931602.5
+      ],
+      "Baseline": [
+        1557332.3,
+        5527171.0,
+        16843597.9,
+        19248831.3
+      ],
+      "+BF": [
+        1546904.1,
+        4961322.2,
+        16049232.4,
+        18343146.9
+      ],
+      "+Simd": [
+        1524890.6,
+        5297938.8,
+        16233302.1,
+        18336742.2
+      ],
+      "+Inline": [
+        1356173.1,
+        4603506.4,
+        13351594.2,
+        14322091.5
+      ],
+      "+Prefault": [
+        1335288.2,
+        4557967.9,
+        13222377.6,
+        13886223.8
+      ]
+    },
+    "Delete": {
+      "RocksDB": [
+        165550.2,
+        350092.4,
+        934682.5,
+        870828.3
+      ],
+      "Baseline": [
+        2649584.9,
+        8258247.3,
+        23100352.0,
+        23646574.1
+      ],
+      "+BF": [
+        2342747.5,
+        7778212.5,
+        21610992.2,
+        22134426.6
+      ],
+      "+Simd": [
+        2335762.0,
+        7793748.8,
+        21252859.1,
+        22382771.4
+      ],
+      "+Inline": [
+        2085162.1,
+        5962965.3,
+        16921780.9,
+        18340748.4
+      ],
+      "+Prefault": [
+        2094479.7,
+        6015033.7,
+        16525961.7,
+        17957145.0
+      ]
+    },
+    "Scan_WithReorg_Zipf": {
+      "Baseline": [
+        126725.0,
+        501623.4,
+        2005952.4,
+        2265196.3
+      ],
+      "+BF": [
+        126866.4,
+        506808.4,
+        2009064.4,
+        2270450.6
+      ],
+      "+Simd": [
+        126138.3,
+        502788.7,
+        2021053.3,
+        2266628.8
+      ],
+      "+Inline": [
+        125327.0,
+        498813.9,
+        2003475.3,
+        2216758.1
+      ],
+      "+Prefault": [
+        124407.5,
+        499209.5,
+        1996013.5,
+        2208001.9
+      ],
+      "RocksDB": [
+        65470.7,
+        261197.1,
+        1045184.0,
+        863608.0
+      ]
+    },
+    "Scan_WithReorg_Uniform": {
+      "Baseline": [
+        112272.0,
+        445061.1,
+        1770260.0,
+        2160017.8
+      ],
+      "+BF": [
+        112561.9,
+        449984.4,
+        1779486.1,
+        2155444.3
+      ],
+      "+Simd": [
+        112678.2,
+        446661.1,
+        1779209.2,
+        2161864.0
+      ],
+      "+Inline": [
+        117328.3,
+        469660.2,
+        1870550.9,
+        2150424.8
+      ],
+      "+Prefault": [
+        117115.8,
+        466806.9,
+        1865622.1,
+        2141156.2
+      ],
+      "RocksDB": [
+        55848.4,
+        223835.3,
+        894774.9,
+        794668.8
+      ]
+    }
+  },
+  "1KB_In-Memory": {
+    "Insert": {
+      "RocksDB": [
+        173196.3,
+        251855.7,
+        441471.6,
+        424749.4
+      ],
+      "Baseline": [
+        1334686.7,
+        1461354.0,
+        1899737.1,
+        1536105.4
+      ],
+      "+BF": [
+        1337339.0,
+        1465483.8,
+        1837144.2,
+        1529742.8
+      ],
+      "+Simd": [
+        1347840.2,
+        1444382.3,
+        1881004.9,
+        1533375.4
+      ],
+      "+Inline": [
+        1381133.9,
+        1572109.8,
+        2095146.4,
+        1695931.9
+      ],
+      "+Prefault": [
+        1340618.0,
+        2093161.3,
+        3352202.6,
+        4324613.6
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "RocksDB": [
+        266666.5,
+        1010340.2,
+        3816676.3,
+        4554937.0
+      ],
+      "Baseline": [
+        1201829.9,
+        5444126.9,
+        22470113.7,
+        35124414.3
+      ],
+      "+BF": [
+        1132082.2,
+        5441201.1,
+        21795996.3,
+        33332597.6
+      ],
+      "+Simd": [
+        1212515.1,
+        5419307.3,
+        21743034.8,
+        33356387.1
+      ],
+      "+Inline": [
+        1233739.2,
+        5659451.4,
+        22614298.4,
+        34485315.3
+      ],
+      "+Prefault": [
+        1306350.3,
+        5745786.5,
+        22951973.3,
+        33290245.7
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "RocksDB": [
+        159020.0,
+        605442.6,
+        2356040.8,
+        3051027.7
+      ],
+      "Baseline": [
+        713271.9,
+        2870079.3,
+        10925304.5,
+        19024211.2
+      ],
+      "+BF": [
+        704705.1,
+        2829914.0,
+        10736263.9,
+        18204780.7
+      ],
+      "+Simd": [
+        687592.4,
+        2795081.7,
+        10764549.6,
+        18211267.9
+      ],
+      "+Inline": [
+        730068.7,
+        2942948.2,
+        11153748.6,
+        18848528.7
+      ],
+      "+Prefault": [
+        726817.8,
+        2926446.3,
+        11159613.6,
+        18535028.4
+      ]
+    },
+    "Get_Miss": {
+      "RocksDB": [
+        460169.8,
+        1851687.3,
+        7432364.1,
+        6470189.3
+      ],
+      "Baseline": [
+        4264386.2,
+        17954739.1,
+        76005810.9,
+        73744452.2
+      ],
+      "+BF": [
+        4944710.8,
+        21524494.4,
+        91111390.2,
+        98680302.2
+      ],
+      "+Simd": [
+        4928907.1,
+        21199548.7,
+        90841951.6,
+        98816045.7
+      ],
+      "+Inline": [
+        4862057.3,
+        21284976.9,
+        89769103.9,
+        98599253.2
+      ],
+      "+Prefault": [
+        4968466.8,
+        21456139.0,
+        91126314.2,
+        87506005.3
+      ]
+    },
+    "Update": {
+      "RocksDB": [
+        84951.7,
+        192505.4,
+        360924.5,
+        176417.6
+      ],
+      "Baseline": [
+        1046921.5,
+        3761096.7,
+        10885107.2,
+        13869824.1
+      ],
+      "+BF": [
+        1019847.2,
+        3473426.9,
+        8520649.9,
+        9658012.6
+      ],
+      "+Simd": [
+        1023125.9,
+        3610799.5,
+        11034282.6,
+        13762412.6
+      ],
+      "+Inline": [
+        1033808.9,
+        3671755.4,
+        11079037.2,
+        13801853.4
+      ],
+      "+Prefault": [
+        1056792.6,
+        3673972.0,
+        10748033.6,
+        13533198.1
+      ]
+    },
+    "Delete": {
+      "RocksDB": [
+        136911.3,
+        309654.3,
+        747168.7,
+        653447.0
+      ],
+      "Baseline": [
+        2091114.9,
+        6466957.9,
+        16816985.0,
+        17284095.8
+      ],
+      "+BF": [
+        1947086.3,
+        5945821.4,
+        16215670.6,
+        16446331.4
+      ],
+      "+Simd": [
+        1934678.4,
+        5925388.0,
+        15529128.3,
+        16835164.9
+      ],
+      "+Inline": [
+        1916805.7,
+        5869833.6,
+        15771072.4,
+        17572375.5
+      ],
+      "+Prefault": [
+        1987887.5,
+        6016673.2,
+        15645492.6,
+        16544174.2
+      ]
+    },
+    "Scan_WithReorg_Zipf": {
+      "Baseline": [
+        104816.5,
+        424747.6,
+        1699409.9,
+        2044202.2
+      ],
+      "+BF": [
+        104779.7,
+        426467.1,
+        1698251.0,
+        2045357.5
+      ],
+      "+Simd": [
+        104890.2,
+        424915.8,
+        1694275.8,
+        2040402.0
+      ],
+      "+Inline": [
+        122494.0,
+        493661.6,
+        1983026.3,
+        2208888.3
+      ],
+      "+Prefault": [
+        121693.4,
+        491837.7,
+        1975956.4,
+        2192279.3
+      ],
+      "RocksDB": [
+        64069.8,
+        255032.8,
+        1021523.9,
+        851136.2
+      ]
+    },
+    "Scan_WithReorg_Uniform": {
+      "Baseline": [
+        83615.9,
+        334289.0,
+        1260927.5,
+        1638729.0
+      ],
+      "+BF": [
+        83826.6,
+        335095.6,
+        1269865.6,
+        1639567.8
+      ],
+      "+Simd": [
+        82859.7,
+        332973.6,
+        1266793.7,
+        1631026.7
+      ],
+      "+Inline": [
+        112319.3,
+        455209.1,
+        1838501.7,
+        2130476.2
+      ],
+      "+Prefault": [
+        112046.7,
+        454911.8,
+        1833423.4,
+        2124139.3
+      ],
+      "RocksDB": [
+        54679.7,
+        218519.8,
+        881064.8,
+        791066.2
+      ]
+    }
+  },
+  "1KB_LTM": {
+    "Insert": {
+      "RocksDB": [
+        59087.7,
+        130604.7,
+        115984.7,
+        78971.0
+      ],
+      "Baseline": [
+        217323.3,
+        215543.5,
+        379084.1,
+        474087.6
+      ],
+      "+BF": [
+        166058.1,
+        308470.7,
+        431697.2,
+        467592.8
+      ],
+      "+Simd": [
+        210867.6,
+        285029.7,
+        401547.7,
+        436551.0
+      ],
+      "+Inline": [
+        187179.1,
+        325983.5,
+        415312.8,
+        497565.2
+      ],
+      "+Prefault": [
+        230256.9,
+        218345.2,
+        267103.6,
+        308575.9
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "RocksDB": [
+        70625.0,
+        172202.2,
+        600764.0,
+        939447.3
+      ],
+      "Baseline": [
+        50324.4,
+        215223.4,
+        552349.0,
+        867685.6
+      ],
+      "+BF": [
+        60842.2,
+        204955.1,
+        542969.4,
+        861512.7
+      ],
+      "+Simd": [
+        86955.9,
+        230579.9,
+        544866.9,
+        862659.9
+      ],
+      "+Inline": [
+        21457.8,
+        243321.1,
+        705249.0,
+        1113691.9
+      ],
+      "+Prefault": [
+        98593.8,
+        333741.3,
+        904277.0,
+        1437896.4
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "RocksDB": [
+        11392.7,
+        46275.2,
+        144890.3,
+        228770.1
+      ],
+      "Baseline": [
+        13565.0,
+        63917.4,
+        172793.3,
+        253260.3
+      ],
+      "+BF": [
+        13416.0,
+        62988.0,
+        173506.7,
+        251436.4
+      ],
+      "+Simd": [
+        13517.4,
+        63772.3,
+        175673.0,
+        252811.7
+      ],
+      "+Inline": [
+        16651.1,
+        67174.0,
+        219039.0,
+        319970.2
+      ],
+      "+Prefault": [
+        16675.7,
+        65932.4,
+        218340.3,
+        317850.5
+      ]
+    },
+    "Get_Miss": {
+      "RocksDB": [
+        436937.8,
+        1730176.6,
+        6951156.1,
+        6110499.1
+      ],
+      "Baseline": [
+        5215244.6,
+        20873113.9,
+        83486509.3,
+        78760410.9
+      ],
+      "+BF": [
+        6931588.1,
+        27888840.2,
+        111866376.3,
+        108209452.5
+      ],
+      "+Simd": [
+        7021392.0,
+        28348968.3,
+        113868982.6,
+        109107278.6
+      ],
+      "+Inline": [
+        7153899.3,
+        25333824.8,
+        108848670.9,
+        109786712.0
+      ],
+      "+Prefault": [
+        6309972.3,
+        25266708.6,
+        100547470.5,
+        103518931.6
+      ]
+    },
+    "Update": {
+      "RocksDB": [
+        11263.7,
+        50479.3,
+        87740.0,
+        64723.5
+      ],
+      "Baseline": [
+        54813.3,
+        124887.9,
+        244485.5,
+        354698.2
+      ],
+      "+BF": [
+        54301.8,
+        126554.1,
+        257642.1,
+        369288.4
+      ],
+      "+Simd": [
+        26921.8,
+        119028.9,
+        261019.8,
+        356954.9
+      ],
+      "+Inline": [
+        72775.5,
+        127439.0,
+        251959.1,
+        373356.3
+      ],
+      "+Prefault": [
+        119759.9,
+        199927.0,
+        301849.6,
+        428296.6
+      ]
+    },
+    "Delete": {
+      "RocksDB": [
+        57572.4,
+        89687.0,
+        208854.3,
+        271359.6
+      ],
+      "Baseline": [
+        1826914.5,
+        2633692.0,
+        1866169.9,
+        2167666.4
+      ],
+      "+BF": [
+        1513935.5,
+        2175149.2,
+        2042903.0,
+        21833223.0
+      ],
+      "+Simd": [
+        1681254.1,
+        2615158.8,
+        2016737.5,
+        1705972.0
+      ],
+      "+Inline": [
+        1467373.3,
+        1588806.4,
+        2535364.3,
+        2219367.4
+      ],
+      "+Prefault": [
+        1909253.4,
+        4999295.3,
+        4378156.2,
+        8254601.1
+      ]
+    },
+    "Scan_WithReorg_Zipf": {
+      "Baseline": [
+        128864.5,
+        513328.3,
+        2053716.2,
+        2283779.6
+      ],
+      "+BF": [
+        129308.0,
+        513541.2,
+        2061549.8,
+        2289557.2
+      ],
+      "+Simd": [
+        129092.3,
+        506132.3,
+        2035043.9,
+        2280997.3
+      ],
+      "+Inline": [
+        127008.4,
+        505848.5,
+        2025442.0,
+        2229769.1
+      ],
+      "+Prefault": [
+        126714.8,
+        502503.4,
+        2017697.8,
+        2219278.0
+      ],
+      "RocksDB": [
+        100651.6,
+        400548.3,
+        1600319.4,
+        1442099.0
+      ]
+    },
+    "Scan_WithReorg_Uniform": {
+      "Baseline": [
+        114451.2,
+        457623.7,
+        1811049.8,
+        2190504.6
+      ],
+      "+BF": [
+        115163.2,
+        458096.3,
+        1820333.8,
+        2201104.7
+      ],
+      "+Simd": [
+        114110.7,
+        453758.4,
+        1804183.3,
+        2190550.4
+      ],
+      "+Inline": [
+        119262.0,
+        474754.8,
+        1906154.4,
+        2173929.8
+      ],
+      "+Prefault": [
+        119513.9,
+        476020.7,
+        1902828.0,
+        2165855.4
+      ],
+      "RocksDB": [
+        85437.6,
+        347898.2,
+        1385752.8,
+        1342092.7
+      ]
+    }
+  },
+  "64KB_LTM": {
+    "Insert": {
+      "RocksDB": [
+        2128.1,
+        3814.7,
+        4114.3,
+        2986.8
+      ],
+      "Baseline": [
+        12632.6,
+        10014.8,
+        23303.1,
+        25556.5
+      ],
+      "+BF": [
+        4429.1,
+        10184.8,
+        23279.6,
+        26586.7
+      ],
+      "+Simd": [
+        5845.4,
+        10320.6,
+        24668.9,
+        27268.8
+      ],
+      "+Inline": [
+        4412.8,
+        10807.8,
+        24023.5,
+        27173.7
+      ],
+      "+Prefault": [
+        4114.9,
+        8849.5,
+        17840.3,
+        23527.2
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "RocksDB": [
+        14689.5,
+        79178.5,
+        159063.8,
+        167047.7
+      ],
+      "Baseline": [
+        4769372.3,
+        19275537.5,
+        51909613.3,
+        70292652.6
+      ],
+      "+BF": [
+        4769872.4,
+        19025783.5,
+        56381426.3,
+        71436784.7
+      ],
+      "+Simd": [
+        4705123.2,
+        19017575.3,
+        76234456.6,
+        83750081.1
+      ],
+      "+Inline": [
+        4824514.2,
+        19461123.3,
+        77743480.4,
+        76296651.0
+      ],
+      "+Prefault": [
+        4812077.1,
+        18974618.2,
+        76624994.1,
+        76355828.6
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "RocksDB": [
+        6904.7,
+        25591.1,
+        42583.7,
+        42249.5
+      ],
+      "Baseline": [
+        4044511.7,
+        15845684.9,
+        63264248.0,
+        67560589.0
+      ],
+      "+BF": [
+        3901929.2,
+        15788119.5,
+        62595264.8,
+        65681425.8
+      ],
+      "+Simd": [
+        3992179.7,
+        15752447.9,
+        62922474.3,
+        67234154.5
+      ],
+      "+Inline": [
+        4039465.1,
+        16235918.4,
+        66404895.0,
+        72394501.7
+      ],
+      "+Prefault": [
+        3548658.2,
+        14260798.2,
+        57393948.7,
+        77206902.7
+      ]
+    },
+    "Get_Miss": {
+      "RocksDB": [
+        654584.3,
+        2601946.7,
+        10377790.5,
+        9187489.6
+      ],
+      "Baseline": [
+        8544357.3,
+        34218886.5,
+        136101998.7,
+        117485340.5
+      ],
+      "+BF": [
+        8496185.5,
+        33942398.8,
+        135324053.0,
+        117491978.5
+      ],
+      "+Simd": [
+        8494273.7,
+        33923301.5,
+        135272700.2,
+        118451367.1
+      ],
+      "+Inline": [
+        8447270.2,
+        33833278.3,
+        135338352.8,
+        117336988.5
+      ],
+      "+Prefault": [
+        8373742.0,
+        30104266.1,
+        133886404.7,
+        116343403.5
+      ]
+    },
+    "Update": {
+      "RocksDB": [
+        761.1,
+        2091.7,
+        3090.1,
+        1852.2
+      ],
+      "Baseline": [
+        9434.6,
+        21525.5,
+        34615.2,
+        49358.3
+      ],
+      "+BF": [
+        9346.0,
+        19077.1,
+        33570.8,
+        45098.0
+      ],
+      "+Simd": [
+        9426.6,
+        21142.4,
+        33435.6,
+        51152.2
+      ],
+      "+Inline": [
+        9522.8,
+        21939.5,
+        29845.1,
+        42659.3
+      ],
+      "+Prefault": [
+        9928.5,
+        23950.8,
+        36991.7,
+        45450.9
+      ]
+    },
+    "Delete": {
+      "RocksDB": [
+        8529.7,
+        13728.4,
+        42580.0,
+        47752.5
+      ],
+      "Baseline": [
+        776599.4,
+        1357052.4,
+        2182844.1,
+        2486389.2
+      ],
+      "+BF": [
+        768221.4,
+        1221963.9,
+        2264035.4,
+        3157093.8
+      ],
+      "+Simd": [
+        798455.7,
+        1295541.4,
+        2071520.6,
+        2382782.8
+      ],
+      "+Inline": [
+        763021.7,
+        1238276.7,
+        2104125.9,
+        3192366.3
+      ],
+      "+Prefault": [
+        721109.9,
+        1117820.1,
+        2474001.6,
+        2433734.1
+      ]
+    },
+    "Scan_WithReorg_Zipf": {
+      "Baseline": [
+        134124.9,
+        531688.8,
+        2138038.9,
+        2321654.7
+      ],
+      "+BF": [
+        134355.6,
+        536013.4,
+        2135960.4,
+        2329764.2
+      ],
+      "+Simd": [
+        133991.8,
+        535809.9,
+        2139640.2,
+        2322411.0
+      ],
+      "+Inline": [
+        129373.1,
+        515061.8,
+        2065677.2,
+        2265238.3
+      ],
+      "+Prefault": [
+        128976.6,
+        514393.8,
+        2052162.8,
+        2240692.6
+      ],
+      "RocksDB": [
+        105602.8,
+        418341.5,
+        1671713.5,
+        1470933.7
+      ]
+    },
+    "Scan_WithReorg_Uniform": {
+      "Baseline": [
+        130806.5,
+        520938.6,
+        2094829.8,
+        2297331.8
+      ],
+      "+BF": [
+        131566.0,
+        526210.5,
+        2098458.7,
+        2300051.1
+      ],
+      "+Simd": [
+        131221.6,
+        523700.3,
+        2098698.5,
+        2295801.9
+      ],
+      "+Inline": [
+        127830.2,
+        510972.4,
+        2035267.8,
+        2233403.3
+      ],
+      "+Prefault": [
+        127507.1,
+        509119.5,
+        2029665.8,
+        2227229.0
+      ],
+      "RocksDB": [
+        101007.2,
+        373389.2,
+        1600237.8,
+        1414085.8
+      ]
+    }
+  }
+};
+
+    const timelineData = {
+  "8B_In-Memory": {
+    "RocksDB": [
+      {
+        "sec": 1,
+        "scan_ops": 30649,
+        "insert_ops": 1631,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 30784,
+        "insert_ops": 1665,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 30622,
+        "insert_ops": 1531,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 30668,
+        "insert_ops": 1647,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 30771,
+        "insert_ops": 1619,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 30764,
+        "insert_ops": 1599,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 30853,
+        "insert_ops": 1691,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 30593,
+        "insert_ops": 1644,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 30782,
+        "insert_ops": 1647,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 30642,
+        "insert_ops": 1610,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 30549,
+        "insert_ops": 1656,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 30599,
+        "insert_ops": 1612,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 30635,
+        "insert_ops": 1653,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 30819,
+        "insert_ops": 1534,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 30642,
+        "insert_ops": 1636,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 30763,
+        "insert_ops": 1632,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 30680,
+        "insert_ops": 1553,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 30771,
+        "insert_ops": 1620,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 30642,
+        "insert_ops": 1626,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 30659,
+        "insert_ops": 1628,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 30889,
+        "insert_ops": 1716,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 30788,
+        "insert_ops": 1574,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 30807,
+        "insert_ops": 1582,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 30762,
+        "insert_ops": 1578,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 30642,
+        "insert_ops": 1613,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 30447,
+        "insert_ops": 1584,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 30704,
+        "insert_ops": 1613,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 30598,
+        "insert_ops": 1580,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 30787,
+        "insert_ops": 1650,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 30639,
+        "insert_ops": 1635,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "Baseline": [
+      {
+        "sec": 1,
+        "scan_ops": 15382,
+        "insert_ops": 783,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 15387,
+        "insert_ops": 838,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 237779,
+        "insert_ops": 12643,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 121873,
+        "insert_ops": 6460,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 139943,
+        "insert_ops": 7285,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 105180,
+        "insert_ops": 5632,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 84833,
+        "insert_ops": 4365,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 72920,
+        "insert_ops": 3800,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 64993,
+        "insert_ops": 3439,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 163906,
+        "insert_ops": 8503,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 113897,
+        "insert_ops": 6097,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 144577,
+        "insert_ops": 7527,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 102937,
+        "insert_ops": 5450,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 83649,
+        "insert_ops": 4399,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 71939,
+        "insert_ops": 3753,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 69092,
+        "insert_ops": 3638,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 161172,
+        "insert_ops": 8478,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 117225,
+        "insert_ops": 6154,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 141115,
+        "insert_ops": 7481,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 101105,
+        "insert_ops": 5318,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 82683,
+        "insert_ops": 4316,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 71447,
+        "insert_ops": 3838,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 100326,
+        "insert_ops": 5253,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 146696,
+        "insert_ops": 7699,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 127553,
+        "insert_ops": 6717,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 128369,
+        "insert_ops": 6677,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 96687,
+        "insert_ops": 5031,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 79983,
+        "insert_ops": 4250,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 69674,
+        "insert_ops": 3720,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 70051,
+        "insert_ops": 3751,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Prefault": [
+      {
+        "sec": 1,
+        "scan_ops": 276374,
+        "insert_ops": 14671,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121689,
+        "insert_ops": 6488,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93554,
+        "insert_ops": 4866,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 77991,
+        "insert_ops": 4029,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68379,
+        "insert_ops": 3742,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 61642,
+        "insert_ops": 3149,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 126957,
+        "insert_ops": 6626,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 111129,
+        "insert_ops": 5844,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 101056,
+        "insert_ops": 5210,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 126171,
+        "insert_ops": 6772,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 95448,
+        "insert_ops": 4946,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 79418,
+        "insert_ops": 4174,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 69138,
+        "insert_ops": 3602,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 62482,
+        "insert_ops": 3267,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 141665,
+        "insert_ops": 7473,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 109321,
+        "insert_ops": 5724,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 109496,
+        "insert_ops": 5763,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 118234,
+        "insert_ops": 6286,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 91765,
+        "insert_ops": 4873,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 76713,
+        "insert_ops": 4033,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 67623,
+        "insert_ops": 3558,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 61346,
+        "insert_ops": 3156,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 119308,
+        "insert_ops": 6358,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 110394,
+        "insert_ops": 5697,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 103611,
+        "insert_ops": 5606,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 127213,
+        "insert_ops": 6646,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 96241,
+        "insert_ops": 4943,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 79753,
+        "insert_ops": 4250,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 69243,
+        "insert_ops": 3617,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 62461,
+        "insert_ops": 3363,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Inline": [
+      {
+        "sec": 1,
+        "scan_ops": 276204,
+        "insert_ops": 14659,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121687,
+        "insert_ops": 6497,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93561,
+        "insert_ops": 4857,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78058,
+        "insert_ops": 4050,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68300,
+        "insert_ops": 3710,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 61681,
+        "insert_ops": 3161,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 135698,
+        "insert_ops": 7081,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 108123,
+        "insert_ops": 5706,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 91365,
+        "insert_ops": 4761,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 125212,
+        "insert_ops": 6617,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 95346,
+        "insert_ops": 4933,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 79367,
+        "insert_ops": 4205,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 69073,
+        "insert_ops": 3608,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 62252,
+        "insert_ops": 3274,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 122270,
+        "insert_ops": 6422,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 112943,
+        "insert_ops": 5970,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 89907,
+        "insert_ops": 4640,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 126093,
+        "insert_ops": 6714,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 98853,
+        "insert_ops": 5265,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 81007,
+        "insert_ops": 4295,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 70391,
+        "insert_ops": 3699,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 63060,
+        "insert_ops": 3304,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 97753,
+        "insert_ops": 5128,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 124787,
+        "insert_ops": 6472,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 94045,
+        "insert_ops": 5021,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 110189,
+        "insert_ops": 5835,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 107602,
+        "insert_ops": 5576,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 86549,
+        "insert_ops": 4547,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 73731,
+        "insert_ops": 3876,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 65442,
+        "insert_ops": 3463,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Simd": [
+      {
+        "sec": 1,
+        "scan_ops": 11336,
+        "insert_ops": 588,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 11169,
+        "insert_ops": 562,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 58077,
+        "insert_ops": 3070,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 210690,
+        "insert_ops": 11246,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 116046,
+        "insert_ops": 6189,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 109608,
+        "insert_ops": 5648,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 100031,
+        "insert_ops": 5325,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 81816,
+        "insert_ops": 4283,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 71030,
+        "insert_ops": 3686,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 64011,
+        "insert_ops": 3335,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 69223,
+        "insert_ops": 3647,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 133782,
+        "insert_ops": 7019,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 98086,
+        "insert_ops": 5183,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 117950,
+        "insert_ops": 6137,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 112104,
+        "insert_ops": 5892,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 88940,
+        "insert_ops": 4624,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 74798,
+        "insert_ops": 4007,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 66376,
+        "insert_ops": 3500,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 125960,
+        "insert_ops": 6604,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 123812,
+        "insert_ops": 6522,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 98540,
+        "insert_ops": 5233,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 126734,
+        "insert_ops": 6712,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 96023,
+        "insert_ops": 5015,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 79645,
+        "insert_ops": 4153,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 69552,
+        "insert_ops": 3695,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 62436,
+        "insert_ops": 3275,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 130301,
+        "insert_ops": 6852,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 111677,
+        "insert_ops": 5919,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 95792,
+        "insert_ops": 5063,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 125850,
+        "insert_ops": 6490,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+BF": [
+      {
+        "sec": 1,
+        "scan_ops": 276336,
+        "insert_ops": 14672,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121753,
+        "insert_ops": 6489,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93536,
+        "insert_ops": 4861,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78133,
+        "insert_ops": 4070,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68660,
+        "insert_ops": 3719,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 61810,
+        "insert_ops": 3174,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 128292,
+        "insert_ops": 6673,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 111141,
+        "insert_ops": 5839,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 92333,
+        "insert_ops": 4814,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 127626,
+        "insert_ops": 6814,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 96341,
+        "insert_ops": 4990,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 79854,
+        "insert_ops": 4241,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 69703,
+        "insert_ops": 3567,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 62808,
+        "insert_ops": 3293,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 123819,
+        "insert_ops": 6565,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 114189,
+        "insert_ops": 5996,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 95428,
+        "insert_ops": 4959,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 129076,
+        "insert_ops": 6934,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 96735,
+        "insert_ops": 5059,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 79988,
+        "insert_ops": 4199,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 69775,
+        "insert_ops": 3665,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 62709,
+        "insert_ops": 3330,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 135353,
+        "insert_ops": 7054,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 111806,
+        "insert_ops": 5872,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 89353,
+        "insert_ops": 4786,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 117106,
+        "insert_ops": 6142,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 97482,
+        "insert_ops": 5081,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 80655,
+        "insert_ops": 4210,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 69759,
+        "insert_ops": 3600,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 67708,
+        "insert_ops": 3692,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ]
+  },
+  "1KB_In-Memory": {
+    "RocksDB": [
+      {
+        "sec": 1,
+        "scan_ops": 30314,
+        "insert_ops": 1611,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 30357,
+        "insert_ops": 1643,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 30229,
+        "insert_ops": 1511,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 30277,
+        "insert_ops": 1624,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 30373,
+        "insert_ops": 1578,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 30371,
+        "insert_ops": 1573,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 30506,
+        "insert_ops": 1688,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 30172,
+        "insert_ops": 1653,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 30162,
+        "insert_ops": 1616,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 30134,
+        "insert_ops": 1580,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 30112,
+        "insert_ops": 1611,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 30272,
+        "insert_ops": 1598,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 30178,
+        "insert_ops": 1640,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 30397,
+        "insert_ops": 1542,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 30255,
+        "insert_ops": 1578,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 30384,
+        "insert_ops": 1623,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 30125,
+        "insert_ops": 1558,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 30323,
+        "insert_ops": 1567,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 30066,
+        "insert_ops": 1584,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 30177,
+        "insert_ops": 1588,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 30325,
+        "insert_ops": 1661,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 30634,
+        "insert_ops": 1598,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 30258,
+        "insert_ops": 1570,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 30115,
+        "insert_ops": 1548,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 30272,
+        "insert_ops": 1570,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 30245,
+        "insert_ops": 1632,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 30114,
+        "insert_ops": 1519,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 29983,
+        "insert_ops": 1589,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 30168,
+        "insert_ops": 1581,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 30242,
+        "insert_ops": 1640,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "Baseline": [
+      {
+        "sec": 1,
+        "scan_ops": 273231,
+        "insert_ops": 14504,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 122160,
+        "insert_ops": 6540,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93677,
+        "insert_ops": 4876,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78166,
+        "insert_ops": 4045,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68482,
+        "insert_ops": 3700,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 61379,
+        "insert_ops": 3165,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 117872,
+        "insert_ops": 6102,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 115360,
+        "insert_ops": 6157,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 90318,
+        "insert_ops": 4620,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 108073,
+        "insert_ops": 5803,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 105313,
+        "insert_ops": 5444,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 86450,
+        "insert_ops": 4536,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 73297,
+        "insert_ops": 3796,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 65159,
+        "insert_ops": 3414,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 116559,
+        "insert_ops": 6187,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 126723,
+        "insert_ops": 6659,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 95483,
+        "insert_ops": 4945,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 93769,
+        "insert_ops": 5044,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 110309,
+        "insert_ops": 5878,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 87712,
+        "insert_ops": 4608,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 74666,
+        "insert_ops": 3901,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 66066,
+        "insert_ops": 3432,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 59887,
+        "insert_ops": 3236,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 140341,
+        "insert_ops": 7305,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 104354,
+        "insert_ops": 5511,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 84330,
+        "insert_ops": 4532,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 126900,
+        "insert_ops": 6592,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 97314,
+        "insert_ops": 5033,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 80399,
+        "insert_ops": 4208,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 70098,
+        "insert_ops": 3699,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Prefault": [
+      {
+        "sec": 1,
+        "scan_ops": 274890,
+        "insert_ops": 14604,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121983,
+        "insert_ops": 6516,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93606,
+        "insert_ops": 4876,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78115,
+        "insert_ops": 4021,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68134,
+        "insert_ops": 3654,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 59773,
+        "insert_ops": 3138,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 57340,
+        "insert_ops": 2976,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 56370,
+        "insert_ops": 2901,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 117508,
+        "insert_ops": 6209,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 91085,
+        "insert_ops": 4686,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 76764,
+        "insert_ops": 4094,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 68449,
+        "insert_ops": 3655,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 62750,
+        "insert_ops": 3254,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 102847,
+        "insert_ops": 5388,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 84114,
+        "insert_ops": 4420,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 72577,
+        "insert_ops": 3777,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 64177,
+        "insert_ops": 3376,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 58809,
+        "insert_ops": 3131,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 55167,
+        "insert_ops": 2919,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 90184,
+        "insert_ops": 4669,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 101119,
+        "insert_ops": 5354,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 82058,
+        "insert_ops": 4316,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 71938,
+        "insert_ops": 3788,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 64829,
+        "insert_ops": 3519,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 83830,
+        "insert_ops": 4388,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 90662,
+        "insert_ops": 4745,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 76309,
+        "insert_ops": 4020,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 66827,
+        "insert_ops": 3521,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 60766,
+        "insert_ops": 3109,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 56970,
+        "insert_ops": 3091,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Inline": [
+      {
+        "sec": 1,
+        "scan_ops": 273967,
+        "insert_ops": 14545,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121964,
+        "insert_ops": 6521,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93604,
+        "insert_ops": 4879,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78018,
+        "insert_ops": 4009,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68195,
+        "insert_ops": 3705,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 61356,
+        "insert_ops": 3181,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 57414,
+        "insert_ops": 2971,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 53444,
+        "insert_ops": 2748,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 90977,
+        "insert_ops": 4844,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 95712,
+        "insert_ops": 4930,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 79576,
+        "insert_ops": 4203,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 69794,
+        "insert_ops": 3755,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 63751,
+        "insert_ops": 3290,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 58608,
+        "insert_ops": 3034,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 97620,
+        "insert_ops": 5158,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 83068,
+        "insert_ops": 4334,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 71811,
+        "insert_ops": 3770,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 63895,
+        "insert_ops": 3340,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 58616,
+        "insert_ops": 3120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 54926,
+        "insert_ops": 2872,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 88823,
+        "insert_ops": 4706,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 99527,
+        "insert_ops": 5228,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 81945,
+        "insert_ops": 4382,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 71351,
+        "insert_ops": 3739,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 64613,
+        "insert_ops": 3423,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 93745,
+        "insert_ops": 4907,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 89333,
+        "insert_ops": 4731,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 75396,
+        "insert_ops": 3926,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 66851,
+        "insert_ops": 3462,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 60346,
+        "insert_ops": 3147,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Simd": [
+      {
+        "sec": 1,
+        "scan_ops": 274221,
+        "insert_ops": 14569,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121973,
+        "insert_ops": 6506,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93584,
+        "insert_ops": 4885,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78147,
+        "insert_ops": 4030,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 66031,
+        "insert_ops": 3537,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 62057,
+        "insert_ops": 3254,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 56997,
+        "insert_ops": 2926,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 53639,
+        "insert_ops": 2788,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 91220,
+        "insert_ops": 4843,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 96830,
+        "insert_ops": 5009,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 80284,
+        "insert_ops": 4256,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 70696,
+        "insert_ops": 3759,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 68453,
+        "insert_ops": 3584,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 109892,
+        "insert_ops": 5720,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 88027,
+        "insert_ops": 4571,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 74727,
+        "insert_ops": 3964,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 65829,
+        "insert_ops": 3453,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 60089,
+        "insert_ops": 3191,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 56052,
+        "insert_ops": 3008,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 92913,
+        "insert_ops": 4788,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 102511,
+        "insert_ops": 5409,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 83686,
+        "insert_ops": 4474,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 72698,
+        "insert_ops": 3840,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 65096,
+        "insert_ops": 3408,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 87416,
+        "insert_ops": 4552,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 88795,
+        "insert_ops": 4670,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 75280,
+        "insert_ops": 3942,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 66379,
+        "insert_ops": 3493,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 60316,
+        "insert_ops": 3082,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 56328,
+        "insert_ops": 3063,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+BF": [
+      {
+        "sec": 1,
+        "scan_ops": 260387,
+        "insert_ops": 13846,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 124251,
+        "insert_ops": 6557,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 95668,
+        "insert_ops": 5057,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 79364,
+        "insert_ops": 4130,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 63565,
+        "insert_ops": 3338,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 59244,
+        "insert_ops": 3123,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 58076,
+        "insert_ops": 2993,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 54087,
+        "insert_ops": 2851,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 51084,
+        "insert_ops": 2692,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 98418,
+        "insert_ops": 5228,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 87950,
+        "insert_ops": 4522,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 75450,
+        "insert_ops": 3988,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 67432,
+        "insert_ops": 3606,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 79025,
+        "insert_ops": 4036,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 103327,
+        "insert_ops": 5386,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 84751,
+        "insert_ops": 4453,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 72758,
+        "insert_ops": 3840,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 64263,
+        "insert_ops": 3397,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 59144,
+        "insert_ops": 3093,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 55452,
+        "insert_ops": 2839,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 60404,
+        "insert_ops": 3247,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 109164,
+        "insert_ops": 5740,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 87040,
+        "insert_ops": 4661,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 74670,
+        "insert_ops": 3895,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 67046,
+        "insert_ops": 3618,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 85715,
+        "insert_ops": 4521,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 96537,
+        "insert_ops": 4963,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 79809,
+        "insert_ops": 4252,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 69777,
+        "insert_ops": 3618,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 62702,
+        "insert_ops": 3289,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ]
+  },
+  "1KB_LTM": {
+    "RocksDB": [
+      {
+        "sec": 1,
+        "scan_ops": 30314,
+        "insert_ops": 1611,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 30357,
+        "insert_ops": 1643,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 30229,
+        "insert_ops": 1511,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 30277,
+        "insert_ops": 1624,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 30373,
+        "insert_ops": 1578,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 30371,
+        "insert_ops": 1573,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 30506,
+        "insert_ops": 1688,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 30172,
+        "insert_ops": 1653,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 30162,
+        "insert_ops": 1616,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 30134,
+        "insert_ops": 1580,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 30112,
+        "insert_ops": 1611,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 30272,
+        "insert_ops": 1598,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 30178,
+        "insert_ops": 1640,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 30397,
+        "insert_ops": 1542,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 30255,
+        "insert_ops": 1578,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 30384,
+        "insert_ops": 1623,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 30125,
+        "insert_ops": 1558,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 30323,
+        "insert_ops": 1567,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 30066,
+        "insert_ops": 1584,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 30177,
+        "insert_ops": 1588,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 30325,
+        "insert_ops": 1661,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 30634,
+        "insert_ops": 1598,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 30258,
+        "insert_ops": 1570,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 30115,
+        "insert_ops": 1548,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 30272,
+        "insert_ops": 1570,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 30245,
+        "insert_ops": 1632,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 30114,
+        "insert_ops": 1519,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 29983,
+        "insert_ops": 1589,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 30168,
+        "insert_ops": 1581,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 30242,
+        "insert_ops": 1640,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "Baseline": [
+      {
+        "sec": 1,
+        "scan_ops": 273231,
+        "insert_ops": 14504,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 122160,
+        "insert_ops": 6540,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93677,
+        "insert_ops": 4876,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78166,
+        "insert_ops": 4045,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68482,
+        "insert_ops": 3700,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 61379,
+        "insert_ops": 3165,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 117872,
+        "insert_ops": 6102,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 115360,
+        "insert_ops": 6157,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 90318,
+        "insert_ops": 4620,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 108073,
+        "insert_ops": 5803,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 105313,
+        "insert_ops": 5444,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 86450,
+        "insert_ops": 4536,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 73297,
+        "insert_ops": 3796,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 65159,
+        "insert_ops": 3414,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 116559,
+        "insert_ops": 6187,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 126723,
+        "insert_ops": 6659,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 95483,
+        "insert_ops": 4945,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 93769,
+        "insert_ops": 5044,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 110309,
+        "insert_ops": 5878,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 87712,
+        "insert_ops": 4608,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 74666,
+        "insert_ops": 3901,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 66066,
+        "insert_ops": 3432,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 59887,
+        "insert_ops": 3236,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 140341,
+        "insert_ops": 7305,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 104354,
+        "insert_ops": 5511,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 84330,
+        "insert_ops": 4532,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 126900,
+        "insert_ops": 6592,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 97314,
+        "insert_ops": 5033,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 80399,
+        "insert_ops": 4208,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 70098,
+        "insert_ops": 3699,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Prefault": [
+      {
+        "sec": 1,
+        "scan_ops": 274890,
+        "insert_ops": 14604,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121983,
+        "insert_ops": 6516,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93606,
+        "insert_ops": 4876,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78115,
+        "insert_ops": 4021,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68134,
+        "insert_ops": 3654,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 59773,
+        "insert_ops": 3138,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 57340,
+        "insert_ops": 2976,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 56370,
+        "insert_ops": 2901,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 117508,
+        "insert_ops": 6209,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 91085,
+        "insert_ops": 4686,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 76764,
+        "insert_ops": 4094,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 68449,
+        "insert_ops": 3655,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 62750,
+        "insert_ops": 3254,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 102847,
+        "insert_ops": 5388,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 84114,
+        "insert_ops": 4420,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 72577,
+        "insert_ops": 3777,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 64177,
+        "insert_ops": 3376,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 58809,
+        "insert_ops": 3131,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 55167,
+        "insert_ops": 2919,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 90184,
+        "insert_ops": 4669,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 101119,
+        "insert_ops": 5354,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 82058,
+        "insert_ops": 4316,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 71938,
+        "insert_ops": 3788,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 64829,
+        "insert_ops": 3519,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 83830,
+        "insert_ops": 4388,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 90662,
+        "insert_ops": 4745,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 76309,
+        "insert_ops": 4020,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 66827,
+        "insert_ops": 3521,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 60766,
+        "insert_ops": 3109,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 56970,
+        "insert_ops": 3091,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Inline": [
+      {
+        "sec": 1,
+        "scan_ops": 273967,
+        "insert_ops": 14545,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121964,
+        "insert_ops": 6521,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93604,
+        "insert_ops": 4879,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78018,
+        "insert_ops": 4009,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 68195,
+        "insert_ops": 3705,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 61356,
+        "insert_ops": 3181,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 57414,
+        "insert_ops": 2971,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 53444,
+        "insert_ops": 2748,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 90977,
+        "insert_ops": 4844,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 95712,
+        "insert_ops": 4930,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 79576,
+        "insert_ops": 4203,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 69794,
+        "insert_ops": 3755,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 63751,
+        "insert_ops": 3290,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 58608,
+        "insert_ops": 3034,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 97620,
+        "insert_ops": 5158,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 83068,
+        "insert_ops": 4334,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 71811,
+        "insert_ops": 3770,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 63895,
+        "insert_ops": 3340,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 58616,
+        "insert_ops": 3120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 54926,
+        "insert_ops": 2872,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 88823,
+        "insert_ops": 4706,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 99527,
+        "insert_ops": 5228,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 81945,
+        "insert_ops": 4382,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 71351,
+        "insert_ops": 3739,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 64613,
+        "insert_ops": 3423,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 93745,
+        "insert_ops": 4907,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 89333,
+        "insert_ops": 4731,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 75396,
+        "insert_ops": 3926,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 66851,
+        "insert_ops": 3462,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 60346,
+        "insert_ops": 3147,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Simd": [
+      {
+        "sec": 1,
+        "scan_ops": 274221,
+        "insert_ops": 14569,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 121973,
+        "insert_ops": 6506,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 93584,
+        "insert_ops": 4885,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 78147,
+        "insert_ops": 4030,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 66031,
+        "insert_ops": 3537,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 62057,
+        "insert_ops": 3254,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 56997,
+        "insert_ops": 2926,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 53639,
+        "insert_ops": 2788,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 91220,
+        "insert_ops": 4843,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 96830,
+        "insert_ops": 5009,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 80284,
+        "insert_ops": 4256,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 70696,
+        "insert_ops": 3759,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 68453,
+        "insert_ops": 3584,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 109892,
+        "insert_ops": 5720,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 88027,
+        "insert_ops": 4571,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 74727,
+        "insert_ops": 3964,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 65829,
+        "insert_ops": 3453,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 60089,
+        "insert_ops": 3191,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 56052,
+        "insert_ops": 3008,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 92913,
+        "insert_ops": 4788,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 102511,
+        "insert_ops": 5409,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 83686,
+        "insert_ops": 4474,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 72698,
+        "insert_ops": 3840,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 65096,
+        "insert_ops": 3408,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 87416,
+        "insert_ops": 4552,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 88795,
+        "insert_ops": 4670,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 75280,
+        "insert_ops": 3942,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 66379,
+        "insert_ops": 3493,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 60316,
+        "insert_ops": 3082,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 56328,
+        "insert_ops": 3063,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+BF": [
+      {
+        "sec": 1,
+        "scan_ops": 260387,
+        "insert_ops": 13846,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 124251,
+        "insert_ops": 6557,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 95668,
+        "insert_ops": 5057,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 79364,
+        "insert_ops": 4130,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 63565,
+        "insert_ops": 3338,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 59244,
+        "insert_ops": 3123,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 58076,
+        "insert_ops": 2993,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 54087,
+        "insert_ops": 2851,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 51084,
+        "insert_ops": 2692,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 98418,
+        "insert_ops": 5228,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 87950,
+        "insert_ops": 4522,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 75450,
+        "insert_ops": 3988,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 67432,
+        "insert_ops": 3606,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 79025,
+        "insert_ops": 4036,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 103327,
+        "insert_ops": 5386,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 84751,
+        "insert_ops": 4453,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 72758,
+        "insert_ops": 3840,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 64263,
+        "insert_ops": 3397,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 59144,
+        "insert_ops": 3093,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 55452,
+        "insert_ops": 2839,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 60404,
+        "insert_ops": 3247,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 109164,
+        "insert_ops": 5740,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 87040,
+        "insert_ops": 4661,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 74670,
+        "insert_ops": 3895,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 67046,
+        "insert_ops": 3618,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 85715,
+        "insert_ops": 4521,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 96537,
+        "insert_ops": 4963,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 79809,
+        "insert_ops": 4252,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 69777,
+        "insert_ops": 3618,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 62702,
+        "insert_ops": 3289,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ]
+  },
+  "64KB_LTM": {
+    "RocksDB": [
+      {
+        "sec": 1,
+        "scan_ops": 1268,
+        "insert_ops": 61,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 1317,
+        "insert_ops": 62,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 1652,
+        "insert_ops": 88,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 1404,
+        "insert_ops": 69,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 1300,
+        "insert_ops": 81,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 1311,
+        "insert_ops": 58,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 1294,
+        "insert_ops": 54,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 1252,
+        "insert_ops": 77,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 1312,
+        "insert_ops": 69,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 1352,
+        "insert_ops": 69,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 1339,
+        "insert_ops": 69,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1283,
+        "insert_ops": 62,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 1099,
+        "insert_ops": 47,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 1318,
+        "insert_ops": 68,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 1329,
+        "insert_ops": 71,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 1334,
+        "insert_ops": 57,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 1298,
+        "insert_ops": 87,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 1271,
+        "insert_ops": 77,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 1420,
+        "insert_ops": 78,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 1328,
+        "insert_ops": 70,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 1332,
+        "insert_ops": 75,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 1401,
+        "insert_ops": 102,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 1353,
+        "insert_ops": 69,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 1196,
+        "insert_ops": 65,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 1346,
+        "insert_ops": 68,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 1389,
+        "insert_ops": 78,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 1403,
+        "insert_ops": 71,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 1318,
+        "insert_ops": 76,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 1348,
+        "insert_ops": 67,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 1405,
+        "insert_ops": 63,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "Baseline": [
+      {
+        "sec": 1,
+        "scan_ops": 18376,
+        "insert_ops": 929,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 206003,
+        "insert_ops": 10917,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 134442,
+        "insert_ops": 7137,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 102166,
+        "insert_ops": 5378,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 85038,
+        "insert_ops": 4403,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 99118,
+        "insert_ops": 5310,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 193896,
+        "insert_ops": 10089,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 124936,
+        "insert_ops": 6509,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 100239,
+        "insert_ops": 5293,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 85611,
+        "insert_ops": 4560,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 73231,
+        "insert_ops": 3820,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 184311,
+        "insert_ops": 9585,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 133246,
+        "insert_ops": 7073,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 116057,
+        "insert_ops": 6031,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 91636,
+        "insert_ops": 4838,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 78594,
+        "insert_ops": 4059,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 69832,
+        "insert_ops": 3704,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 124944,
+        "insert_ops": 6715,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 132753,
+        "insert_ops": 7040,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 101410,
+        "insert_ops": 5285,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 85892,
+        "insert_ops": 4460,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 74872,
+        "insert_ops": 3875,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 52020,
+        "insert_ops": 2814,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 98472,
+        "insert_ops": 5194,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 112869,
+        "insert_ops": 5818,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 90181,
+        "insert_ops": 4709,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 79877,
+        "insert_ops": 4214,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 69422,
+        "insert_ops": 3676,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 56942,
+        "insert_ops": 3064,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 41106,
+        "insert_ops": 2229,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Prefault": [
+      {
+        "sec": 1,
+        "scan_ops": 11281,
+        "insert_ops": 577,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 181936,
+        "insert_ops": 9552,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 164505,
+        "insert_ops": 8811,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 114272,
+        "insert_ops": 5992,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 93801,
+        "insert_ops": 4872,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 76556,
+        "insert_ops": 4131,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 108316,
+        "insert_ops": 5608,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 174751,
+        "insert_ops": 9102,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 158100,
+        "insert_ops": 8302,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 112406,
+        "insert_ops": 5989,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 87740,
+        "insert_ops": 4546,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 74728,
+        "insert_ops": 3863,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 63100,
+        "insert_ops": 3351,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 155305,
+        "insert_ops": 8106,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 163026,
+        "insert_ops": 8561,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 112432,
+        "insert_ops": 6002,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 92856,
+        "insert_ops": 4987,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 81483,
+        "insert_ops": 4228,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 64033,
+        "insert_ops": 3368,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 79911,
+        "insert_ops": 4175,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 122422,
+        "insert_ops": 6519,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 118098,
+        "insert_ops": 6113,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 94527,
+        "insert_ops": 5025,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 79108,
+        "insert_ops": 4225,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 70808,
+        "insert_ops": 3664,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 52373,
+        "insert_ops": 2590,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 61578,
+        "insert_ops": 3253,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 97408,
+        "insert_ops": 5086,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 81931,
+        "insert_ops": 4488,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 70196,
+        "insert_ops": 3695,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Inline": [
+      {
+        "sec": 1,
+        "scan_ops": 12058,
+        "insert_ops": 610,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 132704,
+        "insert_ops": 6972,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 181016,
+        "insert_ops": 9622,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 115219,
+        "insert_ops": 6074,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 93045,
+        "insert_ops": 4829,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 74638,
+        "insert_ops": 4017,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 168961,
+        "insert_ops": 8817,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 169608,
+        "insert_ops": 8965,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 108195,
+        "insert_ops": 5585,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 44806,
+        "insert_ops": 2400,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 87004,
+        "insert_ops": 4516,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 67624,
+        "insert_ops": 3535,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 134358,
+        "insert_ops": 7145,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 169463,
+        "insert_ops": 8818,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 116031,
+        "insert_ops": 6072,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 89253,
+        "insert_ops": 4733,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 75627,
+        "insert_ops": 4052,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 62144,
+        "insert_ops": 3313,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 132973,
+        "insert_ops": 6939,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 143215,
+        "insert_ops": 7560,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 103654,
+        "insert_ops": 5432,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 81897,
+        "insert_ops": 4268,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 74724,
+        "insert_ops": 3976,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 56455,
+        "insert_ops": 3011,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 84615,
+        "insert_ops": 4450,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 105337,
+        "insert_ops": 5509,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 87626,
+        "insert_ops": 4591,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 79594,
+        "insert_ops": 4182,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 73512,
+        "insert_ops": 3864,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 65529,
+        "insert_ops": 3341,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+Simd": [
+      {
+        "sec": 1,
+        "scan_ops": 11423,
+        "insert_ops": 589,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 150064,
+        "insert_ops": 7865,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 171577,
+        "insert_ops": 9150,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 111702,
+        "insert_ops": 5902,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 90934,
+        "insert_ops": 4661,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 73620,
+        "insert_ops": 3956,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 155623,
+        "insert_ops": 8189,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 186650,
+        "insert_ops": 9753,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 119178,
+        "insert_ops": 6284,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 92819,
+        "insert_ops": 4842,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 79232,
+        "insert_ops": 4222,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 84437,
+        "insert_ops": 4395,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 156967,
+        "insert_ops": 8212,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 134775,
+        "insert_ops": 7058,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 109668,
+        "insert_ops": 5822,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 84685,
+        "insert_ops": 4457,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 77118,
+        "insert_ops": 4092,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 66657,
+        "insert_ops": 3510,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 133771,
+        "insert_ops": 6995,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 129362,
+        "insert_ops": 6851,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 96849,
+        "insert_ops": 5053,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 83904,
+        "insert_ops": 4422,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 73411,
+        "insert_ops": 3839,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 54968,
+        "insert_ops": 2917,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 89638,
+        "insert_ops": 4806,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 109660,
+        "insert_ops": 5687,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 93670,
+        "insert_ops": 4878,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 76210,
+        "insert_ops": 4044,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 70404,
+        "insert_ops": 3726,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 63822,
+        "insert_ops": 3383,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      }
+    ],
+    "+BF": [
+      {
+        "sec": 1,
+        "scan_ops": 18106,
+        "insert_ops": 914,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 206408,
+        "insert_ops": 10933,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 132066,
+        "insert_ops": 7054,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 101921,
+        "insert_ops": 5317,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 82304,
+        "insert_ops": 4276,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 108898,
+        "insert_ops": 5828,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 159509,
+        "insert_ops": 8348,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 125953,
+        "insert_ops": 6506,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 105803,
+        "insert_ops": 5549,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 86669,
+        "insert_ops": 4587,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 71015,
+        "insert_ops": 3692,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 156781,
+        "insert_ops": 8133,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 163589,
+        "insert_ops": 8740,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 115111,
+        "insert_ops": 6101,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 89909,
+        "insert_ops": 4702,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 78917,
+        "insert_ops": 4056,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 70076,
+        "insert_ops": 3694,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 143345,
+        "insert_ops": 7628,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 126072,
+        "insert_ops": 6628,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 98894,
+        "insert_ops": 5156,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 80099,
+        "insert_ops": 4197,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 70897,
+        "insert_ops": 3742,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 80636,
+        "insert_ops": 4280,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 86521,
+        "insert_ops": 4595,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 116289,
+        "insert_ops": 5982,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 95459,
+        "insert_ops": 5105,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 80875,
+        "insert_ops": 4289,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 73076,
+        "insert_ops": 3829,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 65576,
+        "insert_ops": 3446,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 49953,
+        "insert_ops": 2650,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0
+      }
+    ]
+  }
+};
+
+    const workloads = ["Insert","Update","Delete","Get_Miss","Get_Hit_Zipf","Get_Hit_Uniform","Scan_WithReorg_Zipf","Scan_WithReorg_Uniform"];
+    const valSizes  = ["8B_In-Memory","1KB_In-Memory","1KB_LTM","64KB_LTM"];
+
+    const colors = {
+      'RocksDB':'#64748b', 'Baseline':'#94a3b8',
+      '+BF':'#f59e0b', '+Simd':'#38bdf8', '+Inline':'#6366f1', '+Prefault':'#ec4899'
+    };
+    const variantOrder = ['RocksDB','Baseline','+BF','+Simd','+Inline','+Prefault'];
+    const threadLabels = ['1 Thread','4 Threads','16 Threads','32 Threads'];
+
+    // ── Tab switching ──────────────────────────────────────────────────────────
+    function switchTab(tabId) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+      document.getElementById(tabId).classList.add('active');
+      document.getElementById('btn-' + tabId).classList.add('active');
+    }
+
+    // ── LocalStorage memos ──────────────────────────────────────────────────────
+    function saveMemo(key, val) {
+      try { localStorage.setItem('vmemkv-2026071600-memo-' + key, val); } catch(e) {}
+    }
+    function initMemos() {
+      document.querySelectorAll('textarea[id^="memo-"]').forEach(el => {
+        const key = el.id.replace('memo-', '');
+        try {
+          const saved = localStorage.getItem('vmemkv-2026071600-memo-' + key);
+          if (saved) el.value = saved;
+        } catch(e) {}
+      });
+    }
+
+    // ── Number formatting ──────────────────────────────────────────────────────
+    function formatVal(v) {
+      if (v >= 1e9) return (v/1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
+      if (v >= 1e6) return (v/1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+      if (v >= 1e3) return (v/1e3).toFixed(1).replace(/\.0$/, '') + 'k';
+      return v.toString();
+    }
+
+    // ── Speedup badge ──────────────────────────────────────────────────────────
+    function updateSpeedupBadge(valSize, op) {
+      const badgeKey = valSize.toLowerCase().replace(/-/g,'_') + '-' + op.toLowerCase().replace(/_/g,'-');
+      const badge = document.getElementById('badge-' + badgeKey);
+      if (!badge) return;
+      const opData = (rawData[valSize] || {})[op];
+      if (!opData || !opData['RocksDB']) { badge.classList.add('hidden'); return; }
+      const rocksValues = opData['RocksDB'];
+      let maxSpeedup = 0, bestThread = 0;
+      for (const [variant, values] of Object.entries(opData)) {
+        if (variant === 'RocksDB') continue;
+        values.forEach((v, idx) => {
+          const rv = rocksValues[idx];
+          if (!rv || !v) return;
+          const r = v / rv;
+          if (r > maxSpeedup) { maxSpeedup = r; bestThread = [1,4,16,32][idx]; }
+        });
+      }
+      if (maxSpeedup === 0) { badge.classList.add('hidden'); return; }
+      badge.classList.remove('hidden');
+      if (maxSpeedup >= 1) {
+        badge.className = 'text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5';
+        badge.textContent = `⚡ Max Speedup: ${maxSpeedup.toFixed(1)}x (${bestThread} Thr)`;
+      } else {
+        badge.className = 'text-[11px] font-semibold bg-rose-50 text-rose-700 border border-rose-100 rounded-full px-2.5 py-0.5';
+        badge.textContent = `⚠️ Slowdown: ${(1/maxSpeedup).toFixed(1)}x (${bestThread} Thr)`;
+      }
+    }
+
+    // ── Workload chart config ──────────────────────────────────────────────────
+    function makeChartConfig(valSize, op) {
+      const opData = (rawData[valSize] || {})[op];
+      if (!opData) return null;
+      const rocksData = opData['RocksDB'];
+      const datasets = variantOrder.filter(v => opData[v]).map(variantName => {
+        const isRocks = variantName === 'RocksDB';
+        const col = colors[variantName] || '#6366f1';
+        return {
+          label: variantName,
+          data: opData[variantName],
+          borderColor: col,
+          backgroundColor: ctx => {
+            const {chartArea, ctx: c} = ctx.chart;
+            if (!chartArea) return null;
+            const g = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+            g.addColorStop(0, col + '25'); g.addColorStop(1, col + '00');
+            return g;
+          },
+          borderWidth: isRocks ? 2.5 : 2,
+          borderDash: isRocks ? [6,6] : [],
+          tension: 0.15, fill: true,
+          pointStyle: isRocks ? 'triangle' : 'circle',
+          pointRadius: isRocks ? 5 : 3.5,
+          pointHoverRadius: isRocks ? 7 : 5.5,
+          hoverBorderWidth: 3
+        };
+      });
+      if (!datasets.length) return null;
+      return {
+        type: 'line',
+        data: { labels: threadLabels, datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          hover: { mode: 'dataset', intersect: false },
+          onHover(event, active, chart) {
+            const ds = chart.data.datasets;
+            if (active.length > 0) {
+              const ai = active[0].datasetIndex;
+              ds.forEach((d, i) => {
+                const bc = colors[d.label] || '#6366f1';
+                const ir = d.label === 'RocksDB';
+                if (i === ai) { d.borderColor = bc; d.borderWidth = ir ? 3.5 : 3; }
+                else { d.borderColor = bc + '18'; d.borderWidth = ir ? 1.5 : 1; }
+              });
+            } else {
+              ds.forEach(d => {
+                d.borderColor = colors[d.label] || '#6366f1';
+                d.borderWidth = d.label === 'RocksDB' ? 2.5 : 2;
+              });
+            }
+            chart.update('none');
+          },
+          plugins: {
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode:'index', intersect:false,
+              backgroundColor:'rgba(15,23,42,0.95)',
+              titleFont:{size:12,family:'Inter',weight:'bold'},
+              bodyFont:{size:11,family:'Inter'},
+              padding:10, cornerRadius:8, boxWidth:8, boxHeight:8, usePointStyle:true,
+              callbacks: {
+                label(context) {
+                  const label = context.dataset.label || '';
+                  const v = context.raw || 0;
+                  const fv = formatVal(v);
+                  if (label === 'RocksDB' || !rocksData) return ` ${label}: ${fv}/s`;
+                  const rv = rocksData[context.dataIndex] || 0;
+                  if (!rv) return ` ${label}: ${fv}/s`;
+                  const ratio = v / rv;
+                  const badge = ratio >= 1
+                    ? ` (+${((ratio-1)*100).toFixed(0)}% vs RDB)`
+                    : ` (${((ratio-1)*100).toFixed(0)}% vs RDB)`;
+                  return ` ${label}: ${fv}/s${badge}`;
+                }
+              }
+            }
+          },
+          scales: {
+            x: { grid:{color:'rgba(100,116,139,0.08)'}, ticks:{font:{size:11,family:'Inter'},color:'#94a3b8'} },
+            y: { grid:{color:'rgba(100,116,139,0.08)'}, ticks:{font:{size:11,family:'Inter'},color:'#94a3b8',callback:v=>formatVal(v)} }
+          }
+        }
+      };
+    }
+
+    // ── YCSB-E Reorg vertical-line plugin ──────────────────────────────────────
+    const reorgLinesPlugin = {
+      id: 'reorgLines',
+      afterDraw(chart, _args, opts) {
+        const secs = opts.reorgSecs || [];
+        if (!secs.length) return;
+        const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(99,102,241,0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5,4]);
+        for (const s of secs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.restore();
+      }
+    };
+    Chart.register(reorgLinesPlugin);
+
+    // ── YCSB-E timeline chart config ───────────────────────────────────────────
+    function makeYcsbTimelineConfig(valSizeKey) {
+      const tl = timelineData[valSizeKey];
+      if (!tl || !Object.keys(tl).length) return null;
+
+      // Compute reorg second indices (union across all variants)
+      const reorgSecs = [];
+      for (const data of Object.values(tl)) {
+        data.forEach((d,i) => { if (d.t1_reorg_ops > 0 && !reorgSecs.includes(i+1)) reorgSecs.push(i+1); });
+      }
+      reorgSecs.sort((a,b) => a-b);
+
+      const datasets = variantOrder.filter(v => tl[v] && tl[v].length).map(v => {
+        const isRocks = v === 'RocksDB';
+        const col = colors[v] || '#6366f1';
+        return {
+          label: v,
+          data: tl[v].map((d,i) => ({ x: i+1, y: d.scan_ops })),
+          borderColor: col,
+          backgroundColor: 'transparent',
+          borderWidth: isRocks ? 2.5 : 1.8,
+          borderDash: isRocks ? [6,6] : [],
+          tension: 0.25, fill: false,
+          pointStyle: 'circle', pointRadius: 0, pointHoverRadius: 4
+        };
+      });
+      if (!datasets.length) return null;
+
+      return {
+        type: 'line',
+        data: { datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            reorgLines: { reorgSecs },
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => {
+                  const s = items[0].raw.x;
+                  return `Second ${s}${reorgSecs.includes(s) ? '  ⟳ T1 Reorg' : ''}`;
+                },
+                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
+              }
+            }
+          },
+          scales: {
+            x: {
+              type: 'linear', min: 1, max: 30,
+              title: { display:true, text:'Elapsed Time (sec)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { stepSize:5, font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            },
+            y: {
+              title: { display:true, text:'Scan Ops / sec', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            }
+          }
+        }
+      };
+    }
+
+    // ── Init all charts ────────────────────────────────────────────────────────
+    function initCharts() {
+      for (const valSize of valSizes) {
+        for (const op of workloads) {
+          const eid = valSize.toLowerCase().replace(/-/g,'_') + '-' + op.toLowerCase().replace(/_/g,'-');
+          const canvas = document.getElementById('chart-' + eid);
+          if (!canvas) continue;
+          const cfg = makeChartConfig(valSize, op);
+          if (!cfg) continue;
+          const chart = new Chart(canvas, cfg);
+          canvas.addEventListener('mouseout', () => {
+            chart.data.datasets.forEach(d => {
+              d.borderColor = colors[d.label] || '#6366f1';
+              d.borderWidth = d.label === 'RocksDB' ? 2.5 : 2;
+            });
+            chart.update('none');
+          });
+          updateSpeedupBadge(valSize, op);
+        }
+        // YCSB-E timeline
+        const yeid = valSize.toLowerCase().replace(/-/g,'_') + '-ycsb-e';
+        const scanCanvas = document.getElementById('chart-' + yeid + '-scan');
+        if (scanCanvas) {
+          const cfg = makeYcsbTimelineConfig(valSize);
+          if (cfg) new Chart(scanCanvas, cfg);
+        }
+      }
+    }
+
+    initMemos();
+    initCharts();
+  </script>
+</body>
+</html>

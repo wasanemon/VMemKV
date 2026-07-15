@@ -21,60 +21,42 @@ namespace vmemkv {
 // This Concept serves as the formal interface contract of VMemKV.
 // Any KVStore implementation must satisfy this constraint.
 template <typename Store>
-concept KVStore = requires(Store store,
-                           std::span<const std::byte> key,
-                           std::span<const std::byte> value,
-                           std::string_view key_str,
-                           uint64_t value_u64) {
+concept KVStore = requires(Store store, std::span<const std::byte> key, std::span<const std::byte> value) {
   // Core byte-span interfaces
   { store.insert(key, value) } -> std::same_as<bool>;
-  { store.get(key) } -> std::same_as<uint64_t>;
   { store.update(key, value) } -> std::same_as<bool>;
   { store.remove(key) } -> std::same_as<bool>;
-  { store.get_bytes(key) } -> std::same_as<std::optional<std::vector<std::byte>>>;
 
-  // Serialization helper interfaces (syntactic sugar)
-  { store.insert(key_str, value_u64) } -> std::same_as<bool>;
-  { store.get(key_str) } -> std::same_as<uint64_t>;
-  { store.update(key_str, value_u64) } -> std::same_as<bool>;
+  // get is now a callback-based API accepting a callable that processes std::span<const std::byte>
+  store.get(key, [](std::span<const std::byte>) {});
 };
 
 // ─── Production Recommended Store ──────────────────────────────────────────
 using VMemKVStore = StoreAdapter<VMemKVImpl<detail::System_AllOn>>;
 
+namespace variants {
+
 // ─── Baseline Plain Store ──────────────────────────────────────────────────
-using VMemKVBaselineStore = StoreAdapter<VMemKVImpl<detail::T1_AllOff>>;
+using VMemKV_Baseline = StoreAdapter<VMemKVImpl<detail::T1_AllOff>>;
 
 using VMemKVRocksDB = StoreAdapter<::RocksDBStore>;
 
-namespace variants {
-// ─── 1. Base Store & RocksDB ───
-using VMemKV_Baseline = VMemKVBaselineStore;
+// ─── 1. Core Stacked Ablation Variants ───
+using VMemKV_Var0_Baseline = VMemKV_Baseline;
+using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
+using VMemKV_Var2_Simd = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan>>>;
+using VMemKV_Var3_Inline = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, T1InlineValue>>>;
+using VMemKV_Var4_Prefault = VMemKVStore;  // Fully optimized production configuration
+using VMemKVStore = VMemKVStore;
+
 using VMemKV_RocksDB = VMemKVRocksDB;
 
-// ─── 2. In-Memory Evaluation Targets (DRAM Ablation) ───
-using VMemKV_InMem_Simd = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan>>>;
-using VMemKV_InMem_Inline = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, T1InlineValue>>>;
-using VMemKV_InMem_Prefault = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan, T1InlineValue, Prefaulting>>>;
-
-// ─── 3. Larger-than-Memory Evaluation Targets (LTM Ablation) ───
-using VMemKV_LTM_Baseline = StoreAdapter<VMemKVImpl<Config<SimdScan>>>;
-using VMemKV_LTM_Bloom = StoreAdapter<VMemKVImpl<Config<SimdScan, BloomFilter>>>;
-using VMemKV_LTM_Hints = StoreAdapter<VMemKVImpl<Config<SimdScan, BloomFilter, MemoryHints>>>;
-using VMemKV_LTM_Inline = VMemKVStore;  // Fully optimized production configuration
-using VMemKV_LTM_Prefault =
-    StoreAdapter<VMemKVImpl<Config<SimdScan, BloomFilter, MemoryHints, T1InlineValue, Prefaulting>>>;
-
-// ─── 4. Unified Benchmark Registration Tuple ───
-using AllPossibleTypes = std::tuple<VMemKV_Baseline,
-                                    VMemKV_InMem_Simd,
-                                    VMemKV_InMem_Inline,
-                                    VMemKV_InMem_Prefault,
-                                    VMemKV_LTM_Baseline,
-                                    VMemKV_LTM_Bloom,
-                                    VMemKV_LTM_Hints,
-                                    VMemKV_LTM_Inline,
-                                    VMemKV_LTM_Prefault,
+// ─── 2. Unified Benchmark Registration Tuple ───
+using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
+                                    VMemKV_Var1_Bloom,
+                                    VMemKV_Var2_Simd,
+                                    VMemKV_Var3_Inline,
+                                    VMemKV_Var4_Prefault,
                                     VMemKV_RocksDB>;
 }  // namespace variants
 

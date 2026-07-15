@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <execution>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <span>
 #include <type_traits>
@@ -20,7 +21,6 @@
 #include "../core/lock_free_hash_table.hpp"
 #include "../core/reference_tracker.hpp"
 #include "../optimizations/bloom_filter.hpp"
-#include "../optimizations/memory_hints.hpp"
 #include "../optimizations/simd_scan.hpp"
 
 inline constexpr std::size_t kStoreKeyBytes = 16;
@@ -134,9 +134,6 @@ class T1Index {
     auto *active = new AppendRegion();
     auto *active_index = new AppendIndex();
     active_index->clear();
-    if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(active->data(), active->capacity_bytes());
-    }
     append_active_.store(active, std::memory_order_release);
     append_active_index_.store(active_index, std::memory_order_release);
     sorted_region_.store(new SortedRegion(), std::memory_order_release);
@@ -293,16 +290,85 @@ class T1Index {
     const AppendRegion *active = append_active_.load(std::memory_order_acquire);
     const AppendRegion *imm = append_immutable_.load(std::memory_order_acquire);
 
-    std::vector<EntrySnapshot> merged = collect_live_entries(sorted, active, imm);
-    sort_and_dedup_entries(merged);
+    struct ScanCandidate {
+      Key key;
+      Payload payload_bits;
+      uint64_t hash;
+      int gen;  // 0: sorted, 1: imm, 2: active (newest)
+    };
 
-    size_t match_count = 0;
-    for (const auto &entry : merged) {
-      if (!(entry.key < lower_bound) && !(upper_bound < entry.key)) {
-        callback(std::span<const std::byte>(entry.key), entry.payload_bits, entry.hash);
-        ++match_count;
+    // Use a stack buffer of 16KB to hold up to ~500 scan candidates without any heap allocations
+    std::array<std::byte, 16384> stack_buf;
+    std::pmr::monotonic_buffer_resource mem_res(stack_buf.data(), stack_buf.size());
+    std::pmr::vector<ScanCandidate> candidates(&mem_res);
+
+    // 1. Extract from sorted_region using binary search (O(log S))
+    if (sorted && sorted->size > 0) {
+      const SortedSlot *slots_begin = sorted->slots.get();
+      const SortedSlot *slots_end = slots_begin + sorted->size;
+      const SortedSlot *it_start =
+          std::lower_bound(slots_begin, slots_end, lower_bound, [](const SortedSlot &slot, const StoreKey &bound) {
+            return slot.key < bound;
+          });
+      for (const SortedSlot *it = it_start; it < slots_end; ++it) {
+        if (upper_bound < it->key) {
+          break;
+        }
+        Payload val = it->payload_bits.load(std::memory_order_relaxed);
+        if (val != vmemkv::STORE_NOT_FOUND) {
+          candidates.push_back({it->key, val, it->hash, 0});
+        }
       }
     }
+
+    // 2. Extract from append active/immutable regions (manual scan to access slot.hash directly)
+    auto extract_append = [&](const AppendRegion *region, int gen) {
+      if (!region) return;
+      size_t count = region->size();
+      for (size_t i = 0; i < count; ++i) {
+        const AppendSlot &slot = region->data()[i];
+        if (!slot.published.load(std::memory_order_acquire)) {
+          continue;
+        }
+        const Payload value = slot.payload_bits.load(std::memory_order_acquire);
+        if (value == vmemkv::STORE_NOT_FOUND) {
+          continue;
+        }
+        if (!(slot.key < lower_bound) && !(upper_bound < slot.key)) {
+          candidates.push_back({slot.key, value, slot.hash, gen});
+        }
+      }
+    };
+
+    extract_append(active, 2);  // active is generation 2 (newest)
+    extract_append(imm, 1);     // imm is generation 1
+
+    if (candidates.empty()) return 0;
+
+    // 3. Sort candidates by Key ASC, then Generation DESC (newest first)
+    std::sort(candidates.begin(), candidates.end(), [](const ScanCandidate &a, const ScanCandidate &b) {
+      if (a.key != b.key) {
+        return a.key < b.key;
+      }
+      return a.gen > b.gen;
+    });
+
+    // 4. Deduplicate (keep only the newest generation) and run callbacks
+    size_t match_count = 0;
+    bool first = true;
+    Key prev_key{};
+
+    for (const auto &cand : candidates) {
+      if (first || cand.key != prev_key) {
+        first = false;
+        prev_key = cand.key;
+        if (cand.payload_bits != vmemkv::STORE_NOT_FOUND) {
+          callback(std::span<const std::byte>(cand.key), cand.payload_bits, cand.hash);
+          ++match_count;
+        }
+      }
+    }
+
     return match_count;
   }
 
@@ -326,9 +392,6 @@ class T1Index {
     auto *next_active = new AppendRegion();
     auto *next_active_idx = new AppendIndex();
     next_active_idx->clear();
-    if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(next_active->data(), next_active->capacity_bytes());
-    }
 
     // 2. Freeze the current active region to immutable
     AppendRegion *old_active = append_active_.load(std::memory_order_acquire);
@@ -382,10 +445,22 @@ class T1Index {
                std::back_inserter(merged),
                comp);
 
+    // Deduplicate merged output (keeping the newest snapshot from imm_entries)
+    // std::merge is stable: elements from imm_entries (newest) will be merged after sorted_entries (oldest).
+    if (!merged.empty()) {
+      auto write_it = merged.begin();
+      for (auto read_it = std::next(merged.begin()); read_it != merged.end(); ++read_it) {
+        if (write_it->key == read_it->key && write_it->hash == read_it->hash) {
+          *write_it = *read_it;  // Overwrite older with newer
+        } else {
+          *(++write_it) = *read_it;
+        }
+      }
+      merged.erase(write_it + 1, merged.end());
+    }
+
     // Assert no duplicate entries exist in the merge output
     assert_no_duplicates(merged);
-
-    maybe_set_sequential_hints(old_active, imm_n);
 
     for (auto &entry : merged) {
       entry.payload_bits = offset_mapper(entry.payload_bits, entry.hash);
@@ -394,9 +469,6 @@ class T1Index {
     const SortedRegion *old_sorted = sorted_region_.load(std::memory_order_relaxed);
 
     auto *next_sorted = new SortedRegion(merged);
-    if constexpr (Config::UseMemoryHints) {
-      t1_detail::apply_region_hints(next_sorted->slots.get(), next_sorted->size * sizeof(SortedSlot));
-    }
 
     // Publish the new sorted region
     sorted_region_.store(next_sorted, std::memory_order_release);
@@ -441,6 +513,10 @@ class T1Index {
     [[nodiscard]] auto clean_hash() const noexcept -> uint64_t { return hash & t1_detail::kCleanHashMask; }
   };
 
+ public:
+  static constexpr size_t APPEND_SLOT_SIZE = sizeof(AppendSlot);
+
+ private:
   struct SortedRegion {
     size_t size = 0;
     // NOLINTNEXTLINE(modernize-avoid-c-arrays)
@@ -624,10 +700,15 @@ class T1Index {
       return ResolvedSlot{slot, nullptr};
     }
 
+    // Defensive: If the key exists in append_immutable_, we must not update it in-place
+    // because append_immutable_ is currently being merged/sorted by reorganize.
+    // Overwriting it in-place leads to Lost Updates. Instead, we bypass and let the write
+    // append a new entry to the active region.
     if (const AppendRegion *imm = append_immutable_.load(std::memory_order_acquire)) {
       const AppendIndex *imm_idx = append_immutable_index_.load(std::memory_order_acquire);
-      if (AppendSlot *slot = const_cast<AppendRegion *>(imm)->find_with_index(*imm_idx, key, hash)) {
-        return ResolvedSlot{slot, nullptr};
+      if (const AppendSlot *slot = const_cast<AppendRegion *>(imm)->find_with_index(*imm_idx, key, hash)) {
+        std::ignore = slot;
+        return ResolvedSlot{};
       }
     }
 
@@ -702,14 +783,6 @@ class T1Index {
     for (size_t i = 1; i < entries.size(); ++i) {
       assert(!(entries[i - 1].key == entries[i].key && entries[i - 1].hash == entries[i].hash) &&
              "T1Index invariant violated: duplicate key prefix + hash detected in merge output");
-    }
-  }
-
-  void maybe_set_sequential_hints(const AppendRegion *region, size_t append_n) {
-    if constexpr (Config::UseMemoryHints) {
-      auto sorted = sorted_region_.load(std::memory_order_acquire);
-      t1_detail::set_sequential_hint(sorted->slots.get(), sorted->size * sizeof(SortedSlot));
-      t1_detail::set_sequential_hint(region->data(), region->bytes_for(append_n));
     }
   }
 

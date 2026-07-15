@@ -284,6 +284,34 @@ $$\text{T2\_GC\_Trigger} = A \ge A_{\text{limit}}$$
 - Tier 2 の Storage Fragmentation を解消する。
 - Tier 1 の offset を新世代の Tier 2 へ張り直す。
 
+### 4.5 T1 Reorganize Auto-Trigger (ワークロード適応型 L2 キャッシュサイズ制限と Soft/Hard しきい値)
+
+T1 `reorganize` は、`append_region` のサイズに応じて自動的にバックグラウンド実行がトリガーされる。この制御には、ライトバーストを吸収するための容量確保と、並行スキャン（Scan）のレイテンシ低減を両立させるため、**ワークロード適応型（Workload-Adaptive）自動トリガー機構**を導入する。
+
+#### 1. しきい値の定義 (Soft Limit と Hard Limit)
+*   **Soft Limit ($T_{\text{soft}}$):** バックグラウンド Reorg スレッドの起動を促すソフトしきい値。
+*   **Hard Limit ($T_{\text{hard}}$):** アペンドバッファの完全枯渇とメモリ破綻を防ぐため、新規の書き込み操作（Insert/Update）を一時的にブロッキング（Stall）させるハードしきい値。常に `APPEND_CAP` の 90% 〜 95% の高レベルに固定し、バースト書き込み耐性を最大化する。
+
+#### 2. ワークロード適応型 Soft Limit 計算式 (Workload-Adaptive Thresholding)
+スキャン（Scan）操作の有無に応じて、ソフトしきい値 $T_{\text{soft}}$ を動的に切り替える。
+
+*   **スキャン非アクティブ（Pure-Insert ワークロード）:**
+    スキャンが実行されていない場合、未ソート領域の走査コストを考慮する必要がないため、書き込み効率と CPU 効率を優先してしきい値を引き上げる。
+    $$T_{\text{soft}} = \text{APPEND\_CAP} \times \frac{\text{SoftThresholdPercent}}{100}$$
+
+*   **スキャンアクティブ（Scan-Heavy / Mixed ワークロード）:**
+    スキャンが実行されている場合、未ソートのアペンド領域に対する $O(N)$ 線形走査がボトルネックとなる。スキャンの走査データを各 CPU コアの **L2 キャッシュ（プライベートキャッシュ）** に完全に収め、キャッシュライン無効化やメモリバス帯域の競合を防ぐため、L2 キャッシュ容量に基づいた絶対件数へしきい値を縮小する。
+    $$T_{\text{soft}} = \min \left( \frac{\text{L2\_Cache\_Bytes}}{\text{sizeof(AppendSlot)}}, \; \text{APPEND\_CAP} \times \frac{\text{SoftThresholdPercent}}{100} \right)$$
+    
+    *   $\text{L2\_Cache\_Bytes} = 1 \text{ MB}$ （現代の一般的なコアあたり L2 キャッシュ容量）
+    *   $\text{sizeof(AppendSlot)} = 40 \text{ バイト}$
+    *   スキャンアクティブ時の絶対上限件数: **26,214 件**
+
+#### 3. スキャンアクティブ状態の検出 (Read-only Fast Path)
+マルチスレッド並行スキャンにおいてフラグ書き込みによるキャッシュラインの奪い合い（Cache Bouncing）を回避するため、**Read-Check-Write (TEST and SET) パターン**による軽量なアトミックフラグ `scan_active_` を用いる。
+1. `scan()` の開始時に `scan_active_` が `false` の場合のみ `true` を書き込む。すでに `true` の場合は読み取り（Read-only）でバイパスし、無駄なキャッシュ無効化を防ぐ。
+2. `reorganize()` のマージ完了時に、`scan_active_` を `false` にリセットする。
+
 ## 5. Checkpoint Reload
 
 ### 5.1 Motivation
@@ -424,16 +452,7 @@ low-level design が要求するのは同期機構の名前ではなく、6.2 �
 
 本節の最適化はすべて opt-in であり、無効でも正しく動作する。
 
-### 7.1 Tier 1 Memory Hints
-
-- `mlock(t1, size)`:
-  Tier 1 を物理 RAM に固定し、Tier 2 圧迫下でもスワップアウトを防ぐ。
-- `madvise(t1, size, MADV_HUGEPAGE)`:
-  TLB 圧力を下げる。
-- `MADV_SEQUENTIAL`:
-  T1 full scan の直前に適用し、先読みを促す。
-
-### 7.2 Group Commit / Early Lock Release / Flush Pipelining
+### 7.1 Group Commit / Early Lock Release / Flush Pipelining
 
 詳細は [Aether](https://dl.acm.org/doi/10.14778/1920841.1920928) を参照。
 
@@ -441,37 +460,37 @@ low-level design が要求するのは同期機構の名前ではなく、6.2 �
 - エントリロック解放を WAL flush 完了前に前倒しする。
 - 読み取りも waiter を介して未 flush データの整合を取る。
 
-### 7.3 SIMD Tier 1 Scan
+### 7.2 SIMD Tier 1 Scan
 
 `IndexEntry` は fixed-size かつ連続配置なので、Tier 1 の append scan や range scan は SIMD 最最適化しやすい。
 
-### 7.4 Index-Level Covering
+### 7.3 Index-Level Covering
 
 index 単位で `payload_mode == Inline64` を選び、Tier 1 payload を 64-bit value として解釈する。
 
 - small fixed-size value workload では Tier 2 アクセスを完全に省略できる
 - WAL / checkpoint では index の payload mode をメタデータとして永続化する
 
-### 7.5 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
+### 7.4 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
 
 エントリーごとに T2 オフセットとインライン 64-bit 値を動的に切り替える最適化である。値が 8バイト（64ビット）以下のときに Tier 2 への書き出しをバイパスして Tier 1 インデックスの payload 領域内に直接バリューをインライン格納する。
 
 本最適化は `vmemkv::Config` のテンプレート引数タグ（`T1InlineValue`）を介して制御される。
 
-#### 7.5.1 メタデータとハッシュのエンコーディング
+#### 7.4.1 メタデータとハッシュのエンコーディング
 T1のインデックススロットに十分な空きビット領域がないため、64ビットのハッシュフィールド（`hash`）の最上位4ビットをメタデータ領域として再利用し、フラグとサイズ情報を格納する。
 
 - **Bit 63 (`is_inline`)**: `1` の場合はインラインデータ、`0` の場合は T2オフセットを表す。
 - **Bits 62-60 (`inline_size`)**: インラインデータのバイトサイズ（1〜8バイト）を表す。サイズ `8` は `0` としてエンコードされる。
 - **Bits 59-0 (`clean_hash`)**: 実際の60ビットFnvハッシュキー。インデックスの検索、Bloom filterの登録・判定、SIMDスキャン等のハッシュ比較時には、上位4ビットをマスクしてこの60ビット部分のみを比較する。
 
-#### 7.5.2 インライン化の動作
+#### 7.4.2 インライン化の動作
 - **T2 オフセットとの識別 (判定)**:
   - 読み出し時、T1から取得したスロットハッシュの最上位ビット（Bit 63）を確認するだけで、T2をフェッチせずにインラインかオフセットかを100%確実に識別できる。
 - **値が 1〜8 バイトの場合**:
   - `payload_bits` に対するビットシフトやビットの埋め込みは行わず、64ビットのビットパターンをそのまま無加工で格納し、デコード時は `inline_size` に従いバイトコピーを行う。これにより、`double`、`time`、連番のサロゲートキー（偶数・奇数を問わず）など、あらゆる64ビット以内のデータ型を完全にインライン化できる。
 
-### 7.6 Chunk Allocation / Pre-faulting (T2 Lock Mitigation)
+### 7.5 Chunk Allocation / Pre-faulting (T2 Lock Mitigation)
 
 マルチコア高並列書き込み環境における Linux カーネルの仮想メモリページフォールトおよび `mmap_lock`（VMAロック）の競合によるオーバーヘッド（Cache Line Bouncing）を緩和するための最適化である。
 
@@ -483,15 +502,11 @@ T1のインデックススロットに十分な空きビット領域がないた
 * **コンパイル時解決の徹底**:
   最適化のオーバーヘッドをゼロにするため、`vmemkv::Config` のテンプレート引数タグ（`Prefaulting`）を介して `constexpr if` によってコンパイル時に分岐とコード生成が制御される。
 
-### 7.7 Sorted Bloom Filter
+### 7.6 Sorted Bloom Filter
 
 `sorted_region` 全体に Bloom filter を付与し、negative lookup を高速化できる。
 
-### 7.8 Tier 2 Prefetch
-
-Scan 時に Tier 1 から得た offset 群に対して `madvise(MADV_WILLNEED)` を出し、Tier 2 を先読みする。
-
-### 7.9 Index-Entry Size Embedding (サイズ情報のインデックス内ビット埋め込み)
+### 7.7 Index-Entry Size Embedding (サイズ情報のインデックス内ビット埋め込み)
 
 T2 へのランダムメモリアクセスを伴わずに $O(1)$ で `T1_Live_Bytes` を集計するため、T1 インデックスエントリー of `payload_bits`（T2 オフセットポインタ）の未使用上位ビットにレコードサイズをエンコードして格納する。
 
@@ -509,7 +524,8 @@ T2 へのランダムメモリアクセスを伴わずに $O(1)$ で `T1_Live_By
 | Parameter | Meaning |
 | --- | --- |
 | `T1_MAX_INDEX_SIZE` | Tier 1 最大 entry 数 |
-| `T1_REORGANIZE_THRESHOLD` | T1 `append_region` が肥大化したときの reorganize 閾値 |
+| `T1_REORGANIZE_SOFT_THRESHOLD` | T1 Reorganize を非同期実行するソフトしきい値（スキャン有無で動的変化） |
+| `T1_REORGANIZE_HARD_THRESHOLD` | 新規書き込みをブロッキング（Stall）するハードしきい値（通常95%固定） |
 | `T2_MAX_VIRTUAL_MEMORY_SIZE` | Tier 2 最大仮想アドレス空間 |
 | `T2_CHECKPOINT_INTERVAL_SEC` | checkpoint reload 実行周期 |
 | `T2_STORAGE_FRAGMENTATION_THRESHOLD` | Tier 2 storage fragmentation の閾値 |

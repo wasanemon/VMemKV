@@ -69,15 +69,16 @@ class RocksDBStore {
 
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
 
-  [[nodiscard]] auto get_impl(std::span<const std::byte> key) const -> uint64_t {
+  template <typename Callback>
+  auto get_impl(std::span<const std::byte> key, Callback callback) const -> bool {
     rocksdb::PinnableSlice pinned_value;
     auto status = db_->Get({}, db_->DefaultColumnFamily(), to_slice(key), &pinned_value);
-    if (!status.ok() || pinned_value.size() != kEncodedScalarValueBytes) {
-      return vmemkv::STORE_NOT_FOUND;
+    if (!status.ok()) {
+      return false;
     }
-    uint64_t value;
-    std::memcpy(&value, pinned_value.data(), kEncodedScalarValueBytes);
-    return value;
+    std::span<const std::byte> val_span(reinterpret_cast<const std::byte *>(pinned_value.data()), pinned_value.size());
+    callback(val_span);
+    return true;
   }
 
   auto insert_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
@@ -107,7 +108,7 @@ class RocksDBStore {
   template <typename KeyFn>
   auto bulk_load_impl(std::size_t key_count,
                       KeyFn &&make_key,
-                      std::span<const std::byte> value,
+                      std::size_t target_value_size,
                       std::string *error_out = nullptr) -> bool {
     if (key_count == 0) {
       return true;
@@ -117,8 +118,10 @@ class RocksDBStore {
     // benchmark workload semantics.
     constexpr std::size_t kBatchBytes = 64ULL * 1024ULL * 1024ULL;
     rocksdb::WriteOptions write_opts = make_bulk_load_write_options();
-    const auto value_slice = to_slice(value);
-    const std::size_t batch_keys = std::max<std::size_t>(1, kBatchBytes / std::max<std::size_t>(1, value.size()));
+
+    std::string dummy_large(target_value_size, 'a');
+    std::string dummy_8b(8, 'a');
+    const std::size_t batch_keys = std::max<std::size_t>(1, kBatchBytes / std::max<std::size_t>(1, target_value_size));
 
     std::size_t next_index = 0;
     while (next_index < key_count) {
@@ -126,7 +129,11 @@ class RocksDBStore {
       const std::size_t chunk_end = std::min(key_count, next_index + batch_keys);
       for (std::size_t index = next_index; index < chunk_end; ++index) {
         const std::string key = make_key(index);
-        batch.Put(key, value_slice);
+        if (target_value_size != 8 && index % 5 == 0) {
+          batch.Put(key, dummy_8b);
+        } else {
+          batch.Put(key, dummy_large);
+        }
       }
 
       auto status = db_->Write(write_opts, &batch);
@@ -136,20 +143,9 @@ class RocksDBStore {
         }
         return false;
       }
-
       next_index = chunk_end;
     }
     return true;
-  }
-
-  [[nodiscard]] auto get_bytes_impl(std::span<const std::byte> key) const -> std::optional<std::vector<std::byte>> {
-    std::string val;
-    auto status = db_->Get({}, to_slice(key), &val);
-    if (!status.ok()) {
-      return std::nullopt;
-    }
-    return std::vector<std::byte>(reinterpret_cast<const std::byte *>(val.data()),
-                                  reinterpret_cast<const std::byte *>(val.data()) + val.size());
   }
 
   template <typename Cb>
@@ -227,10 +223,11 @@ class RocksDBStore {
 
   void reorganize() {}
 
-  // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-  [[nodiscard]] auto get_impl(std::span<const std::byte> key) const -> uint64_t {
+  template <typename Callback>
+  auto get_impl(std::span<const std::byte> key, Callback callback) const -> bool {
     (void)key;
-    return vmemkv::STORE_NOT_FOUND;
+    (void)callback;
+    return false;
   }
   // NOLINTNEXTLINE(readability-convert-member-functions-to-static,bugprone-easily-swappable-parameters)
   auto insert_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
@@ -252,20 +249,15 @@ class RocksDBStore {
   template <typename KeyFn>
   auto bulk_load_impl(std::size_t key_count,
                       KeyFn &&make_key,
-                      std::span<const std::byte> value,
+                      std::size_t target_value_size,
                       std::string *error_out = nullptr) -> bool {
     (void)key_count;
     (void)make_key;
-    (void)value;
+    (void)target_value_size;
     if (error_out != nullptr) {
       *error_out = "RocksDB not enabled in this build";
     }
     return false;
-  }
-  // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-  [[nodiscard]] auto get_bytes_impl(std::span<const std::byte> key) const -> std::optional<std::vector<std::byte>> {
-    (void)key;
-    return std::nullopt;
   }
 
   template <typename Cb>

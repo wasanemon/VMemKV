@@ -3,7 +3,7 @@
 | 論文名 | VMemKVとの関係 |
 |---|---|
 | [WiscKey](/must_read_papers/wisckey.pdf) | 「LSM-TreeのMemtableのvalueにはポインタだけを入れる」「Valueは別のファイルにひたすらappend-only」というアプローチを採用した論文。この２つのアイデアはVMemKVとほぼ同じ。|
-| |
+| [Workload Analysis on Memcached](/must_read_papers/workload_analysis_facebook.pdf) | FacebookのMemcachedのアクセスパターンを分析した論文。Key / Value のサイズのCDFがあり有用。Keyはだいたい40バイト程度、Valueは1KB以下で8B程度もありうる。|
 
 
 
