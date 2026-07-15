@@ -913,15 +913,12 @@ void register_all_benchmarks() {
         struct YCSBState {
           std::unique_ptr<YCSBTimelineCollector> collector;
           std::mutex init_mutex;
-          std::atomic<bool> stop_reorg{false};
-          std::thread reorg_thread;
           std::atomic<uint64_t> current_epoch{0};
           std::atomic<uint64_t> init_done_epoch{0};
           std::atomic<uint64_t> start_done_epoch{0};
-          std::atomic<int> ready_threads{0};
-          std::atomic<uint64_t> total_ops{0};
           // Track last seen epoch per thread locally to this benchmark registration
           std::array<std::atomic<uint64_t>, 128> thread_last_epochs{};
+          std::atomic<size_t> ready_threads{0};
         };
         auto ycsb_state = std::make_shared<YCSBState>();
 
@@ -958,15 +955,8 @@ void register_all_benchmarks() {
               if (thread_idx == 0) {
                 local_epoch = ycsb_state->current_epoch.load(std::memory_order_relaxed) + 1;
 
-                // Stop any background thread from a previous warmup/run epoch
-                ycsb_state->stop_reorg.store(true, std::memory_order_release);
-                if (ycsb_state->reorg_thread.joinable()) {
-                  ycsb_state->reorg_thread.join();
-                }
-
                 // Setup fresh collector with the actual thread count
                 ycsb_state->collector = std::make_unique<YCSBTimelineCollector>(state.threads(), ycsb_populate_size);
-                ycsb_state->stop_reorg.store(false, std::memory_order_release);
                 ycsb_state->ready_threads.store(0, std::memory_order_release);
 
                 // Publish epoch
@@ -992,20 +982,14 @@ void register_all_benchmarks() {
               // Inside the loop: start the timeline on the very first iteration of this run epoch
               if (thread_idx == 0) {
                 if (ycsb_state->start_done_epoch.load(std::memory_order_relaxed) < local_epoch) {
-                  while (ycsb_state->ready_threads.load(std::memory_order_acquire) < state.threads()) {
+                  while (ycsb_state->ready_threads.load(std::memory_order_acquire) <
+                         static_cast<size_t>(state.threads())) {
                     std::this_thread::yield();
                   }
                   col->start();
                   auto stats = store.get_statistics();
                   col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
                   col->last_recorded_t2.store(stats.t2_reorg_count, std::memory_order_relaxed);
-                  ycsb_state->reorg_thread = std::thread([state_ptr = ycsb_state.get(), &store]() {
-                    while (!state_ptr->stop_reorg.load(std::memory_order_acquire)) {
-                      std::this_thread::sleep_for(std::chrono::seconds(10));
-                      if (state_ptr->stop_reorg.load(std::memory_order_acquire)) break;
-                      store.reorganize();
-                    }
-                  });
                   ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
                 }
               } else {
@@ -1073,11 +1057,6 @@ void register_all_benchmarks() {
               }
 
               if (state.thread_index() == 0) {
-                // Stop background reorg thread and wait for it to exit
-                ycsb_state->stop_reorg.store(true, std::memory_order_release);
-                if (ycsb_state->reorg_thread.joinable()) {
-                  ycsb_state->reorg_thread.join();
-                }
                 col->dump_json(sname, variant_label, value_name);
               }
               state.SetItemsProcessed(local_ops);

@@ -513,6 +513,10 @@ class T1Index {
     [[nodiscard]] auto clean_hash() const noexcept -> uint64_t { return hash & t1_detail::kCleanHashMask; }
   };
 
+ public:
+  static constexpr size_t APPEND_SLOT_SIZE = sizeof(AppendSlot);
+
+ private:
   struct SortedRegion {
     size_t size = 0;
     // NOLINTNEXTLINE(modernize-avoid-c-arrays)

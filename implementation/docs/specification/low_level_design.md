@@ -284,6 +284,34 @@ $$\text{T2\_GC\_Trigger} = A \ge A_{\text{limit}}$$
 - Tier 2 の Storage Fragmentation を解消する。
 - Tier 1 の offset を新世代の Tier 2 へ張り直す。
 
+### 4.5 T1 Reorganize Auto-Trigger (ワークロード適応型 L2 キャッシュサイズ制限と Soft/Hard しきい値)
+
+T1 `reorganize` は、`append_region` のサイズに応じて自動的にバックグラウンド実行がトリガーされる。この制御には、ライトバーストを吸収するための容量確保と、並行スキャン（Scan）のレイテンシ低減を両立させるため、**ワークロード適応型（Workload-Adaptive）自動トリガー機構**を導入する。
+
+#### 1. しきい値の定義 (Soft Limit と Hard Limit)
+*   **Soft Limit ($T_{\text{soft}}$):** バックグラウンド Reorg スレッドの起動を促すソフトしきい値。
+*   **Hard Limit ($T_{\text{hard}}$):** アペンドバッファの完全枯渇とメモリ破綻を防ぐため、新規の書き込み操作（Insert/Update）を一時的にブロッキング（Stall）させるハードしきい値。常に `APPEND_CAP` の 90% 〜 95% の高レベルに固定し、バースト書き込み耐性を最大化する。
+
+#### 2. ワークロード適応型 Soft Limit 計算式 (Workload-Adaptive Thresholding)
+スキャン（Scan）操作の有無に応じて、ソフトしきい値 $T_{\text{soft}}$ を動的に切り替える。
+
+*   **スキャン非アクティブ（Pure-Insert ワークロード）:**
+    スキャンが実行されていない場合、未ソート領域の走査コストを考慮する必要がないため、書き込み効率と CPU 効率を優先してしきい値を引き上げる。
+    $$T_{\text{soft}} = \text{APPEND\_CAP} \times \frac{\text{SoftThresholdPercent}}{100}$$
+
+*   **スキャンアクティブ（Scan-Heavy / Mixed ワークロード）:**
+    スキャンが実行されている場合、未ソートのアペンド領域に対する $O(N)$ 線形走査がボトルネックとなる。スキャンの走査データを各 CPU コアの **L2 キャッシュ（プライベートキャッシュ）** に完全に収め、キャッシュライン無効化やメモリバス帯域の競合を防ぐため、L2 キャッシュ容量に基づいた絶対件数へしきい値を縮小する。
+    $$T_{\text{soft}} = \min \left( \frac{\text{L2\_Cache\_Bytes}}{\text{sizeof(AppendSlot)}}, \; \text{APPEND\_CAP} \times \frac{\text{SoftThresholdPercent}}{100} \right)$$
+    
+    *   $\text{L2\_Cache\_Bytes} = 1 \text{ MB}$ （現代の一般的なコアあたり L2 キャッシュ容量）
+    *   $\text{sizeof(AppendSlot)} = 40 \text{ バイト}$
+    *   スキャンアクティブ時の絶対上限件数: **26,214 件**
+
+#### 3. スキャンアクティブ状態の検出 (Read-only Fast Path)
+マルチスレッド並行スキャンにおいてフラグ書き込みによるキャッシュラインの奪い合い（Cache Bouncing）を回避するため、**Read-Check-Write (TEST and SET) パターン**による軽量なアトミックフラグ `scan_active_` を用いる。
+1. `scan()` の開始時に `scan_active_` が `false` の場合のみ `true` を書き込む。すでに `true` の場合は読み取り（Read-only）でバイパスし、無駄なキャッシュ無効化を防ぐ。
+2. `reorganize()` のマージ完了時に、`scan_active_` を `false` にリセットする。
+
 ## 5. Checkpoint Reload
 
 ### 5.1 Motivation
@@ -496,7 +524,8 @@ T2 へのランダムメモリアクセスを伴わずに $O(1)$ で `T1_Live_By
 | Parameter | Meaning |
 | --- | --- |
 | `T1_MAX_INDEX_SIZE` | Tier 1 最大 entry 数 |
-| `T1_REORGANIZE_THRESHOLD` | T1 `append_region` が肥大化したときの reorganize 閾値 |
+| `T1_REORGANIZE_SOFT_THRESHOLD` | T1 Reorganize を非同期実行するソフトしきい値（スキャン有無で動的変化） |
+| `T1_REORGANIZE_HARD_THRESHOLD` | 新規書き込みをブロッキング（Stall）するハードしきい値（通常95%固定） |
 | `T2_MAX_VIRTUAL_MEMORY_SIZE` | Tier 2 最大仮想アドレス空間 |
 | `T2_CHECKPOINT_INTERVAL_SEC` | checkpoint reload 実行周期 |
 | `T2_STORAGE_FRAGMENTATION_THRESHOLD` | Tier 2 storage fragmentation の閾値 |

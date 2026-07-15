@@ -278,6 +278,7 @@ class VMemKVImpl {
       reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
       reset_tombstone_counters();
     }
+    scan_active_.store(false, std::memory_order_relaxed);
   }
 
   // Public, blocking-guaranteed synchronize method
@@ -472,6 +473,9 @@ class VMemKVImpl {
   auto scan_impl(std::span<const std::byte> lower_bound,
                  std::span<const std::byte> upper_bound,
                  Callback callback) const -> size_t {
+    if (!scan_active_.load(std::memory_order_relaxed)) {
+      scan_active_.store(true, std::memory_order_relaxed);
+    }
     size_t count = 0;
     {
       T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
@@ -623,7 +627,20 @@ class VMemKVImpl {
   void maybe_reorganize_if_needed() {
     const size_t append_size = t1_.append_size();
     const size_t append_capacity = T1IndexT::APPEND_CAP;
-    const size_t soft_limit = (append_capacity * ConfigT::T1ReorganizeSoftThresholdPercent) / 100;
+
+    // Dynamically calculate the soft threshold based on workload state
+    size_t soft_limit;
+    if (scan_active_.load(std::memory_order_relaxed)) {
+      // Scale-derived L2 cache capacity threshold (1MB / APPEND_SLOT_SIZE)
+      // This keeps linear scanning bounded within private L2 caches.
+      constexpr size_t kL2CacheSizeBytes = 1024 * 1024;  // 1MB
+      constexpr size_t kL2SlotCapacity = kL2CacheSizeBytes / T1IndexT::APPEND_SLOT_SIZE;
+
+      soft_limit = std::min(kL2SlotCapacity, (append_capacity * ConfigT::T1ReorganizeSoftThresholdPercent) / 100);
+    } else {
+      // Pure insert mode: allow append region to scale up to conservative capacity threshold
+      soft_limit = (append_capacity * ConfigT::T1ReorganizeSoftThresholdPercent) / 100;
+    }
     const size_t hard_limit = (append_capacity * ConfigT::T1ReorganizeHardThresholdPercent) / 100;
 
     if (append_size >= soft_limit) {
@@ -670,6 +687,7 @@ class VMemKVImpl {
   std::jthread reorg_worker_;
   std::atomic<bool> reorg_requested_{false};
   std::atomic<bool> reorg_running_{false};
+  mutable std::atomic<bool> scan_active_{false};
 
   // Mutex striping based on key hash. Splitting into 256 stripes prevents lock contention
   // on concurrent writes without the overhead of dynamic allocation for individual key locks.
