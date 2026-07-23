@@ -37,6 +37,15 @@ auto get_sync(const StorePtr &store, const Key &key) -> uint64_t {
   return res;
 }
 
+// scan() yields the raw value span (see vmemkv_impl.hpp scan_impl); tests that stored
+// plain uint64_t values decode it back the same way ValueSerializer encoded it
+// (little-endian, see serializer.hpp).
+inline auto decode_scanned_u64(std::span<const std::byte> val) -> uint64_t {
+  uint64_t res = 0;
+  std::memcpy(&res, val.data(), std::min(val.size(), sizeof(uint64_t)));
+  return res;
+}
+
 template <typename StorePtr, typename Key>
 auto get_bytes_sync(const StorePtr &store, const Key &key) -> std::optional<std::vector<std::byte>> {
   std::optional<std::vector<std::byte>> res;
@@ -262,7 +271,9 @@ TEST_CASE_TEMPLATE("custom serializers (ADL) for user-defined types", Store, STO
 
   std::vector<uint64_t> results;
   const size_t scan_count =
-      store->scan(key_one, key_two, [&](std::span<const std::byte>, uint64_t value) { results.push_back(value); });
+      store->scan(key_one, key_two, [&](std::span<const std::byte>, std::span<const std::byte> value) {
+        results.push_back(test_util::decode_scanned_u64(value));
+      });
   REQUIRE(scan_count == 2U);
   REQUIRE(results.size() == 2);
   CHECK(results[0] == kSmallValue);
@@ -318,7 +329,7 @@ TEST_CASE_TEMPLATE("scan empty range returns 0", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   size_t entry_count = 0;
   store->insert("b", 1);
-  entry_count = store->scan("a", "a", [](std::span<const std::byte>, uint64_t) {});
+  entry_count = store->scan("a", "a", [](std::span<const std::byte>, std::span<const std::byte>) {});
   CHECK(entry_count == 0U);
 }
 
@@ -328,7 +339,9 @@ TEST_CASE_TEMPLATE("scan returns all entries in range", Store, STORE_TYPES) {
   store->insert("c", 3);
   store->insert("d", 4);
   std::unordered_set<uint64_t> values;
-  size_t entry_count = store->scan("b", "d", [&](std::span<const std::byte>, uint64_t value) { values.insert(value); });
+  size_t entry_count = store->scan("b", "d", [&](std::span<const std::byte>, std::span<const std::byte> value) {
+    values.insert(test_util::decode_scanned_u64(value));
+  });
   CHECK(entry_count == 3U);
   CHECK(values.count(2) == 1);
   CHECK(values.count(3) == 1);
@@ -340,7 +353,7 @@ TEST_CASE_TEMPLATE("scan excludes removed entries", Store, STORE_TYPES) {
   store->insert("a", 1);
   store->insert("b", 2);
   store->remove("a");
-  const size_t entry_count = store->scan("a", "b", [](std::span<const std::byte>, uint64_t) {});
+  const size_t entry_count = store->scan("a", "b", [](std::span<const std::byte>, std::span<const std::byte>) {});
   CHECK(entry_count == 1U);
 }
 
@@ -352,7 +365,7 @@ TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
   CHECK(test_util::get_sync(store, "a") == 1U);
   CHECK(test_util::get_sync(store, "b") == 2U);
   CHECK(store->insert("c", 3));
-  const size_t entry_count = store->scan("a", "c", [](std::span<const std::byte>, uint64_t) {});
+  const size_t entry_count = store->scan("a", "c", [](std::span<const std::byte>, std::span<const std::byte>) {});
   CHECK(entry_count == 3U);
 }
 
@@ -594,15 +607,17 @@ TEST_CASE_TEMPLATE("scan with integral keys verifies lexicographical ordering", 
   store->reorganize();
 
   std::vector<uint64_t> keys;
-  const size_t scan_count = store->scan(
-      kScanStart, kScanUpperBound, [&](std::span<const std::byte> key_bytes, [[maybe_unused]] uint64_t value) {
-        // Retrieve key by deserializing big-endian bytes (decode first 4 bytes for uint32_t)
-        uint64_t key = 0;
-        for (size_t i = 0; i < 4; ++i) {
-          key = (key << kBitsPerByte) | static_cast<uint8_t>(key_bytes[i]);
-        }
-        keys.push_back(key);
-      });
+  const size_t scan_count =
+      store->scan(kScanStart,
+                  kScanUpperBound,
+                  [&](std::span<const std::byte> key_bytes, [[maybe_unused]] std::span<const std::byte> value) {
+                    // Retrieve key by deserializing big-endian bytes (decode first 4 bytes for uint32_t)
+                    uint64_t key = 0;
+                    for (size_t i = 0; i < 4; ++i) {
+                      key = (key << kBitsPerByte) | static_cast<uint8_t>(key_bytes[i]);
+                    }
+                    keys.push_back(key);
+                  });
   REQUIRE(scan_count == 4U);
 
   REQUIRE(keys.size() == 4U);
