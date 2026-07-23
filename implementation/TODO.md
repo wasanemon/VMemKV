@@ -40,3 +40,9 @@ This document outlines the roadmap to implement the full, robust architecture of
   - If a Swap file is not configured or fails validation under memory-constrained environments, raise an initialization warning/error or exit gracefully.
 
 ---
+
+## 4. ベンチマーク対象の追加
+- **Status**: 🔴 **Not Implemented*
+- **Objective**:
+  - LMDBの追加
+  - BlobDBの追加

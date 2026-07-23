@@ -393,6 +393,19 @@ static auto set_benchmark_metadata(benchmark::State &state, const BenchmarkMetad
   state.counters["CorpusBytes"] =
       benchmark::Counter(static_cast<double>(meta.corpus_bytes), benchmark::Counter::kAvgThreads);
 }
+
+// Folds every byte of `value` into a checksum so that DoNotOptimize() actually forces
+// the whole span to be read (and, in the LTM case, paged in from swap if needed).
+// Without this, a callback that only touches the span's pointer/length never faults in
+// pages beyond the one containing the first few bytes, which silently skips the real
+// cost of fetching large values.
+static auto touch_bytes(std::span<const std::byte> value) noexcept -> uint64_t {
+  uint64_t checksum = 0;
+  for (std::byte b : value) {
+    checksum = (checksum * 131) + static_cast<uint8_t>(b);
+  }
+  return checksum;
+}
 }  // namespace
 
 // ---- Key helpers -------------------------------------------------------------
@@ -849,7 +862,7 @@ void register_all_benchmarks() {
               for (auto _ : state) {
                 std::size_t key_index = (std::string(dist) == "Zipf") ? zipf(rng) : uniform_index(rng);
                 store.get(make_key(key_index),
-                          [](std::span<const std::byte> value) { benchmark::DoNotOptimize(value); });
+                          [](std::span<const std::byte> value) { benchmark::DoNotOptimize(touch_bytes(value)); });
               }
               state.SetItemsProcessed(state.iterations());
             },
@@ -944,122 +957,134 @@ void register_all_benchmarks() {
             },
             [ycsb_state, ycsb_populate_size, sname, variant_label = variant_label(sname), value_name, val_size](
                 benchmark::State &state, auto &store) {
-              std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
-              std::uniform_int_distribution<int> op_dist(0, 99);
+              // NOTE: This benchmark drives its own 30s wall-clock window via the
+              // `while (true)` loop below instead of google-benchmark's normal
+              // iteration-count loop. We still wrap it in `for (auto _ : state)`
+              // (which runs exactly once, since Iterations(1) is set at
+              // registration) purely so gbench's StartKeepRunning/FinishKeepRunning
+              // bracket the whole run -- otherwise `state.iterations()` stays 0 and
+              // `real_time`/`items_per_second` in the aggregate JSON are always
+              // 0 / Infinity (the actual per-second data still comes from the
+              // YCSBTimelineCollector JSON dump either way).
+              for (auto _ : state) {
+                std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
+                std::uniform_int_distribution<int> op_dist(0, 99);
 
-              const size_t thread_idx = state.thread_index();
-              uint64_t my_last_epoch =
-                  (thread_idx < 128) ? ycsb_state->thread_last_epochs[thread_idx].load(std::memory_order_relaxed) : 0;
+                const size_t thread_idx = state.thread_index();
+                uint64_t my_last_epoch =
+                    (thread_idx < 128) ? ycsb_state->thread_last_epochs[thread_idx].load(std::memory_order_relaxed) : 0;
 
-              uint64_t local_epoch = 0;
-              if (thread_idx == 0) {
-                local_epoch = ycsb_state->current_epoch.load(std::memory_order_relaxed) + 1;
+                uint64_t local_epoch = 0;
+                if (thread_idx == 0) {
+                  local_epoch = ycsb_state->current_epoch.load(std::memory_order_relaxed) + 1;
 
-                // Setup fresh collector with the actual thread count
-                ycsb_state->collector = std::make_unique<YCSBTimelineCollector>(state.threads(), ycsb_populate_size);
-                ycsb_state->ready_threads.store(0, std::memory_order_release);
+                  // Setup fresh collector with the actual thread count
+                  ycsb_state->collector = std::make_unique<YCSBTimelineCollector>(state.threads(), ycsb_populate_size);
+                  ycsb_state->ready_threads.store(0, std::memory_order_release);
 
-                // Publish epoch
-                ycsb_state->current_epoch.store(local_epoch, std::memory_order_release);
-                ycsb_state->init_done_epoch.store(local_epoch, std::memory_order_release);
-              } else {
-                // Wait for Thread 0 to finish initializing the current epoch
-                while (ycsb_state->init_done_epoch.load(std::memory_order_acquire) <= my_last_epoch) {
-                  std::this_thread::yield();
-                }
-                local_epoch = ycsb_state->init_done_epoch.load(std::memory_order_relaxed);
-              }
-              if (thread_idx < 128) {
-                ycsb_state->thread_last_epochs[thread_idx].store(local_epoch, std::memory_order_relaxed);
-              }
-
-              auto *col = ycsb_state->collector.get();
-              std::string dummy_large(val_size, 'a');
-              std::string dummy_8b(8, 'a');
-              uint64_t local_ops = 0;
-
-              ycsb_state->ready_threads.fetch_add(1, std::memory_order_acq_rel);
-              // Inside the loop: start the timeline on the very first iteration of this run epoch
-              if (thread_idx == 0) {
-                if (ycsb_state->start_done_epoch.load(std::memory_order_relaxed) < local_epoch) {
-                  while (ycsb_state->ready_threads.load(std::memory_order_acquire) <
-                         static_cast<size_t>(state.threads())) {
+                  // Publish epoch
+                  ycsb_state->current_epoch.store(local_epoch, std::memory_order_release);
+                  ycsb_state->init_done_epoch.store(local_epoch, std::memory_order_release);
+                } else {
+                  // Wait for Thread 0 to finish initializing the current epoch
+                  while (ycsb_state->init_done_epoch.load(std::memory_order_acquire) <= my_last_epoch) {
                     std::this_thread::yield();
                   }
-                  col->start();
-                  auto stats = store.get_statistics();
-                  col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
-                  col->last_recorded_t2.store(stats.t2_reorg_count, std::memory_order_relaxed);
-                  ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
+                  local_epoch = ycsb_state->init_done_epoch.load(std::memory_order_relaxed);
                 }
-              } else {
-                while (ycsb_state->start_done_epoch.load(std::memory_order_acquire) < local_epoch) {
-                  std::this_thread::yield();
-                }
-              }
-
-              while (true) {
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - col->start_time).count();
-                if (elapsed >= YCSBTimelineCollector::kDurationSeconds) {
-                  break;
+                if (thread_idx < 128) {
+                  ycsb_state->thread_last_epochs[thread_idx].store(local_epoch, std::memory_order_relaxed);
                 }
 
-                // Thread 0: poll and record Reorg stats (background thread handles actual triggering)
+                auto *col = ycsb_state->collector.get();
+                std::string dummy_large(val_size, 'a');
+                std::string dummy_8b(8, 'a');
+                uint64_t local_ops = 0;
+
+                ycsb_state->ready_threads.fetch_add(1, std::memory_order_acq_rel);
+                // Inside the loop: start the timeline on the very first iteration of this run epoch
                 if (thread_idx == 0) {
-                  auto stats = store.get_statistics();
-
-                  // Track T1 Reorg
-                  uint64_t current_t1 = stats.t1_reorg_count;
-                  uint64_t prev_t1 = col->last_recorded_t1.load(std::memory_order_relaxed);
-                  if (current_t1 > prev_t1) {
-                    uint64_t diff = current_t1 - prev_t1;
-                    col->t1_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
-                    col->last_recorded_t1.store(current_t1, std::memory_order_relaxed);
+                  if (ycsb_state->start_done_epoch.load(std::memory_order_relaxed) < local_epoch) {
+                    while (ycsb_state->ready_threads.load(std::memory_order_acquire) <
+                           static_cast<size_t>(state.threads())) {
+                      std::this_thread::yield();
+                    }
+                    col->start();
+                    auto stats = store.get_statistics();
+                    col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
+                    col->last_recorded_t2.store(stats.t2_reorg_count, std::memory_order_relaxed);
+                    ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
                   }
-
-                  // Track T2 Reorg
-                  uint64_t current_t2 = stats.t2_reorg_count;
-                  uint64_t prev_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
-                  if (current_t2 > prev_t2) {
-                    uint64_t diff = current_t2 - prev_t2;
-                    col->t2_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
-                    col->last_recorded_t2.store(current_t2, std::memory_order_relaxed);
-                  }
-                }
-
-                int op_choice = op_dist(rng);
-                if (op_choice < 95) {
-                  // 95% Scan (100 items)
-                  uint64_t max_keys = col->next_key_index.load(std::memory_order_relaxed);
-                  ZipfDistribution dynamic_zipf({max_keys > 100 ? max_keys - 100 : 1, 1.0});
-                  uint64_t scan_start = dynamic_zipf(rng);
-
-                  size_t result_count = store.scan(
-                      make_key(scan_start), make_key(scan_start + 99), [](std::span<const std::byte>, uint64_t value) {
-                        benchmark::DoNotOptimize(value);
-                      });
-                  benchmark::DoNotOptimize(result_count);
-                  col->record_op(thread_idx, true);
                 } else {
-                  // 5% Insert (with 20% 8B ratio for non-8B workloads)
-                  uint64_t next_idx = col->next_key_index.fetch_add(1, std::memory_order_relaxed);
-                  bool inserted;
-                  if (val_size != 8 && next_idx % 5 == 0) {
-                    inserted = store.insert(make_key(next_idx), dummy_8b);
-                  } else {
-                    inserted = store.insert(make_key(next_idx), dummy_large);
+                  while (ycsb_state->start_done_epoch.load(std::memory_order_acquire) < local_epoch) {
+                    std::this_thread::yield();
                   }
-                  benchmark::DoNotOptimize(inserted);
-                  col->record_op(thread_idx, false);
                 }
-                ++local_ops;
-              }
 
-              if (state.thread_index() == 0) {
-                col->dump_json(sname, variant_label, value_name);
-              }
-              state.SetItemsProcessed(local_ops);
+                while (true) {
+                  auto now = std::chrono::steady_clock::now();
+                  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - col->start_time).count();
+                  if (elapsed >= YCSBTimelineCollector::kDurationSeconds) {
+                    break;
+                  }
+
+                  // Thread 0: poll and record Reorg stats (background thread handles actual triggering)
+                  if (thread_idx == 0) {
+                    auto stats = store.get_statistics();
+
+                    // Track T1 Reorg
+                    uint64_t current_t1 = stats.t1_reorg_count;
+                    uint64_t prev_t1 = col->last_recorded_t1.load(std::memory_order_relaxed);
+                    if (current_t1 > prev_t1) {
+                      uint64_t diff = current_t1 - prev_t1;
+                      col->t1_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
+                      col->last_recorded_t1.store(current_t1, std::memory_order_relaxed);
+                    }
+
+                    // Track T2 Reorg
+                    uint64_t current_t2 = stats.t2_reorg_count;
+                    uint64_t prev_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
+                    if (current_t2 > prev_t2) {
+                      uint64_t diff = current_t2 - prev_t2;
+                      col->t2_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
+                      col->last_recorded_t2.store(current_t2, std::memory_order_relaxed);
+                    }
+                  }
+
+                  int op_choice = op_dist(rng);
+                  if (op_choice < 95) {
+                    // 95% Scan (100 items)
+                    uint64_t max_keys = col->next_key_index.load(std::memory_order_relaxed);
+                    ZipfDistribution dynamic_zipf({max_keys > 100 ? max_keys - 100 : 1, 1.0});
+                    uint64_t scan_start = dynamic_zipf(rng);
+
+                    size_t result_count = store.scan(make_key(scan_start),
+                                                     make_key(scan_start + 99),
+                                                     [](std::span<const std::byte>, std::span<const std::byte> value) {
+                                                       benchmark::DoNotOptimize(touch_bytes(value));
+                                                     });
+                    benchmark::DoNotOptimize(result_count);
+                    col->record_op(thread_idx, true);
+                  } else {
+                    // 5% Insert (with 20% 8B ratio for non-8B workloads)
+                    uint64_t next_idx = col->next_key_index.fetch_add(1, std::memory_order_relaxed);
+                    bool inserted;
+                    if (val_size != 8 && next_idx % 5 == 0) {
+                      inserted = store.insert(make_key(next_idx), dummy_8b);
+                    } else {
+                      inserted = store.insert(make_key(next_idx), dummy_large);
+                    }
+                    benchmark::DoNotOptimize(inserted);
+                    col->record_op(thread_idx, false);
+                  }
+                  ++local_ops;
+                }
+
+                if (state.thread_index() == 0) {
+                  col->dump_json(sname, variant_label, value_name);
+                }
+                state.SetItemsProcessed(local_ops);
+              }  // for (auto _ : state)
             },
             ycsb_threads,
             false,
@@ -1096,47 +1121,73 @@ void register_all_benchmarks() {
           false,
           delete_fixed_iterations);
 
-      auto scan_reorg_holder = std::make_shared<StoreHolder<decltype(make())>>();
       {
+        // Three scan scenarios over an otherwise identical corpus, differing only in how
+        // much reorganize work has been done before the scan measurement starts:
+        //   - NoReorg:   fresh populate only (append_region left as-is; this is the
+        //                "Scan-only (no reorganize)" scenario, previously missing entirely).
+        //   - T1Reorg:   T1-only reorganize (sorts append_region into sorted_region, but
+        //                skips the T2 physical rebuild -- force_t2_gc=false).
+        //   - T1T2Reorg: full T1+T2 reorganize (renamed from the old "ScanReorg" benchmark).
+        // RocksDB has no manual reorganize concept (it self-compacts), so it is populated
+        // identically for all three and the mode label only reflects intent, not a
+        // different underlying store state.
+        struct ScanScenario {
+          const char *mode_label;
+          int reorg_kind;  // 0 = none, 1 = T1-only, 2 = T1+T2
+        };
+        constexpr std::array<ScanScenario, 3> kScanScenarios{{
+            {"NoReorg", 0},
+            {"T1Reorg", 1},
+            {"T1T2Reorg", 2},
+        }};
+
         constexpr int scan_count_reorg = 100;
         const size_t reorg_dataset_size = corpus_size;
-        for (int dist_idx = 0; dist_idx < 2; ++dist_idx) {
-          const char *dist = (dist_idx == 0) ? "Zipf" : "Uniform";
-          auto scan_reorg_meta = make_metadata(reorg_dataset_size, kInlineValueBytes);
-          register_bench(
-              scan_reorg_holder,
-              benchmark_name(sname, "ScanReorg", std::nullopt, dist, value_name),
-              scan_reorg_meta,
-              make,
-              [reorg_dataset_size, sname](auto &store) {
-                populate(store, {reorg_dataset_size, kInlineValueBytes});
-                // VMemKV: explicitly reorganize T1 so sorted_region is fully sorted.
-                // RocksDB: skip (no manual reorganize concept; compaction runs automatically).
-                if (sname != "RocksDB") {
-                  store.reorganize();
-                }
-              },
-              [reorg_dataset_size, dist](benchmark::State &state, auto &store) {
-                std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
-                const std::size_t scan_span = reorg_dataset_size > static_cast<std::size_t>(scan_count_reorg)
-                                                  ? reorg_dataset_size - static_cast<std::size_t>(scan_count_reorg)
-                                                  : 1;
-                ZipfDistribution zipf({scan_span, 1.0});
-                std::uniform_int_distribution<std::size_t> uniform_index(0, scan_span - 1);
-                for (auto _ : state) {
-                  std::size_t scan_start = (std::string(dist) == "Zipf") ? zipf(rng) : uniform_index(rng);
-                  size_t result_count =
-                      store.scan(make_key(scan_start),
-                                 make_key(scan_start + scan_count_reorg - 1),
-                                 [](std::span<const std::byte>, uint64_t value) { benchmark::DoNotOptimize(value); });
-                  benchmark::DoNotOptimize(result_count);
-                }
-                state.SetItemsProcessed(state.iterations());
-              },
-              thread_counts,
-              true,
-              -1,
-              false);
+        for (const auto &scenario : kScanScenarios) {
+          auto scan_holder = std::make_shared<StoreHolder<decltype(make())>>();
+          for (int dist_idx = 0; dist_idx < 2; ++dist_idx) {
+            const char *dist = (dist_idx == 0) ? "Zipf" : "Uniform";
+            auto scan_meta = make_metadata(reorg_dataset_size, val_size);
+            register_bench(
+                scan_holder,
+                benchmark_name(sname, "Scan", scenario.mode_label, dist, value_name),
+                scan_meta,
+                make,
+                [reorg_dataset_size, val_size, sname, reorg_kind = scenario.reorg_kind](auto &store) {
+                  populate(store, {reorg_dataset_size, val_size});
+                  if (sname == "RocksDB") {
+                    return;
+                  }
+                  if (reorg_kind == 1) {
+                    store.reorganize(false);
+                  } else if (reorg_kind == 2) {
+                    store.reorganize(true);
+                  }
+                },
+                [reorg_dataset_size, dist](benchmark::State &state, auto &store) {
+                  std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
+                  const std::size_t scan_span = reorg_dataset_size > static_cast<std::size_t>(scan_count_reorg)
+                                                    ? reorg_dataset_size - static_cast<std::size_t>(scan_count_reorg)
+                                                    : 1;
+                  ZipfDistribution zipf({scan_span, 1.0});
+                  std::uniform_int_distribution<std::size_t> uniform_index(0, scan_span - 1);
+                  for (auto _ : state) {
+                    std::size_t scan_start = (std::string(dist) == "Zipf") ? zipf(rng) : uniform_index(rng);
+                    size_t result_count = store.scan(make_key(scan_start),
+                                                     make_key(scan_start + scan_count_reorg - 1),
+                                                     [](std::span<const std::byte>, std::span<const std::byte> value) {
+                                                       benchmark::DoNotOptimize(touch_bytes(value));
+                                                     });
+                    benchmark::DoNotOptimize(result_count);
+                  }
+                  state.SetItemsProcessed(state.iterations());
+                },
+                thread_counts,
+                true,
+                -1,
+                false);
+          }
         }
       }
     }

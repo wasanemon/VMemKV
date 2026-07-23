@@ -490,8 +490,8 @@ class VMemKVImpl {
                  if constexpr (ConfigT::UseT1InlineValue) {
                    if (t1_detail::is_inline(hash)) {
                      size_t size = t1_detail::decode_size(hash);
-                     uint64_t val_u64 = 0;
-                     std::memcpy(&val_u64, &payload, size);
+                     std::array<std::byte, kInlineScalarValueBytes> stack_value;
+                     std::memcpy(stack_value.data(), &payload, size);
 
                      std::array<std::byte, kStoreKeyBytes> stack_key;
                      size_t len = kStoreKeyBytes;
@@ -503,19 +503,22 @@ class VMemKVImpl {
                      if (!key_in_range(key_view, lower_bound, upper_bound)) {
                        return;
                      }
-                     callback(key_view, val_u64);
+                     callback(key_view, std::span<const std::byte>(stack_value.data(), size));
                      ++count;
                      return;
                    }
                  }
 
                  // T2 record branch (direct callback under SeqLock loop)
+                 // NOTE: the full value span is only valid inside this callback -- it is
+                 // re-validated (and callback re-invoked) by the SeqLock retry loop if a
+                 // concurrent writer raced, matching the pattern used by get_impl().
                  const T2RecordView record = t2_.at(payload & kOffsetMask, mem);
                  read_t2_record_seqlock(record, [&]() -> bool {
                    if (!key_in_range(record.key, lower_bound, upper_bound)) {
                      return false;
                    }
-                   callback(record.key, decode_u64(record.value));
+                   callback(record.key, record.value);
                    return true;
                  });
                  ++count;
@@ -583,12 +586,6 @@ class VMemKVImpl {
 
     bytes_used += aligned_len;
     return offset;
-  }
-
-  static auto decode_u64(std::span<const std::byte> bytes) noexcept -> uint64_t {
-    uint64_t value = 0;
-    std::memcpy(&value, bytes.data(), std::min<size_t>(bytes.size(), kDefaultAlignmentBytes));
-    return value;
   }
 
   static auto byte_span_equal(std::span<const std::byte> lhs, std::span<const std::byte> rhs) noexcept -> bool {

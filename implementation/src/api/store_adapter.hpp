@@ -119,6 +119,17 @@ class StoreAdapter {
   // Delegates to low-level methods if they are exposed
   void reorganize() { impl_.reorganize(); }
 
+  // force_t2_gc selects between a T1-only reorganize (fast, zero I/O) and a full T1+T2
+  // reorganize (rebuilds the T2 file too). RocksDB has no such distinction -- it
+  // self-compacts -- so this is a no-op for it regardless of the flag.
+  void reorganize(bool force_t2_gc) {
+    if constexpr (std::is_same_v<KVSImpl, ::RocksDBStore>) {
+      (void)force_t2_gc;
+    } else {
+      impl_.reorganize(force_t2_gc);
+    }
+  }
+
   auto get_statistics() const noexcept -> ::vmemkv::VMemKVStatistics {
     if constexpr (std::is_same_v<KVSImpl, ::RocksDBStore>) {
       return ::vmemkv::VMemKVStatistics{};

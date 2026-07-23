@@ -26,10 +26,6 @@
 
 #include "../t1_index/t1_index.hpp"  // For STORE_NOT_FOUND definition
 
-namespace {
-constexpr std::size_t kEncodedScalarValueBytes = 8;
-}
-
 class RocksDBStore {
  public:
   static constexpr bool kIsEnabled =
@@ -159,14 +155,7 @@ class RocksDBStore {
     size_t count = 0;
     for (iterator->Seek(lower_bound_slice); iterator->Valid() && iterator->key().compare(upper_bound_slice) <= 0;
          iterator->Next()) {
-      uint64_t value = 0;
-      const auto value_slice = iterator->value();
-      const size_t value_bytes = std::min<size_t>(value_slice.size(), kEncodedScalarValueBytes);
-      for (size_t index = 0; index < value_bytes; ++index) {
-        value |= static_cast<uint64_t>(static_cast<uint8_t>(value_slice[index])) << (index * kEncodedScalarValueBytes);
-      }
-
-      callback(to_bytes(iterator->key()), value);
+      callback(to_bytes(iterator->key()), to_bytes(iterator->value()));
       ++count;
     }
     return count;
