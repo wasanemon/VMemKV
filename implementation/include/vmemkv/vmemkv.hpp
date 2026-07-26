@@ -10,6 +10,8 @@
 
 #include "api/store_adapter.hpp"
 #include "config.hpp"
+#include "rivals/lmdb_store.hpp"
+#include "rivals/rocksdb_blobdb_store.hpp"
 #include "rivals/rocksdb_store.hpp"
 #include "t1_index/t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
@@ -40,6 +42,8 @@ namespace variants {
 using VMemKV_Baseline = StoreAdapter<VMemKVImpl<detail::T1_AllOff>>;
 
 using VMemKVRocksDB = StoreAdapter<::RocksDBStore>;
+using VMemKVRocksDBBlobDB = StoreAdapter<::RocksDBBlobDBStore>;
+using VMemKVLMDB = StoreAdapter<::LMDBStore>;
 
 // ─── 1. Core Stacked Ablation Variants ───
 using VMemKV_Var0_Baseline = VMemKV_Baseline;
@@ -50,6 +54,8 @@ using VMemKV_Var4_Prefault = VMemKVStore;  // Fully optimized production configu
 using VMemKVStore = VMemKVStore;
 
 using VMemKV_RocksDB = VMemKVRocksDB;
+using VMemKV_RocksDBBlobDB = VMemKVRocksDBBlobDB;
+using VMemKV_LMDB = VMemKVLMDB;
 
 // ─── 2. Unified Benchmark Registration Tuple ───
 using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
@@ -57,7 +63,9 @@ using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
                                     VMemKV_Var2_Simd,
                                     VMemKV_Var3_Inline,
                                     VMemKV_Var4_Prefault,
-                                    VMemKV_RocksDB>;
+                                    VMemKV_RocksDB,
+                                    VMemKV_RocksDBBlobDB,
+                                    VMemKV_LMDB>;
 }  // namespace variants
 
 }  // namespace vmemkv

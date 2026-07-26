@@ -25,6 +25,8 @@
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_Baseline>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKVStore>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDB>);
+static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDBBlobDB>);
+static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_LMDB>);
 
 namespace test_util {
 template <typename StorePtr, typename Key>
@@ -98,6 +100,7 @@ static auto reserve_temp_path() -> std::filesystem::path {
       ("vmemkv_kv_" + std::to_string(static_cast<long>(::getpid())) + "_" + std::to_string(sequence_number));
   std::error_code ignored;
   std::filesystem::remove(temp_path, ignored);
+  std::filesystem::remove(vmemkv::derive_wal_path(temp_path), ignored);
   return temp_path;
 }
 
@@ -108,6 +111,7 @@ struct VMemKVDeleter {
     delete store_ptr;
     std::error_code ignored;
     std::filesystem::remove_all(path, ignored);
+    std::filesystem::remove(vmemkv::derive_wal_path(path), ignored);
   }
 };
 
@@ -117,7 +121,8 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 
   static auto make() -> std::unique_ptr<vmemkv::StoreAdapter<Impl>, VMemKVDeleter<Impl>> {
     std::filesystem::path path = reserve_temp_path();
-    if constexpr (std::is_same_v<Impl, ::RocksDBStore>) {
+    if constexpr (std::is_same_v<Impl, ::RocksDBStore> || std::is_same_v<Impl, ::RocksDBBlobDBStore> ||
+                  std::is_same_v<Impl, ::LMDBStore>) {
       std::error_code ignored;
       std::filesystem::remove(path, ignored);
       auto *store = new vmemkv::StoreAdapter<Impl>(path.string());
@@ -136,12 +141,20 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
   vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Simd, \
       vmemkv::variants::VMemKV_Var3_Inline, vmemkv::variants::VMemKV_Var4_Prefault
 
-// 競合バックエンドのバリエーション（RocksDBStoreなど）
+// 競合バックエンドのバリエーション（RocksDBStore, LMDBStoreなど）
 #ifdef ENABLE_ROCKSDB
-#define RivalStores , vmemkv::variants::VMemKV_RocksDB
+#define RocksDBRivalStores , vmemkv::variants::VMemKV_RocksDB, vmemkv::variants::VMemKV_RocksDBBlobDB
 #else
-#define RivalStores
+#define RocksDBRivalStores
 #endif
+
+#ifdef ENABLE_LMDB
+#define LMDBRivalStores , vmemkv::variants::VMemKV_LMDB
+#else
+#define LMDBRivalStores
+#endif
+
+#define RivalStores RocksDBRivalStores LMDBRivalStores
 
 #define STORE_TYPES VMemKVStores RivalStores
 #define LONG_KEY_STORE_TYPES STORE_TYPES
@@ -700,6 +713,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
     CHECK(store->t2().bytes_used() > 0);
 
     std::filesystem::remove(path);
+    std::filesystem::remove(vmemkv::derive_wal_path(path));
   }
 }
 
@@ -740,4 +754,5 @@ TEST_CASE("VMemKV: reorganize lost update race condition (Deterministic)") {
   CHECK((*res)[0] == std::byte{9});
 
   std::filesystem::remove(path);
+  std::filesystem::remove(vmemkv::derive_wal_path(path));
 }

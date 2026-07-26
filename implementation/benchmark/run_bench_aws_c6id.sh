@@ -81,8 +81,8 @@ fi
 AWS_REGION="ap-northeast-1"
 INSTANCE_TYPE="c6id.8xlarge"
 MIN_TIME="5.0s"
-LTM_MEMORY_BUDGET_BYTES=$((1 * 1024 * 1024 * 1024))
-LTM_SWAP_BUDGET_BYTES=$((1024 * 1024 * 1024 * 1024))
+LTM_MEMORY_BUDGET_BYTES="$(vmemkv_matrix::ltm_memory_budget_bytes)"
+LTM_SWAP_BUDGET_BYTES="$(vmemkv_matrix::ltm_swap_budget_bytes)"
 KEY_NAME="vmemkv-c6id-key-$$"
 PEM_FILE="/tmp/${KEY_NAME}.pem"
 SG_NAME="vmemkv-c6id-sg-$$"
@@ -251,7 +251,7 @@ install_remote_dependencies() {
       fi
       sleep 4
     done
-    sudo apt-get update -y >/tmp/setup.log 2>&1 && sudo apt-get install -y build-essential cmake ninja-build libgoogle-perftools-dev librocksdb-dev jq rsync >>/tmp/setup.log 2>&1
+    sudo apt-get update -y >/tmp/setup.log 2>&1 && sudo apt-get install -y build-essential cmake ninja-build libgoogle-perftools-dev librocksdb-dev liblmdb-dev jq rsync >>/tmp/setup.log 2>&1
   "
 }
 
@@ -328,6 +328,7 @@ build_remote_benchmark() {
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -march=native' \
       -DENABLE_ROCKSDB=ON \
+      -DENABLE_LMDB=ON \
       -DENABLE_BENCHMARK=ON &&
     cmake --build build-rel --target bench_kv --clean-first -j\"\$(nproc)\"
   "
@@ -461,7 +462,8 @@ run_scenario() {
 cd /home/ubuntu/faultkv/implementation &&
 ${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} } \
 ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
-./benchmark/common/aws_remote_runner.sh \
+./benchmark/common/run_scenario.sh \
+  './build-rel/benchmark/bench_kv' \
   '$scenario_run_filter' \
   '$MIN_TIME' \
   '$scenario_result_path'

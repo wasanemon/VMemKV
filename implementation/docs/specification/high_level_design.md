@@ -105,16 +105,16 @@ index-level covering を有効にした index では，3. は不要であり，T
 ### 5.2 Insert
 
 1. `Get()` によってすでにエントリが存在するか確認
-2. WAL append + `fsync`
-3. Tier 2 の末尾に value record を追加し，offset を得る
-4. Tier 1 `append_region` に `IndexEntry` を追加し，その offset を書く
+2. Tier 2 の末尾に value record を追加し，offset を得る
+3. Tier 1 `append_region` に `IndexEntry` を追加し，その offset を書く
+4. WAL append + `fsync`
 
-index-level covering を有効にした index では，3. を省略し，Tier 1 entry の payload に 64-bit value を直接書く．
+index-level covering を有効にした index では，2. を省略し，Tier 1 entry の payload に 64-bit value を直接書く．
 
 ### 5.3 Update / Delete / Scan
 
-- Update: `Get()` でエントリを特定し，WAL 書き込みを行い、Tier 2 が in-place update 可能なら既存 record を更新し、不可能なら Tier 2 末尾追記 + Tier 1 offset 更新を行う
-- Delete: `Get()` でエントリを特定し，WAL書き込みを行い，Tier 1 上で offset を tombstone にする．Tier 2 にはアクセスしない．
+- Update: `Get()` でエントリを特定し、Tier 2 が in-place update 可能なら既存 record を更新し、不可能なら Tier 2 末尾追記 + Tier 1 offset 更新を行ったうえで、WAL 書き込みを行う
+- Delete: `Get()` でエントリを特定し，Tier 1 上で offset を tombstone にしたうえで，WAL書き込みを行う．Tier 2 にはアクセスしない．
 - Scan: まず Tier 1 で範囲を絞り込み、得られた offset 集合を使って Tier 2 で value records を収集して返す
 
 index-level covering を有効にした index では，Update / Delete / Scan も Tier 1 payload だけで完結する．
@@ -187,7 +187,11 @@ TODO: ジャイアントロックでfork後に追加されたエントリの同�
 
 以下の要素で、VMemKV は永続性を保証する。
 
-- すべての更新は WAL を先行永続化する
+- Tier 1 / Tier 2 はいずれも、それ自体がディスクへ書き戻される経路を持たない(Tier 2 は `MAP_PRIVATE` で mmap されるため書き込みは元ファイルへ反映されず、Tier 1 は純粋な RAM 上構造体である)。そのため両者は volatile であり、起動のたびに WAL からの replay で再構築される。
+- 更新は、まず Tier 2 / Tier 1 に適用し、それが成功して初めて WAL append + `fsync` を行う。呼び出し元への成功応答は WAL の `fsync` 完了後にのみ返す。
+  - 古典的な WAL (ARIES 等) が要求する "write-ahead" とは、本来「ログの永続化がデータページの**ディスクへの書き戻し**より先行しなければならない」という制約であり、「ログ書き込みがメモリ上の更新より先」という意味ではない。VMemKV では Tier 1 / Tier 2 自体がディスクへ書き戻される経路を持たないため、この制約は構造的に自明に満たされる。
+  - この順序により、Tier 1 / Tier 2 への適用中に例外が発生した操作(例: Tier 2 の容量超過)は WAL に記録されない。もし WAL 先行(ログ→適用の順)にすると、適用が失敗した操作の記録が WAL に残ってしまい、次回起動時の replay で同じ失敗を再現し、リカバリ自体が永久に失敗し続ける("poison pill")リスクがある。
+  - 上記の容量超過は、本来は 6.2 節に述べる checkpoint & reload によるキューイングで解消される想定だが、そのキューイング機構(TODO item 2)が実装されるまでは、適用成功後に WAL へ書く順序を維持する。
 - 障害時は checkpoint の読み込み + WAL replay で復旧する
 - checkpoint 完了後は古い WAL と checkpoint を削除しローテートする
 

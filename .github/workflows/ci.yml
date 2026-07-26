@@ -26,7 +26,8 @@ jobs:
           clang \
           clang-format \
           clang-tidy \
-          librocksdb-dev
+          librocksdb-dev \
+          liblmdb-dev
 
     - name: Verify Code Formatting
       run: |
@@ -39,7 +40,8 @@ jobs:
           -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_WARN_DEPRECATED=OFF \
-          -DENABLE_ROCKSDB=ON
+          -DENABLE_ROCKSDB=ON \
+          -DENABLE_LMDB=ON
 
     - name: Run clang-tidy Static Analysis
       if: matrix.compiler == 'clang++'

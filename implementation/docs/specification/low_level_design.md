@@ -147,42 +147,46 @@ struct VMemKV {
 **Procedure**
 
 1. `Get(full_key)` を実行し、既存 entry がなければ続行する。
-2. WAL に insert record を append し、`fsync` する。
-3. Tier 2 の `bytes_used` 位置に新しい `ValueRecord` を書き込み、論理 `offset` を得る。
-4. `IndexEntry{key_prefix, hash, payload_bits}` を作り、Tier 1 `append_region` に追加する。
+2. Tier 2 の `bytes_used` 位置に新しい `ValueRecord` を書き込み、論理 `offset` を得る。
+3. `IndexEntry{key_prefix, hash, payload_bits}` を作り、Tier 1 `append_region` に追加する。
+4. WAL に insert record を append し、`fsync` する。呼び出し元への成功応答はこの `fsync` 完了後にのみ返す。
 
 **Failure Rule**
 
-- WAL 永続化前に Tier 1 / Tier 2 を更新してはならない。
+- 2.〜3. (Tier 1 / Tier 2 への適用)が例外・失敗で完了しなかった操作を、WAL に記録してはならない。
+- 言い換えると、WAL append は Tier 1 / Tier 2 への適用が成功したことが確定した後にのみ行う。
+- 理由: Tier 1 / Tier 2 は volatile であり (5.1 節)、それ自体がディスクへ書き戻される経路を持たないため、古典的 WAL が要求する「ログ永続化 ≺ データページのディスクへの書き戻し」という制約はここでは構造的に自明に満たされる。したがって WAL を先に書く必然性はなく、むしろ適用失敗時に WAL へ記録が残ると、次回起動時の replay で同じ失敗が再現し続け、リカバリ自体が永久に失敗する("poison pill")リスクがある。
+- 2. で容量不足 (`bytes_used + required_bytes > bytes_capacity`) となった場合、本来は checkpoint & reload によるキューイング (2.2 節) で解消される想定だが、そのキューイング機構が実装されるまでは、この操作は失敗として扱い、WAL には何も記録しない。
 
 ### 3.3 Update
 
 **Procedure**
 
 1. `Get(full_key)` で対象 entry を特定する。見つからなければ not found。
-2. WAL に update record を append し、`fsync` する。
-3. Tier 2 の既存 record を見る。
-4. `new_value_len <= alloc_len` なら Tier 2 record を in-place update する。
-5. それ以外なら Tier 2 の `bytes_used` 位置に新 record を追加し、新しい `offset` を得る。
-6. Tier 1 の該当 `IndexEntry.payload_bits` を新しい `offset` に書き換える。
+2. Tier 2 の既存 record を見る。
+3. `new_value_len <= alloc_len` なら Tier 2 record を in-place update する。
+4. それ以外なら Tier 2 の `bytes_used` 位置に新 record を追加し、新しい `offset` を得たうえで、Tier 1 の該当 `IndexEntry.payload_bits` を書き換える。
+5. WAL に update record を append し、`fsync` する。呼び出し元への成功応答はこの `fsync` 完了後にのみ返す。
 
 **Notes**
 
 - old Tier 2 record はその場では削除しない。
 - old Tier 2 record は Tier 1 から到達不能になり、後続の `reorganize` で物理削除される。
+- Failure Rule は 3.2 節と同様: 2.〜4. が失敗した操作を WAL に記録してはならない。
 
 ### 3.4 Delete
 
 **Procedure**
 
 1. `Get(full_key)` で対象 entry を特定する。見つからなければ not found。
-2. WAL に delete record を append し、`fsync` する。
-3. Tier 1 の該当 `IndexEntry.payload_bits` を `TOMBSTONE_OFFSET` に書き換える。
+2. Tier 1 の該当 `IndexEntry.payload_bits` を `TOMBSTONE_OFFSET` に書き換える。
+3. WAL に delete record を append し、`fsync` する。呼び出し元への成功応答はこの `fsync` 完了後にのみ返す。
 
 **Notes**
 
 - Tier 2 の record は delete 時には触らない。
 - delete 済み record は Tier 1 から到達不能になり、`reorganize` で物理削除される。
+- Failure Rule は 3.2 節と同様: 2. が失敗した操作を WAL に記録してはならない。
 
 ### 3.5 Scan
 

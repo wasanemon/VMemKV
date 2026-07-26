@@ -13,6 +13,8 @@
 #include "serializer.hpp"
 
 class RocksDBStore;
+class RocksDBBlobDBStore;
+class LMDBStore;
 
 namespace vmemkv {
 
@@ -28,6 +30,12 @@ template <typename T>
 struct get_config_type<T, std::void_t<typename T::ConfigType>> {
   using type = typename T::ConfigType;
 };
+
+// Rival (non-VMemKV) backends have no T1/T2 concept: they self-manage storage
+// layout, so reorganize()/get_statistics() are no-ops/empty for all of them.
+template <typename T>
+inline constexpr bool is_rival_store_v =
+    std::is_same_v<T, ::RocksDBStore> || std::is_same_v<T, ::RocksDBBlobDBStore> || std::is_same_v<T, ::LMDBStore>;
 }  // namespace detail
 
 template <typename KVSImpl>
@@ -39,6 +47,10 @@ class StoreAdapter {
   static auto name() -> std::string {
     if constexpr (std::is_same_v<KVSImpl, ::RocksDBStore>) {
       return "RocksDB";
+    } else if constexpr (std::is_same_v<KVSImpl, ::RocksDBBlobDBStore>) {
+      return "RocksDB-BlobDB";
+    } else if constexpr (std::is_same_v<KVSImpl, ::LMDBStore>) {
+      return "LMDB";
     } else {
       return KVSImpl::name();
     }
@@ -120,10 +132,11 @@ class StoreAdapter {
   void reorganize() { impl_.reorganize(); }
 
   // force_t2_gc selects between a T1-only reorganize (fast, zero I/O) and a full T1+T2
-  // reorganize (rebuilds the T2 file too). RocksDB has no such distinction -- it
-  // self-compacts -- so this is a no-op for it regardless of the flag.
+  // reorganize (rebuilds the T2 file too). Rival backends have no such distinction --
+  // they self-compact/self-manage storage -- so this is a no-op for them regardless
+  // of the flag.
   void reorganize(bool force_t2_gc) {
-    if constexpr (std::is_same_v<KVSImpl, ::RocksDBStore>) {
+    if constexpr (detail::is_rival_store_v<KVSImpl>) {
       (void)force_t2_gc;
     } else {
       impl_.reorganize(force_t2_gc);
@@ -131,7 +144,7 @@ class StoreAdapter {
   }
 
   auto get_statistics() const noexcept -> ::vmemkv::VMemKVStatistics {
-    if constexpr (std::is_same_v<KVSImpl, ::RocksDBStore>) {
+    if constexpr (detail::is_rival_store_v<KVSImpl>) {
       return ::vmemkv::VMemKVStatistics{};
     } else {
       return impl_.get_statistics();

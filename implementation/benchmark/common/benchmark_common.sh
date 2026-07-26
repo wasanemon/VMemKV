@@ -80,7 +80,7 @@ vmemkv_target_profile_label() {
   for scenario_key in "$@"; do
     case "$scenario_key" in
       in_memory) ratio="0.5" ;;
-      ltm) ratio="2.0" ;;
+      ltm) ratio="8.0" ;;
       *) ratio="?" ;;
     esac
 

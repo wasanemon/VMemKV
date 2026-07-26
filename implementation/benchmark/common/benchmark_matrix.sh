@@ -5,7 +5,22 @@
 # duplicating filter strings.
 
 vmemkv_matrix::scenario_filter() {
-  printf '%s\n' '(^Store=VMemKV/|^Store=RocksDB/)'
+  printf '%s\n' '(^Store=VMemKV/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/)'
+}
+
+# LTM scenario memory parameters: a small *declared* budget (fed to bench_kv as
+# VMEMKV_CONTEXT_memory_budget_bytes) combined with a large target_ratio (8.0) yields a
+# corpus a few times bigger than the budget. Actually forcing that corpus to spill into
+# swap requires constraining the process's real RSS to roughly this budget (e.g. via
+# `systemd-run ... -p MemoryHigh=... -p MemoryMax=...` as the AWS runner does); without
+# that cgroup wrap, the numbers here only size the corpus consistently across
+# environments, they do not by themselves recreate memory pressure.
+vmemkv_matrix::ltm_memory_budget_bytes() {
+  printf '%s\n' "$((1 * 1024 * 1024 * 1024))"
+}
+
+vmemkv_matrix::ltm_swap_budget_bytes() {
+  printf '%s\n' "$((1024 * 1024 * 1024 * 1024))"
 }
 
 vmemkv_matrix::scenario_env_prefix() {
@@ -134,13 +149,15 @@ vmemkv_matrix::scenario_quick_filter() {
 
   case "$scenario_key" in
     in_memory)
-      # One representative in-memory workload, chosen to match the previous
-      # long-running end-of-scenario region with a single 32-thread case.
-      printf '%s\n' '^Store=VMemKV/Variant=Bloom-Simd/Op=ScanReorg/Dist=Uniform/Value=8B/real_time/threads:32$'
+      # One representative in-memory workload from the tail end of the matrix
+      # (Scan is registered last). threads:1 keeps this portable across
+      # machines with different core counts (unlike a hardcoded thread count).
+      printf '%s\n' '^Store=VMemKV/Variant=Bloom-Simd/Op=Scan/Mode=T1T2Reorg/Dist=Uniform/Value=8B/real_time/threads:1$'
       ;;
     ltm)
       # One representative LTM workload, chosen to reach the scenario boundary quickly.
-      printf '%s\n' '^Store=VMemKV/Variant=Bloom-Simd-Hints-T1InlineValue/Op=Get/Mode=Hit/Dist=Zipf/Value=64KB/real_time/threads:1$'
+      # Value labels carry a "(20% 8B)" suffix for non-8B sizes, hence the ".*".
+      printf '%s\n' '^Store=VMemKV/Variant=Bloom-Simd-T1InlineValue-Prefaulting/Op=Get/Mode=Hit/Dist=Zipf/Value=64KB.*threads:1$'
       ;;
     *)
       return 1

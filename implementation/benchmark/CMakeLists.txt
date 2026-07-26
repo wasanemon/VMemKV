@@ -25,6 +25,11 @@ if(ENABLE_ROCKSDB AND RocksDB_FOUND)
   target_link_libraries(bench_kv PRIVATE RocksDB::rocksdb)
 endif()
 
+if(ENABLE_LMDB AND LMDB_FOUND)
+  target_compile_definitions(bench_kv PRIVATE ENABLE_LMDB)
+  target_link_libraries(bench_kv PRIVATE LMDB::lmdb)
+endif()
+
 option(ENABLE_GPERFTOOLS_PROFILER "Enable gperftools CPU profiler support for bench_kv" ON)
 if(ENABLE_GPERFTOOLS_PROFILER)
   find_library(GPERFTOOLS_PROFILER_LIB

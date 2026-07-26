@@ -302,14 +302,7 @@ static inline bool prefer_large_value_first() {
   const char *env = std::getenv("VMEMKV_BENCH_LARGE_VALUE_FIRST");
   return env != nullptr && std::string(env) == "1";
 }
-static inline int insert_total_iterations(std::size_t value_size) {
-  if (const char *override_total = std::getenv("VMEMKV_BENCH_INSERT_TOTAL_ITERATIONS")) {
-    char *end = nullptr;
-    long parsed = std::strtol(override_total, &end, 10);
-    if (end != override_total && *end == '\0' && parsed > 0 && parsed <= std::numeric_limits<int>::max()) {
-      return static_cast<int>(parsed);
-    }
-  }
+static inline int default_total_iterations_for_value_size(std::size_t value_size) {
   if (value_size == kInlineValueBytes) {
     return 5'000'000;
   }
@@ -319,17 +312,60 @@ static inline int insert_total_iterations(std::size_t value_size) {
   return 1'000'000;
 }
 
+static inline int total_iterations_from_env_or_default(const char *env_name, std::size_t value_size) {
+  if (const char *override_total = std::getenv(env_name)) {
+    char *end = nullptr;
+    long parsed = std::strtol(override_total, &end, 10);
+    if (end != override_total && *end == '\0' && parsed > 0 && parsed <= std::numeric_limits<int>::max()) {
+      return static_cast<int>(parsed);
+    }
+  }
+  return default_total_iterations_for_value_size(value_size);
+}
+
+static inline int insert_total_iterations(std::size_t value_size) {
+  return total_iterations_from_env_or_default("VMEMKV_BENCH_INSERT_TOTAL_ITERATIONS", value_size);
+}
+
+// Delete has no min_time-adaptive path via google-benchmark's normal iteration
+// counting (each deleted key is gone for good, so re-running more iterations isn't
+// meaningful once the corpus is exhausted). A *fixed iteration count* is not a safe
+// substitute: per-delete cost can degrade non-linearly with how much has already been
+// deleted (observed locally: LMDB/1KB went from ~212K deletes/sec at a 20M-key corpus
+// to ~5K deletes/sec at a 16M-key corpus -- a 40x swing from value size alone), so any
+// fixed count can still land in a slow regime for some engine/corpus combination.
+// Instead, Delete runs its own bounded wall-clock loop (same technique as YCSB-E):
+// walk the corpus deleting keys until either the time budget or the corpus is
+// exhausted, whichever comes first. This caps worst-case per-cell time regardless of
+// how badly a given engine degrades, while still populating and testing against the
+// *full* corpus_size so LTM scenarios keep exercising genuine memory pressure (a
+// fixed small delete-only corpus would fit in the LTM memory budget and stop being
+// "larger than memory").
+static inline double delete_time_budget_seconds() {
+  if (const char *override_seconds = std::getenv("VMEMKV_BENCH_DELETE_TIME_BUDGET_SECONDS")) {
+    char *end = nullptr;
+    double parsed = std::strtod(override_seconds, &end);
+    if (end != override_seconds && *end == '\0' && parsed > 0.0) {
+      return parsed;
+    }
+  }
+  return 5.0;
+}
+
+// Rival backends (RocksDB, RocksDB-BlobDB, LMDB, ...) report a bare name with no
+// "VMemKV/" prefix; only actual VMemKV configurations use that prefix. This lets a
+// new rival be added without touching this string matching.
 static auto store_label(std::string_view store_name) -> std::string {
-  return store_name == "RocksDB" ? "RocksDB" : "VMemKV";
+  constexpr std::string_view kVMemKVPrefix = "VMemKV/";
+  return store_name.rfind(kVMemKVPrefix, 0) == 0 ? "VMemKV" : std::string(store_name);
 }
 
 static auto variant_label(std::string_view store_name) -> std::string {
-  if (store_name == "RocksDB") {
-    return "RocksDB";
-  }
   constexpr std::string_view kPrefix = "VMemKV/";
-  std::string variant =
-      store_name.rfind(kPrefix, 0) == 0 ? std::string(store_name.substr(kPrefix.size())) : std::string(store_name);
+  if (store_name.rfind(kPrefix, 0) != 0) {
+    return std::string(store_name);
+  }
+  std::string variant = std::string(store_name.substr(kPrefix.size()));
   std::replace(variant.begin(), variant.end(), '/', '-');
   return variant;
 }
@@ -436,14 +472,21 @@ struct PopulateOptions {
   size_t value_size = kInlineValueBytes;
 };
 
+// Rival backends that expose a batched bulk_load_impl() instead of the generic
+// insert() loop below (much faster population for large corpora).
+template <typename Impl>
+inline constexpr bool kHasBulkLoadImpl =
+    std::is_same_v<Impl, ::RocksDBStore> || std::is_same_v<Impl, ::RocksDBBlobDBStore> ||
+    std::is_same_v<Impl, ::LMDBStore>;
+
 template <typename Store>
 static void populate(Store &store, PopulateOptions options) {
   using Impl = std::remove_reference_t<decltype(store.impl())>;
-  if constexpr (std::is_same_v<Impl, ::RocksDBStore>) {
+  if constexpr (kHasBulkLoadImpl<Impl>) {
     std::string error_message;
     if (!store.impl().bulk_load_impl(
             options.key_count, [](std::size_t index) { return make_key(index); }, options.value_size, &error_message)) {
-      throw std::runtime_error(error_message.empty() ? "RocksDB bulk populate failed" : error_message);
+      throw std::runtime_error(error_message.empty() ? "bulk populate failed" : error_message);
     }
   } else {
     const size_t max_concurrency = std::min<size_t>(8, std::thread::hardware_concurrency());
@@ -519,6 +562,7 @@ template <typename Constructor>
 static auto make_vmemkv(const std::string &path, Constructor &&constructor) {
   std::error_code error_code;
   std::filesystem::remove(path, error_code);
+  std::filesystem::remove(vmemkv::derive_wal_path(path), error_code);
   return constructor();
 }
 
@@ -535,6 +579,13 @@ void for_each_in_tuple(Visitor &&visitor) {
 
 using BenchmarkTypes = vmemkv::variants::AllPossibleTypes;
 
+// Rival backends take a bare path (they manage their own on-disk capacity/layout);
+// only VMemKV configurations take the extra T2 capacity argument.
+template <typename Store>
+inline constexpr bool kUsesSingleArgConstructor = std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDB> ||
+                                                  std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDBBlobDB> ||
+                                                  std::is_same_v<Store, vmemkv::variants::VMemKV_LMDB>;
+
 template <typename Visitor>
 static void for_each_store_variant(Visitor &&visitor) {
   auto visit_one = [&](auto *dummy) {
@@ -546,7 +597,7 @@ static void for_each_store_variant(Visitor &&visitor) {
 
       visitor(Store::name().c_str(), [filename]() {
         return make_vmemkv(filename, [filename]() {
-          if constexpr (std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDB>) {
+          if constexpr (kUsesSingleArgConstructor<Store>) {
             return std::make_unique<Store>(filename);
           } else {
             return std::make_unique<Store>(filename, Store::ConfigType::DefaultT2CapacityBytes);
@@ -735,8 +786,8 @@ static void register_bench(std::shared_ptr<StoreHolder<StorePtr>> holder,
     };
 
     auto *reg = benchmark::RegisterBenchmark(name.c_str(), bench_func)->Threads(threads)->UseRealTime();
-    if (name.find("/Op=YCSB-E/") != std::string::npos) {
-      // YCSB-E already enforces a 30-second wall-clock window internally.
+    if (name.find("/Op=YCSB-E/") != std::string::npos || name.find("/Op=Delete/") != std::string::npos) {
+      // YCSB-E and Delete both enforce their own wall-clock window internally.
       // Keep Google Benchmark to a single execution so it does not add another
       // adaptive MinTime pass on top of the benchmark's own timing.
       reg->Iterations(1);
@@ -1096,30 +1147,39 @@ void register_all_benchmarks() {
       // Delete mutates benchmark state, so it starts from a fresh corpus for
       // each thread-count instance. It is T1-only, but we keep it in both
       // scenarios so the T1 path remains comparable against RocksDB.
+      //
+      // Populates the *full* corpus_size (same as Get/Update/Scan) so LTM scenarios
+      // keep exercising genuine memory pressure; the run itself is time-bounded (see
+      // delete_time_budget_seconds() above) rather than iteration-count-bounded, so a
+      // worst-case engine/corpus combination can't blow up a single cell's runtime.
       auto delete_meta = make_metadata(corpus_size, val_size);
-      const int delete_fixed_iterations = static_cast<int>(
-          std::min<std::size_t>(corpus_size, static_cast<std::size_t>(std::numeric_limits<int>::max())));
       register_bench(
           benchmark_name(sname, "Delete", std::nullopt, std::nullopt, value_name),
           delete_meta,
           make,
           [corpus_size, val_size](auto &store) { populate(store, {corpus_size, val_size}); },
-          [](benchmark::State &state, auto &store) {
+          [corpus_size](benchmark::State &state, auto &store) {
             std::size_t threads = static_cast<std::size_t>(state.threads());
             std::size_t thread_idx = static_cast<std::size_t>(state.thread_index());
-            std::size_t i = 0;
+            const auto time_budget = std::chrono::duration<double>(delete_time_budget_seconds());
             for (auto _ : state) {
-              std::size_t key_index = static_cast<std::size_t>(thread_idx) +
-                                      static_cast<std::size_t>(i) * static_cast<std::size_t>(threads);
-              bool removed = store.remove(make_key(key_index));
-              benchmark::DoNotOptimize(removed);
-              i++;
+              const auto deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(time_budget);
+              std::size_t i = 0;
+              while (std::chrono::steady_clock::now() < deadline) {
+                std::size_t key_index = thread_idx + i * threads;
+                if (key_index >= corpus_size) {
+                  break;  // this thread's slice of the corpus is exhausted
+                }
+                bool removed = store.remove(make_key(key_index));
+                benchmark::DoNotOptimize(removed);
+                ++i;
+              }
+              state.SetItemsProcessed(i);
             }
-            state.SetItemsProcessed(state.iterations());
           },
           thread_counts,
-          false,
-          delete_fixed_iterations);
+          false);
 
       {
         // Three scan scenarios over an otherwise identical corpus, differing only in how
@@ -1129,7 +1189,8 @@ void register_all_benchmarks() {
         //   - T1Reorg:   T1-only reorganize (sorts append_region into sorted_region, but
         //                skips the T2 physical rebuild -- force_t2_gc=false).
         //   - T1T2Reorg: full T1+T2 reorganize (renamed from the old "ScanReorg" benchmark).
-        // RocksDB has no manual reorganize concept (it self-compacts), so it is populated
+        // Rival backends (RocksDB, RocksDB-BlobDB, LMDB) have no manual reorganize
+        // concept -- they self-manage storage layout -- so they are populated
         // identically for all three and the mode label only reflects intent, not a
         // different underlying store state.
         struct ScanScenario {
@@ -1144,7 +1205,15 @@ void register_all_benchmarks() {
 
         constexpr int scan_count_reorg = 100;
         const size_t reorg_dataset_size = corpus_size;
+        const bool is_vmemkv = sname.rfind("VMemKV/", 0) == 0;
         for (const auto &scenario : kScanScenarios) {
+          // Rival backends skip the reorganize() call entirely (see the populate lambda
+          // below), so NoReorg/T1Reorg/T1T2Reorg would measure the exact same store state
+          // three times over for them. Only register T1T2Reorg (reorg_kind == 2) for
+          // rivals to avoid tripling their Scan benchmark time for zero extra signal.
+          if (!is_vmemkv && scenario.reorg_kind != 2) {
+            continue;
+          }
           auto scan_holder = std::make_shared<StoreHolder<decltype(make())>>();
           for (int dist_idx = 0; dist_idx < 2; ++dist_idx) {
             const char *dist = (dist_idx == 0) ? "Zipf" : "Uniform";
@@ -1156,7 +1225,9 @@ void register_all_benchmarks() {
                 make,
                 [reorg_dataset_size, val_size, sname, reorg_kind = scenario.reorg_kind](auto &store) {
                   populate(store, {reorg_dataset_size, val_size});
-                  if (sname == "RocksDB") {
+                  // Only VMemKV configurations have a manual reorganize concept; skip
+                  // the call entirely for rival backends (RocksDB, RocksDB-BlobDB, LMDB).
+                  if (sname.rfind("VMemKV/", 0) != 0) {
                     return;
                   }
                   if (reorg_kind == 1) {

@@ -15,6 +15,7 @@ endif()
 
 # ── Interface library for headers ─────────────────────────────────────────────
 option(ENABLE_ROCKSDB "Build with RocksDB backend" ON)
+option(ENABLE_LMDB "Build with LMDB backend" ON)
 add_library(vmemkv_headers INTERFACE)
 target_include_directories(vmemkv_headers INTERFACE 
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -33,6 +34,7 @@ endif()
 # ── Static library for source implementation ─────────────────────────────────
 add_library(vmemkv STATIC
   src/t2_flat_file/t2_flat_file.cpp
+  src/wal/wal.cpp
 )
 target_link_libraries(vmemkv PUBLIC vmemkv_headers vmemkv_warnings)
 
@@ -64,6 +66,27 @@ if(ENABLE_ROCKSDB)
       message(STATUS "Found RocksDB: ${ROCKSDB_LIB}")
     else()
       message(FATAL_ERROR "ENABLE_ROCKSDB=ON but RocksDB not found.")
+    endif()
+  endif()
+endif()
+
+# ── LMDB (optional) ───────────────────────────────────────────────────────────
+if(ENABLE_LMDB)
+  find_package(LMDB QUIET)
+  if(NOT LMDB_FOUND)
+    find_library(LMDB_LIB lmdb
+      HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
+    find_path(LMDB_INCLUDE_DIR lmdb.h
+      HINTS /opt/homebrew/include /usr/local/include /usr/include)
+    if(LMDB_LIB AND LMDB_INCLUDE_DIR)
+      add_library(LMDB::lmdb UNKNOWN IMPORTED)
+      set_target_properties(LMDB::lmdb PROPERTIES
+        IMPORTED_LOCATION "${LMDB_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES "${LMDB_INCLUDE_DIR}")
+      set(LMDB_FOUND TRUE)
+      message(STATUS "Found LMDB: ${LMDB_LIB}")
+    else()
+      message(FATAL_ERROR "ENABLE_LMDB=ON but LMDB not found.")
     endif()
   endif()
 endif()

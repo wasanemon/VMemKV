@@ -53,6 +53,7 @@
 
 #include "t1_index/t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
+#include "wal/wal.hpp"
 
 inline constexpr std::size_t kCacheLineAlignment = 64;
 
@@ -137,8 +138,13 @@ class VMemKVImpl {
   using T1IndexT = vmemkv::T1Index<ConfigT>;
 
   // Constructor. Creates a VMemKV coordination instance.
-  VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity) : t2_(t2_path, t2_bytes_capacity) {
-    reorg_worker_ = std::jthread(&VMemKVImpl::reorg_worker_loop, this);
+  // T2 is always MAP_PRIVATE (volatile: writes never reach disk), so on-disk T2 bytes from a
+  // previous run are meaningless -- the WAL is the only source of truth. T2 is wiped and rebuilt
+  // from scratch by replaying the WAL before the store is considered ready.
+  VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity)
+      : t2_(prepare_fresh_t2_file(t2_path), t2_bytes_capacity), wal_(vmemkv::derive_wal_path(t2_path)) {
+    recover_from_wal();
+    reorg_worker_ = std::jthread(&VMemKVImpl::reorg_worker_loop, this);  // Started after recovery completes.
   }
 
   ~VMemKVImpl() noexcept {
@@ -363,6 +369,13 @@ class VMemKVImpl {
   // Inserts a new key-value pair.
   // - Ordering: Writing to T2 (File) must strictly precede T1 (Index) write
   //   to prevent concurrent readers from encountering dangling offsets in T1.
+  //   The WAL append comes last, only after the T1/T2 mutation has actually
+  //   succeeded: write_entry_lockfree() can throw (e.g. T2 capacity exceeded),
+  //   and logging the op to the WAL first would durably persist a record for a
+  //   write that never happened -- replaying it on the next restart would hit
+  //   the identical throw from inside the constructor, permanently bricking
+  //   the store. Since T1/T2 are volatile and always rebuilt from the WAL, an
+  //   op that fails here is safe to simply not log at all.
   // - Thread-safety: Thread-safe (guarded by slot-level spinlocks for writes).
   auto insert_impl(std::span<const std::byte> full_key, std::span<const std::byte> value) -> bool {
     std::lock_guard<std::mutex> key_lock(key_mutex(full_key));
@@ -374,6 +387,7 @@ class VMemKVImpl {
     }
 
     if (write_entry_lockfree(full_key, value)) {
+      wal_.append_insert(full_key, value);
       stripe_state(full_key).live_count.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
@@ -418,7 +432,9 @@ class VMemKVImpl {
 
   // Updates the value of an existing key.
   // - Ordering: Performs in-place updates directly on T2 if allocation size matches,
-  //   otherwise appends to T2 first before updating the pointer in T1.
+  //   otherwise appends to T2 first before updating the pointer in T1. Either way,
+  //   the WAL append happens only after the mutation has actually applied -- see the
+  //   comment on insert_impl for why logging ahead of a possibly-throwing mutation is unsafe.
   // - Thread-safety: Thread-safe (guarded by key hash locks).
   auto update_impl(std::span<const std::byte> full_key, std::span<const std::byte> value) -> bool {
     std::lock_guard<std::mutex> key_lock(key_mutex(full_key));
@@ -432,13 +448,21 @@ class VMemKVImpl {
       T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
       const T2RecordView record = t2_.at(res.payload_bits & kOffsetMask, mem);
       if (byte_span_equal(record.key, full_key) && value.size() <= record.header->alloc_len) {
-        return t2_.update_value_at(res.payload_bits & kOffsetMask, value);
+        if (!t2_.update_value_at(res.payload_bits & kOffsetMask, value)) {
+          return false;
+        }
+        wal_.append_update(full_key, value);
+        return true;
       }
     }
 
     maybe_reorganize_if_needed();
 
-    return write_entry_lockfree(full_key, value);
+    if (write_entry_lockfree(full_key, value)) {
+      wal_.append_update(full_key, value);
+      return true;
+    }
+    return false;
   }
 
   // Logically removes a key from the store.
@@ -455,6 +479,7 @@ class VMemKVImpl {
       }
 
       if (t1_.put(full_key, vmemkv::STORE_NOT_FOUND) == T1IndexT::PutResult::Applied) {
+        wal_.append_delete(full_key);
         stripe.live_count.fetch_sub(1, std::memory_order_relaxed);
         stripe.delete_count.fetch_add(1, std::memory_order_relaxed);
       } else {
@@ -529,6 +554,45 @@ class VMemKVImpl {
 
  private:
   auto t2_path() const -> std::filesystem::path { return t2_.path(); }
+
+  // T2 is MAP_PRIVATE (volatile), so any bytes surviving on disk from a previous run are
+  // meaningless -- they must never be trusted. Called from the constructor's initializer list
+  // before t2_ is constructed, so this must be static.
+  static auto prepare_fresh_t2_file(const std::filesystem::path &t2_path) -> const std::filesystem::path & {
+    std::error_code error_code;
+    std::filesystem::remove(t2_path, error_code);
+    return t2_path;
+  }
+
+  // Rebuilds T1 (and, via write_entry_lockfree, T2) from scratch by replaying the WAL from the
+  // beginning. Runs before reorg_worker_ is started, so maybe_reorganize_if_needed()'s usual
+  // "signal the background worker and wait" path is unavailable here -- reorganize() is instead
+  // driven directly (it is public, self-contained, and CAS-guarded, so it runs synchronously
+  // when no worker thread is competing for reorg_running_). Without this explicit capacity
+  // check, replaying a WAL with more live distinct keys than one append region holds would
+  // livelock inside write_entry_lockfree, which can only escape AppendRegionFull by waiting on
+  // a worker thread that does not exist yet.
+  void recover_from_wal() {
+    wal_.replay([&](vmemkv::WalRecordType type,
+                    std::span<const std::byte> key,
+                    std::span<const std::byte> value,
+                    uint64_t /*lsn*/) {
+      if (t1_.append_size() + 1 >= T1IndexT::APPEND_CAP) {
+        reorganize(false);
+      }
+      switch (type) {
+        case vmemkv::WalRecordType::Insert:
+        case vmemkv::WalRecordType::Update:
+          // T1Index::put() overwrites in place if the key exists, so Insert and Update replay
+          // identically -- last-writer-wins falls out of existing T1 semantics for free.
+          write_entry_lockfree(key, value);
+          break;
+        case vmemkv::WalRecordType::Delete:
+          t1_.put(key, vmemkv::STORE_NOT_FOUND);  // Mirrors remove_impl's tombstone write.
+          break;
+      }
+    });
+  }
 
   // Inline optimization is restricted to keys with size <= 16 bytes.
   // Since T1 only stores a 16-byte prefix (StoreKey), we must preserve the full key in T2
@@ -711,6 +775,7 @@ class VMemKVImpl {
 
   T1IndexT t1_;
   vmemkv::T2FlatFile t2_;
+  vmemkv::Wal wal_;
   std::atomic<uint64_t> reorg_t1_count_{0};
   std::atomic<uint64_t> reorg_t2_count_{0};
   std::atomic<uint64_t> hard_stall_count_{0};
