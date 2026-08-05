@@ -80,14 +80,15 @@ class ThreadReferenceTracker {
 
  private:
   auto get_thread_id() const noexcept -> size_t {
+    // No reference back to the tracker and no destructor: `reg` is thread_local, shared by
+    // every ThreadReferenceTracker<T, MaxThreads> instance this thread ever registers with, so
+    // a destructor tied to one specific instance could run after that instance was destroyed.
+    // Safe to skip: every acquire() is paired with a release() via Guard's RAII, so a live
+    // tracker's slot is already back to T{} well before its thread could exit.
     struct SlotRegistration {
-      const ThreadReferenceTracker *tracker;
-      size_t slot_id;
-
-      SlotRegistration() noexcept : tracker(nullptr), slot_id(static_cast<size_t>(-1)) {}
+      size_t slot_id = static_cast<size_t>(-1);
 
       void register_slot(const ThreadReferenceTracker *trt) noexcept {
-        tracker = trt;
         static std::atomic<size_t> search_start{0};
         size_t start = search_start.fetch_add(1) % MaxThreads;
 
@@ -101,12 +102,6 @@ class ThreadReferenceTracker {
           }
         }
         slot_id = start;
-      }
-
-      ~SlotRegistration() {
-        if (tracker && slot_id != static_cast<size_t>(-1)) {
-          tracker->slots_[slot_id].value.store(T{}, std::memory_order_release);
-        }
       }
     };
 

@@ -43,11 +43,11 @@
 //   - [EN]: Tag to swap the storage backend to RocksDB for academic performance comparison.
 //   - [JP]: バックエンドのストレージ実装を RocksDB に差し替え、VMemKV 本体と
 //           同一の統一インターフェース上で学術的性能比較（ベンチマーク）を行うためのタグ。
-//
 
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <type_traits>
 
 namespace vmemkv {
@@ -83,8 +83,14 @@ struct Config {
   static constexpr size_t T1AppendCapacityLog2 = 22;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
-  // Default Tier 2 (T2) file storage capacity: 256 GiB.
+  // Default Tier 2 (T2) file storage capacity: 1 TiB.
   static constexpr size_t DefaultT2CapacityBytes = 1ULL << 40;
+
+  // Checkpoint trigger independent of T2StorageFragmentationThresholdPercent: once this many
+  // WAL bytes accumulate since the last checkpoint, a checkpoint fires regardless of
+  // fragmentation, bounding replay time for workloads that never trip the fragmentation
+  // trigger. See docs/specification/low_level_design.md 4.4.
+  static constexpr size_t WalMaxBytesSinceCheckpoint = 64ULL << 20;  // 64 MiB.
 
   static_assert(T1ReorganizeSoftThresholdPercent > 0 && T1ReorganizeSoftThresholdPercent < kPercentBase,
                 "T1ReorganizeSoftThresholdPercent must be in (0, 100)");

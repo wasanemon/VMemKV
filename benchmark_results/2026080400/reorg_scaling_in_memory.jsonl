@@ -1,0 +1,16 @@
+{"scenario":"in_memory","value_size":8,"mode":"t1only","ratio":0.25,"key_count":5000000,"elapsed_sec":0.692993,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1only","ratio":0.5,"key_count":10000000,"elapsed_sec":1.43793,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1only","ratio":0.75,"key_count":15000000,"elapsed_sec":1.34164,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1only","ratio":1,"key_count":20000000,"elapsed_sec":2.96119,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1t2","ratio":0.25,"key_count":5000000,"elapsed_sec":8.00278,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1t2","ratio":0.5,"key_count":10000000,"elapsed_sec":16.8216,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1t2","ratio":0.75,"key_count":15000000,"elapsed_sec":23.5232,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1t2","ratio":1,"key_count":20000000,"elapsed_sec":33.4102,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1only","ratio":0.25,"key_count":2000000,"elapsed_sec":0.746026,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1only","ratio":0.5,"key_count":4000000,"elapsed_sec":0.655069,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1only","ratio":0.75,"key_count":6000000,"elapsed_sec":0.53807,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1only","ratio":1,"key_count":8000000,"elapsed_sec":1.05629,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1t2","ratio":0.25,"key_count":2000000,"elapsed_sec":5.60619,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1t2","ratio":0.5,"key_count":4000000,"elapsed_sec":10.3934,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1t2","ratio":0.75,"key_count":6000000,"elapsed_sec":15.2754,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1t2","ratio":1,"key_count":8000000,"elapsed_sec":21.2007,"timed_out":false}

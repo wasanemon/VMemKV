@@ -24,11 +24,15 @@ show_help() {
   echo "  --ltm-first      Run Scenario B (Larger-than-Memory) before Scenario A (In-Memory)"
   echo "  --large-value-first  Run larger-value benchmarks before smaller-value benchmarks"
   echo "  --quick          Run one workload per scenario with a short min_time"
+  echo "  --reorg-scaling-probe  After the normal matrix, additionally sweep reorganize()"
+  echo "                   duration vs. corpus size (T1-only vs T1+T2) on the same instance via"
+  echo "                   run_reorg_scaling_probe.sh and download its JSONL output"
   exit 0
 }
 
 SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
+REORG_SCALING_PROBE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -56,6 +60,10 @@ while [[ $# -gt 0 ]]; do
       VALUE_SIZE_LIMIT="$2"
       shift 2
       ;;
+    --reorg-scaling-probe)
+      REORG_SCALING_PROBE=true
+      shift
+      ;;
     *)
       echo "[ERROR] Unknown option: $1" >&2
       echo "Use -h or --help to see available options." >&2
@@ -79,13 +87,30 @@ fi
 
 # ── Configuration Parameters ──────────────────────────────────────────────
 AWS_REGION="ap-northeast-1"
-INSTANCE_TYPE="c6id.8xlarge"
+# i4i: current-generation storage-optimized family (3rd-gen Nitro SSD local NVMe), switched from
+# c6id.8xlarge on 2026-07-30 after c6id spot capacity in this region dried up (placement scores of
+# 1/10 across all 3 AZs). i4i.8xlarge matches c6id.8xlarge's 32 vCPUs (keeps the existing
+# 1/4/16/32-thread concurrency sweep unchanged) and is a more direct fit for this project's actual
+# claim (how well OS-managed paging/swap performs against fast local NVMe) than a compute-
+# optimized family where NVMe is a secondary feature. At switch time it was *also* both more
+# available (placement score 3/10 vs 1/10, all 3 AZs) and cheaper on spot (~$0.60-0.64/hr vs
+# ~$0.74-0.75/hr) than c6id.8xlarge, despite a higher on-demand list price ($3.22 vs $2.05/hr) --
+# re-check both `get-spot-placement-scores` and `describe-spot-price-history` before assuming
+# either holds, they shift over time.
+INSTANCE_TYPE="i4i.8xlarge"
+# Pin the spot request to whichever AZ currently has the best odds, rather than leaving subnet
+# selection to run-instances' own (uncontrollable, for a single non-Fleet request) default. At
+# switch time, `aws ec2 get-spot-placement-scores --instance-types i4i.8xlarge --target-capacity 1
+# --region-names ap-northeast-1 --single-availability-zone` scored all 3 AZs equally (3/10), so
+# ap-northeast-1a was kept for continuity with the prior c6id-era choice rather than for any actual
+# advantage. Re-run that command before assuming this still holds; it can shift over time.
+PREFERRED_AZ="ap-northeast-1a"
 MIN_TIME="5.0s"
 LTM_MEMORY_BUDGET_BYTES="$(vmemkv_matrix::ltm_memory_budget_bytes)"
 LTM_SWAP_BUDGET_BYTES="$(vmemkv_matrix::ltm_swap_budget_bytes)"
-KEY_NAME="vmemkv-c6id-key-$$"
+KEY_NAME="vmemkv-i4i-key-$$"
 PEM_FILE="/tmp/${KEY_NAME}.pem"
-SG_NAME="vmemkv-c6id-sg-$$"
+SG_NAME="vmemkv-i4i-sg-$$"
 PORT=22
 SIGNAL_LOG="/tmp/vmemkv_signal_${KEY_NAME}.log"
 PROGRESS_STATE="/tmp/vmemkv_progress_state_${KEY_NAME}.txt"
@@ -197,6 +222,17 @@ create_security_group() {
     --protocol tcp \
     --port "$PORT" \
     --cidr "${MY_IP}/32" >/dev/null
+
+  echo "Locating default subnet in preferred AZ ($PREFERRED_AZ)..."
+  SUBNET_ID=$(aws ec2 describe-subnets \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=availability-zone,Values=$PREFERRED_AZ" \
+    --query "Subnets[0].SubnetId" \
+    --output text)
+  if [[ -z "$SUBNET_ID" || "$SUBNET_ID" == "None" ]]; then
+    echo "[ERROR] No default subnet found in $PREFERRED_AZ (VPC $VPC_ID)." >&2
+    exit 1
+  fi
+  echo "Using subnet $SUBNET_ID in $PREFERRED_AZ"
 }
 
 launch_spot_instance() {
@@ -209,9 +245,10 @@ nohup bash -c 'sleep 14400 && sudo poweroff' >/dev/null 2>&1 &"
     --instance-type "$INSTANCE_TYPE" \
     --key-name "$KEY_NAME" \
     --security-group-ids "$SG_ID" \
+    --subnet-id "$SUBNET_ID" \
     --instance-market-options "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}" \
     --user-data "$user_data_script" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=VMemKV-c6id-Bench},{Key=VMemKV-Temp-Spot,Value=$KEY_NAME}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=VMemKV-i4i-Bench},{Key=VMemKV-Temp-Spot,Value=$KEY_NAME}]" \
     --query "Instances[0]" \
     --output json)
 
@@ -230,7 +267,16 @@ nohup bash -c 'sleep 14400 && sudo poweroff' >/dev/null 2>&1 &"
 
 wait_for_ssh_ready() {
   echo "Waiting for SSH to become available..."
-  SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $PEM_FILE -o ConnectTimeout=10"
+  # ServerAliveInterval/CountMax: the LTM priming step's ssh command blocks for many minutes
+  # while the remote side silently builds large corpora on NVMe -- no output flows back over the
+  # SSH channel for most of that time. Observed repeatedly: the local side of that connection
+  # dies (and this script exits) after ~16-18 minutes regardless of whether the remote instance
+  # or work is actually still healthy (confirmed via `aws ec2 describe-spot-instance-requests`
+  # showing the instance was still "active"/"fulfilled" when this happened) -- consistent with a
+  # NAT/firewall silently dropping a connection it sees as idle (WSL2's own NAT is a candidate),
+  # not an AWS-side problem. Periodic keepalives keep the channel visibly active even when the
+  # remote command itself has nothing to print for a while.
+  SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $PEM_FILE -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=6"
   for i in {1..30}; do
     if ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "echo 'SSH Ready'" >/dev/null 2>&1; then
       echo "Connection established successfully."
@@ -312,6 +358,36 @@ prepare_remote_storage() {
     sudo swapon /mnt/nvme/swapfile
     sudo sysctl -w vm.swappiness=100
     echo \"Swap file created and enabled successfully.\"
+
+    # Transparent Huge Pages: VMemKV's T2 is a large MAP_PRIVATE region that gets randomly
+    # accessed and, under the LTM scenario, swapped -- exactly the pattern THP hurts most (COW
+    # amplification to a full 2MB on any write, khugepaged scan/lock overhead, synchronous
+    # compaction stalls under the memory pressure this scenario deliberately creates, and 2MB-
+    # granularity swap I/O that drags cold data in with hot data). VMemKV never opts in via
+    # MADV_HUGEPAGE anywhere, so there is no upside to THP being enabled for it; only ever
+    # observed locally under WSL2 (which happens to default to madvise, i.e. this was never an
+    # issue there) -- this AMI's actual default was unverified until now. 'madvise' rather than
+    # 'never': functionally equivalent for VMemKV (which never advises for it) while remaining
+    # the standard, less invasive system-wide choice.
+    THP_ENABLED_PATH=/sys/kernel/mm/transparent_hugepage/enabled
+    THP_DEFRAG_PATH=/sys/kernel/mm/transparent_hugepage/defrag
+    if [ -f \"\$THP_ENABLED_PATH\" ]; then
+      CURRENT_THP=\$(grep -o '\\[[a-z]*\\]' \"\$THP_ENABLED_PATH\" | tr -d '[]')
+      echo \"Transparent Huge Pages: currently '\$CURRENT_THP' (raw: \$(cat \"\$THP_ENABLED_PATH\"))\"
+      if [ \"\$CURRENT_THP\" != \"madvise\" ] && [ \"\$CURRENT_THP\" != \"never\" ]; then
+        echo \"  -> not madvise/never; setting to madvise (VMemKV never opts in via MADV_HUGEPAGE, so this is effectively 'never' for it).\"
+        echo madvise | sudo tee \"\$THP_ENABLED_PATH\" >/dev/null
+      fi
+      if [ -f \"\$THP_DEFRAG_PATH\" ]; then
+        CURRENT_DEFRAG=\$(grep -o '\\[[a-z+]*\\]' \"\$THP_DEFRAG_PATH\" | tr -d '[]')
+        if [ \"\$CURRENT_DEFRAG\" != \"madvise\" ] && [ \"\$CURRENT_DEFRAG\" != \"never\" ]; then
+          echo madvise | sudo tee \"\$THP_DEFRAG_PATH\" >/dev/null
+        fi
+      fi
+      echo \"Transparent Huge Pages: now '\$(grep -o '\\[[a-z]*\\]' \"\$THP_ENABLED_PATH\" | tr -d '[]')'\"
+    else
+      echo \"Transparent Huge Pages: sysfs knob not present on this kernel, skipping.\"
+    fi
   "
 }
 
@@ -369,7 +445,7 @@ scenario_context_env_prefix() {
       memory_budget_bytes="$LTM_MEMORY_BUDGET_BYTES"
       memory_swap_max_bytes="$LTM_SWAP_BUDGET_BYTES"
       swap_storage_media="Local NVMe SSD"
-      memo="$(vmemkv_benchmark_memo "aws_c6id" "ltm")"
+      memo="$(vmemkv_benchmark_memo "aws_i4i" "ltm")"
       ;;
     in_memory)
       memory_budget_source="host"
@@ -383,7 +459,7 @@ scenario_context_env_prefix() {
   esac
 
   vmemkv_context_env_prefix \
-    "aws_c6id" \
+    "aws_i4i" \
     "Release" \
     "build-rel" \
     "ON" \
@@ -458,9 +534,58 @@ run_scenario() {
     large_value_first_env="VMEMKV_BENCH_LARGE_VALUE_FIRST=1"
   fi
 
+  local skip_cleanup_env_prefix=""
+  if [[ "$scenario_key" == "ltm" ]]; then
+    # Both the priming pass below and the cgroup-wrapped measurement pass after it run with
+    # VMEMKV_BENCH_SKIP_CLEANUP=1 (see its comment in bench_kv.cpp), so bench_kv's own automatic
+    # sweeps don't fight a deliberate multi-store, multi-master-generation priming pass. That
+    # means this script owns the "start from a clean slate" step neither of those invocations
+    # will do on their own -- do it once, here, unconditionally, exactly like bench_kv's own
+    # startup sweep normally would (same "bench_" prefix, same directory: /mnt/nvme).
+    ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "find /mnt/nvme -maxdepth 1 -name 'bench_*' -exec rm -rf {} +" \
+      >>"$scenario_stdout_log" 2>>"$scenario_stderr_log"
+
+    # Prime every shared master corpus this run will need at full, unconstrained NVMe speed
+    # *before* entering the cgroup below. Without this, a real per-master populate under this
+    # exact cgroup was measured locally at 200-1200s (vs. ~20-30s unconstrained) -- paying that
+    # cost here means the cgroup-wrapped measurement pass only ever needs to clone, not rebuild,
+    # those masters. See vmemkv_matrix::ltm_priming_filter()'s comment for what this
+    # single-cell-per-(store,value size) filter does and does not cover (notably not Scan's
+    # T1Reorg scenario, which has no master to prime and stays exposed to the cgroup regardless).
+    local priming_filter priming_cmd priming_cmd_quoted
+    priming_filter="$(vmemkv_matrix::ltm_priming_filter)"
+    # VMEMKV_CONTEXT_memory_budget_bytes must be set here too, not just on the measurement pass
+    # below (scenario_context_prefix) -- bench_kv's detect_machine_memory_bytes() falls back to
+    # the host's raw /proc/meminfo MemTotal whenever this is unset, and priming runs unconstrained
+    # (no cgroup, so no memory.max to fall back to either). Without it, the "small declared budget
+    # x large target_ratio" corpus-sizing scheme (see vmemkv_matrix::ltm_memory_budget_bytes()'s
+    # comment: 1GB budget x 8.0 ratio should be an ~8GB corpus) instead sizes against this
+    # instance's full ~62GB RAM, producing a ~530GB corpus -- large enough to reliably OOM-kill
+    # bench_kv partway through populate. Observed directly: every LTM priming attempt without this
+    # fix died to the OOM killer, never a script or SSH problem.
+    priming_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} } VMEMKV_BENCH_SKIP_CLEANUP=1 \
+./benchmark/common/run_scenario.sh \
+  './build-rel/benchmark/bench_kv' \
+  '$priming_filter' \
+  '$MIN_TIME' \
+  '/mnt/nvme/ltm_priming_discard.json'
+    "
+    printf -v priming_cmd_quoted '%q' "$priming_cmd"
+    echo "[runner] priming LTM master corpora (unconstrained) for scenario=$scenario_key ..."
+    ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${priming_cmd_quoted}" \
+      >>"$scenario_stdout_log" 2>>"$scenario_stderr_log"
+    echo "[runner] priming complete for scenario=$scenario_key"
+
+    # The measurement pass below reuses the masters priming just built -- it must not let
+    # bench_kv's own startup cleanup_stale_benchmark_files() wipe them the instant it starts.
+    skip_cleanup_env_prefix="VMEMKV_BENCH_SKIP_CLEANUP=1"
+  fi
+
   remote_cmd="
 cd /home/ubuntu/faultkv/implementation &&
-${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} } \
+${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} }${skip_cleanup_env_prefix:+${skip_cleanup_env_prefix} } \
 ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 ./benchmark/common/run_scenario.sh \
   './build-rel/benchmark/bench_kv' \
@@ -476,6 +601,21 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 
   set +e
   if [[ "$scenario_key" == "ltm" ]]; then
+    # Drop the OS page cache right before entering the cgroup: RocksDB's Checkpoint-based clone
+    # (rocksdb_store.hpp/rocksdb_blobdb_store.hpp) hardlinks SST/blob files instead of copying
+    # them, and cgroup v2 charges page-cache pages to whichever cgroup first faulted them in --
+    # so without this, the cgroup-constrained measurement process below reads the SAME
+    # already-warm pages the unconstrained priming pass above just wrote, with no new charge
+    # against MemoryHigh, meaning RocksDB never experiences the intended 8x memory
+    # oversubscription at all. Confirmed directly: RocksDB showed 0 major-faults/0% real-cpu-time
+    # gap without this, jumping to real fault activity and an 83.5% gap (10.7x slower) once
+    # caches were forced cold (implementation/docs/benchmark/20260805_ltm_get_hit_profiling.md).
+    # LMDB's clone_from() (mdb_env_copy2, a real byte copy) and VMemKV's T2 (MAP_PRIVATE,
+    # genuinely COW/anonymous) don't share this exemption -- both already showed real memory
+    # pressure with or without this -- so this only closes RocksDB's loophole, it doesn't
+    # meaningfully punish the other two.
+    ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null" \
+      >>"$scenario_stdout_log" 2>>"$scenario_stderr_log"
     {
       ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
         "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${remote_cmd_quoted}" \
@@ -587,5 +727,102 @@ fi
 # Retrieve YCSB-E timeline results if they exist
 echo "Downloading YCSB-E timeline logs..."
 scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/ycsb_e_timeline_*.json" "${RESULTS_DIR}/" || true
+
+if [[ "$REORG_SCALING_PROBE" == "true" ]]; then
+  # Additive extra measurement (reorganize() duration vs. corpus size, T1-only vs T1+T2) on top
+  # of the normal matrix just run above -- not part of the Google Benchmark-registered matrix
+  # itself, see run_reorg_scaling_probe.sh's own comment for why. Reuses this same
+  # already-provisioned instance rather than spinning up a dedicated one: run_4parallel_bench.sh's
+  # 4 instances already partition (scenario, value_size) 1:1 the same way this sweep's 4 combos
+  # do, so there is nothing a 5th instance would add. Up to two invocations, exactly mirroring
+  # run_scenario()'s ltm-only cgroup wrap: unconstrained for in_memory's combo(s), systemd-run-
+  # wrapped (same MemoryHigh/MemoryMax/MemorySwapMax as the real ltm scenario) for ltm's --
+  # mixing both under one wrap would starve in_memory's combos of memory they were never meant to
+  # be constrained by. Respects --scenario/--value-size exactly like the matrix above: with
+  # VALUE_SIZE_LIMIT set, only that one combo runs (not its scenario sibling too) and the
+  # downloaded filename is scoped to it, matching results_in_memory_*.json's own convention above,
+  # so run_4parallel_bench.sh's 4 concurrent instances don't clobber each other's output in this
+  # shared local logs/ directory. A failure here is logged but does not fail the whole run --
+  # unlike the matrix above, this is a supplementary measurement, not the main deliverable.
+  inmem_dst_name="reorg_scaling_in_memory.jsonl"
+  ltm_dst_name="reorg_scaling_ltm.jsonl"
+  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+    inmem_dst_name="reorg_scaling_in_memory_${VALUE_SIZE_LIMIT}.jsonl"
+    ltm_dst_name="reorg_scaling_ltm_${VALUE_SIZE_LIMIT}.jsonl"
+  fi
+
+  reorg_probe_failed=0
+
+  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+    inmem_combo_filter="in_memory"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      inmem_combo_filter="in_memory:${VALUE_SIZE_LIMIT}"
+    fi
+    inmem_probe_stdout_log="/tmp/vmemkv_reorg_probe_inmem_${KEY_NAME}.stdout.log"
+    inmem_probe_stderr_log="/tmp/vmemkv_reorg_probe_inmem_${KEY_NAME}.stderr.log"
+    : >"$inmem_probe_stdout_log"
+    : >"$inmem_probe_stderr_log"
+    inmem_probe_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+./benchmark/run_reorg_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/reorg_scaling_in_memory.jsonl' '/mnt/nvme' '$inmem_combo_filter'
+    "
+    printf -v inmem_probe_remote_cmd_quoted '%q' "$inmem_probe_remote_cmd"
+    echo "[runner] start reorg-scaling-probe scenario=in_memory combo_filter=$inmem_combo_filter"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${inmem_probe_remote_cmd_quoted}" \
+        2> >(tee -a "$inmem_probe_stderr_log" >&2); } | tee -a "$inmem_probe_stdout_log"
+    inmem_probe_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end reorg-scaling-probe scenario=in_memory status=$inmem_probe_status"
+    if [[ "$inmem_probe_status" -ne 0 ]]; then
+      # [WARN], deliberately not [ERROR]: this run's own on-error logging (and any external
+      # watcher pattern-matching "[ERROR]" to decide the whole run failed, see this session's
+      # AWS-monitoring convention) must not treat a supplementary-measurement hiccup as fatal
+      # when the main benchmark matrix above already succeeded.
+      echo "[WARN] reorg-scaling-probe (in_memory) failed with exit code $inmem_probe_status -- logs: $inmem_probe_stdout_log $inmem_probe_stderr_log" >&2
+      reorg_probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/reorg_scaling_in_memory.jsonl" "${RESULTS_DIR}/${inmem_dst_name}" || true
+  fi
+
+  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+    ltm_combo_filter="ltm"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      ltm_combo_filter="ltm:${VALUE_SIZE_LIMIT}"
+    fi
+    ltm_probe_stdout_log="/tmp/vmemkv_reorg_probe_ltm_${KEY_NAME}.stdout.log"
+    ltm_probe_stderr_log="/tmp/vmemkv_reorg_probe_ltm_${KEY_NAME}.stderr.log"
+    : >"$ltm_probe_stdout_log"
+    : >"$ltm_probe_stderr_log"
+    # VMEMKV_CONTEXT_memory_budget_bytes must be set explicitly here, not left to
+    # detect_machine_memory_bytes()'s cgroup-file fallback: that would read this systemd-run scope's
+    # MemoryMax (2x LTM_MEMORY_BUDGET_BYTES, see below), not the declared budget itself, mis-sizing
+    # every corpus by 2x -- same reasoning as run_scenario()'s priming/measurement passes above.
+    ltm_probe_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
+./benchmark/run_reorg_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/reorg_scaling_ltm.jsonl' '/mnt/nvme' '$ltm_combo_filter'
+    "
+    printf -v ltm_probe_remote_cmd_quoted '%q' "$ltm_probe_remote_cmd"
+    echo "[runner] start reorg-scaling-probe scenario=ltm combo_filter=$ltm_combo_filter"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${ltm_probe_remote_cmd_quoted}" \
+        2> >(tee -a "$ltm_probe_stderr_log" >&2); } | tee -a "$ltm_probe_stdout_log"
+    ltm_probe_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end reorg-scaling-probe scenario=ltm status=$ltm_probe_status"
+    if [[ "$ltm_probe_status" -ne 0 ]]; then
+      # [WARN], not [ERROR] -- same reasoning as the in_memory branch above.
+      echo "[WARN] reorg-scaling-probe (ltm) failed with exit code $ltm_probe_status -- logs: $ltm_probe_stdout_log $ltm_probe_stderr_log" >&2
+      reorg_probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/reorg_scaling_ltm.jsonl" "${RESULTS_DIR}/${ltm_dst_name}" || true
+  fi
+
+  if [[ "$reorg_probe_failed" -ne 0 ]]; then
+    echo "[WARN] reorg-scaling-probe had failures -- main benchmark matrix results above are still valid" >&2
+  fi
+fi
 
 echo "All tasks finished."

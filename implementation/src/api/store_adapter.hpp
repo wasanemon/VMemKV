@@ -43,6 +43,9 @@ class StoreAdapter {
  public:
   static constexpr bool kIsEnabled = KVSImpl::kIsEnabled;
   using ConfigType = typename detail::get_config_type<KVSImpl>::type;
+  // Exposes the wrapped backend type so generic code (e.g. the benchmark harness) can reach
+  // backend-specific static members/tag types without needing its own KVSImpl parameter.
+  using Impl = KVSImpl;
 
   static auto name() -> std::string {
     if constexpr (std::is_same_v<KVSImpl, ::RocksDBStore>) {
@@ -111,6 +114,17 @@ class StoreAdapter {
   auto remove(const Key &key) -> bool {
     return kvs_detail::with_key_serialized(
         key, [this](std::span<const std::byte> key_bytes) -> bool { return impl_.remove_impl(key_bytes); });
+  }
+
+  // Bulk-loads `count` entries generated on demand by make_key(index)/make_value(index). Throws
+  // on failure. Much faster than `count` individual insert() calls, but unlike insert()/update()
+  // gives no durability guarantee by itself -- see each backend's bulk_load_impl() (VMemKVImpl,
+  // e.g., skips its WAL entirely; callers needing crash survival must checkpoint afterward, e.g.
+  // reorganize(true)). Upsert semantics (no existing-key check), and not safe for concurrent
+  // access during the call.
+  template <typename KeyFn, typename ValueFn>
+  void bulk_load(std::size_t count, KeyFn &&make_key, ValueFn &&make_value) {
+    impl_.bulk_load_impl(count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
   }
 
   template <typename LoKey, typename HiKey, typename Callback>

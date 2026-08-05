@@ -28,10 +28,15 @@ for task in "${TASKS[@]}"; do
   
   echo "Launching Instance for: Scenario=$scenario, ValueSize=$val_size (Log: $log_file)"
   
-  # Run the orchestrator script in the background
+  # Run the orchestrator script in the background. --reorg-scaling-probe is additive: it runs
+  # after this instance's normal (scenario, value_size) matrix, scoped to that same combo, on the
+  # same already-provisioned instance -- no 5th instance needed, since these 4 tasks already
+  # partition the same 4 combos the probe sweeps (see run_bench_aws_c6id.sh's own comment on this
+  # flag).
   "$SCRIPT_DIR/run_bench_aws_c6id.sh" \
     --scenario "$scenario" \
     --value-size "$val_size" \
+    --reorg-scaling-probe \
     > "$log_file" 2>&1 &
   pids+=($!)
   

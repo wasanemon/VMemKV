@@ -1,13 +1,10 @@
 // rocksdb_blobdb_store.hpp — Thin RocksDB "BlobDB" wrapper exposing byte-span APIs
 // for comparison.
 //
-// This uses RocksDB's modern integrated blob-file support (ColumnFamilyOptions::
-// enable_blob_files and friends), not the legacy standalone rocksdb/utilities/
-// blob_db.h stacked API, which is unavailable in the RocksDB version this project
-// links against. Key-value separation (storing large values in separate blob files
-// instead of inline in SST files) trades write amplification for reduced compaction
-// I/O on large values, which is the interesting comparison point against plain
-// RocksDBStore for the LTM(64KB) scenarios.
+// Uses RocksDB's integrated blob-file support (enable_blob_files), not the legacy standalone
+// blob_db.h API (unavailable in this project's RocksDB version). Key-value separation trades
+// write amplification for reduced compaction I/O on large values -- the interesting comparison
+// point against plain RocksDBStore for the LTM(64KB) scenarios.
 //
 // Thread safety: RocksDB is internally thread-safe.
 
@@ -30,6 +27,7 @@
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
 #include <rocksdb/slice.h>
+#include <rocksdb/utilities/checkpoint.h>
 #include <rocksdb/write_batch.h>
 #endif
 
@@ -69,6 +67,31 @@ class RocksDBBlobDBStore {
   RocksDBBlobDBStore(const RocksDBBlobDBStore &) = delete;
   auto operator=(const RocksDBBlobDBStore &) -> RocksDBBlobDBStore & = delete;
 
+  // Tag type selecting the clone-from-master constructor below. Public so StoreAdapter's
+  // variadic forwarding constructor can name it directly -- see
+  // for_each_store_variant()'s make_fresh_corpus()/make_fresh_corpus_checkpoint() in bench_kv.cpp.
+  struct CloneFromMasterTag {};
+
+  // See RocksDBStore's identically-named constructor's comment -- same reasoning applies here.
+  template <typename KeyFn, typename ValueFn>
+  RocksDBBlobDBStore(CloneFromMasterTag /*tag*/,
+                     const std::string &master_path,
+                     std::size_t key_count,
+                     KeyFn &&make_key,
+                     ValueFn &&make_value) {
+    ensure_master_built(master_path, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
+    static std::atomic<uint64_t> clone_counter{0};
+    path_ = master_path + "_clone_" + std::to_string(clone_counter.fetch_add(1, std::memory_order_relaxed));
+    clone_from(master_path, path_);
+    rocksdb::Options opts = make_benchmark_db_options();
+    rocksdb::DB *db_handle = nullptr;
+    auto status = rocksdb::DB::Open(opts, path_, &db_handle);
+    if (!status.ok()) {
+      throw std::runtime_error("RocksDB(BlobDB) Open (clone) failed: " + status.ToString());
+    }
+    db_.reset(db_handle);
+  }
+
   // No-op: RocksDB self-compacts (including blob garbage collection during compaction).
   void reorganize() {}
 
@@ -91,7 +114,7 @@ class RocksDBBlobDBStore {
     if (db_->Get({}, db_->DefaultColumnFamily(), to_slice(key), &pinned_value).ok()) {
       return false;  // already exists
     }
-    return db_->Put({}, to_slice(key), to_slice(value)).ok();
+    return db_->Put(make_durable_write_options(), to_slice(key), to_slice(value)).ok();
   }
 
   auto update_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
@@ -99,7 +122,7 @@ class RocksDBBlobDBStore {
     if (!db_->Get({}, db_->DefaultColumnFamily(), to_slice(key), &pinned_value).ok()) {
       return false;  // not found
     }
-    return db_->Put({}, to_slice(key), to_slice(value)).ok();
+    return db_->Put(make_durable_write_options(), to_slice(key), to_slice(value)).ok();
   }
 
   auto remove_impl(std::span<const std::byte> key) -> bool {
@@ -107,50 +130,42 @@ class RocksDBBlobDBStore {
     if (!db_->Get({}, db_->DefaultColumnFamily(), to_slice(key), &pinned_value).ok()) {
       return false;  // not found
     }
-    return db_->Delete({}, to_slice(key)).ok();
+    return db_->Delete(make_durable_write_options(), to_slice(key)).ok();
   }
 
-  template <typename KeyFn>
-  auto bulk_load_impl(std::size_t key_count,
-                      KeyFn &&make_key,
-                      std::size_t target_value_size,
-                      std::string *error_out = nullptr) -> bool {
+  template <typename KeyFn, typename ValueFn>
+  void bulk_load_impl(std::size_t key_count, KeyFn &&make_key, ValueFn &&make_value) {
+    bulk_load_into(db_.get(), key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
+  }
+
+  template <typename KeyFn, typename ValueFn>
+  static void bulk_load_into(rocksdb::DB *db, std::size_t key_count, KeyFn &&make_key, ValueFn &&make_value) {
     if (key_count == 0) {
-      return true;
+      return;
     }
-    // Keep each WriteBatch within a fixed byte budget so 8B values can be
-    // grouped much more aggressively than 64KB values without changing the
-    // benchmark workload semantics.
+    // Keep each WriteBatch within a fixed byte budget so many small values can be grouped
+    // much more aggressively than few large ones without needing to know sizes up front.
     constexpr std::size_t kBatchBytes = 64ULL * 1024ULL * 1024ULL;
     rocksdb::WriteOptions write_opts = make_bulk_load_write_options();
-
-    std::string dummy_large(target_value_size, 'a');
-    std::string dummy_8b(8, 'a');
-    const std::size_t batch_keys = std::max<std::size_t>(1, kBatchBytes / std::max<std::size_t>(1, target_value_size));
 
     std::size_t next_index = 0;
     while (next_index < key_count) {
       rocksdb::WriteBatch batch;
-      const std::size_t chunk_end = std::min(key_count, next_index + batch_keys);
-      for (std::size_t index = next_index; index < chunk_end; ++index) {
+      std::size_t batch_bytes = 0;
+      std::size_t index = next_index;
+      for (; index < key_count && batch_bytes < kBatchBytes; ++index) {
         const std::string key = make_key(index);
-        if (target_value_size != 8 && index % 5 == 0) {
-          batch.Put(key, dummy_8b);
-        } else {
-          batch.Put(key, dummy_large);
-        }
+        const std::string value = make_value(index);
+        batch_bytes += key.size() + value.size();
+        batch.Put(key, value);
       }
 
-      auto status = db_->Write(write_opts, &batch);
+      auto status = db->Write(write_opts, &batch);
       if (!status.ok()) {
-        if (error_out != nullptr) {
-          *error_out = "RocksDB(BlobDB) WriteBatch failed: " + status.ToString();
-        }
-        return false;
+        throw std::runtime_error("RocksDB(BlobDB) WriteBatch failed: " + status.ToString());
       }
-      next_index = chunk_end;
+      next_index = index;
     }
-    return true;
   }
 
   template <typename Cb>
@@ -171,12 +186,60 @@ class RocksDBBlobDBStore {
   }
 
  private:
+  // See RocksDBStore::ensure_master_built()'s comment -- same reasoning applies here.
+  template <typename KeyFn, typename ValueFn>
+  static void ensure_master_built(const std::string &master_path,
+                                  std::size_t key_count,
+                                  KeyFn &&make_key,
+                                  ValueFn &&make_value) {
+    if (std::filesystem::exists(master_path)) {
+      return;
+    }
+    const std::string building_path = master_path + ".building";
+    rocksdb::DestroyDB(building_path, {});
+    rocksdb::DB *db_handle = nullptr;
+    auto status = rocksdb::DB::Open(make_benchmark_db_options(), building_path, &db_handle);
+    if (!status.ok()) {
+      throw std::runtime_error("RocksDB(BlobDB) Open (master build) failed: " + status.ToString());
+    }
+    bulk_load_into(db_handle, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
+    delete db_handle;
+    rocksdb::DestroyDB(master_path, {});
+    std::error_code rename_error;
+    std::filesystem::rename(building_path, master_path, rename_error);
+    if (rename_error) {
+      throw std::runtime_error("RocksDB(BlobDB) master build rename failed: " + rename_error.message());
+    }
+  }
+
+  // Briefly opens `source_path` read-only, checkpoints it to `dest_path` (destroying any stale
+  // directory already there), then closes the read-only handle -- see the CloneFromMasterTag
+  // constructor's comment for why this is fast and safe.
+  static void clone_from(const std::string &source_path, const std::string &dest_path) {
+    rocksdb::DB *source_db = nullptr;
+    auto status = rocksdb::DB::OpenForReadOnly(make_benchmark_db_options(), source_path, &source_db);
+    if (!status.ok()) {
+      throw std::runtime_error("RocksDB(BlobDB) OpenForReadOnly (clone source) failed: " + status.ToString());
+    }
+    rocksdb::Checkpoint *checkpoint = nullptr;
+    status = rocksdb::Checkpoint::Create(source_db, &checkpoint);
+    if (!status.ok()) {
+      delete source_db;
+      throw std::runtime_error("RocksDB(BlobDB) Checkpoint::Create failed: " + status.ToString());
+    }
+    rocksdb::DestroyDB(dest_path, {});
+    status = checkpoint->CreateCheckpoint(dest_path);
+    delete checkpoint;
+    delete source_db;
+    if (!status.ok()) {
+      throw std::runtime_error("RocksDB(BlobDB) CreateCheckpoint failed: " + status.ToString());
+    }
+  }
+
   static auto make_benchmark_db_options() -> rocksdb::Options {
     rocksdb::Options opts;
     opts.create_if_missing = true;
-    // Same base tuning as the plain RocksDBStore rival, plus blob-file (key-value
-    // separation) settings so large values are stored in separate blob files
-    // instead of inline in SST files during compaction.
+    // Same base tuning as the plain RocksDBStore rival, plus blob-file settings below.
     opts.compression = rocksdb::kNoCompression;
     opts.write_buffer_size = 256ULL * 1024ULL * 1024ULL;
     opts.max_write_buffer_number = 16;
@@ -190,8 +253,7 @@ class RocksDBBlobDBStore {
     opts.max_subcompactions = 4;
     opts.max_open_files = 256;
 
-    // Values below this size stay inline in SST files; only larger values are
-    // redirected to blob files, matching the workload's 20% 8B / 80% large-value mix.
+    // Values below this size stay inline in SST files; larger ones go to blob files.
     opts.enable_blob_files = true;
     opts.min_blob_size = 256;
     opts.blob_file_size = 256ULL * 1024ULL * 1024ULL;
@@ -203,6 +265,13 @@ class RocksDBBlobDBStore {
   static auto make_bulk_load_write_options() -> rocksdb::WriteOptions {
     rocksdb::WriteOptions opts;
     opts.disableWAL = true;
+    return opts;
+  }
+
+  // See RocksDBStore::make_durable_write_options()'s comment -- same reasoning applies here.
+  static auto make_durable_write_options() -> rocksdb::WriteOptions {
+    rocksdb::WriteOptions opts;
+    opts.sync = true;
     return opts;
   }
 
@@ -227,6 +296,20 @@ class RocksDBBlobDBStore {
 
   RocksDBBlobDBStore(const RocksDBBlobDBStore &) = delete;
   auto operator=(const RocksDBBlobDBStore &) -> RocksDBBlobDBStore & = delete;
+
+  struct CloneFromMasterTag {};
+  template <typename KeyFn, typename ValueFn>
+  RocksDBBlobDBStore(CloneFromMasterTag /*tag*/,
+                     const std::string &master_path,
+                     std::size_t key_count,
+                     KeyFn &&make_key,
+                     ValueFn &&make_value) {
+    (void)master_path;
+    (void)key_count;
+    (void)make_key;
+    (void)make_value;
+    throw std::runtime_error("RocksDB not enabled in this build");
+  }
 
   void reorganize() {}
 
@@ -253,18 +336,12 @@ class RocksDBBlobDBStore {
     (void)key;
     return false;
   }
-  template <typename KeyFn>
-  auto bulk_load_impl(std::size_t key_count,
-                      KeyFn &&make_key,
-                      std::size_t target_value_size,
-                      std::string *error_out = nullptr) -> bool {
+  template <typename KeyFn, typename ValueFn>
+  void bulk_load_impl(std::size_t key_count, KeyFn &&make_key, ValueFn &&make_value) {
     (void)key_count;
     (void)make_key;
-    (void)target_value_size;
-    if (error_out != nullptr) {
-      *error_out = "RocksDB not enabled in this build";
-    }
-    return false;
+    (void)make_value;
+    throw std::runtime_error("RocksDB not enabled in this build");
   }
 
   template <typename Cb>

@@ -66,6 +66,54 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-04</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026080400_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/04)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                reorganize_internal()の残存ウィンドウ競合（T1エントリが退避直前のT2世代を指したまま生き残るレース）をドレインバリアで修正。Scan T1Reorg/T1T2Reorgベンチマークの不公平（挿入順序の違いによりT2物理レイアウトが実質同一になっていた）を、共有マスターをランダム順で構築しreorganize()の呼び分けだけで両モードを差別化する方式に修正。そのT1-onlyスナップショット構築が背景reorg_worker_スレッドとレースしエントリを1件だけ恒久的に取りこぼす不具合（ltm/1KBが無限ハング）を発見・修正——専用フックや新規ロック付きラッパーを追加する案を経て、reorganize(false)収束後にT1Index::scan()で読み出すだけで済むと判明し、ライブラリへの新規インタフェース追加なしで解決。YCSB-Eタイムラインでt=15sの強制reorganizeと自然発生reorganizeを区別して縦線表示するよう変更（LTMシナリオは自然発生がほぼ起きないため、強制トリガーを自然発生と誤認しないように）。単発reorganize()の所要時間をコーパスサイズに対してスイープする新実験（T1-only vs T1+T2、各タブのYCSB-E直下に追加）を実施：T1-onlyはLTM下でも8.26M件で2.7秒と軽量だが、T1+T2はLTM下でターゲットの25%（1KB, 206万件）や100%（64KB, 13万件だがT2実データは~8.6GB）で60秒キャップに到達し、実用限界を確認。これに伴い、「T1-onlyでもLTM cgroup制約下で1分優に超える」という誤った旧コメントを削除・訂正（実際に遅いのはpopulate中の並行reorg競合であり、単発reorganize()自体は高速）。
+              </td>
+            </tr>
+
+            <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-07-31</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026073100_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (07/31)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                T1Index::scan()が候補を毎回全件ソートしていた無駄を、ソート済みsorted_region分をスキップする直接マージに変更(8B In-MemoryのScanがRocksDB比3.5x→7.5xへ改善)。update_impl()がinline値の更新時に不要なT2メモリハンドルを取得していたのを高速パス化。write_stripeロック保持中のreorganizeチェックをロック外へ移動。THP(Transparent Huge Pages)の実際の設定を確認しmadviseへ強制する仕組みを追加。書き込み系の改善効果はAWS実行間のノイズに埋もれ有意差を確認できず。
+              </td>
+            </tr>
+
+            <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-07-30</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026073000_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (07/30)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                WAL group commit通知方式をnotify_one()ループからnotify_all()に変更、T1 append領域のbounds-skipスキャン最適化、reorganize()の直接マージ化、チェックポイント書き込み時のメモリ逼迫対策を実施。インスタンスをc6idからi4i(現行世代・最速ローカルNVMe)に変更。
+              </td>
+            </tr>
+
+            <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-07-29</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026072900_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS c6id (07/29)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                WAL / Checkpoint 実装完了。ベンチマークのバグ修正済み。
+              </td>
+            </tr>
+
+            <tr>
               <td class="py-4 pr-4 text-slate-400">2026-07-15</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026071600_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
@@ -73,9 +121,10 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                YCSB-E (Scan 95% / Insert 5%)追加。Reorganizeのトリガをadaptiveに変更。
+                YCSB-E (Scan 95% / Insert 5%)追加。Reorganizeのトリガをadaptiveに変更。ベンチマークにバグあり（slack参照）
               </td>
             </tr>
+
           </tbody>
         </table>
       </div>
@@ -103,6 +152,7 @@
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100">
+
               <tr>
                 <td class="py-4 pr-4 text-slate-400">2026-07-15</td>
                 <td class="py-4 px-4 font-medium">

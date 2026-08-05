@@ -4,6 +4,7 @@
 #include <concepts>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -29,8 +30,13 @@ concept KVStore = requires(Store store, std::span<const std::byte> key, std::spa
   { store.update(key, value) } -> std::same_as<bool>;
   { store.remove(key) } -> std::same_as<bool>;
 
-  // get is now a callback-based API accepting a callable that processes std::span<const std::byte>
+  // get() takes a callback that processes the resulting std::span<const std::byte>
   store.get(key, [](std::span<const std::byte>) {});
+
+  // Bulk-loads entries generated on demand by index -> std::string callbacks. See
+  // StoreAdapter::bulk_load()'s own doc comment for its (weaker than insert/update)
+  // durability contract.
+  store.bulk_load(std::size_t{0}, [](std::size_t) { return std::string{}; }, [](std::size_t) { return std::string{}; });
 };
 
 // ─── Production Recommended Store ──────────────────────────────────────────

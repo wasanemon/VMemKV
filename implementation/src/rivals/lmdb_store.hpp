@@ -49,13 +49,11 @@ class LMDBStore {
     mdb_env_set_mapsize(env_, kMapSizeBytes);
     mdb_env_set_maxreaders(env_, kMaxReaders);
 
-    // Benchmark tuning lives here so the wrapper API stays separate from the
-    // current population policy. MDB_WRITEMAP + MDB_MAPASYNC skips the per-commit
-    // fsync (async background flush instead), matching RocksDB's benchmark
-    // WriteOptions{} default of sync=false -- otherwise LMDB's default full fsync
-    // per transaction would make the comparison unfair (measuring disk latency
-    // rather than the engine itself).
-    constexpr unsigned int kEnvFlags = MDB_NOSUBDIR | MDB_WRITEMAP | MDB_MAPASYNC;
+    // MDB_WRITEMAP without MDB_MAPASYNC means every commit synchronously msyncs, matching
+    // VMemKV's own per-write fsync contract (wal.hpp) and RocksDB's WriteOptions.sync=true (see
+    // RocksDBStore::make_durable_write_options()). bulk_load_impl() below toggles MDB_MAPASYNC
+    // on for its own duration instead, like the other two engines' bulk loaders.
+    constexpr unsigned int kEnvFlags = MDB_NOSUBDIR | MDB_WRITEMAP;
     int rc = mdb_env_open(env_, path_.c_str(), kEnvFlags, 0664);
     if (rc != 0) {
       mdb_env_close(env_);
@@ -92,6 +90,56 @@ class LMDBStore {
 
   LMDBStore(const LMDBStore &) = delete;
   auto operator=(const LMDBStore &) -> LMDBStore & = delete;
+
+  // Tag type selecting the clone-from-master constructor below. Public so StoreAdapter's
+  // variadic forwarding constructor can name it directly -- see
+  // for_each_store_variant()'s make_fresh_corpus()/make_fresh_corpus_checkpoint() in bench_kv.cpp.
+  struct CloneFromMasterTag {};
+
+  // Builds `master_path` once via bulk_load, then clones it into this instance's own path with
+  // mdb_env_copy2(..., MDB_CP_COMPACT) -- much cheaper than re-running bulk_load_impl against an
+  // empty environment each time. Must be a real copy, not a hardlink: LMDB mmaps and writes its
+  // B+Tree pages in place, so a hardlinked clone and its master would corrupt each other on the
+  // first write (unlike RocksDBStore::clone_from(), which can hardlink immutable SST files).
+  template <typename KeyFn, typename ValueFn>
+  LMDBStore(CloneFromMasterTag /*tag*/,
+            const std::string &master_path,
+            std::size_t key_count,
+            KeyFn &&make_key,
+            ValueFn &&make_value) {
+    ensure_master_built(master_path, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
+    static std::atomic<uint64_t> clone_counter{0};
+    path_ = master_path + "_clone_" + std::to_string(clone_counter.fetch_add(1, std::memory_order_relaxed)) + ".lmdb";
+    clone_from(master_path, path_);
+
+    if (mdb_env_create(&env_) != 0) {
+      throw std::runtime_error("LMDB env_create failed (clone)");
+    }
+    mdb_env_set_mapsize(env_, kMapSizeBytes);
+    mdb_env_set_maxreaders(env_, kMaxReaders);
+    constexpr unsigned int kEnvFlags = MDB_NOSUBDIR | MDB_WRITEMAP;
+    int rc = mdb_env_open(env_, path_.c_str(), kEnvFlags, 0664);
+    if (rc != 0) {
+      mdb_env_close(env_);
+      env_ = nullptr;
+      throw std::runtime_error("LMDB env_open failed (clone): " + std::string(mdb_strerror(rc)));
+    }
+    MDB_txn *txn = nullptr;
+    rc = mdb_txn_begin(env_, nullptr, 0, &txn);
+    if (rc != 0) {
+      mdb_env_close(env_);
+      env_ = nullptr;
+      throw std::runtime_error("LMDB txn_begin failed (clone): " + std::string(mdb_strerror(rc)));
+    }
+    rc = mdb_dbi_open(txn, nullptr, 0, &dbi_);
+    if (rc != 0) {
+      mdb_txn_abort(txn);
+      mdb_env_close(env_);
+      env_ = nullptr;
+      throw std::runtime_error("LMDB dbi_open failed (clone): " + std::string(mdb_strerror(rc)));
+    }
+    mdb_txn_commit(txn);
+  }
 
   // No-op: LMDB reclaims freed B+Tree pages automatically via its freelist; there is
   // no manual reorganize/compaction concept during normal operation.
@@ -171,52 +219,51 @@ class LMDBStore {
     return mdb_txn_commit(txn) == 0;
   }
 
-  template <typename KeyFn>
-  auto bulk_load_impl(std::size_t key_count,
-                      KeyFn &&make_key,
-                      std::size_t target_value_size,
-                      std::string *error_out = nullptr) -> bool {
+  template <typename KeyFn, typename ValueFn>
+  void bulk_load_impl(std::size_t key_count, KeyFn &&make_key, ValueFn &&make_value) {
+    bulk_load_into(env_, dbi_, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
+  }
+
+  template <typename KeyFn, typename ValueFn>
+  static void bulk_load_into(MDB_env *env, MDB_dbi dbi, std::size_t key_count, KeyFn &&make_key, ValueFn &&make_value) {
     if (key_count == 0) {
-      return true;
+      return;
     }
+    // Non-durable during bulk load, like VMemKV's own bulk_load_impl (bypasses its WAL) and
+    // RocksDB's (disableWAL=true): toggle MDB_MAPASYNC on for the duration so batch commits skip
+    // the synchronous msync, then restore the durable default.
+    mdb_env_set_flags(env, MDB_MAPASYNC, 1);
+    struct RestoreDurability {
+      MDB_env *env;
+      ~RestoreDurability() { mdb_env_set_flags(env, MDB_MAPASYNC, 0); }
+    } restore_durability{env};
+
     // Batch many puts per write transaction: committing once per key would pay the
     // (async, but still non-trivial) commit overhead key_count times.
     constexpr std::size_t kBatchKeys = 100'000;
-    std::string dummy_large(target_value_size, 'a');
-    std::string dummy_8b(8, 'a');
 
     std::size_t next_index = 0;
     while (next_index < key_count) {
       MDB_txn *txn = nullptr;
-      if (mdb_txn_begin(env_, nullptr, 0, &txn) != 0) {
-        if (error_out != nullptr) {
-          *error_out = "LMDB txn_begin failed during bulk load";
-        }
-        return false;
+      if (mdb_txn_begin(env, nullptr, 0, &txn) != 0) {
+        throw std::runtime_error("LMDB txn_begin failed during bulk load");
       }
       const std::size_t chunk_end = std::min(key_count, next_index + kBatchKeys);
       for (std::size_t index = next_index; index < chunk_end; ++index) {
         const std::string key = make_key(index);
-        const std::string &value = (target_value_size != 8 && index % 5 == 0) ? dummy_8b : dummy_large;
+        const std::string value = make_value(index);
         MDB_val mkey{key.size(), const_cast<char *>(key.data())};
         MDB_val mval{value.size(), const_cast<char *>(value.data())};
-        if (mdb_put(txn, dbi_, &mkey, &mval, 0) != 0) {
+        if (mdb_put(txn, dbi, &mkey, &mval, 0) != 0) {
           mdb_txn_abort(txn);
-          if (error_out != nullptr) {
-            *error_out = "LMDB put failed during bulk load";
-          }
-          return false;
+          throw std::runtime_error("LMDB put failed during bulk load");
         }
       }
       if (mdb_txn_commit(txn) != 0) {
-        if (error_out != nullptr) {
-          *error_out = "LMDB txn_commit failed during bulk load";
-        }
-        return false;
+        throw std::runtime_error("LMDB txn_commit failed during bulk load");
       }
       next_index = chunk_end;
     }
-    return true;
   }
 
   template <typename Cb>
@@ -260,6 +307,87 @@ class LMDBStore {
   static constexpr size_t kMapSizeBytes = 1ULL << 40;
   static constexpr unsigned int kMaxReaders = 512;
 
+  // Builds a fresh master at a ".building" sibling path, renamed into place only once fully
+  // populated and closed, so a crash mid-build never leaves a partial master for a later call
+  // to trust. The build env is closed before the rename: LMDB forbids the same file being open
+  // twice at once in one process, and clone_from() below opens this path again afterward.
+  template <typename KeyFn, typename ValueFn>
+  static void ensure_master_built(const std::string &master_path,
+                                  std::size_t key_count,
+                                  KeyFn &&make_key,
+                                  ValueFn &&make_value) {
+    if (std::filesystem::exists(master_path)) {
+      return;
+    }
+    const std::string building_path = master_path + ".building";
+    std::error_code ignored;
+    std::filesystem::remove(building_path, ignored);
+    std::filesystem::remove(building_path + "-lock", ignored);
+
+    MDB_env *build_env = nullptr;
+    if (mdb_env_create(&build_env) != 0) {
+      throw std::runtime_error("LMDB env_create failed (master build)");
+    }
+    mdb_env_set_mapsize(build_env, kMapSizeBytes);
+    mdb_env_set_maxreaders(build_env, kMaxReaders);
+    int rc = mdb_env_open(build_env, building_path.c_str(), MDB_NOSUBDIR | MDB_WRITEMAP, 0664);
+    if (rc != 0) {
+      mdb_env_close(build_env);
+      throw std::runtime_error("LMDB env_open failed (master build): " + std::string(mdb_strerror(rc)));
+    }
+    MDB_dbi build_dbi = 0;
+    MDB_txn *txn = nullptr;
+    rc = mdb_txn_begin(build_env, nullptr, 0, &txn);
+    if (rc != 0) {
+      mdb_env_close(build_env);
+      throw std::runtime_error("LMDB txn_begin failed (master build): " + std::string(mdb_strerror(rc)));
+    }
+    rc = mdb_dbi_open(txn, nullptr, 0, &build_dbi);
+    if (rc != 0) {
+      mdb_txn_abort(txn);
+      mdb_env_close(build_env);
+      throw std::runtime_error("LMDB dbi_open failed (master build): " + std::string(mdb_strerror(rc)));
+    }
+    mdb_txn_commit(txn);
+
+    bulk_load_into(build_env, build_dbi, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
+    mdb_env_close(build_env);
+
+    std::filesystem::remove(master_path, ignored);
+    std::filesystem::remove(master_path + "-lock", ignored);
+    std::error_code rename_error;
+    std::filesystem::rename(building_path, master_path, rename_error);
+    if (rename_error) {
+      throw std::runtime_error("LMDB master build rename failed: " + rename_error.message());
+    }
+  }
+
+  // Copies `source_path` to `dest_path` via mdb_env_copy2(..., MDB_CP_COMPACT), which also
+  // drops free/unused pages so the clone is no larger than its live data. See the
+  // CloneFromMasterTag constructor above for why this must be a real copy, not a hardlink.
+  static void clone_from(const std::string &source_path, const std::string &dest_path) {
+    std::error_code ignored;
+    std::filesystem::remove(dest_path, ignored);
+    std::filesystem::remove(dest_path + "-lock", ignored);
+
+    MDB_env *source_env = nullptr;
+    if (mdb_env_create(&source_env) != 0) {
+      throw std::runtime_error("LMDB env_create failed (clone source)");
+    }
+    mdb_env_set_mapsize(source_env, kMapSizeBytes);
+    mdb_env_set_maxreaders(source_env, kMaxReaders);
+    int rc = mdb_env_open(source_env, source_path.c_str(), MDB_NOSUBDIR | MDB_RDONLY, 0664);
+    if (rc != 0) {
+      mdb_env_close(source_env);
+      throw std::runtime_error("LMDB env_open failed (clone source): " + std::string(mdb_strerror(rc)));
+    }
+    rc = mdb_env_copy2(source_env, dest_path.c_str(), MDB_CP_COMPACT);
+    mdb_env_close(source_env);
+    if (rc != 0) {
+      throw std::runtime_error("LMDB env_copy2 failed: " + std::string(mdb_strerror(rc)));
+    }
+  }
+
   static auto to_val(std::span<const std::byte> bytes) noexcept -> MDB_val {
     return MDB_val{bytes.size(), const_cast<std::byte *>(bytes.data())};
   }
@@ -294,6 +422,20 @@ class LMDBStore {
   LMDBStore(const LMDBStore &) = delete;
   auto operator=(const LMDBStore &) -> LMDBStore & = delete;
 
+  struct CloneFromMasterTag {};
+  template <typename KeyFn, typename ValueFn>
+  LMDBStore(CloneFromMasterTag /*tag*/,
+            const std::string &master_path,
+            std::size_t key_count,
+            KeyFn &&make_key,
+            ValueFn &&make_value) {
+    (void)master_path;
+    (void)key_count;
+    (void)make_key;
+    (void)make_value;
+    throw std::runtime_error("LMDB not enabled in this build");
+  }
+
   void reorganize() {}
 
   template <typename Callback>
@@ -319,18 +461,12 @@ class LMDBStore {
     (void)key;
     return false;
   }
-  template <typename KeyFn>
-  auto bulk_load_impl(std::size_t key_count,
-                      KeyFn &&make_key,
-                      std::size_t target_value_size,
-                      std::string *error_out = nullptr) -> bool {
+  template <typename KeyFn, typename ValueFn>
+  void bulk_load_impl(std::size_t key_count, KeyFn &&make_key, ValueFn &&make_value) {
     (void)key_count;
     (void)make_key;
-    (void)target_value_size;
-    if (error_out != nullptr) {
-      *error_out = "LMDB not enabled in this build";
-    }
-    return false;
+    (void)make_value;
+    throw std::runtime_error("LMDB not enabled in this build");
   }
 
   template <typename Cb>

@@ -214,6 +214,36 @@ run_local_scenario() {
   local -a scenario_cmd=("$SCRIPT_DIR/common/run_scenario.sh" "$BENCH_BIN" "$filter" "$MIN_TIME" "$temp_json")
   if [[ "$USE_CGROUP" == "true" && "$scenario_key" == "ltm" ]]; then
     if command -v systemd-run >/dev/null 2>&1; then
+      # Both the priming pass below and the cgroup-wrapped measurement pass after it run with
+      # VMEMKV_BENCH_SKIP_CLEANUP=1 (see its comment in bench_kv.cpp), so bench_kv's own
+      # automatic sweeps don't fight a deliberate multi-store, multi-master-generation priming
+      # pass. That means *this* script owns the "start from a clean slate" step neither of those
+      # invocations will do on their own -- do it once, here, unconditionally, exactly like
+      # bench_kv's own startup sweep normally would (same "bench_" prefix, same directory: this
+      # script never sets VMEMKV_DB_DIR, so bench_kv defaults to ".", i.e. $REPO_ROOT after the
+      # `cd "$REPO_ROOT"` above).
+      find "$REPO_ROOT" -maxdepth 1 -name 'bench_*' -exec rm -rf {} +
+
+      # Prime every shared master corpus this run will need at full, unconstrained disk speed
+      # *before* entering the cgroup below. Without this, a real per-master populate under this
+      # exact cgroup was measured at 200-1200s (vs. ~20-30s unconstrained) -- paying that cost
+      # here means the cgroup-wrapped measurement pass only ever needs to clone, not rebuild,
+      # those masters. See vmemkv_matrix::ltm_priming_filter()'s comment for what this
+      # single-cell-per-(store,value size) filter does and does not cover.
+      echo "Priming LTM master corpora (unconstrained) before entering the cgroup..."
+      local priming_filter priming_json
+      priming_filter="$(vmemkv_matrix::ltm_priming_filter)"
+      priming_json="$(mktemp /tmp/vmemkv_ltm_priming.XXXXXX.json)"
+      env $scenario_env_prefix ${scenario_runtime_env:+$scenario_runtime_env} VMEMKV_BENCH_SKIP_CLEANUP=1 \
+        "$SCRIPT_DIR/common/run_scenario.sh" "$BENCH_BIN" "$priming_filter" "$MIN_TIME" "$priming_json" \
+        >/dev/null
+      rm -f "$priming_json"
+      echo "Priming complete."
+
+      # The measurement pass below reuses the masters priming just built -- it must not let
+      # bench_kv's own startup cleanup_stale_benchmark_files() wipe them the instant it starts.
+      scenario_runtime_env="${scenario_runtime_env:+$scenario_runtime_env }VMEMKV_BENCH_SKIP_CLEANUP=1"
+
       local ltm_swap_budget
       ltm_swap_budget="$(vmemkv_matrix::ltm_swap_budget_bytes)"
       scenario_cmd=(systemd-run --user --scope --quiet \

@@ -56,15 +56,28 @@ if [ -n "$SGS" ]; then
   echo "Found temporary security groups: $SGS"
   for sg in $SGS; do
     echo "Deleting security group $sg..."
-    # Retry a few times in case dependencies (network interfaces) take a moment to clear
-    for i in {1..5}; do
-      if aws ec2 delete-security-group --group-id "$sg" 2>/dev/null; then
+    # Retry with a generous budget: the ENI attached to this SG normally releases within
+    # seconds of `aws ec2 wait instance-terminated` returning, but that wait is only in the
+    # code path where *we* call terminate-instances above. When the instance instead vanished
+    # on its own (e.g. a spot capacity reclaim -- "instance-terminated-no-capacity" -- observed
+    # in practice to leave orphaned SGs behind with the previous 5x3s=15s budget), this is the
+    # only wait covering ENI teardown, so it needs real margin, not a token retry.
+    deleted=false
+    last_err=""
+    for i in {1..20}; do
+      if last_err=$(aws ec2 delete-security-group --group-id "$sg" 2>&1); then
         echo "Deleted security group $sg."
+        deleted=true
         break
       fi
-      echo "Waiting for security group dependencies to clear (retry $i/5)..."
-      sleep 3
+      echo "Waiting for security group dependencies to clear (retry $i/20)..."
+      sleep 5
     done
+    if [[ "$deleted" == "false" ]]; then
+      echo "[WARNING] Failed to delete security group $sg after 20 retries (100s) -- leaving it" >&2
+      echo "[WARNING] behind as an orphaned resource. Last error: $last_err" >&2
+      echo "[WARNING] Clean it up manually: aws ec2 delete-security-group --group-id $sg" >&2
+    fi
   done
 else
   echo "No temporary security groups found."

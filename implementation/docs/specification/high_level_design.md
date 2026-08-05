@@ -61,7 +61,7 @@ Tier 1 固有のポイントは以下
 - `sorted_region` は key 順のIndexEntry配列、`append_region` は unorderedなIndexEntry配列．
 - すべての操作が触るホットな層なので、`mlock` や huge page などのメモリ最適化対象になる
 
-また，opt-in 最適化として，ある index 全体について payload を `offset` ではなく 64-bit value として解釈する **index-level covering** を導入してもよい．この場合，small fixed-size value に限っては Tier 1 のヒットだけで `Get()` が完結し，Tier 2 アクセスを省略できる．
+また，opt-in 最適化として，値が 8 バイト以下の entry について payload を `offset` ではなく 64-bit value として解釈する **entry-level adaptive covering** をサポートする．該当 entry では Tier 1 のヒットだけで `Get()` が完結し，Tier 2 アクセスを省略できる．詳細は low_level_design.md 2.1.1 節を参照．
 
 ### 4.2 Tier 2
 
@@ -100,7 +100,7 @@ Tier 1 と Tier 2 の責務分離と、`offset` で両者を接続するレイ�
 
 - prefix, hash 一致だが実際のキーは異なる場合を区別するために照合する．
 
-index-level covering を有効にした index では，3. は不要であり，Tier 1 の payload をそのまま返す．
+entry がインライン化されている場合は，3. は不要であり，Tier 1 の payload をそのまま返す．
 
 ### 5.2 Insert
 
@@ -109,7 +109,7 @@ index-level covering を有効にした index では，3. は不要であり，T
 3. Tier 1 `append_region` に `IndexEntry` を追加し，その offset を書く
 4. WAL append + `fsync`
 
-index-level covering を有効にした index では，2. を省略し，Tier 1 entry の payload に 64-bit value を直接書く．
+値が 8 バイト以下でインライン化対象の entry では，2. を省略し，Tier 1 entry の payload に 64-bit value を直接書く．
 
 ### 5.3 Update / Delete / Scan
 
@@ -117,7 +117,7 @@ index-level covering を有効にした index では，2. を省略し，Tier 1 
 - Delete: `Get()` でエントリを特定し，Tier 1 上で offset を tombstone にしたうえで，WAL書き込みを行う．Tier 2 にはアクセスしない．
 - Scan: まず Tier 1 で範囲を絞り込み、得られた offset 集合を使って Tier 2 で value records を収集して返す
 
-index-level covering を有効にした index では，Update / Delete / Scan も Tier 1 payload だけで完結する．
+インライン化されている entry では，Update / Delete / Scan も Tier 1 payload だけで完結する．
 
 payload が offset の index については，Update と Delete における古いデータの削除は T1 の offset を書き換えるだけで行われるのが重要なポイントである．T1 の offset がポインタ/参照だとみなしたとき，これらの T2 の削除されたデータは参照カウントがゼロになったものといえる．これらは，後述する `reorganize()` で物理削除される．
 
@@ -151,26 +151,19 @@ Tier 2 は checkpoint 時の再配置により storage fragmentation をまと�
 
 VMemKVの `reorganize` の一連の処理の結果として，T1 については新規に `sorted_region` と `append_region` が生まれ、T2 については新しい単一 byte array が生まれることになる．これを現在使用中のものと差し替えるにあたって，二つの問題がある．
 
-1. 停止時間を最小化したい．`reorganize` のために T1 の region と T2 の byte array を走査することになるが，その際にはオンラインで読み取りたい．短時間のstop-the-worldにしたい．
+1. 停止時間を最小化したい．`reorganize` のために T1 の region と T2 の byte array を走査することになるが，その際にはオンラインで読み取りたい．(atomic pointer swap による無停止化については後述．)
 2. メモリ領域を大幅に圧迫する．フルスキャンしたうえでフルコピーを行うため，キャッシュラインに与える影響は大きく，`reorganize` 中の性能劣化は避けられない．T1は軽量のためフルスキャン＆フルコピーしても性能影響は限定的だが，T2のそれは非常に問題である．
 
-この二つの問題を解決するため，VMemKVでは，**T2のreorganize が行われる際には必ずcheckpointingを行い，ファイルを介してlive reloadする**ことで，メモリ消費を抑えつつ永続化を行う．これを `checkpoint reload` と呼ぶ．以下のフローで行う．
+この二つの問題を解決するため，VMemKVでは，**T2のreorganize が行われる際には必ずcheckpointingを行い，ファイルを介してlive reloadする**ことで，メモリ消費を抑えつつ永続化を行う．これを `checkpoint reload` と呼ぶ．
+
+> [!IMPORTANT]
+> 旧設計では `fork()` による CoW スナップショットでこれを実現していたが、マルチスレッド環境における fork-safety(デッドロックリスク)と OOM Killer によるページ複製オーバーヘッドを避けるため、fork を使わない in-process 方式に変更した。
 
 ![live reload](../images/live_reload_checkpoint.svg)
 
-1. 新規のチェックポイントファイル (T1, T2で2ファイル) を作成する．
-2. `fork` で CoW スナップショットを取る
-3. `fork` 直後の child 側スナップショットにおける LSN を保存する．
-4. T1の `reorganize()` を行う．二つのregion をソート＆マージした新たな領域を作成する．
-5. T2の `reorganize` を行う．T1のマージ後の`sorted_region` の順にT2にアクセスし，そのデータをT2のチェックポイントファイルに書き込む．同時に，T1のoffsetを書き換えていく．
-6. T1のデータをT1のチェックポイントファイルに書き出す．
-7. チェックポイントファイルが完成したら，親プロセスへのクライアントのアクセス (Get, Scan, Insert, Update, Delete) をすべて止める．
-8. `mmap(MAP_PRIVATE)` でT1, T2のチェックポイントファイルを開き，新たな T1, T2 とする．T1のファイルは `mlock` する．
-9. `fork` 時に記録した LSN の次のエントリから，stop-the-world 中に親プロセス側で確定した現在の LSN までの WAL は未適用であるため，これをリプレイし，新たな T1, T2 に反映して同期をとる．
-10. クライアントのアクセスを解放する．
-11. チェックポイント済みのWALを削除する．
+概略は次のとおりである。T1 の `reorganize()` 呼び出しの中で checkpoint LSN を確定し(6.1節および WAL サイズ上限のトリガー成立時)、新しい `sorted_region` と新しい T2 ファイルを一時ファイルへ書き出したうえで、manifest の `rename()` を新世代の有効化点として atomic pointer swap で公開し、最後に不要になった WAL レコードと旧世代のファイルを片付ける。詳細な手順と正しさの根拠は low_level_design.md 5.2 節 (Flow) および 5.3 節 (Correctness Rule) を参照。
 
-TODO: ジャイアントロックでfork後に追加されたエントリの同期をとるところ，ロックなしで実装できないか？一旦ロックありでいいと思うが．
+このフローに stop-the-world や、fork 版が必要としていたジャイアントロックは存在しない(理由は low_level_design.md 5.2 節末尾を参照)．
 
 ### 6.3 reorganize と checkpoint reloadの違い
 
@@ -188,25 +181,22 @@ TODO: ジャイアントロックでfork後に追加されたエントリの同�
 以下の要素で、VMemKV は永続性を保証する。
 
 - Tier 1 / Tier 2 はいずれも、それ自体がディスクへ書き戻される経路を持たない(Tier 2 は `MAP_PRIVATE` で mmap されるため書き込みは元ファイルへ反映されず、Tier 1 は純粋な RAM 上構造体である)。そのため両者は volatile であり、起動のたびに WAL からの replay で再構築される。
-- 更新は、まず Tier 2 / Tier 1 に適用し、それが成功して初めて WAL append + `fsync` を行う。呼び出し元への成功応答は WAL の `fsync` 完了後にのみ返す。
-  - 古典的な WAL (ARIES 等) が要求する "write-ahead" とは、本来「ログの永続化がデータページの**ディスクへの書き戻し**より先行しなければならない」という制約であり、「ログ書き込みがメモリ上の更新より先」という意味ではない。VMemKV では Tier 1 / Tier 2 自体がディスクへ書き戻される経路を持たないため、この制約は構造的に自明に満たされる。
-  - この順序により、Tier 1 / Tier 2 への適用中に例外が発生した操作(例: Tier 2 の容量超過)は WAL に記録されない。もし WAL 先行(ログ→適用の順)にすると、適用が失敗した操作の記録が WAL に残ってしまい、次回起動時の replay で同じ失敗を再現し、リカバリ自体が永久に失敗し続ける("poison pill")リスクがある。
-  - 上記の容量超過は、本来は 6.2 節に述べる checkpoint & reload によるキューイングで解消される想定だが、そのキューイング機構(TODO item 2)が実装されるまでは、適用成功後に WAL へ書く順序を維持する。
+- 更新は、まず Tier 2 / Tier 1 に適用し、それが成功して初めて WAL append + `fsync` を行う。呼び出し元への成功応答は WAL の `fsync` 完了後にのみ返す。適用失敗を WAL に残さないための順序であり、詳細な理由は low_level_design.md 3.2 節 Failure Rule を参照。
 - 障害時は checkpoint の読み込み + WAL replay で復旧する
-- checkpoint 完了後は古い WAL と checkpoint を削除しローテートする
+- checkpoint 完了後、不要になった旧世代の checkpoint ファイルは削除し、WAL は low_level_design.md 5.5 節の手順でローテートする
 
 ## 8. 最適化の全体像
 
 いくつかの最適化が存在する。すべて独立の opt-in で、無効でも正しく動作する。
 詳細は [low_level_design.md](./low_level_design.md) を参照。
 
-- Tier 1 `mlock` / `MADV_HUGEPAGE` / 一時的 `MADV_SEQUENTIAL`
-- Group Commit / Early Lock Release / Flush Pipelining
+- Tier 1 `mlock` / `MADV_HUGEPAGE` / 一時的 `MADV_SEQUENTIAL`（未実装・将来検討）
+- Group Commit / Early Lock Release / Flush Pipelining（未実装・将来検討）
 - SIMD による Tier 1 scan 高速化
-- index-level covering
 - entry-level adaptive covering
 - `sorted_region` ネガティブルックアップ用 Bloom filter による miss時の O(1)化
-- Tier 2 `MADV_WILLNEED` prefetch
+- Tier 2 `MADV_WILLNEED` prefetch（検証済み・不採用 — 単一/並行スレッドいずれも悪化。詳細は low_level_design.md 7.4.1 節）
+- Tier 2 `MADV_HUGEPAGE`（検証済み・不採用 — スワップ発生時は 2MB 単位を保てず効果なし。詳細は low_level_design.md 7.4.2 節）
 
 ## Appendix A. LineairDB との関係
 

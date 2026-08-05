@@ -35,6 +35,7 @@ endif()
 add_library(vmemkv STATIC
   src/t2_flat_file/t2_flat_file.cpp
   src/wal/wal.cpp
+  src/checkpoint/checkpoint.cpp
 )
 target_link_libraries(vmemkv PUBLIC vmemkv_headers vmemkv_warnings)
 

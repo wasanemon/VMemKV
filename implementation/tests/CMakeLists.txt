@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # ─── test_kv_store ────────────────────────────────────────────────────────────
-add_executable(test_kv_store test_kv_store.cpp test_wal.cpp test_crash_recovery.cpp test_main.cpp)
+add_executable(test_kv_store test_kv_store.cpp test_wal.cpp test_checkpoint.cpp test_crash_recovery.cpp test_t1_index.cpp test_t2_flat_file.cpp test_main.cpp)
 target_link_libraries(test_kv_store PRIVATE vmemkv vmemkv_headers doctest::doctest)
 
 

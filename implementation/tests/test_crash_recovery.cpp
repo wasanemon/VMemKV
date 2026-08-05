@@ -11,6 +11,7 @@
 
 #include <array>
 #include <atomic>
+#include <checkpoint/checkpoint.hpp>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
@@ -42,6 +43,17 @@ void cleanup_store_files(const std::filesystem::path &t2_path) {
   std::error_code ignored;
   std::filesystem::remove(t2_path, ignored);
   std::filesystem::remove(vmemkv::derive_wal_path(t2_path), ignored);
+  std::filesystem::remove(vmemkv::derive_manifest_path(t2_path), ignored);
+
+  // Generation-numbered checkpoint files (t2_path + ".chkN.t1" / ".chkN.t2") have an
+  // unpredictable N, so sweep the parent directory for anything sharing the base filename.
+  const std::string prefix = t2_path.filename().string() + ".chk";
+  std::error_code iter_ec;
+  for (const auto &entry : std::filesystem::directory_iterator(t2_path.parent_path(), iter_ec)) {
+    if (entry.path().filename().string().starts_with(prefix)) {
+      std::filesystem::remove(entry.path(), ignored);
+    }
+  }
 }
 
 // Values are always >= 9 bytes so T1InlineValue's <=8B inlining never applies,
@@ -402,11 +414,8 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
 
 namespace {
 struct TinyAppendConfig : vmemkv::Config<> {
-  // Partial override style, same as ReorgEveryWriteConfig in test_kv_store.cpp: inherit all
-  // defaults and only shrink the append-region capacity to force frequent reorganizes.
-  // Both fields must be redeclared: T1AppendCapacityEntries is computed from
-  // T1AppendCapacityLog2 inside Config<>'s own scope, so overriding the log2 alone (without
-  // also shadowing Entries here) would silently leave APPEND_CAP at the base 2^22 default.
+  // Shrinks append-region capacity to force frequent reorganizes. Both fields must be
+  // redeclared: Entries is computed from Log2 inside Config<>'s own scope.
   static constexpr size_t T1AppendCapacityLog2 = 8;  // 256-entry append region.
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 };
@@ -445,13 +454,10 @@ namespace {
 auto capacity_test_key(int index) -> std::string { return "key_over16bytes_" + std::to_string(index); }
 }  // namespace
 
-// Regression test for a WAL-durability-ordering bug: insert_impl()/update_impl() used to call
-// wal_.append_insert()/append_update() *before* the T1/T2 mutation was known to succeed. When
-// the mutation then threw (T2 physical capacity exceeded, via write_entry_lockfree), the WAL
-// already held a durably fsynced "phantom" record for a write that never actually happened.
-// Replaying that record on the next restart hit the identical throw, this time from inside the
-// constructor -- permanently bricking the store. The fix logs to the WAL only after the mutation
-// has actually applied, so a failed insert()/update() leaves no trace in the WAL at all.
+// Regression test: insert_impl()/update_impl() used to log to the WAL before the T1/T2 mutation
+// was known to succeed. A failed mutation (e.g. T2 capacity exceeded) left a durably-fsynced
+// "phantom" WAL record whose replay hit the identical throw on the next restart, permanently
+// bricking the store. Fixed by logging only after the mutation actually applies.
 TEST_CASE("crash recovery: insert failing on T2 capacity exceeded leaves no phantom WAL record") {
   const auto path = reserve_crash_temp_path();
   constexpr uint64_t kTinyT2Capacity = 200;  // Room for 3 of these ~56B records, not 4.
@@ -511,6 +517,194 @@ TEST_CASE("crash recovery: update failing on T2 capacity exceeded leaves no phan
   const auto val1 = get_bytes(store, capacity_test_key(1));
   REQUIRE(val1.has_value());
   CHECK(*val1 == "01234567");
+
+  cleanup_store_files(path);
+}
+
+// ─── Checkpoint / Reload integration tests ──────────────────────────────────────────────────
+// See docs/specification/low_level_design.md 5.2-5.5. These exercise the checkpoint mechanism
+// entirely through the public Store interface plus filesystem inspection of the manifest and
+// generation-numbered files it produces -- never through VMemKVImpl internals directly.
+
+TEST_CASE_TEMPLATE("checkpoint: explicit reorganize(true) persists a manifest and survives restart",
+                   Store,
+                   CRASH_RECOVERY_STORE_TYPES) {
+  const auto path = reserve_crash_temp_path();
+  constexpr int kKeyCount = 50;
+  {
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
+    for (int i = 0; i < kKeyCount; ++i) {
+      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+    }
+    store->reorganize(true);  // Forces the T2-GC path -- now also a checkpoint.
+    CHECK(std::filesystem::exists(vmemkv::derive_manifest_path(path)));
+  }
+  {
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
+    for (int i = 0; i < kKeyCount; ++i) {
+      const auto val = get_bytes(store, "k" + std::to_string(i));
+      REQUIRE(val.has_value());
+      CHECK(*val == make_value(i));
+    }
+  }
+  cleanup_store_files(path);
+}
+
+TEST_CASE("checkpoint: rotates the WAL down to just the post-checkpoint tail") {
+  const auto path = reserve_crash_temp_path();
+  constexpr int kKeyCount = 200;
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+  for (int i = 0; i < kKeyCount; ++i) {
+    REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+  }
+  const uint64_t wal_size_before = std::filesystem::file_size(vmemkv::derive_wal_path(path));
+
+  store->reorganize(true);
+
+  const uint64_t wal_size_after = std::filesystem::file_size(vmemkv::derive_wal_path(path));
+  CHECK(wal_size_after < wal_size_before);  // Rotation dropped everything up to checkpoint_lsn.
+
+  cleanup_store_files(path);
+}
+
+TEST_CASE("checkpoint: a second checkpoint deletes the previous generation's files") {
+  const auto path = reserve_crash_temp_path();
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+  for (int i = 0; i < 20; ++i) {
+    REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
+  }
+  store->reorganize(true);
+  const auto manifest1 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
+  REQUIRE(manifest1.has_value());
+  const auto gen1_t1 = vmemkv::derive_t1_chk_path(path, manifest1->generation);
+  const auto gen1_t2 = vmemkv::derive_t2_chk_path(path, manifest1->generation);
+  REQUIRE(std::filesystem::exists(gen1_t1));
+  REQUIRE(std::filesystem::exists(gen1_t2));
+
+  for (int i = 0; i < 20; ++i) {
+    REQUIRE(store->insert("b" + std::to_string(i), make_value(1000 + i)));
+  }
+  store->reorganize(true);
+  const auto manifest2 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
+  REQUIRE(manifest2.has_value());
+  CHECK(manifest2->generation != manifest1->generation);
+
+  CHECK_FALSE(std::filesystem::exists(gen1_t1));  // Previous generation cleaned up.
+  CHECK_FALSE(std::filesystem::exists(gen1_t2));
+  CHECK(std::filesystem::exists(vmemkv::derive_t1_chk_path(path, manifest2->generation)));
+  CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path, manifest2->generation)));
+
+  cleanup_store_files(path);
+}
+
+TEST_CASE("checkpoint: deletes and updates after a checkpoint are correctly reflected after restart") {
+  const auto path = reserve_crash_temp_path();
+  constexpr int kKeyCount = 30;
+  {
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+    for (int i = 0; i < kKeyCount; ++i) {
+      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+    }
+    store->reorganize(true);  // Checkpoint captures all 30 keys.
+
+    // Tail activity after the checkpoint: delete half, update the rest.
+    for (int i = 0; i < kKeyCount / 2; ++i) {
+      REQUIRE(store->remove("k" + std::to_string(i)));
+    }
+    for (int i = kKeyCount / 2; i < kKeyCount; ++i) {
+      REQUIRE(store->update("k" + std::to_string(i), make_value(1000 + i)));
+    }
+  }
+  {
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+    for (int i = 0; i < kKeyCount / 2; ++i) {
+      CHECK_FALSE(get_bytes(store, "k" + std::to_string(i)).has_value());
+    }
+    for (int i = kKeyCount / 2; i < kKeyCount; ++i) {
+      const auto val = get_bytes(store, "k" + std::to_string(i));
+      REQUIRE(val.has_value());
+      CHECK(*val == make_value(1000 + i));
+    }
+  }
+  cleanup_store_files(path);
+}
+
+TEST_CASE("checkpoint: insert/checkpoint/insert-more/restart preserves both pre- and post-checkpoint keys") {
+  const auto path = reserve_crash_temp_path();
+  constexpr int kFirstBatch = 20;
+  constexpr int kSecondBatch = 20;
+  {
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+    for (int i = 0; i < kFirstBatch; ++i) {
+      REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
+    }
+    store->reorganize(true);
+    for (int i = 0; i < kSecondBatch; ++i) {
+      REQUIRE(store->insert("b" + std::to_string(i), make_value(1000 + i)));
+    }
+  }
+  {
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+    for (int i = 0; i < kFirstBatch; ++i) {
+      const auto val = get_bytes(store, "a" + std::to_string(i));
+      REQUIRE(val.has_value());
+      CHECK(*val == make_value(i));
+    }
+    for (int i = 0; i < kSecondBatch; ++i) {
+      const auto val = get_bytes(store, "b" + std::to_string(i));
+      REQUIRE(val.has_value());
+      CHECK(*val == make_value(1000 + i));
+    }
+  }
+  cleanup_store_files(path);
+}
+
+TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file fails construction loudly") {
+  const auto path = reserve_crash_temp_path();
+  {
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+    REQUIRE(store->insert("k", make_value(0)));
+    store->reorganize(true);
+  }
+  const auto manifest = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
+  REQUIRE(manifest.has_value());
+  // Simulate loss/corruption of the checkpointed generation's T1 chk file. Since the WAL has
+  // already been rotated down to the tail, falling back to full replay would silently lose the
+  // pre-checkpoint key -- construction must fail loudly instead (see load_checkpoint_if_present).
+  std::filesystem::remove(vmemkv::derive_t1_chk_path(path, manifest->generation));
+
+  CHECK_THROWS(std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes));
+
+  cleanup_store_files(path);
+}
+
+namespace {
+struct TinyWalCheckpointConfig : vmemkv::Config<> {
+  static constexpr size_t WalMaxBytesSinceCheckpoint = 2048;  // Small enough to trip quickly.
+};
+using VMemKV_TinyWalCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyWalCheckpointConfig>>;
+}  // namespace
+
+// Regression test for the WAL-size checkpoint trigger (low_level_design.md 4.4): unlike the
+// space-amplification trigger, this must fire even for an insert-only workload that never
+// generates fragmentation on its own.
+TEST_CASE("checkpoint: WAL size trigger checkpoints automatically, no explicit reorganize(true) needed") {
+  const auto path = reserve_crash_temp_path();
+  auto store = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
+  for (int i = 0; i < 200; ++i) {
+    REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+  }
+  // Deterministically drive one reorganize pass (rather than racing the background worker) --
+  // force_t2_gc=false still evaluates the WAL-size trigger inside reorganize_internal.
+  store->impl().reorganize(false);
+
+  CHECK(std::filesystem::exists(vmemkv::derive_manifest_path(path)));
+
+  for (int i = 0; i < 200; ++i) {
+    const auto val = get_bytes(store, "k" + std::to_string(i));
+    REQUIRE(val.has_value());
+    CHECK(*val == make_value(i));
+  }
 
   cleanup_store_files(path);
 }
