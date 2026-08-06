@@ -1,0 +1,9 @@
+- Do not `git commit` or `git push`
+- Following the rules:
+    - YAGNI
+    - DRY
+    - KISS
+- When creating a documentation, follows the `diataxis` framework.
+- Use **Spot** Instances for the AWS EC2 instances to reduce costs.
+- Check remaining AWS EC2 instances and terminate them periodically to avoid unnecessary costs.
+- Do not consume too much disk space in the local machine.

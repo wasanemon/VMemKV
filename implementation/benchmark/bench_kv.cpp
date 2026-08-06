@@ -947,6 +947,9 @@ static auto make_vmemkv_clone_from_t1only_snapshot(const std::string &master_pat
   if (mapped == MAP_FAILED) {
     throw std::system_error(mmap_errno, std::generic_category(), "mmap t1only t2 snapshot");
   }
+  if (::madvise(mapped, capacity, MADV_RANDOM) != 0) {
+    throw std::system_error(errno, std::generic_category(), "madvise MADV_RANDOM (t1only snapshot)");
+  }
   const uint64_t t2_pair_generation = vmemkv::T2Memory::allocate_generation();
   auto new_mem =
       std::make_unique<vmemkv::T2Memory>(static_cast<std::byte *>(mapped), capacity, t2_pair_generation, bytes_used);

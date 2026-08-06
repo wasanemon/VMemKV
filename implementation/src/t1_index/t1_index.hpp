@@ -520,6 +520,14 @@ class T1Index {
 
     post_freeze_hook();
 
+    // Advance epoch and wait for all writers currently accessing the old append region to exit.
+    // Once they do, we are guaranteed that:
+    // 1. No more writers can call reserve() on old_active_gen (they will see next_active_gen).
+    // 2. All slots currently reserved on old_active_gen are fully written and published.
+    // This resolves all straggler writer and post-freeze reservation races.
+    uint64_t freeze_epoch = reorg_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    active_epochs_.wait_until_epoch(freeze_epoch);
+
     // 3. Rebuild sorted region from sorted_region and append_immutable
     const auto sorted = sorted_snapshot_.load(std::memory_order_acquire)->region;
     AppendRegion *old_active = old_active_gen->region;

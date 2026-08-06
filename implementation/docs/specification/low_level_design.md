@@ -342,8 +342,8 @@ T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時�
 
 `checkpoint reload` は次の手順で行う。`fork` は使用しない(TODO item 2 により廃止)。
 
-1. `reorganize` トリガー(4.4 節の空間増幅率、および WAL サイズ上限のいずれか)成立時、**先に** `checkpoint_lsn = wal.next_lsn() - 1` を読む。その直後に T1 `reorganize()` を呼び出す。呼び出しの中で旧 `append_region` が `append_immutable_` として凍結され、新規の空 `append_region` が atomic pointer swap で公開される。これ以降の Insert / Update / Delete はすべて新世代へのみ書き込まれる(5.3 節 Correctness Rule 参照)。
-2. 凍結された `sorted_region` + `append_immutable_` をマージし、新しい `sorted_region` を in-memory に構築する(まだ未公開)。
+1. `reorganize` トリガー(4.4 節の空間増幅率、および WAL サイズ上限のいずれか)成立時、**先に** `checkpoint_lsn = wal.next_lsn() - 1` を読む。その直後に T1 `reorganize()` を呼び出す。呼び出しの中で旧 `append_region` が `append_immutable_` として凍結され、新規の空 `append_region` が atomic pointer swap で公開される。スワップ完了直後、再編成スレッドは一段目のエポック同期バリア（`wait_until_epoch`）を実行し、旧世代領域への書き込み権を保持していたすべての concurrent writers の完了（publish）を待機する。これ以降の Insert / Update / Delete はすべて新世代へのみ書き込まれる(5.3 節 Correctness Rule 参照)。
+2. 凍結され、かつ書き込みが完全に静止した `sorted_region` + `append_immutable_` をマージし、新しい `sorted_region` を in-memory に構築する(まだ未公開)。
 3. 手順 2 の新しい `sorted_region` を T1 checkpoint の一時ファイルへ書き出す。
 4. `offset_mapper` を通じて T2 の live record を新しい T2 の一時ファイルへ順次書き出し、新 offset を手順 2 の `sorted_region` に反映する(既存の T2 reorganize と同一手順)。
 5. T1 checkpoint ファイル・T2 ファイルの両方が完成したら、両者の世代情報と checkpoint LSN を記す manifest 一時ファイルを書き、`fsync` する。
@@ -476,10 +476,7 @@ checkpoint reload は T1 `reorganize()` がトリガーする atomic pointer swa
 #### T1 Reorganize vs Writers
 
 - Insert / Update / Delete は T1 `reorganize` と並行してよい。
-- ただし、writer は
-  - 旧世代に対して成功し、その後 merge 境界以降の差分として扱われる
-  - または切り替えを検出して retry する
-  のどちらかで、更新を失わないことが必要である。
+- ただし、writer が旧世代バッファに対して行う書き込み（reserve & publish）は、再編成スレッド側のマージ開始前に実行される一段目のエポック同期バリア（`wait_until_epoch`）によって完全にドレインされる。これにより、書き込みスレッド側でのリトライや明示的なロック同期を一切不要としつつ、進行中のすべての更新がデータロストなく新旧いずれかの世代に安全に振り分けられる。
 
 #### Checkpoint Reload vs All Operations
 
@@ -586,6 +583,12 @@ T1のインデックススロットに十分な空きビット領域がないた
 ### 7.6 WAL Rotation via `FALLOC_FL_COLLAPSE_RANGE`（未実装・将来検討）
 
 5.5 節の WAL Rotation はレコードコピー方式(移植性重視)を基本とするが、対応ファイルシステム(ext4, xfs 等。tmpfs 等では非対応)では `fallocate(FALLOC_FL_COLLAPSE_RANGE)` によりファイル先頭のバイト範囲をコピー無しで直接除去できる。コピーを伴わないためローテーションの停止時間をさらに縮小できるが、Linux カーネル・ファイルシステム依存の機能であるため opt-in とする。
+
+### 7.7 Tier 1 madvise(MADV_RANDOM) Optimization (NoMadvise アブレーション)
+
+T1インデックスに対して、仮想メモリマップ時のReadahead（カーネル先読み）を抑止しランダムアクセス性能を最適化する。
+- **最適化の内容**: mmap領域のマップ直後に `madvise(..., MADV_RANDOM)` を呼び出し、OSカーネルの不要なページ先読み・カーネル空間メモリバス帯域の浪費を防ぐ。
+- **NoMadvise アブレーションバリアント**: `vmemkv::Config` のテンプレート引数タグを介して、madvise呼び出しの有無をコンパイル時（constexpr if）に分岐解決する。ベンチマーク測定により、このmadviseの適用によって in-memory Get_Hit において約 5% の有意な性能向上効果が得られることが実証されている。
 
 ## 8. Parameters
 

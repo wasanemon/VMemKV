@@ -57,6 +57,7 @@ struct BloomFilter {};
 struct SimdScan {};
 struct T1InlineValue {};
 struct Prefaulting {};
+struct DisableMadviseRandom {};
 
 // ─── Unified System Config Template (Tag-List Pattern) ──────────────────────
 template <typename... Opts>
@@ -68,6 +69,7 @@ struct Config {
   static constexpr bool UseSimdScan = has_opt<SimdScan>;
   static constexpr bool UseT1InlineValue = has_opt<T1InlineValue>;
   static constexpr bool UsePrefaulting = has_opt<Prefaulting>;
+  static constexpr bool UseMadviseRandom = !has_opt<DisableMadviseRandom>;
 
   // Reorganize thresholds for append-region usage.
   // These are intentionally conservative defaults to avoid hitting APPEND_CAP.

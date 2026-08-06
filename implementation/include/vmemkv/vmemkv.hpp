@@ -52,6 +52,7 @@ using VMemKVRocksDBBlobDB = StoreAdapter<::RocksDBBlobDBStore>;
 using VMemKVLMDB = StoreAdapter<::LMDBStore>;
 
 // ─── 1. Core Stacked Ablation Variants ───
+using VMemKV_NoMadvise = StoreAdapter<VMemKVImpl<Config<DisableMadviseRandom>>>;
 using VMemKV_Var0_Baseline = VMemKV_Baseline;
 using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
 using VMemKV_Var2_Simd = StoreAdapter<VMemKVImpl<Config<BloomFilter, SimdScan>>>;
@@ -64,7 +65,8 @@ using VMemKV_RocksDBBlobDB = VMemKVRocksDBBlobDB;
 using VMemKV_LMDB = VMemKVLMDB;
 
 // ─── 2. Unified Benchmark Registration Tuple ───
-using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
+using AllPossibleTypes = std::tuple<VMemKV_NoMadvise,
+                                    VMemKV_Var0_Baseline,
                                     VMemKV_Var1_Bloom,
                                     VMemKV_Var2_Simd,
                                     VMemKV_Var3_Inline,

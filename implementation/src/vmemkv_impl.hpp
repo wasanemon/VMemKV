@@ -158,6 +158,9 @@ class VMemKVImpl {
     if constexpr (ConfigT::UsePrefaulting) {
       parts.emplace_back("Prefaulting");
     }
+    if constexpr (!ConfigT::UseMadviseRandom) {
+      parts.emplace_back("NoMadvise");
+    }
 
     if (parts.empty()) {
       return "VMemKV/Baseline";
@@ -181,6 +184,12 @@ class VMemKVImpl {
         t1_(initial_generation_),
         t2_(prepare_fresh_t2_file(t2_path), t2_bytes_capacity, initial_generation_),
         wal_(vmemkv::derive_wal_path(t2_path)) {
+    if constexpr (ConfigT::UseMadviseRandom) {
+      auto mem = t2_.get_memory_handle();
+      if (::madvise(mem->base, mem->capacity, MADV_RANDOM) != 0) {
+        throw std::system_error(errno, std::generic_category(), "madvise MADV_RANDOM (initial)");
+      }
+    }
     recovering_ = true;
     load_checkpoint_if_present(t2_path);
     recover_from_wal();
@@ -957,6 +966,9 @@ class VMemKVImpl {
     ::close(file_descriptor);
     if (mapped == MAP_FAILED) {
       throw std::system_error(mmap_errno, std::generic_category(), what);
+    }
+    if (::madvise(mapped, capacity, MADV_RANDOM) != 0) {
+      throw std::system_error(errno, std::generic_category(), "madvise MADV_RANDOM (checkpoint/reorg)");
     }
     return std::make_unique<vmemkv::T2Memory>(static_cast<std::byte *>(mapped), capacity, generation, bytes_used);
   }

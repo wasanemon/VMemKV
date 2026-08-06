@@ -66,6 +66,58 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-06</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026080600_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/06)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                コンパイル時アブレーション実験として <code>madvise(..., MADV_RANDOM)</code> を無効化した
+                <code>NoMadvise</code> バリアントを新規導入。
+              </td>
+              </tr>
+              
+              <tr>
+                <td class="py-4 pr-4 text-slate-400">2026-07-29</td>
+                <td class="py-4 px-4 font-medium">
+                  <a href="2026072900_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                    AWS c6id (07/29)
+                  </a>
+                </td>
+                <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                  WAL / Checkpoint 実装完了。ベンチマークのバグ修正済み。
+                </td>
+              </tr>
+              
+              </tbody>
+              </table>
+              </div>
+              </section>
+              
+              <!-- Collapsible Table (Other Results) -->
+              <section class="space-y-4 pt-4">
+                <details class="group">
+                  <summary
+                    class="text-xs font-bold uppercase tracking-widest text-slate-700 cursor-pointer hover:text-slate-600 select-none flex items-center gap-1.5 focus:outline-none">
+                    <svg class="w-3.5 h-3.5 transition-transform group-open:rotate-90 text-slate-700" fill="none"
+                      stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+                    </svg>
+                    その他の実験結果 (Other Results)
+                  </summary>
+              
+                  <div class="mt-4 border-t border-b border-slate-200 overflow-x-auto">
+                    <table class="w-full text-left text-sm border-collapse">
+                      <thead>
+                        <tr class="border-b border-slate-100">
+                          <th class="py-3.5 pr-4 font-semibold text-slate-500 w-24">Date</th>
+                          <th class="py-3.5 px-4 font-semibold text-slate-500 w-64">Link</th>
+                          <th class="py-3.5 pl-4 font-semibold text-slate-500">Description</th>
+                        </tr>
+                      </thead>
+                      <tbody class="divide-y divide-slate-100">
+                        <tr>
               <td class="py-4 pr-4 text-slate-400">2026-08-04</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026080400_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
@@ -101,18 +153,7 @@
               </td>
             </tr>
 
-            <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-07-29</td>
-              <td class="py-4 px-4 font-medium">
-                <a href="2026072900_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS c6id (07/29)
-                </a>
-              </td>
-              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                WAL / Checkpoint 実装完了。ベンチマークのバグ修正済み。
-              </td>
-            </tr>
-
+            
             <tr>
               <td class="py-4 pr-4 text-slate-400">2026-07-15</td>
               <td class="py-4 px-4 font-medium">
@@ -124,34 +165,6 @@
                 YCSB-E (Scan 95% / Insert 5%)追加。Reorganizeのトリガをadaptiveに変更。ベンチマークにバグあり（slack参照）
               </td>
             </tr>
-
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Collapsible Table (Other Results) -->
-    <section class="space-y-4 pt-4">
-      <details class="group">
-        <summary
-          class="text-xs font-bold uppercase tracking-widest text-slate-700 cursor-pointer hover:text-slate-600 select-none flex items-center gap-1.5 focus:outline-none">
-          <svg class="w-3.5 h-3.5 transition-transform group-open:rotate-90 text-slate-700" fill="none" stroke="currentColor"
-            stroke-width="2.5" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
-          </svg>
-          その他の実験結果 (Other Results)
-        </summary>
-        
-        <div class="mt-4 border-t border-b border-slate-200 overflow-x-auto">
-          <table class="w-full text-left text-sm border-collapse">
-            <thead>
-              <tr class="border-b border-slate-100">
-                <th class="py-3.5 pr-4 font-semibold text-slate-500 w-24">Date</th>
-                <th class="py-3.5 px-4 font-semibold text-slate-500 w-64">Link</th>
-                <th class="py-3.5 pl-4 font-semibold text-slate-500">Description</th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-100">
 
               <tr>
                 <td class="py-4 pr-4 text-slate-400">2026-07-15</td>

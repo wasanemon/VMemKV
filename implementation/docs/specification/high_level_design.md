@@ -163,6 +163,8 @@ VMemKVの `reorganize` の一連の処理の結果として，T1 については
 
 概略は次のとおりである。T1 の `reorganize()` 呼び出しの中で checkpoint LSN を確定し(6.1節および WAL サイズ上限のトリガー成立時)、新しい `sorted_region` と新しい T2 ファイルを一時ファイルへ書き出したうえで、manifest の `rename()` を新世代の有効化点として atomic pointer swap で公開し、最後に不要になった WAL レコードと旧世代のファイルを片付ける。詳細な手順と正しさの根拠は low_level_design.md 5.2 節 (Flow) および 5.3 節 (Correctness Rule) を参照。
 
+このフローにおいて、旧世代バッファへの書き込みがまだ進行中の状態でマージが進まないよう、pointer swapの直後（マージ開始前）に「一段目のエポック同期バリア」を挟み、旧世代のすべての書き込みスレッドの完了を待機する。
+
 このフローに stop-the-world や、fork 版が必要としていたジャイアントロックは存在しない(理由は low_level_design.md 5.2 節末尾を参照)．
 
 ### 6.3 reorganize と checkpoint reloadの違い
@@ -191,6 +193,7 @@ VMemKVの `reorganize` の一連の処理の結果として，T1 については
 詳細は [low_level_design.md](./low_level_design.md) を参照。
 
 - Tier 1 `mlock` / `MADV_HUGEPAGE` / 一時的 `MADV_SEQUENTIAL`（未実装・将来検討）
+- Tier 1 `madvise(MADV_RANDOM)`（Baselineにて常時有効。アブレーション検証により In-Memory 読出で約5%の有意な性能向上に貢献していることを実証。非適用版は `NoMadvise` バリアントとして定義）
 - Group Commit / Early Lock Release / Flush Pipelining（未実装・将来検討）
 - SIMD による Tier 1 scan 高速化
 - entry-level adaptive covering
