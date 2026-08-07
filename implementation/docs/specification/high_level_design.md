@@ -198,8 +198,7 @@ VMemKVの `reorganize` の一連の処理の結果として，T1 については
 - SIMD による Tier 1 scan 高速化
 - entry-level adaptive covering
 - `sorted_region` ネガティブルックアップ用 Bloom filter による miss時の O(1)化
-- Tier 2 `MADV_WILLNEED` prefetch（検証済み・不採用 — 単一/並行スレッドいずれも悪化。詳細は low_level_design.md 7.4.1 節）
-- Tier 2 `MADV_HUGEPAGE`（検証済み・不採用 — スワップ発生時は 2MB 単位を保てず効果なし。詳細は low_level_design.md 7.4.2 節）
+- Tier 2 `MADV_HUGEPAGE`（検証済み・不採用 — スワップ発生時は 2MB 単位を保てず効果なし。詳細は low_level_design.md 7.4.1 節）
 
 ## Appendix A. LineairDB との関係
 

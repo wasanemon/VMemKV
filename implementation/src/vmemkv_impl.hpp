@@ -967,8 +967,10 @@ class VMemKVImpl {
     if (mapped == MAP_FAILED) {
       throw std::system_error(mmap_errno, std::generic_category(), what);
     }
-    if (::madvise(mapped, capacity, MADV_RANDOM) != 0) {
-      throw std::system_error(errno, std::generic_category(), "madvise MADV_RANDOM (checkpoint/reorg)");
+    if constexpr (ConfigT::UseMadviseRandom) {
+      if (::madvise(mapped, capacity, MADV_RANDOM) != 0) {
+        throw std::system_error(errno, std::generic_category(), "madvise MADV_RANDOM (checkpoint/reorg)");
+      }
     }
     return std::make_unique<vmemkv::T2Memory>(static_cast<std::byte *>(mapped), capacity, generation, bytes_used);
   }
