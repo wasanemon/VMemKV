@@ -33,10 +33,20 @@ Source: `benchmark_results/pages/2026081000_charts.html` Winners Matrix (threads
 * Not yet verified on AWS/real concurrency scale (local dev box, threads:20 not 32).
 
 ### 4.3 Scan (Zipf) 64KB LTM -- 0.49x vs LMDB
-* Likely cause: LMDB's B+tree keeps range-scan order close to physical order (including overflow pages), while VMemKV's base_mmap `MADV_SEQUENTIAL` readahead window may not be sized well for 64KB records under real I/O pressure.
-* Candidate countermeasures:
-  - Explicit `madvise(MADV_WILLNEED)` a bit ahead of the scan cursor instead of relying purely on `MADV_SEQUENTIAL`.
-  - Tune the readahead window size based on record size (64KB) rather than a fixed default.
+* **Status**: 🟡 **Partially improved by 4.2's fix, still losing** (re-measured AWS i4i.8xlarge, 2026-08-12, after commit 7991345)
+* Re-measurement (threads:32, 1GiB budget, isolated cgroup): Zipf ratio 0.49x -> **0.55x** (4.2's `walk_sorted_region()` fast path is in the shared `T1Index::scan()` path, so it applies here too, for free). Uniform is now essentially at parity (1.05x, wasn't a red badge before either).
+* New finding: comparing each store's *own* Zipf/Uniform ratio at 64KB LTM -- LMDB itself is 3.45x faster on Zipf than Uniform (2,526/s vs 732/s), while VMemKV is only 1.80x faster (1,381/s vs 767/s) for the exact same corpus/access pattern. Both benefit from repeated-hot-range skew (page cache reuse), but LMDB benefits *much* more.
+* Also worth remembering going in: LMDB is not "in-memory" -- it's natively an mmap'd, disk-backed B+tree, so "LTM" isn't a special mode for it the way it is for VMemKV (T1 index + T2 mmap + WAL + checkpoints as separate layers all sharing one memory budget). LMDB has ~15+ years of engineering specifically for "huge mmap'd file under real memory pressure" as its core use case; VMemKV's LTM support (ScanBaseSequential etc.) is comparatively new.
+* **Root cause found** (perf stat + /proc/diskstats profiling, AWS i4i.8xlarge, 2026-08-12, 4 legs: {vmemkv,lmdb} x {zipf,uniform} @ threads:32): normalized per benchmark iteration (one iteration = one `scan_count_reorg`=100-record window = 6.25MiB logical), actual bytes pulled from the block device via `/proc/diskstats` sector deltas:
+  | | major-faults/iter | disk bytes/iter | vs 6.25MiB logical window | bytes/major-fault |
+  |---|---|---|---|---|
+  | VMemKV Zipf | 24.3 | 9.10 MiB | 1.46x | 383 KB |
+  | VMemKV Uniform | 62.7 | 22.37 MiB | 3.58x | 365 KB |
+  | LMDB Zipf | 21.8 | 5.96 MiB | 0.95x | 280 KB |
+  | LMDB Uniform | 71.8 | 21.62 MiB | 3.46x | 308 KB |
+
+  Under Uniform (essentially all-cold access) both stores are close (~3.5x the logical window, i.e. similar absolute read amplification). The gap is specific to Zipf: LMDB reads *less* than the logical window (0.95x -- most of the hot range is already page-cache resident), while VMemKV still reads 1.46x the logical window even on repeated/hot access. Consistently across both distributions, VMemKV pulls ~25-30% more bytes per major fault than LMDB (383KB vs 280KB on Zipf, 365KB vs 308KB on Uniform). This is explained by `vmemkv_impl.hpp:1470`: the `ScanBaseSequential` second mapping is unconditionally `madvise(MADV_SEQUENTIAL)`'d, which makes the kernel's readahead window wide regardless of distribution. Wide readahead is a good trade under Uniform (next access is elsewhere anyway) but is pure waste under Zipf, where the win comes from a *narrow* hot range staying resident -- the extra readahead bytes rarely get reused before eviction, and their fetch/cache-pressure cost eats into the skew's benefit. This is why VMemKV's own Zipf/Uniform speedup (1.80x) undershoots LMDB's (3.21x measured in this profiling run, consistent with the 3.45x figure above) even though both benefit from the same corpus-level skew.
+* Candidate countermeasure (updated, now quantitatively supported rather than speculative): replace the unconditional `MADV_SEQUENTIAL` on the `ScanBaseSequential` mapping with an explicit, bounded `madvise(MADV_WILLNEED)` sized to the actual scan request (e.g. ~`scan_count_reorg` x record size) instead of letting the kernel's adaptive sequential-readahead heuristic decide the window width. Not yet implemented.
 
 ### 4.4 YCSB-E 64KB LTM -- 0.60x vs RocksDB
 * Likely cause: YCSB-E is scan-heavy, so this probably just inherits 4.3's weakness. Expect it to improve once 4.3 is fixed -- verify before investing separately.
