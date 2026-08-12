@@ -354,6 +354,28 @@ class T1Index {
       const AppendGeneration *imm_gen = append_immutable_.load(std::memory_order_acquire);
       const AppendRegion *imm = imm_gen != nullptr ? imm_gen->region : nullptr;
 
+      // Fast path: if neither append region can contain a key in range, stream straight from the
+      // sorted region via walk_sorted_region() -- no candidates buffer, no merge, no dedup pass
+      // (sorted region has no duplicate keys by construction).
+      auto region_disjoint = [&](const AppendRegion *region) {
+        if (region == nullptr) return true;
+        Key region_min{};
+        Key region_max{};
+        if (!region->bounds(region_min, region_max)) return true;
+        return upper_bound < region_min || region_max < lower_bound;
+      };
+      if (region_disjoint(active) && region_disjoint(imm)) {
+        size_t match_count = 0;
+        walk_sorted_region(sorted,
+                           lower_bound,
+                           upper_bound,
+                           [&](const SortedSlot &slot, uint64_t hash, Payload payload, uint64_t generation) {
+                             callback(std::span<const std::byte>(slot.key), payload, hash, generation);
+                             ++match_count;
+                           });
+        return match_count;
+      }
+
       struct ScanCandidate {
         Key key;
         Payload payload_bits;
@@ -368,25 +390,12 @@ class T1Index {
       std::pmr::vector<ScanCandidate> candidates(&mem_res);
 
       // 1. Extract from sorted_region using binary search (O(log S))
-      if (sorted && sorted->size > 0) {
-        const SortedSlot *slots_begin = sorted->slots.get();
-        const SortedSlot *slots_end = slots_begin + sorted->size;
-        const SortedSlot *it_start =
-            std::lower_bound(slots_begin, slots_end, lower_bound, [](const SortedSlot &slot, const StoreKey &bound) {
-              return slot.key < bound;
-            });
-        for (const SortedSlot *it = it_start; it < slots_end; ++it) {
-          if (upper_bound < it->key) {
-            break;
-          }
-          // Paired read via load_slot_consistent() -- feeds scan_impl()'s T2 dereference, same
-          // reasoning as get_with_hash() (see SortedSlot::version).
-          const auto [it_hash, it_val, it_generation] = load_slot_consistent(*it);
-          if (it_val != vmemkv::STORE_NOT_FOUND) {
-            candidates.push_back({it->key, it_val, it_hash, 0, it_generation});
-          }
-        }
-      }
+      walk_sorted_region(sorted,
+                         lower_bound,
+                         upper_bound,
+                         [&](const SortedSlot &slot, uint64_t hash, Payload payload, uint64_t generation) {
+                           candidates.push_back({slot.key, payload, hash, 0, generation});
+                         });
 
       // 2. Extract from append active/immutable regions (manual scan to access slot.hash directly)
       auto extract_append = [&](const AppendRegion *region, int gen) {
@@ -746,6 +755,35 @@ class T1Index {
     }
     delete snapshot->region;
     delete snapshot;
+  }
+
+  // Walks the sorted region within [lower_bound, upper_bound], calling
+  // sink(slot, hash, payload, t2_generation) for each live match. Shared by scan()'s fast
+  // (direct-delivery) and slow (candidate-buffering) paths so the sorted-region walk has exactly
+  // one implementation; the sink decides what happens per match. Templated rather than a
+  // std::function so each call site's sink is fully inlined.
+  template <typename Sink>
+  static void walk_sorted_region(const SortedRegion *sorted, Key lower_bound, Key upper_bound, Sink &&sink) {
+    if (sorted == nullptr || sorted->size == 0) {
+      return;
+    }
+    const SortedSlot *slots_begin = sorted->slots.get();
+    const SortedSlot *slots_end = slots_begin + sorted->size;
+    const SortedSlot *it_start =
+        std::lower_bound(slots_begin, slots_end, lower_bound, [](const SortedSlot &slot, const StoreKey &bound) {
+          return slot.key < bound;
+        });
+    for (const SortedSlot *it = it_start; it < slots_end; ++it) {
+      if (upper_bound < it->key) {
+        break;
+      }
+      // Paired read via load_slot_consistent() -- feeds scan_impl()'s T2 dereference, same
+      // reasoning as get_with_hash() (see SortedSlot::version).
+      const auto [hash, payload, generation] = load_slot_consistent(*it);
+      if (payload != vmemkv::STORE_NOT_FOUND) {
+        sink(*it, hash, payload, generation);
+      }
+    }
   }
 
   using AppendIndex = LockFreeHashTable<Key, AppendSlot, APPEND_CAP>;

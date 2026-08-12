@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <cstring>
@@ -1264,15 +1265,27 @@ class VMemKVImpl {
                 std::array<std::byte, kInlineScalarValueBytes> stack_value;
                 std::memcpy(stack_value.data(), &payload, size);
 
-                std::array<std::byte, kStoreKeyBytes> stack_key;
-                size_t len = kStoreKeyBytes;
-                while (len > 0 && index_key[len - 1] == std::byte{0}) {
-                  --len;
-                }
-                std::memcpy(stack_key.data(), index_key.data(), len);
-                std::span<const std::byte> key_view(stack_key.data(), len);
+                // Trailing-zero-byte trim via bit_width instead of a byte-by-byte loop: index_key
+                // is exactly two uint64_t's worth of bytes, so the last non-zero byte's position
+                // comes directly from whichever half is nonzero, no per-byte branching needed.
+                // Requires little-endian (memcpy'd byte 0 must land in the least-significant
+                // position) -- true for every platform this codebase targets (see simd_scan.hpp's
+                // identical x86_64-only assumption) but asserted here since it's not obvious from
+                // the arithmetic alone.
+                static_assert(kStoreKeyBytes == 2 * sizeof(uint64_t));
+                static_assert(std::endian::native == std::endian::little);
+                uint64_t lo_word;
+                uint64_t hi_word;
+                std::memcpy(&lo_word, index_key.data(), sizeof(lo_word));
+                std::memcpy(&hi_word, index_key.data() + sizeof(lo_word), sizeof(hi_word));
+                const size_t len = hi_word != 0 ? sizeof(lo_word) + (std::bit_width(hi_word) + 7) / 8
+                                                : (std::bit_width(lo_word) + 7) / 8;
+
                 // Inline values never reference T2, so they can never generation-mismatch.
+                // last_key needs the full, untrimmed bytes regardless (a later record's mismatch
+                // can resume from here); key_view reuses that copy instead of a second one.
                 std::memcpy(last_key.data(), index_key.data(), kStoreKeyBytes);
+                std::span<const std::byte> key_view(last_key.data(), len);
                 advanced = true;
                 if (!key_in_range(key_view, lower_bound, upper_bound)) {
                   return;
