@@ -106,12 +106,21 @@ struct T2Memory {
   // lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based retirement scheme
   // that already protects `base`/`capacity`. nullptr unless explicitly set by the caller
   // (mmap_t2_memory() in vmemkv_impl.hpp, only under that ablation, and only best-effort -- a
-  // failure to create it just means scan_impl() falls back to the always-correct `base` + seqlock
+  // failure to create it just means the reader falls back to the always-correct `base` + seqlock
   // path) -- the plain T2FlatFile-owned initial mapping never sets this, since a fresh store has
   // base_boundary == 0 and thus nothing to map yet. `mutable` only so the destructor (a
   // const-safe operation) can unmap it through the same `const T2Memory *` pattern bytes_used
-  // already uses; never mutated after construction otherwise.
+  // already uses; never mutated after construction otherwise. Read by get_impl() (per-record
+  // access -- wants MADV_SEQUENTIAL's multi-page readahead batching, see
+  // docs/benchmark/20260810_t2_no_madvise_random.md).
   mutable std::byte *base_mmap = nullptr;
+
+  // A third mapping of the identical [0, capacity) region as `base_mmap` above -- same
+  // immutability/lifetime/retirement story, but left at the kernel's default readahead policy
+  // (no madvise call) instead of MADV_SEQUENTIAL, and read only by scan_impl(). See
+  // ScanBaseSequential's doc comment in config.hpp for why Get and Scan need different policies on
+  // the same bytes (madvise is per-VMA, hence the second mapping rather than a second policy).
+  mutable std::byte *base_mmap_scan = nullptr;
 
   // Auto-assigns a fresh, process-global-unique generation. Used where no caller needs to know
   // the value in advance (e.g. tests exercising the ABA-detection field directly).
@@ -139,6 +148,9 @@ struct T2Memory {
       // Mapped to `capacity` (see base_mmap's own comment above), not base_boundary -- the
       // mapping's length never changes after creation even though base_boundary grows in place.
       ::munmap(base_mmap, static_cast<size_t>(capacity));
+    }
+    if (base_mmap_scan != nullptr) {
+      ::munmap(base_mmap_scan, static_cast<size_t>(capacity));
     }
   }
 

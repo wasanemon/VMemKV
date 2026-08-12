@@ -984,25 +984,26 @@ class VMemKVImpl {
     return inserted;
   }
 
-  // Attempts a seqlock-free read of the T2 record at `offset` straight from `base_mmap`. Valid
-  // exactly when ScanBaseSequential is enabled and `offset` falls in the immutable "base" region
-  // (below `base_boundary` -- update_impl() redirects in-place updates targeting that range
-  // out-of-place instead, so unlike `base`'s primary MADV_RANDOM mapping, these bytes can never
-  // change out from under a reader and no seqlock retry is needed). Returns std::nullopt when
-  // unavailable (ablation off, `offset` is still in the mutable tail, or a defense-in-depth bounds
-  // check fails) -- callers must fall back to t2_.at() + read_t2_record_seqlock() in that case.
-  // Shared by get_impl() and scan_impl(): originally scan_impl()-only (see
-  // docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md for why base_mmap exists at all --
-  // MADV_SEQUENTIAL on a second, PROT_READ-only mapping that never leaves the page cache for swap),
-  // extended to get_impl() per docs/benchmark/20260810_t2_no_madvise_random.md's conclusion: large
-  // values in the base region hit the same swap-in-one-page-at-a-time penalty Scan already solved,
-  // and this reuses that exact fix instead of touching the primary mapping's policy.
+  // Attempts a seqlock-free read of the T2 record at `offset` straight from `base_mmap` (or
+  // `base_mmap_scan` when `for_scan` is set). Valid exactly when ScanBaseSequential is enabled and
+  // `offset` falls in the immutable "base" region (below `base_boundary` -- update_impl()
+  // redirects in-place updates targeting that range out-of-place instead, so unlike `base`'s
+  // primary MADV_RANDOM mapping, these bytes can never change out from under a reader and no
+  // seqlock retry is needed). Returns std::nullopt when unavailable (ablation off, `offset` is
+  // still in the mutable tail, or a defense-in-depth bounds check fails) -- callers must fall back
+  // to t2_.at() + read_t2_record_seqlock() in that case. Shared by get_impl() (`for_scan=false`)
+  // and scan_impl() (`for_scan=true`), which read through separate mappings of the identical
+  // region with independent readahead policies -- see T2Memory::base_mmap/base_mmap_scan's doc
+  // comments for why (madvise is per-VMA, and profiling showed Get and Scan want opposite
+  // policies under memory pressure; TODO.md Sec.4.3).
   auto try_read_base_record(const T2FlatFile::T2MemoryHandle &mem,
-                            uint64_t offset) const -> std::optional<T2RecordView> {
+                            uint64_t offset,
+                            bool for_scan) const -> std::optional<T2RecordView> {
     if constexpr (!ConfigT::UseScanBaseSequential) {
       return std::nullopt;
     } else {
-      if (mem->base_mmap == nullptr) {
+      std::byte *const mapping = for_scan ? mem->base_mmap_scan : mem->base_mmap;
+      if (mapping == nullptr) {
         return std::nullopt;
       }
       // Single read: base_boundary can grow concurrently (a T1-only checkpoint's incremental
@@ -1013,7 +1014,7 @@ class VMemKVImpl {
       if (offset >= base_boundary) {
         return std::nullopt;
       }
-      const std::byte *record_base = mem->base_mmap + offset;
+      const std::byte *record_base = mapping + offset;
       const auto *header = reinterpret_cast<const ValueRecordHeader *>(record_base);
       const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
       // Should always hold for a record reorganize() actually wrote here -- kept as a
@@ -1077,7 +1078,7 @@ class VMemKVImpl {
       // Base-region fast path: see try_read_base_record()'s doc comment. Unlike the seqlock path
       // below, base_mmap's bytes are immutable once written, so callback can safely receive a
       // live span straight into it -- no torn-read risk, no copy needed.
-      if (const auto base_record = try_read_base_record(mem, offset); base_record.has_value()) {
+      if (const auto base_record = try_read_base_record(mem, offset, /*for_scan=*/false); base_record.has_value()) {
         if (byte_span_equal(base_record->key, full_key)) {
           callback(base_record->value);
           return true;
@@ -1275,107 +1276,108 @@ class VMemKVImpl {
       bool advanced = false;
       size_t pass_count = 0;
 
-      t1_.scan(
-          current_lower,
-          upper_bound,
-          // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-          [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash, uint64_t t2_generation) {
-            if (mismatch) {
-              return;
-            }
-            if (payload == vmemkv::STORE_NOT_FOUND) {
-              return;
-            }
-            // Resuming re-scans from the last delivered key inclusively -- skip re-delivering it.
-            if (have_resume_key &&
-                byte_span_equal(index_key, std::span<const std::byte>(resume_key.data(), kStoreKeyBytes))) {
-              return;
-            }
+      t1_.scan(current_lower,
+               upper_bound,
+               // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+               [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash, uint64_t t2_generation) {
+                 if (mismatch) {
+                   return;
+                 }
+                 if (payload == vmemkv::STORE_NOT_FOUND) {
+                   return;
+                 }
+                 // Resuming re-scans from the last delivered key inclusively -- skip re-delivering it.
+                 if (have_resume_key &&
+                     byte_span_equal(index_key, std::span<const std::byte>(resume_key.data(), kStoreKeyBytes))) {
+                   return;
+                 }
 
-            if constexpr (ConfigT::UseT1InlineValue) {
-              if (t1_detail::is_inline(hash)) {
-                size_t size = t1_detail::decode_size(hash);
-                std::array<std::byte, kInlineScalarValueBytes> stack_value;
-                std::memcpy(stack_value.data(), &payload, size);
+                 if constexpr (ConfigT::UseT1InlineValue) {
+                   if (t1_detail::is_inline(hash)) {
+                     size_t size = t1_detail::decode_size(hash);
+                     std::array<std::byte, kInlineScalarValueBytes> stack_value;
+                     std::memcpy(stack_value.data(), &payload, size);
 
-                // Trailing-zero-byte trim via bit_width instead of a byte-by-byte loop: index_key
-                // is exactly two uint64_t's worth of bytes, so the last non-zero byte's position
-                // comes directly from whichever half is nonzero, no per-byte branching needed.
-                // Requires little-endian (memcpy'd byte 0 must land in the least-significant
-                // position) -- true for every platform this codebase targets (see simd_scan.hpp's
-                // identical x86_64-only assumption) but asserted here since it's not obvious from
-                // the arithmetic alone.
-                static_assert(kStoreKeyBytes == 2 * sizeof(uint64_t));
-                static_assert(std::endian::native == std::endian::little);
-                uint64_t lo_word;
-                uint64_t hi_word;
-                std::memcpy(&lo_word, index_key.data(), sizeof(lo_word));
-                std::memcpy(&hi_word, index_key.data() + sizeof(lo_word), sizeof(hi_word));
-                const size_t len = hi_word != 0 ? sizeof(lo_word) + (std::bit_width(hi_word) + 7) / 8
-                                                : (std::bit_width(lo_word) + 7) / 8;
+                     // Trailing-zero-byte trim via bit_width instead of a byte-by-byte loop: index_key
+                     // is exactly two uint64_t's worth of bytes, so the last non-zero byte's position
+                     // comes directly from whichever half is nonzero, no per-byte branching needed.
+                     // Requires little-endian (memcpy'd byte 0 must land in the least-significant
+                     // position) -- true for every platform this codebase targets (see simd_scan.hpp's
+                     // identical x86_64-only assumption) but asserted here since it's not obvious from
+                     // the arithmetic alone.
+                     static_assert(kStoreKeyBytes == 2 * sizeof(uint64_t));
+                     static_assert(std::endian::native == std::endian::little);
+                     uint64_t lo_word;
+                     uint64_t hi_word;
+                     std::memcpy(&lo_word, index_key.data(), sizeof(lo_word));
+                     std::memcpy(&hi_word, index_key.data() + sizeof(lo_word), sizeof(hi_word));
+                     const size_t len = hi_word != 0 ? sizeof(lo_word) + (std::bit_width(hi_word) + 7) / 8
+                                                     : (std::bit_width(lo_word) + 7) / 8;
 
-                // Inline values never reference T2, so they can never generation-mismatch.
-                // last_key needs the full, untrimmed bytes regardless (a later record's mismatch
-                // can resume from here); key_view reuses that copy instead of a second one.
-                std::memcpy(last_key.data(), index_key.data(), kStoreKeyBytes);
-                std::span<const std::byte> key_view(last_key.data(), len);
-                advanced = true;
-                if (!key_in_range(key_view, lower_bound, upper_bound)) {
-                  return;
-                }
-                callback(key_view, std::span<const std::byte>(stack_value.data(), size));
-                ++pass_count;
-                return;
-              }
-            }
+                     // Inline values never reference T2, so they can never generation-mismatch.
+                     // last_key needs the full, untrimmed bytes regardless (a later record's mismatch
+                     // can resume from here); key_view reuses that copy instead of a second one.
+                     std::memcpy(last_key.data(), index_key.data(), kStoreKeyBytes);
+                     std::span<const std::byte> key_view(last_key.data(), len);
+                     advanced = true;
+                     if (!key_in_range(key_view, lower_bound, upper_bound)) {
+                       return;
+                     }
+                     callback(key_view, std::span<const std::byte>(stack_value.data(), size));
+                     ++pass_count;
+                     return;
+                   }
+                 }
 
-            // Generation mismatch -- see scan_impl()'s doc comment above.
-            T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-            if (t2_generation != mem->generation) {
-              mismatch = true;
-              return;
-            }
+                 // Generation mismatch -- see scan_impl()'s doc comment above.
+                 T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+                 if (t2_generation != mem->generation) {
+                   mismatch = true;
+                   return;
+                 }
 
-            std::memcpy(last_key.data(), index_key.data(), kStoreKeyBytes);
-            advanced = true;
+                 std::memcpy(last_key.data(), index_key.data(), kStoreKeyBytes);
+                 advanced = true;
 
-            // Base-region fast path: see try_read_base_record()'s doc comment (also used by
-            // get_impl()). No seqlock needed -- base_mmap's bytes are immutable once written,
-            // so callback can safely receive live spans straight into it.
-            if (const auto base_record = try_read_base_record(mem, payload & kOffsetMask); base_record.has_value()) {
-              if (key_in_range(base_record->key, lower_bound, upper_bound)) {
-                callback(base_record->key, base_record->value);
-              }
-              ++pass_count;
-              return;
-            }
+                 // Base-region fast path: see try_read_base_record()'s doc comment (also used by
+                 // get_impl()). No seqlock needed -- base_mmap's bytes are immutable once written,
+                 // so callback can safely receive live spans straight into it.
+                 if (const auto base_record = try_read_base_record(mem, payload & kOffsetMask, /*for_scan=*/true);
+                     base_record.has_value()) {
+                   if (key_in_range(base_record->key, lower_bound, upper_bound)) {
+                     callback(base_record->key, base_record->value);
+                   }
+                   ++pass_count;
+                   return;
+                 }
 
-            // t2_.at() called inside read_t2_record_seqlock() (as AtFunc), matching get_impl() --
-            // see read_t2_record_seqlock()'s comment.
-            //
-            // Torn-read fix: copy_func below must only *copy* into an owned buffer and
-            // return, never invoke `callback` from inside it -- see get_impl()'s identical
-            // fix and comment for the full rationale (TODO.md, "get_impl()/scan_impl()
-            // expose torn, mid-write T2 records to the caller's callback"). thread_local
-            // since this is called concurrently from many threads; static so repeated calls
-            // (once per matching record, possibly many per scan()) reuse already-grown
-            // capacity instead of reallocating.
-            thread_local static std::vector<std::byte> tl_scan_key_buf;
-            thread_local static std::vector<std::byte> tl_scan_value_buf;
-            bool in_range = read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(payload & kOffsetMask, mem); },
-                                                   [&](const T2RecordView &record) -> bool {
-                                                     if (!key_in_range(record.key, lower_bound, upper_bound)) {
-                                                       return false;
-                                                     }
-                                                     tl_scan_key_buf.assign(record.key.begin(), record.key.end());
-                                                     tl_scan_value_buf.assign(record.value.begin(), record.value.end());
-                                                     return true;
-                                                   });
-            if (in_range) {
-              callback(std::span<const std::byte>(tl_scan_key_buf), std::span<const std::byte>(tl_scan_value_buf));
-            }
-            ++pass_count;
-          });
+                 // t2_.at() called inside read_t2_record_seqlock() (as AtFunc), matching get_impl() --
+                 // see read_t2_record_seqlock()'s comment.
+                 //
+                 // Torn-read fix: copy_func below must only *copy* into an owned buffer and
+                 // return, never invoke `callback` from inside it -- see get_impl()'s identical
+                 // fix and comment for the full rationale (TODO.md, "get_impl()/scan_impl()
+                 // expose torn, mid-write T2 records to the caller's callback"). thread_local
+                 // since this is called concurrently from many threads; static so repeated calls
+                 // (once per matching record, possibly many per scan()) reuse already-grown
+                 // capacity instead of reallocating.
+                 thread_local static std::vector<std::byte> tl_scan_key_buf;
+                 thread_local static std::vector<std::byte> tl_scan_value_buf;
+                 bool in_range =
+                     read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(payload & kOffsetMask, mem); },
+                                            [&](const T2RecordView &record) -> bool {
+                                              if (!key_in_range(record.key, lower_bound, upper_bound)) {
+                                                return false;
+                                              }
+                                              tl_scan_key_buf.assign(record.key.begin(), record.key.end());
+                                              tl_scan_value_buf.assign(record.value.begin(), record.value.end());
+                                              return true;
+                                            });
+                 if (in_range) {
+                   callback(std::span<const std::byte>(tl_scan_key_buf), std::span<const std::byte>(tl_scan_value_buf));
+                 }
+                 ++pass_count;
+               });
 
       total_count += pass_count;
       if (!mismatch) {
@@ -1464,6 +1466,7 @@ class VMemKVImpl {
     // already provides full correctness via scan_impl()'s existing seqlock fallback, this is
     // purely a Scan speed optimization layered on top.
     std::byte *base_mmap_ptr = nullptr;
+    std::byte *base_mmap_scan_ptr = nullptr;
     if constexpr (ConfigT::UseScanBaseSequential) {
       void *base_mapped = ::mmap(nullptr, capacity, PROT_READ, MAP_PRIVATE, file_descriptor, 0);
       if (base_mapped != MAP_FAILED) {
@@ -1481,11 +1484,22 @@ class VMemKVImpl {
           ::munmap(base_mapped, capacity);
         }
       }
+
+      // Third mapping, same region, for scan_impl() only -- see T2Memory::base_mmap_scan's doc
+      // comment for why this needs its own VMA rather than reusing base_mmap's. Left at the
+      // kernel's default readahead policy (no madvise call at all): best-effort like the mapping
+      // above, and independent of it -- a failure here just means scan_impl() falls back to
+      // base_mmap (still correct, just without this split's Zipf-skew benefit).
+      void *base_mapped_scan = ::mmap(nullptr, capacity, PROT_READ, MAP_PRIVATE, file_descriptor, 0);
+      if (base_mapped_scan != MAP_FAILED) {
+        base_mmap_scan_ptr = static_cast<std::byte *>(base_mapped_scan);
+      }
     }
 
     ::close(file_descriptor);
     auto mem = std::make_unique<vmemkv::T2Memory>(static_cast<std::byte *>(mapped), capacity, generation, bytes_used);
     mem->base_mmap = base_mmap_ptr;
+    mem->base_mmap_scan = base_mmap_scan_ptr;
     return mem;
   }
 

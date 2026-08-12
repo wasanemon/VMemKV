@@ -16,7 +16,7 @@ This document outlines the roadmap to implement the full, robust architecture of
 
 Source: `benchmark_results/pages/2026081000_charts.html` Winners Matrix (threads:32, fixed vs. fastest rival). Analysis done 2026-08-11; no AWS work started yet on any of these.
 
-* **Status**: 🟡 **In Progress** -- 4.2 improved (see below), 4.1/4.3/4.4/4.5 still analysis only.
+* **Status**: 🟡 **In Progress** -- 4.2 and 4.3 improved (see below), 4.1/4.4/4.5 still analysis only.
 
 ### 4.1 Get (Hit) 64KB LTM -- 0.38x-0.51x vs RocksDB / RocksDB-BlobDB
 * Likely cause: RocksDB-BlobDB stores large values in a dedicated blob file and reaches them via a single direct `pread` at a known offset -- effectively the same idea `base_mmap` is going for, but purpose-built. VMemKV still pays ~16 page faults per 64KB record via mmap even with the `ScanBaseSequential`/base_mmap fast path.
@@ -33,7 +33,7 @@ Source: `benchmark_results/pages/2026081000_charts.html` Winners Matrix (threads
 * Not yet verified on AWS/real concurrency scale (local dev box, threads:20 not 32).
 
 ### 4.3 Scan (Zipf) 64KB LTM -- 0.49x vs LMDB
-* **Status**: 🟡 **Partially improved by 4.2's fix, still losing** (re-measured AWS i4i.8xlarge, 2026-08-12, after commit 7991345)
+* **Status**: 🟢 **Fixed, now winning** (0.49x -> 1.08x vs LMDB, AWS i4i.8xlarge, 2026-08-12)
 * Re-measurement (threads:32, 1GiB budget, isolated cgroup): Zipf ratio 0.49x -> **0.55x** (4.2's `walk_sorted_region()` fast path is in the shared `T1Index::scan()` path, so it applies here too, for free). Uniform is now essentially at parity (1.05x, wasn't a red badge before either).
 * New finding: comparing each store's *own* Zipf/Uniform ratio at 64KB LTM -- LMDB itself is 3.45x faster on Zipf than Uniform (2,526/s vs 732/s), while VMemKV is only 1.80x faster (1,381/s vs 767/s) for the exact same corpus/access pattern. Both benefit from repeated-hot-range skew (page cache reuse), but LMDB benefits *much* more.
 * Also worth remembering going in: LMDB is not "in-memory" -- it's natively an mmap'd, disk-backed B+tree, so "LTM" isn't a special mode for it the way it is for VMemKV (T1 index + T2 mmap + WAL + checkpoints as separate layers all sharing one memory budget). LMDB has ~15+ years of engineering specifically for "huge mmap'd file under real memory pressure" as its core use case; VMemKV's LTM support (ScanBaseSequential etc.) is comparatively new.
@@ -46,7 +46,22 @@ Source: `benchmark_results/pages/2026081000_charts.html` Winners Matrix (threads
   | LMDB Uniform | 71.8 | 21.62 MiB | 3.46x | 308 KB |
 
   Under Uniform (essentially all-cold access) both stores are close (~3.5x the logical window, i.e. similar absolute read amplification). The gap is specific to Zipf: LMDB reads *less* than the logical window (0.95x -- most of the hot range is already page-cache resident), while VMemKV still reads 1.46x the logical window even on repeated/hot access. Consistently across both distributions, VMemKV pulls ~25-30% more bytes per major fault than LMDB (383KB vs 280KB on Zipf, 365KB vs 308KB on Uniform). This is explained by `vmemkv_impl.hpp:1470`: the `ScanBaseSequential` second mapping is unconditionally `madvise(MADV_SEQUENTIAL)`'d, which makes the kernel's readahead window wide regardless of distribution. Wide readahead is a good trade under Uniform (next access is elsewhere anyway) but is pure waste under Zipf, where the win comes from a *narrow* hot range staying resident -- the extra readahead bytes rarely get reused before eviction, and their fetch/cache-pressure cost eats into the skew's benefit. This is why VMemKV's own Zipf/Uniform speedup (1.80x) undershoots LMDB's (3.21x measured in this profiling run, consistent with the 3.45x figure above) even though both benefit from the same corpus-level skew.
-* Candidate countermeasure (updated, now quantitatively supported rather than speculative): replace the unconditional `MADV_SEQUENTIAL` on the `ScanBaseSequential` mapping with an explicit, bounded `madvise(MADV_WILLNEED)` sized to the actual scan request (e.g. ~`scan_count_reorg` x record size) instead of letting the kernel's adaptive sequential-readahead heuristic decide the window width. Not yet implemented.
+* **First fix attempt (reverted): removing `MADV_SEQUENTIAL` outright regressed Get.** Blanket-removing the `madvise(MADV_SEQUENTIAL)` on `ScanBaseSequential`'s base_mmap fixed Scan (Zipf ratio vs LMDB 0.49x -> 1.08x, own Zipf/Uniform speedup 1.80x -> 3.67x) but was never actually scoped to Scan alone: `try_read_base_record()` -- the function this mapping feeds -- is shared by `get_impl()` too (extended there per `docs/benchmark/20260810_t2_no_madvise_random.md`, since a 64KB record spans ~16 pages and wants that batched in one readahead). A broader AWS A/B (Get/Hit and Scan, x Zipf/Uniform, x LTM/In-Memory, threads:32, before=HEAD vs after=this fix) caught it: Get/Hit under LTM regressed **0.749x (Zipf) and 0.478x (Uniform)** -- Uniform got cut in half. In-Memory (no memory pressure) was unaffected for both ops in every case, confirming the mechanism is entirely about LTM/swap-pressure readahead behavior. This change was reverted (not committed) -- the Scan win didn't come close to justifying halving Get.
+* **Actual fix: split into two separate mappings of the same base region, one per access pattern.** madvise is per-VMA, and the codebase already had precedent for this (the base_mmap/`ScanBaseSequential` split itself exists specifically because Get/Update's primary mapping needed `MADV_RANDOM` while Scan wanted something else). Applied the same trick one level deeper: `T2Memory::base_mmap` (unchanged, `MADV_SEQUENTIAL`, read by `get_impl()`) and a new `T2Memory::base_mmap_scan` (kernel default/no madvise, read by `scan_impl()`) -- both PROT_READ|MAP_PRIVATE mappings of the identical `[0, capacity)` region, independently advised, sharing the same underlying page-cache pages. `try_read_base_record()` takes a `for_scan` bool to pick which mapping to read through. ~60 lines added across `t2_flat_file.hpp` (new field + destructor unmap), `vmemkv_impl.hpp` (second mmap block in `mmap_t2_memory()`, call-site routing), `config.hpp` (doc comment). Full local test suite (340 cases + clang-tidy) passes.
+* **Re-measured on AWS i4i.8xlarge** (same broad A/B methodology: Get/Hit and Scan, x Zipf/Uniform, x LTM/In-Memory, threads:32, before=HEAD 931f051 vs after=dual-mapping fix, one fresh instance so all 16 legs share the same baseline run):
+  | Op | Dist | Mode | before/s | after/s | after/before |
+  |---|---|---|---:|---:|---:|
+  | Get/Hit | Zipf | LTM | 61,309.5 | 70,829.4 | **1.155x** |
+  | Get/Hit | Uniform | LTM | 33,852.2 | 37,224.5 | **1.100x** |
+  | Get/Hit | Zipf | In-Mem | 462,013.7 | 463,443.5 | 1.003x |
+  | Get/Hit | Uniform | In-Mem | 432,219.6 | 435,470.9 | 1.008x |
+  | Scan | Zipf | LTM | 1,317.6 | 2,764.1 | **2.098x** |
+  | Scan | Uniform | LTM | 819.2 | 817.4 | 0.998x |
+  | Scan | Zipf | In-Mem | 4,420.9 | 4,344.8 | 0.983x |
+  | Scan | Uniform | In-Mem | 4,411.0 | 4,376.0 | 0.992x |
+
+  Clean result: Get/Hit LTM is not regressed (actually mildly *up*, 1.10-1.16x, within run-to-run noise but clearly not worse), Scan/LTM/Zipf more than doubles (2.10x), and every In-Memory (no-memory-pressure) cell is ~1.0x as expected since this change only affects LTM/swap-pressure readahead behavior. This resolves 4.3 without the collateral damage the first attempt had.
+* Not yet committed -- pending user confirmation.
 
 ### 4.4 YCSB-E 64KB LTM -- 0.60x vs RocksDB
 * Likely cause: YCSB-E is scan-heavy, so this probably just inherits 4.3's weakness. Expect it to improve once 4.3 is fixed -- verify before investing separately.
