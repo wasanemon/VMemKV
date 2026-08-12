@@ -48,17 +48,21 @@ class ThreadReferenceTracker {
   ThreadReferenceTracker(const ThreadReferenceTracker &) = delete;
   auto operator=(const ThreadReferenceTracker &) -> ThreadReferenceTracker & = delete;
 
-  // Registers the current thread's reference.
-  void acquire(T val) const noexcept { slots_[get_thread_id()].value.store(val, std::memory_order_release); }
+  // Registers the current thread's reference. seq_cst (not release): paired with
+  // wait_until_retired()'s seq_cst load below to close a store-buffering race where a writer's
+  // "is draining_ set?" check and the drain scan's "has this slot registered?" check could each
+  // observe the other's pre-update value -- acquire/release alone doesn't rule that out for two
+  // independent atomics read/written by both sides. See T2FlatFile::acquire_write_handle().
+  void acquire(T val) const noexcept { slots_[get_thread_id()].value.store(val, std::memory_order_seq_cst); }
 
   // Clears the current thread's reference.
   void release() const noexcept { slots_[get_thread_id()].value.store(T{}, std::memory_order_release); }
 
   // Waits (spins/yields) until all thread slots no longer reference the specified old value.
-  // Useful for Hazard-pointer-like pointer retired validation.
+  // Useful for Hazard-pointer-like pointer retired validation. seq_cst load: see acquire()'s comment.
   void wait_until_retired(T old_val) const noexcept {
     for (size_t i = 0; i < MaxThreads; ++i) {
-      while (slots_[i].value.load(std::memory_order_acquire) == old_val) {
+      while (slots_[i].value.load(std::memory_order_seq_cst) == old_val) {
         std::this_thread::yield();
       }
     }

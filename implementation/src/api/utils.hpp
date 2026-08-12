@@ -15,8 +15,6 @@ constexpr auto align_up(uint64_t size, uint64_t alignment = kDefaultAlignmentByt
   return (size + alignment - 1) & ~(alignment - 1);
 }
 
-constexpr auto align_down(uint64_t size, uint64_t alignment) noexcept -> uint64_t { return size & ~(alignment - 1); }
-
 // FNV-1a64: shared by every on-disk format (WAL, checkpoint) that needs a fast, non-cryptographic
 // checksum for detecting torn writes / bit rot. Not for security use.
 inline constexpr uint64_t kFnvOffsetBasis64 = 14695981039346656037ULL;

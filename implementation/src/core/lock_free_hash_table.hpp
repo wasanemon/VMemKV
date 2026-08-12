@@ -46,12 +46,6 @@ class LockFreeHashTable {
   LockFreeHashTable(const LockFreeHashTable &) = delete;
   auto operator=(const LockFreeHashTable &) -> LockFreeHashTable & = delete;
 
-  void clear() noexcept {
-    for (size_t i = 0; i < kBucketCount; ++i) {
-      buckets_[i].slot_plus_one.store(kEmpty, std::memory_order_release);
-    }
-  }
-
   // Caller-provided hash, e.g. hash(full_key) for T1 append indexing.
   template <typename SlotAccessor>
   auto find_slot_index(const Key &key, uint64_t hash, SlotAccessor &&slot_at) const noexcept -> slot_index_type {

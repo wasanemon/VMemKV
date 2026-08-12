@@ -47,20 +47,17 @@ using WalReplayCallback = std::function<void(
 
 // Sequential Write-Ahead Log.
 //
-// Contract: an append_*() call does not return until its record is durably fsynced, and the
-// only record a crash can ever tear is the physically last one written.
-//
-// Split API (reserve_insert()/reserve_update()/reserve_delete() + await_durable()): same
-// contract, decomposed into two phases. reserve_*() is the fast half -- builds the record,
-// reserves a strictly increasing LSN, and publishes it into the group-commit ring, with no
-// blocking wait. await_durable() is the slow half -- leader election and (for a follower) the
+// Contract: reserve_insert()/reserve_update()/reserve_delete() + await_durable() together append
+// one record and do not consider it done until it is durably fsynced; the only record a crash can
+// ever tear is the physically last one written. reserve_*() is the fast half -- builds the
+// record, reserves a strictly increasing LSN, and publishes it into the group-commit ring, with
+// no blocking wait. await_durable() is the slow half -- leader election and (for a follower) the
 // wait for the round's writev()+fdatasync() to complete. This split lets a caller fix a record's
 // LSN ordering while still holding its own per-key lock (see VMemKVImpl::insert_impl() et al. in
 // vmemkv_impl.hpp), then release that lock before the much longer durability wait, without
-// risking a second reserve_*() for the same key racing ahead of it. append_insert()/
-// append_update()/append_delete() are just reserve_*() immediately followed by await_durable().
+// risking a second reserve_*() for the same key racing ahead of it.
 //
-// Implementation: lock-free group commit. Each append_*() call builds its own record buffer and
+// Implementation: lock-free group commit. Each reserve_*() call builds its own record buffer and
 // reserves an LSN via a single atomic fetch_add, then CAS-publishes it into a fixed-size ring
 // buffer slot (lsn % capacity). Whichever caller finds no flush in progress becomes "leader" for
 // the round (elected via atomic exchange, same idiom as VMemKVImpl::reorganize()'s
@@ -70,10 +67,9 @@ using WalReplayCallback = std::function<void(
 // syncing file size (POSIX-guaranteed) -- same choice RocksDB's WAL makes. A writev()/fdatasync()
 // failure fails every record in the round uniformly. All participants (including the leader) are
 // woken via one shared highest_settled_lsn_ counter -- the leader does one store+notify_all() per
-// round -- rather than a per-record done-flag, since per-record notify_one() cost grew
-// superlinearly with batch size and came to dominate over fdatasync() itself. See wal.cpp's
-// Wal::drain_pending()/Wal::release_leadership() for how a leader absorbs backlog that arrives
-// mid-flush and how leadership is handed off without stranding a follower.
+// round, keeping the per-round wakeup cost independent of how many records the round holds. See
+// wal.cpp's Wal::drain_pending()/Wal::release_leadership() for how a leader absorbs backlog that
+// arrives mid-flush and how leadership is handed off without stranding a follower.
 //
 // The constructor scans the file once and truncates at the first invalid record (torn header,
 // torn payload, bad magic, unrecognized format_version, or checksum mismatch), guaranteeing the
@@ -111,12 +107,7 @@ class Wal {
   Wal(Wal &&) = delete;
   auto operator=(Wal &&) -> Wal & = delete;
 
-  // Each call durably appends one record before returning (see class contract above).
-  auto append_insert(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t;
-  auto append_update(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t;
-  auto append_delete(std::span<const std::byte> key) -> uint64_t;
-
-  // Split API -- see class contract above. Each reserve_*() return value must be passed to
+  // See class contract above. Each reserve_*() return value must be passed to
   // exactly one await_durable() call: skipping it leaks the record (the leader still writes it
   // regardless) and the caller never learns if the write succeeded. [[nodiscard]] catches that
   // mistake at compile time.

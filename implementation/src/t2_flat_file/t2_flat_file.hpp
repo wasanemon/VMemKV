@@ -2,6 +2,7 @@
 #pragma once
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
@@ -65,6 +66,53 @@ struct T2Memory {
   // T2Memory *` get_memory_handle() hands back.
   mutable std::atomic<uint64_t> bytes_used{0};
 
+  // The offset below which every byte is (a) durably on disk and (b) guaranteed never to be
+  // touched by an in-place update again, and is thus safe to read seqlock-free via `base_mmap`
+  // below. Unlike `write_gate_boundary` below, this is only ever advanced *after* the
+  // corresponding bytes have actually been made durable (a full T1+T2 reorganize, a checkpoint
+  // load, or a T1-only checkpoint's incremental delta flush -- see
+  // VMemKVImpl::reorganize_internal()'s T1-only-checkpoint branch) -- publishing it any earlier
+  // would let a base_mmap reader observe bytes that haven't reached disk yet. `mutable`/atomic
+  // for the same reason as `bytes_used`: a T1-only checkpoint extends it in place, without a full
+  // swap_memory(), so concurrent scan_impl() readers of this exact generation must see it grow
+  // safely. Offsets >= base_boundary (the tail, may still receive in-place updates) must still go
+  // through `base`'s COW-current, seqlock-protected view.
+  mutable std::atomic<uint64_t> base_boundary{0};
+
+  // The offset below which an in-place update is forbidden (update_impl() checks this, not
+  // base_boundary, to decide whether to redirect out-of-place -- see kOffsetMask/write_gate_boundary
+  // check there). Distinct from base_boundary because the two must be published at different
+  // times relative to a T1-only checkpoint's delta flush: this one is bumped *before* the flush
+  // (closing off new in-place writes to the range about to be promoted), while base_boundary is
+  // only bumped *after* the flush's bytes are durably on disk (so base_mmap readers never see a
+  // boundary that outruns what's actually been written). Between those two points, any updater
+  // that already read the *old* write_gate_boundary and is still mid-write is drained via
+  // VMemKVImpl::update_epoch_tracker_ before the flush proceeds. Always >= 0 and <= base_boundary
+  // is not guaranteed at every instant (write_gate_boundary leads base_boundary during the brief
+  // promotion window), but both converge to the same value once a promotion completes.
+  mutable std::atomic<uint64_t> write_gate_boundary{0};
+
+  // A second, read-only mmap covering [0, capacity) of this exact generation's file -- distinct
+  // from `base`'s MAP_PRIVATE|MADV_RANDOM mapping used everywhere else, so ScanBaseSequential can
+  // advise it MADV_SEQUENTIAL (and MAP_POPULATE-equivalent warm the currently-valid prefix under
+  // Prefaulting) without disturbing Get/Update's random-access policy on the same underlying
+  // file. Mapped full-capacity (not just bytes_used-at-creation-time) specifically so that
+  // base_boundary can grow via a T1-only checkpoint's incremental promotion without ever needing
+  // to remap: since this mapping is PROT_READ-only, it never triggers copy-on-write, so it always
+  // transparently reflects whatever the backing file's current page-cache content is, including
+  // bytes written by a later pwrite() through a different fd -- reads are only ever gated by the
+  // `offset < base_boundary` check (scan_impl()), never by whether this specific mapping has
+  // "seen" a write, so nothing beyond that gate needs to change when base_boundary grows. Its
+  // lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based retirement scheme
+  // that already protects `base`/`capacity`. nullptr unless explicitly set by the caller
+  // (mmap_t2_memory() in vmemkv_impl.hpp, only under that ablation, and only best-effort -- a
+  // failure to create it just means scan_impl() falls back to the always-correct `base` + seqlock
+  // path) -- the plain T2FlatFile-owned initial mapping never sets this, since a fresh store has
+  // base_boundary == 0 and thus nothing to map yet. `mutable` only so the destructor (a
+  // const-safe operation) can unmap it through the same `const T2Memory *` pattern bytes_used
+  // already uses; never mutated after construction otherwise.
+  mutable std::byte *base_mmap = nullptr;
+
   // Auto-assigns a fresh, process-global-unique generation. Used where no caller needs to know
   // the value in advance (e.g. tests exercising the ABA-detection field directly).
   T2Memory(std::byte *base_ptr, uint64_t capacity_bytes) noexcept
@@ -77,10 +125,20 @@ struct T2Memory {
            uint64_t capacity_bytes,
            uint64_t explicit_generation,
            uint64_t initial_bytes_used = 0) noexcept
-      : base(base_ptr), capacity(capacity_bytes), generation(explicit_generation), bytes_used(initial_bytes_used) {}
+      : base(base_ptr),
+        capacity(capacity_bytes),
+        generation(explicit_generation),
+        bytes_used(initial_bytes_used),
+        base_boundary(initial_bytes_used),
+        write_gate_boundary(initial_bytes_used) {}
   ~T2Memory() noexcept {
     if ((base != nullptr) && capacity > 0) {
       ::munmap(base, static_cast<size_t>(capacity));
+    }
+    if (base_mmap != nullptr) {
+      // Mapped to `capacity` (see base_mmap's own comment above), not base_boundary -- the
+      // mapping's length never changes after creation even though base_boundary grows in place.
+      ::munmap(base_mmap, static_cast<size_t>(capacity));
     }
   }
 
@@ -90,13 +148,19 @@ struct T2Memory {
   // Every T2Memory this process ever constructs must draw from this one process-global counter,
   // never a fixed/arbitrary value: process-global uniqueness is what append_prefault()'s
   // thread-local chunk cache depends on to detect a freed T2Memory's heap address being reused by
-  // an unrelated instance (see `generation`'s declaration above). A fixed value here previously
-  // caused two unrelated stores to share a tag, letting a stale thread-local cache write through a
-  // freed T2Memory into the wrong store's mapping.
+  // an unrelated instance (see `generation`'s declaration above). A fixed value here would let
+  // two unrelated stores share a tag, letting a stale thread-local cache write through a freed
+  // T2Memory into the wrong store's mapping.
   static auto allocate_generation() noexcept -> uint64_t {
     static std::atomic<uint64_t> counter{1};
     return counter.fetch_add(1, std::memory_order_relaxed);
   }
+};
+
+// Test-only seam for T2FlatFile::acquire_write_handle(); fires once, right after registering the
+// handle and before checking `draining_`. No-op in production.
+struct NoOpAcquireWriteHandleHook {
+  void operator()() const noexcept {}
 };
 
 // ─── T2FlatFile Class ──────────────────────────────────────────────────────
@@ -116,11 +180,6 @@ struct T2Memory {
 class T2FlatFile {
  public:
   // ─── Types and Constructors ───
-  struct LookupResult {
-    uint64_t offset = ~0ULL;
-    T2RecordView record;
-  };
-
   // RAII handle for lock-free reader thread safety without shared_ptr copy overhead.
   using T2MemoryHandle = typename ThreadReferenceTracker<const T2Memory *>::Guard;
 
@@ -149,7 +208,35 @@ class T2FlatFile {
   // handle until their T1 publish (T1Index::put()) attempt has returned -- releasing it earlier
   // would let this same generation look "drained" to begin_draining_and_wait_for_writers() before
   // the T1 entry naming it actually exists, reopening the exact race this pairing closes.
-  auto acquire_write_handle() const noexcept -> T2MemoryHandle;
+  //
+  // Registers first, then checks `draining_` -- checking first would leave a gap: a writer whose
+  // check saw draining_==false, but who hadn't registered yet, could still be missed by
+  // wait_until_retired()'s single index-ordered pass (it never revisits a slot once past it), so
+  // the drain could complete while the writer went on to write into a generation about to be
+  // retired. Registering first closes this: if draining_ turns out to already be true, this
+  // handle is dropped and retried, so no caller ever receives a handle to a generation the drain
+  // might have already (or might be about to) declare fully quiesced. `hook` is a test-only seam,
+  // firing once right after registering and before the draining_ check -- lets a test pause a
+  // writer in exactly that window to reproduce the race deterministically; no-op in production.
+  //
+  // Registers/releases through active_readers_ directly (rather than a named T2MemoryHandle
+  // local) on the retry path: T2MemoryHandle's Guard has a deleted copy constructor and no
+  // implicit move constructor, so `return handle;` for a named local isn't guaranteed elided
+  // (NRVO is optional, unlike a prvalue return) -- only the success path constructs one, as a
+  // prvalue in the return statement itself, which mandatory copy elision does cover.
+  template <typename Hook = NoOpAcquireWriteHandleHook>
+  auto acquire_write_handle(Hook &&hook = {}) const noexcept -> T2MemoryHandle {
+    while (true) {
+      const T2Memory *mem = get_memory();
+      active_readers_.acquire(mem);
+      hook();
+      if (!draining_.load(std::memory_order_seq_cst)) {
+        return {active_readers_, mem};  // re-acquire()s the same value; harmless.
+      }
+      active_readers_.release();
+      std::this_thread::yield();
+    }
+  }
 
   // Reorganize-side half: marks `mem` (the still-live generation about to be retired) as
   // draining, so acquire_write_handle() stops handing it to new callers, then blocks until every

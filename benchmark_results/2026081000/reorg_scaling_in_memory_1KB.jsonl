@@ -1,0 +1,8 @@
+{"scenario":"in_memory","value_size":1024,"mode":"t1only","ratio":0.25,"key_count":2000000,"elapsed_sec":0.729629,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1only","ratio":0.5,"key_count":4000000,"elapsed_sec":0.660493,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1only","ratio":0.75,"key_count":6000000,"elapsed_sec":0.548238,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1only","ratio":1,"key_count":8000000,"elapsed_sec":0.649054,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1t2","ratio":0.25,"key_count":2000000,"elapsed_sec":5.61863,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1t2","ratio":0.5,"key_count":4000000,"elapsed_sec":10.6532,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1t2","ratio":0.75,"key_count":6000000,"elapsed_sec":15.6981,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"t1t2","ratio":1,"key_count":8000000,"elapsed_sec":21.1886,"timed_out":false}

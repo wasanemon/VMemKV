@@ -405,16 +405,6 @@ auto Wal::reserve_delete(std::span<const std::byte> key) -> PendingRecord * {
   return reserve_record(WalRecordType::Delete, key, std::span<const std::byte>{});
 }
 
-auto Wal::append_insert(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t {
-  return await_durable(reserve_insert(key, value));
-}
-
-auto Wal::append_update(std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t {
-  return await_durable(reserve_update(key, value));
-}
-
-auto Wal::append_delete(std::span<const std::byte> key) -> uint64_t { return await_durable(reserve_delete(key)); }
-
 auto Wal::replay(const WalReplayCallback &callback) const -> uint64_t {
   const int local_fd = fd_.load(std::memory_order_acquire);
   struct stat file_stat {};

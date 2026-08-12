@@ -66,6 +66,24 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-10</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026081000_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/10)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <p class="mb-1.5">(<a href="2026080600_charts.html" class="text-indigo-600 hover:underline">08/06</a>時点比、要点のみ):</p>
+                <ul class="list-disc pl-4 space-y-1">
+                  <li><code>NoMadvise</code>/<code>SimdScan</code>アブレーションは実測の結果撤去。</li>
+                  <li>T2 reorganize: T2再構築をkey順ソート書き込みから物理オフセット順コンパクションへ再設計し、reorganize所要時間を大幅短縮(WALトリガー間隔に対して追いつかない問題を解消)。</li>
+                  <li>WAL/checkpoint: T1-onlyチェックポイントを導入してWALチェックポイントをT2 GCから分離、<code>reorganize()</code>を<code>reorganize()</code>/<code>defragment()</code>/<code>checkpoint()</code>に分割。</li>
+                  <li>並行性バグ2件を修正(torn read、reorganize残存ウィンドウのrace)。</li>
+                  <li>T2のcheckpoint済み領域をimmutable化し、別のmmapでアクセスするScanBaseSequential アブレーションを追加。</li>
+                </ul>
+              </td>
+              </tr>
+            <tr>
               <td class="py-4 pr-4 text-slate-400">2026-08-06</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026080600_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">

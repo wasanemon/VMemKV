@@ -21,32 +21,15 @@
 #include <vector>
 #include <vmemkv_impl.hpp>  // for the free function vmemkv::read_t2_record_seqlock() only
 
+#include "test_support.hpp"
+
 namespace {
 
-auto reserve_t2_path() -> std::filesystem::path {
-  static std::atomic<uint64_t> counter{0};
-  const uint64_t sequence_number = counter.fetch_add(1, std::memory_order_relaxed);
-  std::filesystem::path temp_path =
-      std::filesystem::temp_directory_path() /
-      ("vmemkv_t2_test_" + std::to_string(static_cast<long>(::getpid())) + "_" + std::to_string(sequence_number));
-  std::error_code ignored;
-  std::filesystem::remove(temp_path, ignored);
-  return temp_path;
-}
+auto reserve_t2_path() -> std::filesystem::path { return vmemkv_test::reserve_unique_temp_path("vmemkv_t2_test"); }
 
-auto bytes_of(const std::string &value) -> std::vector<std::byte> {
-  std::vector<std::byte> out(value.size());
-  std::memcpy(out.data(), value.data(), value.size());
-  return out;
-}
-
-auto as_span(const std::vector<std::byte> &value) -> std::span<const std::byte> {
-  return std::span<const std::byte>(value.data(), value.size());
-}
-
-auto span_to_string(std::span<const std::byte> value) -> std::string {
-  return {reinterpret_cast<const char *>(value.data()), value.size()};
-}
+using vmemkv_test::as_span;
+using vmemkv_test::bytes_of;
+using vmemkv_test::span_to_string;
 
 // append_prefault() carves 2MB thread-local chunks (t2_flat_file.cpp), so capacity must clear
 // that regardless of how little data a given test actually writes.

@@ -12,26 +12,47 @@ This document outlines the roadmap to implement the full, robust architecture of
 
 ---
 
-## Report: distinguish forced vs. natural T1 reorg in YCSB-E timeline charts
-* **Status**: 🔴 **Not Implemented**
-* **Background**: `bench_kv.cpp`'s YCSB-E benchmark now forces a T1-only `reorganize(false)`
-  once, deterministically, at the t=15s mark of the 30s timeline window (see the
-  `forced_reorg_done` block in the YCSB-E benchmark body). This exists because, under LTM
-  scenarios, VMemKV's natural reorg trigger is unreliable within the 30s window (the append
-  region's soft-limit threshold is often never reached at LTM's much lower throughput), so
-  those charts previously showed no reorg vertical line at all. The forced reorg's count is
-  tracked in a separate JSON field, `t1_forced_reorg_ops`, alongside the pre-existing
-  `t1_reorg_ops` (natural) and `t2_reorg_ops` fields in each `ycsb_e_timeline_*.json`'s
-  per-second `timeline` entries -- the two are mutually exclusive per second (the forced
-  call's delta is deliberately absorbed out of `t1_reorg_ops` at the moment it fires, so no
-  double counting).
-* **Objective**: When the chart-generation scripts next regenerate a report page from a run
-  that includes this field (i.e. any run captured after this TODO was written), update the
-  chart JS (`reorgLinesPlugin` / `makeYcsbTimelineConfig`, in the generated
-  `benchmark_results/pages/*_charts.html`) to draw the forced-reorg vertical line(s) in a
-  visually distinct color/style from the natural-reorg line(s), instead of merging both into
-  the current single `reorgSecs` (currently computed purely from `t1_reorg_ops > 0`). Also
-  update `benchmark_results/pages/2026072900_charts.html`'s data-generation scripts
-  (`gen_chart_data.py`'s `build_timeline_data()`) to pass the new field through once a run
-  with it exists -- the 2026072900 data predates this change and has no
-  `t1_forced_reorg_ops` field.
+## 4. Winners Matrix Red-Badge Countermeasures (vs RocksDB/-BlobDB/LMDB)
+
+Source: `benchmark_results/pages/2026081000_charts.html` Winners Matrix (threads:32, fixed vs. fastest rival). Analysis done 2026-08-11; no AWS work started yet on any of these.
+
+* **Status**: 🔴 **Not Started** (analysis only so far)
+
+### 4.1 Get (Hit) 64KB LTM -- 0.38x-0.51x vs RocksDB / RocksDB-BlobDB
+* Likely cause: RocksDB-BlobDB stores large values in a dedicated blob file and reaches them via a single direct `pread` at a known offset -- effectively the same idea `base_mmap` is going for, but purpose-built. VMemKV still pays ~16 page faults per 64KB record via mmap even with the `ScanBaseSequential`/base_mmap fast path.
+* Candidate countermeasures:
+  - Explicit `pread`/`readv` for large-value records instead of relying on mmap page faults.
+  - Tune NVMe `read_ahead_kb` to match large-record size.
+  - Dedicated large-value file/mapping designed like BlobDB's blob files.
+
+### 4.2 Scan (Zipf/Uniform) 8B In-Memory -- 0.63x-0.64x vs LMDB
+* Likely cause: no swap involved here, so this is pure CPU/algorithmic overhead, not I/O. LMDB's B+tree leaf scan is very cache-efficient; VMemKV likely pays per-record overhead (seqlock retry, function-call overhead) that dominates when records are only 8B.
+* Candidate countermeasures:
+  - Re-verify the `SimdScan` config tag (currently kept but measured "no signal" -- see `config.hpp`) specifically for tiny fixed-size records.
+  - A batched small-record scan fast path that skips the generic seqlock retry loop when scanning the immutable base region.
+
+### 4.3 Scan (Zipf) 64KB LTM -- 0.49x vs LMDB
+* Likely cause: LMDB's B+tree keeps range-scan order close to physical order (including overflow pages), while VMemKV's base_mmap `MADV_SEQUENTIAL` readahead window may not be sized well for 64KB records under real I/O pressure.
+* Candidate countermeasures:
+  - Explicit `madvise(MADV_WILLNEED)` a bit ahead of the scan cursor instead of relying purely on `MADV_SEQUENTIAL`.
+  - Tune the readahead window size based on record size (64KB) rather than a fixed default.
+
+### 4.4 YCSB-E 64KB LTM -- 0.60x vs RocksDB
+* Likely cause: YCSB-E is scan-heavy, so this probably just inherits 4.3's weakness. Expect it to improve once 4.3 is fixed -- verify before investing separately.
+
+### 4.5 Minor (lower priority)
+* Scan (Zipf) 1KB LTM -- 0.88x vs RocksDB (light lose)
+* YCSB-E 1KB LTM -- 0.91x vs RocksDB (light lose)
+
+**Suggested order**: start with 4.3 (Scan 64KB LTM vs LMDB) since it reuses the existing `base_mmap` infrastructure and may also fix 4.4 for free; 4.1 next (structurally harder -- BlobDB's design is purpose-built for this).
+
+---
+
+## 5. LTM/1KB Get(Hit) "regression" -- investigated, fix reverted, root cause still unknown
+
+* **Status**: 🟡 **Inconclusive -- do not re-attempt the same fix without re-reading this first**
+* **Background**: The `2026081000_charts.html` rawData appeared to show `+ScanBaseSequential` losing badly to `+Prefault` for LTM/1KB Get(Hit) (reported as ~605,876 -> ~93,990 items/s at threads:32 Zipf). Note `+Prefault` and `+ScanBaseSequential` are two different **compile-time** variants (cumulative feature stack), not a before/after of one code change.
+* **Fix attempted (and reverted)**: added a `require_multi_page` runtime guard to `try_read_base_record()` so `get_impl()` skips the `base_mmap` fast path for records <= 4096B (single page), falling back to the primary mmap+seqlock path -- on the theory that `base_mmap`'s benefit only comes from batching multi-page reads.
+* **AWS verification result (i4i.8xlarge, isolated cgroup, real 32-core)**: the guard fix made **no measurable difference** (Zipf@32: 127,150 -> 126,641 items/s; Uniform@32: 34,375 -> 34,414 items/s), even though debug instrumentation confirmed the guard fires on 100% of these Get calls. A second hypothesis (the `T2Memory` constructor eagerly `MADV_POPULATE_READ`-prefaulting the *entire* `base_mmap` region under `UsePrefaulting`, doubling memory pressure) was also ruled out by disabling that prefault and re-measuring -- still no change (Zipf@32: 129,310/s, Uniform@32: 38,834/s).
+* **Open question**: the absolute numbers measured in this investigation (~127K items/s Zipf@32) don't match *either* endpoint of the originally reported 605,876/93,990 figures, under the exact same harness config (`run_bench_aws_c6id.sh`'s 1GiB memory budget, target_ratio 8.0, i4i.8xlarge). This means the original 2026081000 report's rawData cell for this comparison may itself need re-verification (possible anomaly/fluke run, or a config/commit mismatch) before chasing a fix further.
+* **Next step if resumed**: re-run `+Prefault` and `+ScanBaseSequential` as actual compile-time variants side by side, on the same instance, under the same conditions, to confirm the regression is real and reproducible *before* attempting another fix. Don't reuse the `require_multi_page` guard approach without new evidence -- it's confirmed not to be the mechanism.

@@ -141,7 +141,7 @@
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Workload Winners & Relative Speedup</h3>
-            <p class="text-xs text-slate-500">Comparison of the best VMemKV variant against the best rival engine (RocksDB, LMDB, RocksDB-BlobDB) at max threads (32 Threads).</p>
+            <p class="text-xs text-slate-500">Best VMemKV variant vs. whichever rival (RocksDB, LMDB, RocksDB-BlobDB) is FASTEST at that cell, at 32 threads (max concurrency tested) -- not the best-of-any-thread-count-or-rival figure, since both axes are known to shrink (sometimes invert) the ratio if picked favorably. The rival actually being compared against is named in small text under each badge.</p>
           </div>
         </div>
         
@@ -157,404 +157,425 @@
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100">
-              <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Insert</td>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Insert</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.50x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.63x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">vmemkv (All opts)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.52x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (3.02x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Update (Zipf)</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Update (Zipf)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.47x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.58x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">vmemkv (All opts)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (2.07x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (NoMadvise)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (3.03x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Delete</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Delete</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.57x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (NoMadvise)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.63x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.76x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (3.73x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Simd)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Miss)</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Miss)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (2.74x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (2.99x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (2.79x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Simd)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (2.48x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Hit, Zipf)</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Hit, Zipf)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.36x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">vmemkv (All opts)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-100 font-semibold w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
       ✅ WIN (1.16x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (NoMadvise)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.63x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB (Blob)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.29x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB (Blob)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Hit, Uniform)</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Hit, Uniform)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-100 font-semibold w-fit">
-      ✅ WIN (1.07x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold  w-fit">
+      WIN (1.07x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-100 font-semibold w-fit">
-      ✅ WIN (1.13x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold  w-fit">
+      WIN (1.13x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">vmemkv (All opts)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-semibold w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.83x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB (Blob)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.24x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB (Blob)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (T1 Reorg) Zipf</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (T1 Reorg) Zipf</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.64x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-semibold w-fit">
-      ❌ LOSE (0.97x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-slate-100 text-slate-600 border-slate-200 font-bold  w-fit">
+      ≈ EVEN (0.97x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.07x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.21x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (T1 Reorg) Uniform</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (T1 Reorg) Uniform</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.65x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-semibold w-fit">
-      ❌ LOSE (0.97x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-slate-100 text-slate-600 border-slate-200 font-bold  w-fit">
+      ≈ EVEN (0.97x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.10x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.23x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB (Blob)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (T1+T2 Reorg) Zipf</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (T1+T2 Reorg) Zipf</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.64x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-semibold w-fit">
-      ❌ LOSE (0.89x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-200 font-bold  w-fit">
+      LOSE (0.89x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.39x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.23x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Simd)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (T1+T2 Reorg) Uniform</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (T1+T2 Reorg) Uniform</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.65x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-100 font-semibold w-fit">
-      ✅ WIN (1.09x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold  w-fit">
+      WIN (1.09x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.47x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.24x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB (Blob)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (NoMadvise)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-</tr><tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">YCSB-E (Timeline Workload)</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">YCSB-E (Timeline Workload)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
-      ✅ WIN (2.86x)
+      ✅ WIN (2.88x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">vmemkv (All opts)</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
-      ✅ WIN (1.25x)
+      ✅ WIN (1.54x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.37x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">RocksDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
   </div>
 </td>
-
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
     <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent font-bold shadow-sm w-fit">
       ❌ LOSE (0.21x)
     </span>
-    <span class="text-[11px] text-slate-500 font-medium">LMDB</span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
   </div>
 </td>
 </tr>
-            </tbody>
+</tbody>
           </table>
         </div>
       </section>

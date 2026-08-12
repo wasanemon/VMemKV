@@ -8,19 +8,25 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <checkpoint/checkpoint.hpp>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <random>
 #include <rivals/rocksdb_store.hpp>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 #include <vmemkv/vmemkv.hpp>
+
+#include "test_support.hpp"
 
 // Verify that all major variants satisfy the C++20 KVStore concept
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_Baseline>);
@@ -93,17 +99,12 @@ struct StoreFactory;
 
 // Helper to reserve temp path for T2 files
 static auto reserve_temp_path() -> std::filesystem::path {
-  static std::atomic<uint64_t> counter{0};
-  const uint64_t sequence_number = counter.fetch_add(1, std::memory_order_relaxed);
-  std::filesystem::path temp_path =
-      std::filesystem::temp_directory_path() /
-      ("vmemkv_kv_" + std::to_string(static_cast<long>(::getpid())) + "_" + std::to_string(sequence_number));
-  std::error_code ignored;
-  std::filesystem::remove(temp_path, ignored);
-  std::filesystem::remove(vmemkv::derive_wal_path(temp_path), ignored);
+  const std::filesystem::path temp_path =
+      vmemkv_test::reserve_unique_temp_path("vmemkv_kv", /*also_remove_wal_sibling=*/true);
   // Also clear leftover .manifest/.chkN.t1/.chkN.t2 files from a reused PID (seen when relaunching
   // this binary in a tight loop lets a later run adopt an earlier run's stale checkpoint via
   // load_checkpoint_if_present()). A single full suite run never hits this; cheap insurance.
+  std::error_code ignored;
   const std::string manifest_prefix = temp_path.filename().string() + ".";
   for (const auto &entry : std::filesystem::directory_iterator(temp_path.parent_path(), ignored)) {
     if (entry.path().filename().string().starts_with(manifest_prefix)) {
@@ -146,9 +147,10 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 // ─── Store type lists ───────────────────────────────────────────────────────
 
 // VMemKV 自体のバリエーション（Baseline, Cumulative Steps, Ablations, Inlining）
-#define VMemKVStores                                                                                               \
-  vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Simd, \
-      vmemkv::variants::VMemKV_Var3_Inline, vmemkv::variants::VMemKV_Var4_Prefault
+#define VMemKVStores                                                                                                 \
+  vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Inline, \
+      vmemkv::variants::VMemKV_Var3_Prefault, vmemkv::variants::VMemKV_Var4_ScanBaseSequential,                      \
+      vmemkv::variants::VMemKV_ScanBaseSequential
 
 // 競合バックエンドのバリエーション（RocksDBStore, LMDBStoreなど）
 #ifdef ENABLE_ROCKSDB
@@ -383,7 +385,7 @@ TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);
   store->insert("b", 2);
-  store->reorganize();
+  store->defragment();
   CHECK(test_util::get_sync(store, "a") == 1U);
   CHECK(test_util::get_sync(store, "b") == 2U);
   CHECK(store->insert("c", 3));
@@ -409,13 +411,384 @@ TEST_CASE("VMemKV: manual reorganize forces physical storage garbage collection"
 
   CHECK(store->t2().bytes_used() == initial_t2_used);
 
-  store->reorganize();
+  store->defragment();
 
   uint64_t post_reorg_t2_used = store->t2().bytes_used();
   CHECK(post_reorg_t2_used < initial_t2_used);
 
   for (int i = remove_count; i < key_count; ++i) {
     CHECK(test_util::get_sync(store, std::to_string(i)) == static_cast<uint64_t>(i + 1000));
+  }
+}
+
+// Regression test for the no-sort compaction redesign (implementation/TODO.md's "Resolved
+// (analytically)" entry): a full T1+T2 reorganize used to lay T2 out in *key* order (a byproduct
+// of offset_mapper being invoked in T1's key-merge order); it now relocates entries in *old
+// physical offset* order instead (see offset_mapper_fn's batch implementation in
+// vmemkv_impl.hpp), producing a T2 file that's compacted (dead space dropped) but not key-sorted.
+// This directly proves both halves of that claim: the new physical offsets preserve the *old*
+// offsets' relative order, and that order does not coincide with key order.
+TEST_CASE("VMemKV: reorganize compacts T2 in old-physical-offset order, not key order") {
+  auto store = StoreFactory<vmemkv::variants::VMemKV_Baseline>::make();
+  using ImplType = std::remove_reference_t<decltype(store->impl())>;
+
+  auto to_span = [](const std::string &key_string) {
+    return std::span<const std::byte>(reinterpret_cast<const std::byte *>(key_string.data()), key_string.size());
+  };
+  auto offset_of = [&](const std::string &key) -> uint64_t {
+    return store->impl().t1().get_with_hash(to_span(key)).payload_bits & ImplType::kOffsetMask;
+  };
+
+  // Keys inserted in an order decorrelated from lexicographic order, so their T1-key order and
+  // T1-insertion(~old T2 physical offset) order disagree for at least one pair.
+  const std::vector<std::string> keys = {"m5", "a9", "z1", "c3", "k7", "b2", "y8", "d4"};
+  for (const auto &key : keys) {
+    store->insert(key, 1);
+  }
+  // Delete a couple of keys so the post-reorg T2 file is genuinely compacted (dead entries
+  // dropped), not just relocated 1:1.
+  store->remove("a9");
+  store->remove("y8");
+
+  std::vector<std::string> surviving = {"m5", "z1", "c3", "k7", "b2", "d4"};
+  std::vector<std::pair<std::string, uint64_t>> pre_reorg;
+  pre_reorg.reserve(surviving.size());
+  for (const auto &key : surviving) {
+    pre_reorg.emplace_back(key, offset_of(key));
+  }
+  // Old-offset order and key order genuinely disagree pre-reorg (sanity check on the fixture
+  // itself, not the thing under test): insertion order was m5,a9(removed),z1,c3,k7,b2,y8(removed),d4.
+  std::vector<std::pair<std::string, uint64_t>> by_old_offset = pre_reorg;
+  std::ranges::sort(by_old_offset, {}, &std::pair<std::string, uint64_t>::second);
+  std::vector<std::string> old_offset_order;
+  for (const auto &[key, offset] : by_old_offset) {
+    old_offset_order.push_back(key);
+  }
+  std::vector<std::string> key_order = surviving;
+  std::ranges::sort(key_order);
+  REQUIRE(old_offset_order != key_order);
+
+  store->defragment();
+
+  std::vector<std::pair<std::string, uint64_t>> post_reorg;
+  post_reorg.reserve(surviving.size());
+  for (const auto &key : surviving) {
+    post_reorg.emplace_back(key, offset_of(key));
+  }
+
+  // (a) Old-offset order is preserved: sorting post-reorg offsets ascending must reproduce the
+  // exact same key order as sorting pre-reorg offsets ascending -- proving relocation walked
+  // entries in old-physical-offset order, not key order.
+  std::vector<std::pair<std::string, uint64_t>> by_new_offset = post_reorg;
+  std::ranges::sort(by_new_offset, {}, &std::pair<std::string, uint64_t>::second);
+  std::vector<std::string> new_offset_order;
+  for (const auto &[key, offset] : by_new_offset) {
+    new_offset_order.push_back(key);
+  }
+  CHECK(new_offset_order == old_offset_order);
+
+  // (b) The new layout is NOT key-sorted: it still disagrees with lexicographic key order.
+  CHECK(new_offset_order != key_order);
+
+  // (c) Still a real compaction: dead space from the two removed keys is gone.
+  for (const auto &key : surviving) {
+    CHECK(test_util::get_sync(store, key) == 1U);
+  }
+}
+
+// Regression test for ScanBaseSequential: a same-size update targeting a record in T2's "base"
+// region (written by the last full reorganize) must be redirected out-of-place instead of taking
+// the in-place fast path -- see update_impl()'s base_boundary check and T2Memory::base_boundary's
+// declaration for why an in-place write there would never be visible through the base region's
+// own separate, seqlock-free mmap (T2's main mapping is MAP_PRIVATE; only this process's own
+// writes exist anywhere). If that redirect were missing or wrong, this test would observe Scan
+// (base_mmap-served) and Get (main-mmap-served) silently disagreeing on "key_a"'s value.
+TEST_CASE("VMemKV ScanBaseSequential: update after reorganize redirects out-of-place, Scan sees fresh value") {
+  auto store = StoreFactory<vmemkv::variants::VMemKV_ScanBaseSequential>::make();
+
+  const std::string value_a(kValue200Bytes, 'a');
+  const std::string value_b(kValue200Bytes, 'b');
+  REQUIRE(store->insert("key_a", value_a));
+  REQUIRE(store->insert("key_b", value_b));
+
+  store->defragment();  // Forces a full T1+T2 rebuild: both records now sit in the base region.
+
+  // Same-size update: would take the in-place fast path if key_a's offset weren't in the base.
+  const std::string value_a_updated(kValue200Bytes, 'A');
+  REQUIRE(store->update("key_a", value_a_updated));
+
+  std::map<std::string, std::string> seen;
+  std::ignore = store->scan("key_a", "key_c", [&](std::span<const std::byte> key, std::span<const std::byte> value) {
+    seen.emplace(std::string(reinterpret_cast<const char *>(key.data()), key.size()),
+                 std::string(reinterpret_cast<const char *>(value.data()), value.size()));
+  });
+
+  REQUIRE(seen.count("key_a") == 1);
+  CHECK(seen.at("key_a") == value_a_updated);
+  REQUIRE(seen.count("key_b") == 1);
+  CHECK(seen.at("key_b") == value_b);
+
+  // Get (main mmap path) must agree with Scan (base_mmap path) on the same key.
+  const auto get_result = test_util::get_bytes_sync(store, "key_a");
+  REQUIRE(get_result.has_value());
+  CHECK(std::string(reinterpret_cast<const char *>(get_result->data()), get_result->size()) == value_a_updated);
+
+  // A second reorganize should absorb the out-of-place update into a new base region, and a
+  // further same-size update should again be redirected rather than corrupting the new base.
+  store->defragment();
+  const std::string value_a_updated2(kValue200Bytes, 'Z');
+  REQUIRE(store->update("key_a", value_a_updated2));
+  std::map<std::string, std::string> seen2;
+  std::ignore = store->scan("key_a", "key_c", [&](std::span<const std::byte> key, std::span<const std::byte> value) {
+    seen2.emplace(std::string(reinterpret_cast<const char *>(key.data()), key.size()),
+                  std::string(reinterpret_cast<const char *>(value.data()), value.size()));
+  });
+  REQUIRE(seen2.count("key_a") == 1);
+  CHECK(seen2.at("key_a") == value_a_updated2);
+}
+
+// Stress/regression test for ScanBaseSequential: update() (base-region redirect decision) races
+// scan() (base_mmap read path) races repeated defragment() (moves base_boundary, swaps
+// T2Memory generations, remaps base_mmap) -- the three-way race the base/tail split's correctness
+// depends on. Run under ThreadSanitizer for direct race detection; also self-checks independent of
+// TSan, since every value written here is `kStressValueBytes` copies of one repeated character, so
+// a torn read shows up directly as a non-uniform byte value.
+//
+// kReorgCycles is capped well below what a "why not more?" instinct would suggest: this store's
+// underlying reorganize_internal() has a separate, pre-existing, already-documented race (see its
+// "KNOWN OPEN ISSUE" assert and test_kv_store's own deliberately-failing repro for it) that
+// sustained concurrent reorganize+write pressure can trip regardless of ScanBaseSequential --
+// confirmed unrelated to this branch by reproducing the same TSan report on unmodified
+// `VMemKVStore`. 60 cycles cleared 8/8 TSan runs without tripping it; raising this constant is
+// likely to make this test flaky on that unrelated, unfixed issue rather than exercise more of
+// the code this test actually targets.
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+TEST_CASE("VMemKV ScanBaseSequential: concurrent update+scan survive repeated reorganize (stress)") {
+  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  constexpr int kKeyCount = 50;
+  constexpr std::size_t kStressValueBytes = 200;  // Non-inline; see other tests' same-size note.
+  constexpr int kReorgCycles = 60;
+
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  for (int i = 0; i < kKeyCount; ++i) {
+    REQUIRE(store->insert("key" + std::to_string(i), std::string(kStressValueBytes, 'a')));
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> corruption_found{false};
+
+  std::thread updater([&] {
+    std::mt19937 rng(1);
+    std::uniform_int_distribution<int> key_dist(0, kKeyCount - 1);
+    uint64_t i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      const std::string key = "key" + std::to_string(key_dist(rng));
+      const std::string value(kStressValueBytes, static_cast<char>('a' + (i++ % 26)));
+      store->update(key, value);
+    }
+  });
+
+  std::thread scanner([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::ignore =
+          store->scan("key0", "key9", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
+            if (value.size() != kStressValueBytes) {
+              corruption_found.store(true, std::memory_order_relaxed);
+              return;
+            }
+            const auto expected = value[0];
+            for (std::byte b : value) {
+              if (b != expected) {
+                corruption_found.store(true, std::memory_order_relaxed);
+                break;
+              }
+            }
+          });
+    }
+  });
+
+  for (int i = 0; i < kReorgCycles; ++i) {
+    store->defragment();
+  }
+  stop.store(true, std::memory_order_relaxed);
+  updater.join();
+  scanner.join();
+
+  CHECK_FALSE(corruption_found.load());
+
+  for (int i = 0; i < kKeyCount; ++i) {
+    const auto final_value = test_util::get_bytes_sync(store, "key" + std::to_string(i));
+    REQUIRE(final_value.has_value());
+    CHECK(final_value->size() == kStressValueBytes);
+  }
+}
+
+// Regression test for incremental base_boundary promotion: a cheap T1-only checkpoint() (the
+// WAL-size-triggered path, distinct from defragment()'s full T2 rebuild) now also extends
+// base_boundary/base_mmap coverage in place -- see reorganize_internal()'s T1-only-checkpoint
+// branch and T2Memory::write_gate_boundary's comment. Without this, a long-running insert-only
+// process (space_amp stays ~1.0 forever with no deletes, so defragment() never fires
+// organically) would have base_mmap's coverage frozen forever at whatever the first forced
+// checkpoint() established, even as the live corpus kept growing past it.
+TEST_CASE("VMemKV ScanBaseSequential: cheap checkpoint() incrementally promotes base_boundary") {
+  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  auto padded_key = [](int i) { return "key" + std::string(i < 10 ? "0" : "") + std::to_string(i); };
+  const std::string value(kValue200Bytes, 'a');
+  for (int i = 0; i < 10; ++i) {
+    REQUIRE(store->insert(padded_key(i), value));
+  }
+  store->checkpoint();  // First checkpoint: no_t2_checkpoint_yet forces a full rebuild.
+
+  const uint64_t boundary_after_first = store->impl().t2().get_memory()->base_boundary.load();
+  CHECK(boundary_after_first > 0);
+  CHECK(store->impl().t2().get_memory()->base_mmap != nullptr);
+
+  // Insert more without ever deleting anything: space_amp stays ~1.0, so this insert-only
+  // workload never crosses T2_Rebuild_Trigger -- checkpoint() below must take the cheap path.
+  for (int i = 10; i < 20; ++i) {
+    REQUIRE(store->insert(padded_key(i), value));
+  }
+  store->checkpoint();
+
+  const uint64_t boundary_after_second = store->impl().t2().get_memory()->base_boundary.load();
+  CHECK(boundary_after_second > boundary_after_first);
+
+  // Confirm the newly-promoted range is actually reachable and correct via the base_mmap path
+  // (Scan), not just the always-correct fallback (Get).
+  std::map<std::string, std::string> seen;
+  std::ignore =
+      store->scan(padded_key(0), "key19~", [&](std::span<const std::byte> key, std::span<const std::byte> val) {
+        seen.emplace(std::string(reinterpret_cast<const char *>(key.data()), key.size()),
+                     std::string(reinterpret_cast<const char *>(val.data()), val.size()));
+      });
+  for (int i = 0; i < 20; ++i) {
+    REQUIRE(seen.count(padded_key(i)) == 1);
+    CHECK(seen.at(padded_key(i)) == value);
+  }
+}
+
+// Stress/regression test: update()'s in-place path racing repeated cheap checkpoint()
+// promotions -- distinct from the "...repeated reorganize (stress)" test above, which only
+// exercises full defragment()-driven base_boundary changes and thus never touches
+// update_epoch_tracker_'s drain at all.
+//
+// Deliberately bounded (kOpsPerCycle updates/scans per cycle, spawned and joined once per
+// checkpoint() call) rather than free-spinning update/scan threads for the whole test duration:
+// the race this test targets is narrow and one-shot per promotion (the window around a single
+// write_gate_boundary bump -> epoch drain -> publish sequence), not something that needs
+// sustained throughput to expose -- a handful of concurrent attempts per cycle, 60 times over,
+// is enough to give it a fair chance. Free-spinning threads were tried first and run into a
+// separate, already-known, already-documented bug instead (see TODO.md, "get_impl()/scan_impl()
+// expose torn, mid-write T2 records to the caller's callback"): at millions of scan calls, that
+// unrelated race in the ordinary seqlock-protected read path reproduces on its own, with zero
+// checkpoint()/reorganize() activity at all, and would make this test flaky for a reason that has
+// nothing to do with what it's actually trying to catch. Run under ThreadSanitizer for direct
+// race detection where available; also self-checks independent of TSan via the same
+// uniform-byte-value technique as the "...repeated reorganize" test above.
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+TEST_CASE(
+    "VMemKV ScanBaseSequential: concurrent update+scan survive repeated cheap checkpoint() "
+    "promotions (stress)") {
+  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  constexpr int kKeyCount = 50;
+  constexpr std::size_t kStressValueBytes = 200;
+  constexpr int kCheckpointCycles = 60;
+  constexpr int kOpsPerCycle = 50;
+
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  for (int i = 0; i < kKeyCount; ++i) {
+    REQUIRE(store->insert("key" + std::to_string(i), std::string(kStressValueBytes, 'a')));
+  }
+  store->checkpoint();  // Establish an initial base region for the cheap path to keep promoting.
+
+  std::atomic<bool> corruption_found{false};
+
+  for (int cycle = 0; cycle < kCheckpointCycles; ++cycle) {
+    std::thread updater([&, cycle] {
+      std::mt19937 rng(static_cast<unsigned>(cycle));
+      std::uniform_int_distribution<int> key_dist(0, kKeyCount - 1);
+      for (int i = 0; i < kOpsPerCycle; ++i) {
+        const std::string key = "key" + std::to_string(key_dist(rng));
+        const std::string value(kStressValueBytes, static_cast<char>('a' + (i % 26)));
+        store->update(key, value);
+      }
+    });
+    std::thread scanner([&] {
+      for (int i = 0; i < kOpsPerCycle; ++i) {
+        std::ignore =
+            store->scan("key0", "key9", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
+              if (value.size() != kStressValueBytes) {
+                corruption_found.store(true, std::memory_order_relaxed);
+                return;
+              }
+              const auto expected = value[0];
+              for (std::byte b : value) {
+                if (b != expected) {
+                  corruption_found.store(true, std::memory_order_relaxed);
+                  break;
+                }
+              }
+            });
+      }
+    });
+
+    // A fresh key each cycle so there's always new, not-yet-durable data for the cheap path to
+    // actually promote (checkpoint() is a no-op promotion if nothing changed since the last one).
+    // Runs on the main thread concurrently with updater/scanner above, joined only after.
+    REQUIRE(store->insert("cycle" + std::to_string(cycle), std::string(kStressValueBytes, 'c')));
+    store->checkpoint();
+
+    updater.join();
+    scanner.join();
+  }
+
+  CHECK_FALSE(corruption_found.load());
+
+  for (int i = 0; i < kKeyCount; ++i) {
+    const auto final_value = test_util::get_bytes_sync(store, "key" + std::to_string(i));
+    REQUIRE(final_value.has_value());
+    CHECK(final_value->size() == kStressValueBytes);
+  }
+}
+
+// Edge case: checkpoint() called on a store that has never had a single insert (append_size()==0,
+// bytes_used()==0 at rebuild time). Per checkpoint()'s no_t2_checkpoint_yet fallback this still
+// forces a full rebuild -- mmap_t2_memory() must establish a real (non-null) base_mmap even
+// though bytes_used==0 at that moment, or the incremental-promotion mechanism above would never
+// have anything to extend for a store built this way (see mmap_t2_memory()'s comment for why the
+// earlier `if (bytes_used > 0)` guard was removed).
+TEST_CASE("VMemKV ScanBaseSequential: checkpoint() on an empty store still establishes base_mmap") {
+  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  store->checkpoint();  // Forced full rebuild via no_t2_checkpoint_yet, with zero live entries.
+  CHECK(store->impl().t2().get_memory()->base_mmap != nullptr);
+  CHECK(store->impl().t2().get_memory()->base_boundary.load() == 0);
+
+  const std::string value(kValue200Bytes, 'a');
+  for (int i = 0; i < 10; ++i) {
+    REQUIRE(store->insert("key" + std::to_string(i), value));
+  }
+  store->checkpoint();  // Cheap path now: base_mmap already existed, just needs promoting.
+
+  CHECK(store->impl().t2().get_memory()->base_boundary.load() > 0);
+
+  std::map<std::string, std::string> seen;
+  std::ignore = store->scan("key0", "key9~", [&](std::span<const std::byte> key, std::span<const std::byte> val) {
+    seen.emplace(std::string(reinterpret_cast<const char *>(key.data()), key.size()),
+                 std::string(reinterpret_cast<const char *>(val.data()), val.size()));
+  });
+  for (int i = 0; i < 10; ++i) {
+    REQUIRE(seen.count("key" + std::to_string(i)) == 1);
+    CHECK(seen.at("key" + std::to_string(i)) == value);
   }
 }
 
@@ -477,9 +850,7 @@ TEST_CASE("Offset64 + hash-index disambiguates long keys sharing a prefix") {
   CHECK(idx->put(to_span(key_one), 9) == OffsetAppendMapIndex::PutResult::Applied);
   CHECK(idx->get(to_span(key_one)) == 9U);
 
-  idx->reorganize([](uint64_t physical_offset, uint64_t, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
-    return {physical_offset, generation};
-  });
+  idx->reorganize([](auto) {});
   CHECK(idx->get(to_span(key_one)) == 9U);
   CHECK(idx->get(to_span(key_two)) == 2U);
 }
@@ -596,7 +967,7 @@ TEST_CASE("VMemKV reorganize resolves storage fragmentation") {
 
   CHECK(store->remove("k1"));
 
-  store->reorganize();
+  store->defragment();
 
   uint64_t bytes_used_after_reorg = store->t2().bytes_used();
   CHECK(bytes_used_after_reorg < bytes_used_after_update);
@@ -652,7 +1023,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   constexpr uint64_t kEvenInlineValue = 0x123456789ABCDEF0ULL;
 
   SUBCASE("T1InlineValue behavior (1-8 bytes)") {
-    using InlineStore = vmemkv::variants::VMemKV_Var3_Inline;
+    using InlineStore = vmemkv::variants::VMemKV_Var2_Inline;
     auto store = std::make_unique<InlineStore>(path, kInlineStoreCapacityBytes);
 
     uint64_t initial_bytes = store->t2().bytes_used();
@@ -722,7 +1093,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
 // reorganize_internal()'s stress-harness verification.
 
 // Regression test: scan_impl() used to acquire one T2MemoryHandle up front and hold it for the
-// whole scan, but a concurrent reorganize(true) rebuilds T2 (fresh mmap, fresh layout) partway
+// whole scan, but a concurrent defragment() rebuilds T2 (fresh mmap, fresh layout) partway
 // through -- later T1 offsets could belong to a newer generation than that handle protects,
 // causing out-of-bounds reads or an infinite seqlock retry loop. Fixed by stamping every T1
 // sorted_snapshot_ with the T2Memory generation it was built against and validating the pair on
@@ -748,7 +1119,7 @@ TEST_CASE("VMemKV: scan survives a T2-rebuilding reorganize running concurrently
   std::atomic<bool> stop{false};
   std::thread reorganizer([&] {
     while (!stop.load(std::memory_order_relaxed)) {
-      store->reorganize(true);  // Forces a full T2 rebuild (new mmap, new generation) every call.
+      store->defragment();  // Forces a full T2 rebuild (new mmap, new generation) every call.
     }
   });
 
@@ -805,7 +1176,7 @@ TEST_CASE("VMemKV: reorganize's T2 record read survives a concurrent in-place up
 
   constexpr int kReorgCycles = 300;
   for (int i = 0; i < kReorgCycles; ++i) {
-    store->reorganize(true);  // Forces a full T2 rebuild every call, maximizing race opportunities.
+    store->defragment();  // Forces a full T2 rebuild every call, maximizing race opportunities.
   }
   stop.store(true, std::memory_order_relaxed);
   updater.join();
@@ -817,6 +1188,164 @@ TEST_CASE("VMemKV: reorganize's T2 record read survives a concurrent in-place up
   const auto final_value = test_util::get_bytes_sync(store, "hot");
   REQUIRE(final_value.has_value());
   CHECK(final_value->size() == value.size());
+}
+
+// Regression tests for the formerly-open "torn read via user callback" bug (TODO.md,
+// "get_impl()/scan_impl() expose torn, mid-write T2 records to the caller's callback"):
+// get_impl()/scan_impl() used to invoke the caller-supplied callback directly from inside
+// read_t2_record_seqlock()'s copy_func, handing it a std::span into T2Memory::base -- live,
+// concurrently update_value_at()-writable memory -- *before* the seqlock's version re-check had
+// run. The seqlock did correctly detect the race and retry afterward, but could not retract the
+// fact that the callback had already observed torn (part-old, part-new) bytes on the first,
+// discarded attempt. Fixed by having copy_func only copy into an owned buffer and invoking the
+// callback after read_t2_record_seqlock() returns (see get_impl()/scan_impl()'s own comments).
+//
+// Deliberately no reorganize()/checkpoint()/defragment() anywhere in either test below: unlike
+// the drain-barrier/residual-window tests elsewhere in this file, this race needed nothing but
+// plain concurrent update()+scan() (or update()+get()) on a single key -- proving the fix holds
+// even in that minimal case is the point.
+TEST_CASE("VMemKV: scan callback never observes a torn read across a concurrent update (regression)") {
+  using TestStore = vmemkv::variants::VMemKV_Baseline;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  constexpr std::size_t kValueBytes = 200;  // Non-inline; same-size updates stay in the in-place path.
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  REQUIRE(store->insert("hot", std::string(kValueBytes, 'a')));
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> torn_read_found{false};
+
+  std::thread updater([&] {
+    uint64_t i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::string next_value(kValueBytes, static_cast<char>('a' + (i++ % 26)));
+      store->update("hot", next_value);
+    }
+  });
+
+  std::thread scanner([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::ignore =
+          store->scan("hot", "hot~", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
+            if (value.empty()) {
+              return;
+            }
+            const auto expected = value[0];
+            for (std::byte b : value) {
+              if (b != expected) {
+                torn_read_found.store(true, std::memory_order_relaxed);
+                return;
+              }
+            }
+          });
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  stop.store(true, std::memory_order_relaxed);
+  updater.join();
+  scanner.join();
+
+  CHECK_FALSE(torn_read_found.load());
+}
+
+// Same bug, same fix, but via get() instead of scan() -- get_impl()'s copy_func had the identical
+// callback-inside-the-seqlock-window shape as scan_impl()'s.
+TEST_CASE("VMemKV: get callback never observes a torn read across a concurrent update (regression)") {
+  using TestStore = vmemkv::variants::VMemKV_Baseline;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  constexpr std::size_t kValueBytes = 200;
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  REQUIRE(store->insert("hot", std::string(kValueBytes, 'a')));
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> torn_read_found{false};
+
+  std::thread updater([&] {
+    uint64_t i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::string next_value(kValueBytes, static_cast<char>('a' + (i++ % 26)));
+      store->update("hot", next_value);
+    }
+  });
+
+  std::thread getter([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::ignore = store->get("hot", [&](std::span<const std::byte> value) {
+        if (value.empty()) {
+          return;
+        }
+        const auto expected = value[0];
+        for (std::byte b : value) {
+          if (b != expected) {
+            torn_read_found.store(true, std::memory_order_relaxed);
+            return;
+          }
+        }
+      });
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  stop.store(true, std::memory_order_relaxed);
+  updater.join();
+  getter.join();
+
+  CHECK_FALSE(torn_read_found.load());
+}
+
+// ScanBaseSequential-specific variant of the same regression, free-spinning and with no
+// reorganize()/checkpoint() at all: prior to the fix above, this exact shape (see the
+// "...repeated cheap checkpoint() promotions (stress)" test's own comment elsewhere in this file)
+// had to be deliberately avoided because it reliably tripped this bug on its own, independent of
+// anything ScanBaseSequential-specific. Now that the underlying bug is fixed, confirm the
+// simplest possible free-spinning form is safe under this ablation too.
+TEST_CASE(
+    "VMemKV ScanBaseSequential: free-spinning update+scan survive with no reorganize/checkpoint "
+    "at all (regression)") {
+  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  constexpr std::size_t kValueBytes = 200;
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  REQUIRE(store->insert("hot", std::string(kValueBytes, 'a')));
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> torn_read_found{false};
+
+  std::thread updater([&] {
+    uint64_t i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::string next_value(kValueBytes, static_cast<char>('a' + (i++ % 26)));
+      store->update("hot", next_value);
+    }
+  });
+
+  std::thread scanner([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::ignore =
+          store->scan("hot", "hot~", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
+            if (value.empty()) {
+              return;
+            }
+            const auto expected = value[0];
+            for (std::byte b : value) {
+              if (b != expected) {
+                torn_read_found.store(true, std::memory_order_relaxed);
+                return;
+              }
+            }
+          });
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  stop.store(true, std::memory_order_relaxed);
+  updater.join();
+  scanner.join();
+
+  CHECK_FALSE(torn_read_found.load());
 }
 
 // Regression test for reorganize_internal()'s formerly-open "residual window" race: even with
@@ -866,8 +1395,9 @@ TEST_CASE(
   // still-current (about-to-be-retired) generation, registering it with the reference tracker
   // before begin_draining_and_wait_for_writers() ever scans it.
   store->impl().reorganize_internal(
-      /*force_t2_gc=*/
+      /*do_t2_rebuild=*/
       true,
+      /*do_checkpoint=*/true,
       /*post_convergence_hook=*/[] {},
       /*generation_mismatch_hook=*/vmemkv::NoOpGenerationMismatchHook{},
       /*pre_drain_hook=*/
@@ -898,8 +1428,9 @@ TEST_CASE(
   // held, its stamped generation must equal cycle 1's, so the mismatch hook must never fire.
   bool mismatch_detected = false;
   store->impl().reorganize_internal(
-      /*force_t2_gc=*/
+      /*do_t2_rebuild=*/
       true,
+      /*do_checkpoint=*/true,
       /*post_convergence_hook=*/[] {},
       /*generation_mismatch_hook=*/
       [&](uint64_t /*old_generation*/, uint64_t /*live_generation*/) {
@@ -912,4 +1443,179 @@ TEST_CASE(
   const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
   REQUIRE(straggler_readback.has_value());
   CHECK(straggler_readback->size() == straggler_value.size());
+}
+
+// Regression test for the formerly-open "residual window" race described in
+// reorganize_internal()'s offset_mapper_fn comment: T2FlatFile::acquire_write_handle() used to
+// check draining_ *before* registering with the reference tracker, which
+// ThreadReferenceTracker::wait_until_retired()'s single index-ordered scan (it never re-examines
+// a slot once past it) could race -- a writer whose check saw draining_==false, but who hadn't
+// registered yet, could still be missed by an already-in-progress scan, so the drain could
+// complete and the writer would go on to write into a generation the next cycle no longer
+// recognizes. Fixed by registering first and only then checking draining_, retrying if it turns
+// out to already be true.
+//
+// Reproduces the adversarial timing deterministically via acquire_write_handle()'s hook seam
+// (fires once, right after registering and before the draining_ check): the writer thread
+// registers, signals pre_drain_hook that it has done so, then sleeps -- guaranteeing
+// begin_draining_and_wait_for_writers() (called on the main thread right after pre_drain_hook
+// returns) sets draining_=true and starts scanning while this thread is still paused, already
+// registered but not yet having checked draining_. Under the fix, the writer's own check must
+// then see draining_==true and back out/retry rather than proceed with a handle that might be to
+// an about-to-retire generation -- exactly the guarantee the old check-then-register order could
+// not make.
+TEST_CASE(
+    "VMemKV: acquire_write_handle()'s register-then-check-retry survives a writer racing the "
+    "drain scan (regression)") {
+  using TestStore = vmemkv::variants::VMemKVStore;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  const std::string baseline_value(200, 'v');
+  REQUIRE(store->insert("baseline", baseline_value));
+
+  const std::string straggler_value(200, 's');
+  std::thread straggler_writer;
+  std::atomic<bool> writer_registered{false};
+
+  store->impl().reorganize_internal(
+      /*do_t2_rebuild=*/
+      true,
+      /*do_checkpoint=*/true,
+      /*post_convergence_hook=*/[] {},
+      /*generation_mismatch_hook=*/vmemkv::NoOpGenerationMismatchHook{},
+      /*pre_drain_hook=*/
+      [&] {
+        using ImplT = std::decay_t<decltype(store->impl())>;
+        straggler_writer = std::thread([&] {
+          vmemkv::T2FlatFile::T2MemoryHandle mem = store->impl().t2().acquire_write_handle([&] {
+            writer_registered.store(true, std::memory_order_release);
+            // Long enough that begin_draining_and_wait_for_writers() below is guaranteed to have
+            // set draining_=true and started its scan (finding this thread's slot registered,
+            // hence blocking on it) before this thread wakes up and checks draining_ itself.
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+          });
+          kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
+            kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
+              const uint64_t offset = vmemkv::T2FlatFile::append_default(mem, key_bytes, val_bytes);
+              uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_bytes.size() + val_bytes.size());
+              uint64_t block_count = aligned_len / ImplT::kBlockAlignment;
+              uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
+              REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0, mem->generation) ==
+                      ImplT::T1IndexT::PutResult::Applied);
+            });
+          });
+        });
+        // Don't let pre_drain_hook return until the writer has registered -- otherwise
+        // begin_draining_and_wait_for_writers() might start scanning before the writer's slot is
+        // set at all, which wouldn't exercise the "scan already saw/blocked on a registered slot,
+        // writer only then wakes up and self-checks" path this test targets.
+        while (!writer_registered.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+      });
+  straggler_writer.join();
+
+  bool mismatch_detected = false;
+  store->impl().reorganize_internal(
+      /*do_t2_rebuild=*/
+      true,
+      /*do_checkpoint=*/true,
+      /*post_convergence_hook=*/[] {},
+      /*generation_mismatch_hook=*/
+      [&](uint64_t /*old_generation*/, uint64_t /*live_generation*/) {
+        mismatch_detected = true;
+        return true;
+      });
+
+  CHECK_FALSE(mismatch_detected);
+
+  const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
+  REQUIRE(straggler_readback.has_value());
+  CHECK(straggler_readback->size() == straggler_value.size());
+}
+
+namespace {
+struct TinyWalCheckpointConfig : vmemkv::Config<> {
+  static constexpr size_t WalMaxBytesSinceCheckpoint = 2048;  // Small enough to trip quickly.
+};
+using VMemKV_TinyWalCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyWalCheckpointConfig>>;
+}  // namespace
+
+// Regression test for the T1-only-checkpoint path's KNOWN OPEN ISSUE mitigation
+// (reorganize_internal()'s new T1-only-with-checkpoint branch, see implementation/TODO.md-adjacent
+// design notes): that branch's offset_mapper is a pure passthrough (same as the plain T1-only
+// branch), so it never validates generations the way the T2-rebuild branch's offset_mapper does.
+// Without a check, a straggler entry left stamped with an already-retired T2 generation by the
+// still-open, separately-tracked residual-window race would be persisted into a T1-only
+// checkpoint completely unvalidated -- load_checkpoint_if_present() re-stamps every loaded entry
+// uniformly with zero per-entry checking, so this would silently resolve to the wrong T2 file
+// after a restart. This test proves the chk_writer_fn precondition check catches it instead: no
+// checkpoint gets committed this cycle, exactly as if the WAL trigger hadn't fired at all.
+TEST_CASE("VMemKV: T1-only checkpoint refuses to persist a straggler stamped with a retired T2 generation") {
+  using TestStore = VMemKV_TinyWalCheckpoint;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+  using ImplT = std::decay_t<decltype(store->impl())>;
+
+  const std::string baseline_value(200, 'v');
+  REQUIRE(store->insert("baseline", baseline_value));
+
+  // Uses the gated public defragment() (reorg_running_ CAS), not reorganize_internal() directly:
+  // TinyWalCheckpointConfig's tiny threshold means the background reorg_worker_ thread is a real,
+  // active competitor here (unlike the drain-barrier regression test above, whose default 64MiB
+  // threshold never lets the worker fire during a short test) -- bypassing the gate would let this
+  // test's direct calls race the worker's own reorganize_internal() calls.
+
+  // Cycle 1: force a full T2 rebuild -- generation G1.
+  store->impl().defragment();
+  const uint64_t g1 = store->impl().t2().get_memory()->generation;
+
+  // Cycle 2: force another full T2 rebuild -- generation G2, retiring G1's T2Memory.
+  store->impl().defragment();
+  const uint64_t g2 = store->impl().t2().get_memory()->generation;
+  REQUIRE(g2 != g1);
+
+  const auto manifest_path = vmemkv::derive_manifest_path(store->impl().t2().path());
+  const auto manifest_before = vmemkv::read_manifest(manifest_path);
+  REQUIRE(manifest_before.has_value());
+
+  // Directly inject a "straggler": an entry stamped with the now-retired G1, simulating exactly
+  // what the residual-window race would leave behind (same technique the drain-barrier regression
+  // test above uses -- T1Index::put()'s explicit-generation overload, no new test seam needed).
+  // Deliberately not read back afterward: get_impl()/update_impl() retry-loop on a generation
+  // mismatch until a future full T2 rebuild's offset_mapper_fn relocates and re-stamps it (see
+  // that retry's own comment) -- this test's cycle 3 never performs one, by design (that's the
+  // whole point of the T1-only checkpoint path), so reading "straggler" back here would just hit
+  // that same pre-existing, separately-tracked livelock, unrelated to what this test verifies.
+  const std::string straggler_value(200, 's');
+  kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
+    kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
+      vmemkv::T2FlatFile::T2MemoryHandle mem = store->impl().t2().acquire_write_handle();
+      const uint64_t offset = vmemkv::T2FlatFile::append_default(mem, key_bytes, val_bytes);
+      const uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_bytes.size() + val_bytes.size());
+      const uint64_t block_count = aligned_len / ImplT::kBlockAlignment;
+      const uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
+      REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0, /*generation=*/g1) ==
+              ImplT::T1IndexT::PutResult::Applied);
+    });
+  });
+
+  // Cycle 3: checkpoint() takes the T1-only-with-checkpoint path (T2 isn't fragmented, and
+  // current_t2_generation_ is already set from cycle 2, so its no_t2_checkpoint_yet fallback
+  // doesn't force a full rebuild either). The straggler's stale generation must make
+  // chk_writer_fn refuse to persist.
+  const auto stats_before = store->impl().get_statistics();
+  store->impl().checkpoint();
+  const auto stats_after = store->impl().get_statistics();
+
+  CHECK(stats_after.t2_reorg_count == stats_before.t2_reorg_count);  // T2 was never rebuilt.
+
+  const auto manifest_after = vmemkv::read_manifest(manifest_path);
+  REQUIRE(manifest_after.has_value());
+  CHECK(manifest_after->t1_generation == manifest_before->t1_generation);  // No new checkpoint committed.
+  CHECK(manifest_after->t2_generation == manifest_before->t2_generation);
+
+  // Unrelated keys remain readable via the normal (non-checkpoint) path throughout.
+  CHECK(test_util::get_sync(store, "baseline") != vmemkv::STORE_NOT_FOUND);
 }

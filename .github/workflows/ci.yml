@@ -27,7 +27,8 @@ jobs:
           clang-format \
           clang-tidy \
           librocksdb-dev \
-          liblmdb-dev
+          liblmdb-dev \
+          gdb
 
     - name: Verify Code Formatting
       run: |
@@ -55,4 +56,18 @@ jobs:
     - name: Run Tests
       run: |
         cd build
+        # Watchdog: 300s is generously past this suite's normal ~1-2min runtime but well short of
+        # ctest's own TIMEOUT below, so if test_kv_store is still alive at that point, it's stuck,
+        # not just slow -- dump every thread's backtrace via gdb before ctest's TIMEOUT kills it,
+        # since a killed process's buffered stdout is otherwise lost with no way to inspect it.
+        ( sleep 300
+          for pid in $(pgrep -f 'tests/test_kv_store'); do
+            echo "=== WATCHDOG: test_kv_store (pid $pid) still running after 300s -- dumping backtraces ==="
+            sudo gdb -p "$pid" -batch -ex "thread apply all bt" -ex detach || true
+          done
+        ) &
+        watchdog_pid=$!
         ctest --output-on-failure
+        ctest_exit=$?
+        kill "$watchdog_pid" 2>/dev/null || true
+        exit "$ctest_exit"

@@ -549,9 +549,9 @@ run_scenario() {
     # *before* entering the cgroup below. Without this, a real per-master populate under this
     # exact cgroup was measured locally at 200-1200s (vs. ~20-30s unconstrained) -- paying that
     # cost here means the cgroup-wrapped measurement pass only ever needs to clone, not rebuild,
-    # those masters. See vmemkv_matrix::ltm_priming_filter()'s comment for what this
-    # single-cell-per-(store,value size) filter does and does not cover (notably not Scan's
-    # T1Reorg scenario, which has no master to prime and stays exposed to the cgroup regardless).
+    # those masters. See vmemkv_matrix::ltm_priming_filter()'s comment: one Get/Hit/Zipf cell per
+    # (store, value size) is enough, since Scan now clones from that same shared master too (no
+    # separate Scan-only master to prime).
     local priming_filter priming_cmd priming_cmd_quoted
     priming_filter="$(vmemkv_matrix::ltm_priming_filter)"
     # VMEMKV_CONTEXT_memory_budget_bytes must be set here too, not just on the measurement pass
@@ -599,36 +599,114 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
   echo "Scenario $scenario_key stderr log: $scenario_stderr_log"
   echo "[runner] start scenario=$scenario_key quick=$QUICK"
 
+  local ssh_status
   set +e
   if [[ "$scenario_key" == "ltm" ]]; then
-    # Drop the OS page cache right before entering the cgroup: RocksDB's Checkpoint-based clone
-    # (rocksdb_store.hpp/rocksdb_blobdb_store.hpp) hardlinks SST/blob files instead of copying
-    # them, and cgroup v2 charges page-cache pages to whichever cgroup first faulted them in --
-    # so without this, the cgroup-constrained measurement process below reads the SAME
-    # already-warm pages the unconstrained priming pass above just wrote, with no new charge
-    # against MemoryHigh, meaning RocksDB never experiences the intended 8x memory
-    # oversubscription at all. Confirmed directly: RocksDB showed 0 major-faults/0% real-cpu-time
-    # gap without this, jumping to real fault activity and an 83.5% gap (10.7x slower) once
-    # caches were forced cold (implementation/docs/benchmark/20260805_ltm_get_hit_profiling.md).
-    # LMDB's clone_from() (mdb_env_copy2, a real byte copy) and VMemKV's T2 (MAP_PRIVATE,
-    # genuinely COW/anonymous) don't share this exemption -- both already showed real memory
-    # pressure with or without this -- so this only closes RocksDB's loophole, it doesn't
-    # meaningfully punish the other two.
-    ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null" \
-      >>"$scenario_stdout_log" 2>>"$scenario_stderr_log"
-    {
-      ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
-        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${remote_cmd_quoted}" \
-        2> >(tee -a "$scenario_stderr_log" >&2)
-    } | tee -a "$scenario_stdout_log"
+    # Each (Store, Variant) identity gets drop_caches + its OWN systemd-run cgroup scope for the
+    # measurement pass below, instead of one shared scope for the whole scenario_run_filter.
+    # Sharing one cgroup scope across multiple stores/variants was found to make whichever one is
+    # measured LATER in that scope's lifetime look artificially faster than it should -- the
+    # cgroup's own memory-reclaim heuristics seem to "warm up" over the scope's life in a way that
+    # carries across different stores' corpus files, not just within one store's own corpus. A
+    # drop_caches right before entering the cgroup (kept below, and necessary regardless -- see the
+    # RocksDB Checkpoint-hardlink note in that step) does NOT fix this by itself: it only clears
+    # page cache, not the cgroup's reclaim-heuristic state, which develops fresh after page-cache
+    # tenants are entered. Confirmed empirically: a 1KB/Zipf/threads:32 comparison that showed a
+    # new ablation LOSING to RocksDB/LMDB when all three were measured in one shared scope showed
+    # it WINNING once each got its own isolated scope. Costs more wall-clock (each identity
+    # re-clones its own corpus from the already-primed master, on top of paying its own
+    # drop_caches), but is the only way to get trustworthy cross-store relative numbers here.
+    # Discover the exact benchmark names scenario_run_filter matches, then group them by
+    # (Store, Variant) identity and rebuild each group's filter as an anchored alternation of its
+    # own exact names -- deliberately NOT a re-derived Value=/Op= regex, so this stays correct
+    # under every shape scenario_run_filter can take above (plain (scenario,value), --quick,
+    # --scenario/--value-size limits, and YCSB_ONLY, which has no Value= constraint at all).
+    echo "[runner] discovering per-store isolation groups for scenario=$scenario_key ..."
+    local all_bench_names
+    all_bench_names=$(ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+      "bash -lc 'cd ~/faultkv/implementation && ${scenario_env_prefix:+${scenario_env_prefix} }./build-rel/benchmark/bench_kv --benchmark_list_tests --benchmark_filter=\"${scenario_run_filter}\" 2>/dev/null'")
+
+    local -a identities=()
+    while IFS= read -r identity_line; do
+      [[ -z "$identity_line" ]] && continue
+      identities+=("$identity_line")
+    done < <(printf '%s\n' "$all_bench_names" | sed -nE 's#^(Store=[^/]+/Variant=[^/]+)/.*#\1#p' | sort -u)
+
+    if [[ "${#identities[@]}" -eq 0 ]]; then
+      echo "[ERROR] No benchmarks matched scenario=$scenario_key filter -- nothing to isolate/run." >&2
+      ssh_status=1
+    else
+      echo "[runner] ${#identities[@]} isolation groups: ${identities[*]}"
+
+      local -a group_result_paths=()
+      local group_idx=0 identity group_names group_filter group_result_path group_remote_cmd group_remote_cmd_quoted group_status
+      ssh_status=0
+      for identity in "${identities[@]}"; do
+        group_idx=$((group_idx + 1))
+        group_names="$(printf '%s\n' "$all_bench_names" | grep -F "${identity}/" | sed -E 's/[][(){}.^$*+?\\|]/\\&/g' | paste -sd'|' -)"
+        group_filter="^(${group_names})\$"
+        group_result_path="/tmp/vmemkv_ltm_group_${group_idx}_${KEY_NAME}.json"
+        group_result_paths+=("$group_result_path")
+
+        echo "[runner] LTM isolated pass ${group_idx}/${#identities[@]}: ${identity}"
+        # See the comment above this loop for why this is per-identity, not once for the whole
+        # scenario: RocksDB's Checkpoint-based clone hardlinks SST/blob files instead of copying
+        # them, and cgroup v2 charges page-cache pages to whichever cgroup first faulted them in --
+        # so without a fresh drop_caches here, a cgroup-constrained pass could read the SAME
+        # already-warm pages an earlier pass (or the unconstrained priming pass) just wrote, with
+        # no new charge against MemoryHigh, meaning RocksDB never experiences the intended 8x
+        # memory oversubscription at all (confirmed directly:
+        # implementation/docs/benchmark/20260805_ltm_get_hit_profiling.md).
+        ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null" \
+          >>"$scenario_stdout_log" 2>>"$scenario_stderr_log"
+
+        group_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} }VMEMKV_BENCH_SKIP_CLEANUP=1 \
+${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
+./benchmark/common/run_scenario.sh \
+  './build-rel/benchmark/bench_kv' \
+  '$group_filter' \
+  '$MIN_TIME' \
+  '$group_result_path'
+        "
+        printf -v group_remote_cmd_quoted '%q' "$group_remote_cmd"
+
+        {
+          ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+            "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${group_remote_cmd_quoted}" \
+            2> >(tee -a "$scenario_stderr_log" >&2)
+        } | tee -a "$scenario_stdout_log"
+        group_status=${PIPESTATUS[0]}
+        if [[ "$group_status" -ne 0 ]]; then
+          echo "[ERROR] LTM isolated pass for ${identity} failed with exit code $group_status" >&2
+          ssh_status="$group_status"
+          break
+        fi
+      done
+
+      if [[ "$ssh_status" -eq 0 ]]; then
+        # Merge every isolated pass's standalone Google Benchmark JSON into one document at
+        # scenario_result_path, exactly as if it had all come from a single run: same "context"
+        # (taken from the first pass), "benchmarks" arrays concatenated in isolation-pass order.
+        local merge_paths_quoted="" p
+        for p in "${group_result_paths[@]}"; do
+          merge_paths_quoted+=" $(printf '%q' "$p")"
+        done
+        ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+          "jq -s '{context: .[0].context, benchmarks: (map(.benchmarks) | add)}'${merge_paths_quoted} > $(printf '%q' "$scenario_result_path")" \
+          >>"$scenario_stdout_log" 2>>"$scenario_stderr_log"
+        ssh_status=$?
+      fi
+    fi
   else
     {
       ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
         "bash -lc ${remote_cmd_quoted}" \
         2> >(tee -a "$scenario_stderr_log" >&2)
     } | tee -a "$scenario_stdout_log"
+    ssh_status=${PIPESTATUS[0]}
   fi
-  local ssh_status=${PIPESTATUS[0]}
   set -e
   echo "[runner] end scenario=$scenario_key status=$ssh_status"
 
@@ -645,8 +723,8 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 inmem_filter="${inmem_filter:-}"
 ltm_filter="${ltm_filter:-}"
 if [[ "${YCSB_ONLY:-0}" == "1" ]]; then
-  inmem_filter="${inmem_filter:-Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-Simd-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf}"
-  ltm_filter="${ltm_filter:-Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-Simd-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf}"
+  inmem_filter="${inmem_filter:-Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-T1InlineValue-Prefaulting-ScanBaseSequential|RocksDB)/Op=YCSB-E/Dist=Zipf}"
+  ltm_filter="${ltm_filter:-Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-T1InlineValue-Prefaulting-ScanBaseSequential|RocksDB)/Op=YCSB-E/Dist=Zipf}"
   MIN_TIME="${MIN_TIME:-30s}"
 elif [[ -n "$VALUE_SIZE_LIMIT" ]]; then
   inmem_filter="${inmem_filter:-$(vmemkv_matrix::benchmark_filter_for_case in_memory "${VALUE_SIZE_LIMIT,,}")}"

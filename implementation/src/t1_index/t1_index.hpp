@@ -483,10 +483,13 @@ class T1Index {
 
   // Reorganizes T1 by merging append_region_ into sorted_region_. Thread-safe; lock-free
   // readers (get/scan) can run concurrently.
-  // - OffsetMapper: `(payload, hash, entry_generation) -> {new_payload, new_generation}`. Maps
-  //   an old T2 offset to its new one and reports which T2 generation the result is valid
-  //   against; must return `{payload, entry_generation}` unchanged for entries it doesn't touch
-  //   (inline, tombstone, T1-only reorg).
+  // - OffsetMapper: `void(std::span<EntrySnapshot> merged)`, called exactly once with the full,
+  //   already-deduped, key-ordered live set. May rewrite any entry's `.payload_bits`/`.generation`
+  //   in place (e.g. to relocate a T2 offset), in any order it likes, but must NOT reorder or
+  //   resize `merged` itself -- chk_writer and the SortedRegion built from it right after both
+  //   require key order to survive unchanged. `merged` is not published/visible to any other
+  //   thread at the point this is called, so free in-place mutation of the fields above is safe.
+  //   Entries this mapper doesn't need to touch (inline, T1-only reorg) must be left untouched.
   // - ChkWriter: optional, called once with the finalized sorted entries right before publish,
   //   so a caller can serialize a checkpoint without T1Index knowing about files. No-op default.
   // `generation`: tag published on the new sorted_snapshot_. Callers pairing T1 against another
@@ -612,9 +615,7 @@ class T1Index {
     // Assert no duplicate entries exist in the merge output
     assert_no_duplicates(merged);
 
-    for (auto &entry : merged) {
-      std::tie(entry.payload_bits, entry.generation) = offset_mapper(entry.payload_bits, entry.hash, entry.generation);
-    }
+    offset_mapper(std::span<EntrySnapshot>(merged));
 
     chk_writer(std::span<const EntrySnapshot>(merged));
 
@@ -857,10 +858,6 @@ class T1Index {
 
     [[nodiscard]] auto size() const noexcept -> size_t { return tail_.load(std::memory_order_acquire); }
 
-    [[nodiscard]] auto capacity_bytes() const noexcept -> size_t { return APPEND_CAP * sizeof(AppendSlot); }
-
-    [[nodiscard]] auto bytes_for(size_t count) const noexcept -> size_t { return count * sizeof(AppendSlot); }
-
     auto reserve() noexcept -> size_t {
       size_t index = tail_.load(std::memory_order_relaxed);
       while (true) {
@@ -919,13 +916,6 @@ class T1Index {
       }
       bounds_lock_.clear(std::memory_order_release);
       return present;
-    }
-
-    void clear(size_t count) noexcept {
-      for (size_t i = 0; i < count; ++i) {
-        slots_[i].published.store(false, std::memory_order_release);
-      }
-      tail_.store(0, std::memory_order_release);
     }
 
     auto find_with_index(const AppendIndex &index, Key key, uint64_t hash) noexcept -> AppendSlot * {
@@ -1037,8 +1027,8 @@ class T1Index {
 
   // Runs `func` registered in active_epochs_. Every method dereferencing sorted_snapshot_/
   // append_active_/append_immutable_ must go through this, or reorganize()'s wait_until_epoch()
-  // can't know the buffers it's about to delete are still in use (previously a real
-  // use-after-free in put()).
+  // can't know the buffers it's about to delete are still in use, letting a caller like put()
+  // dereference a buffer reorganize() has already freed.
   //
   // Scoped to exactly `func`'s duration: nothing inside `func` may block on reorganize()
   // completing, or it would deadlock against wait_until_epoch().

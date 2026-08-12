@@ -120,7 +120,7 @@ class StoreAdapter {
   // on failure. Much faster than `count` individual insert() calls, but unlike insert()/update()
   // gives no durability guarantee by itself -- see each backend's bulk_load_impl() (VMemKVImpl,
   // e.g., skips its WAL entirely; callers needing crash survival must checkpoint afterward, e.g.
-  // reorganize(true)). Upsert semantics (no existing-key check), and not safe for concurrent
+  // defragment() or checkpoint()). Upsert semantics (no existing-key check), and not safe for concurrent
   // access during the call.
   template <typename KeyFn, typename ValueFn>
   void bulk_load(std::size_t count, KeyFn &&make_key, ValueFn &&make_value) {
@@ -142,18 +142,28 @@ class StoreAdapter {
   auto impl() noexcept -> KVSImpl & { return impl_; }
   [[nodiscard]] auto impl() const noexcept -> const KVSImpl & { return impl_; }
 
-  // Delegates to low-level methods if they are exposed
+  // T1-only in-memory merge. Never touches T2, never persists a checkpoint. Rival backends
+  // define their own no-op reorganize() (they self-manage compaction), so this delegates
+  // unconditionally rather than needing an is_rival_store_v branch.
   void reorganize() { impl_.reorganize(); }
 
-  // force_t2_gc selects between a T1-only reorganize (fast, zero I/O) and a full T1+T2
-  // reorganize (rebuilds the T2 file too). Rival backends have no such distinction --
-  // they self-compact/self-manage storage -- so this is a no-op for them regardless
-  // of the flag.
-  void reorganize(bool force_t2_gc) {
+  // Always fully rebuilds T2 (GC) and persists a checkpoint. Rival backends self-compact/
+  // self-manage storage and have no such distinction -- no-op for them.
+  void defragment() {
     if constexpr (detail::is_rival_store_v<KVSImpl>) {
-      (void)force_t2_gc;
+      // no-op: rivals self-manage compaction, same rationale as reorganize()'s rival no-op.
     } else {
-      impl_.reorganize(force_t2_gc);
+      impl_.defragment();
+    }
+  }
+
+  // Always persists a checkpoint via the cheapest available path (see VMemKVImpl::checkpoint()).
+  // No-op for rival backends -- they have no equivalent checkpoint/manifest concept exposed here.
+  void checkpoint() {
+    if constexpr (detail::is_rival_store_v<KVSImpl>) {
+      // no-op
+    } else {
+      impl_.checkpoint();
     }
   }
 

@@ -139,23 +139,19 @@ vmemkv_matrix::scenario_effective_filter() {
 }
 
 vmemkv_matrix::ltm_priming_filter() {
-  # Triggers exactly one Get/Hit/Zipf/threads:1 cell, plus one Scan/T1Reorg/Zipf/threads:1 and one
-  # Scan/T1T2Reorg/Zipf/threads:1 cell, per (store, variant, value size) -- enough to build every
-  # shared master corpus this scenario's real run will need. Get/Update/Delete/YCSB-E/Insert's LTM
-  # pre-populate all clone from the Get-triggered (val_size, corpus_size) master (see
-  # make_fresh_corpus_checkpoint()'s comment in bench_kv.cpp); Scan's T1Reorg/T1T2Reorg both clone
-  # from a *separate* "_scanfair" master pair the two Scan triggers below build (see
-  # make_scan_fair_corpus()'s comment in bench_kv.cpp -- distinct from the Get-triggered master
-  # because it needs a randomized, not ascending, insertion order). Used to "prime" those masters
-  # at full, unconstrained disk speed before a cgroup-wrapped LTM run (see run_bench.sh's --cgroup
-  # path): a real per-master populate under that same cgroup was measured at 200-1200s, vs.
-  # ~20-30s unconstrained -- and building the "_scanfair" master specifically involves an extra
-  # full T1-only reorganize on top of that populate, observed to occasionally exceed even the
-  # generous retry budget make_vmemkv_clone_from_t1only_snapshot() waits on when left to build
-  # lazily under the cgroup instead of here.
+  # Triggers exactly one Get/Hit/Zipf/threads:1 cell per (store, variant, value size) -- enough
+  # to build the one shared master corpus every other scenario needs. Get/Update/Delete/YCSB-E/
+  # Scan/Insert's LTM pre-populate all clone from this same (val_size, corpus_size) master (see
+  # make_fresh_corpus_checkpoint()'s comment in bench_kv.cpp). Scan does not need a second,
+  # separately-populated master: base_mmap -- the only thing that could genuinely differ between
+  # two Scan variants -- is already established on this ordinary shared master for any variant
+  # with ScanBaseSequential enabled (see bench_kv.cpp's Scan registration comment).
+  # Used to "prime" this master at full, unconstrained disk speed before a cgroup-wrapped LTM run
+  # (see run_bench.sh's --cgroup path): a real per-master populate under that same cgroup was
+  # measured at 200-1200s, vs. ~20-30s unconstrained.
   local scenario_regex
   scenario_regex="$(vmemkv_matrix::scenario_filter)"
-  printf '(%s).*Op=(Get/Mode=Hit/Dist=Zipf|Scan/Mode=(T1Reorg|T1T2Reorg)/Dist=Zipf)/.*threads:1$\n' "$scenario_regex"
+  printf '(%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$\n' "$scenario_regex"
 }
 
 vmemkv_matrix::local_quick_filter() {
@@ -172,12 +168,12 @@ vmemkv_matrix::scenario_quick_filter() {
       # One representative in-memory workload from the tail end of the matrix
       # (Scan is registered last). threads:1 keeps this portable across
       # machines with different core counts (unlike a hardcoded thread count).
-      printf '%s\n' '^Store=VMemKV/Variant=Bloom-Simd/Op=Scan/Mode=T1T2Reorg/Dist=Uniform/Value=8B/real_time/threads:1$'
+      printf '%s\n' '^Store=VMemKV/Variant=Bloom-T1InlineValue/Op=Scan/Dist=Uniform/Value=8B/real_time/threads:1$'
       ;;
     ltm)
       # One representative LTM workload, chosen to reach the scenario boundary quickly.
       # Value labels carry a "(20% 8B)" suffix for non-8B sizes, hence the ".*".
-      printf '%s\n' '^Store=VMemKV/Variant=Bloom-Simd-T1InlineValue-Prefaulting/Op=Get/Mode=Hit/Dist=Zipf/Value=64KB.*threads:1$'
+      printf '%s\n' '^Store=VMemKV/Variant=Bloom-T1InlineValue-Prefaulting/Op=Get/Mode=Hit/Dist=Zipf/Value=64KB.*threads:1$'
       ;;
     *)
       return 1

@@ -14,17 +14,12 @@
 #include <string>
 #include <vector>
 
+#include "test_support.hpp"
+
 namespace {
 
 auto reserve_checkpoint_path() -> std::filesystem::path {
-  static std::atomic<uint64_t> counter{0};
-  const uint64_t sequence_number = counter.fetch_add(1, std::memory_order_relaxed);
-  std::filesystem::path temp_path =
-      std::filesystem::temp_directory_path() /
-      ("vmemkv_chk_test_" + std::to_string(static_cast<long>(::getpid())) + "_" + std::to_string(sequence_number));
-  std::error_code ignored;
-  std::filesystem::remove(temp_path, ignored);
-  return temp_path;
+  return vmemkv_test::reserve_unique_temp_path("vmemkv_chk_test");
 }
 
 // Duck-typed stand-in for T1Index<Config>::EntrySnapshot -- exercises write_t1_checkpoint's
@@ -143,27 +138,45 @@ TEST_CASE("T1 checkpoint: entry_count mismatched with actual file size is detect
   std::filesystem::remove(path);
 }
 
-TEST_CASE("Manifest: write then read round-trips the generation and t2_bytes_used") {
+TEST_CASE("Manifest: write then read round-trips t1_generation/t2_generation/t2_bytes_used") {
   const auto path = reserve_checkpoint_path();
-  vmemkv::write_manifest(path, 42, 12345);
+  vmemkv::write_manifest(path, 42, 42, 12345);
 
   const auto manifest = vmemkv::read_manifest(path);
   REQUIRE(manifest.has_value());
-  CHECK(manifest->generation == 42);
+  CHECK(manifest->t1_generation == 42);
+  CHECK(manifest->t2_generation == 42);
   CHECK(manifest->t2_bytes_used == 12345);
 
   std::filesystem::remove(path);
 }
 
-TEST_CASE("Manifest: re-writing replaces the generation atomically") {
+TEST_CASE("Manifest: re-writing replaces the generations atomically") {
   const auto path = reserve_checkpoint_path();
-  vmemkv::write_manifest(path, 1, 100);
-  vmemkv::write_manifest(path, 2, 200);
+  vmemkv::write_manifest(path, 1, 1, 100);
+  vmemkv::write_manifest(path, 2, 2, 200);
 
   const auto manifest = vmemkv::read_manifest(path);
   REQUIRE(manifest.has_value());
-  CHECK(manifest->generation == 2);
+  CHECK(manifest->t1_generation == 2);
+  CHECK(manifest->t2_generation == 2);
   CHECK(manifest->t2_bytes_used == 200);
+
+  std::filesystem::remove(path);
+}
+
+// The split's whole point: a T1-only checkpoint advances t1_generation (a fresh checkpoint_lsn)
+// while leaving t2_generation pointing at an older, still-valid T2 checkpoint file (see
+// VMemKVImpl::reorganize_internal()'s T1-only-with-checkpoint branch).
+TEST_CASE("Manifest: t1_generation and t2_generation round-trip independently") {
+  const auto path = reserve_checkpoint_path();
+  vmemkv::write_manifest(path, 5, 2, 999);
+
+  const auto manifest = vmemkv::read_manifest(path);
+  REQUIRE(manifest.has_value());
+  CHECK(manifest->t1_generation == 5);
+  CHECK(manifest->t2_generation == 2);
+  CHECK(manifest->t2_bytes_used == 999);
 
   std::filesystem::remove(path);
 }
@@ -176,7 +189,7 @@ TEST_CASE("Manifest: missing file reads as nullopt, not an error") {
 
 TEST_CASE("Manifest: corrupted checksum reads as nullopt") {
   const auto path = reserve_checkpoint_path();
-  vmemkv::write_manifest(path, 7, 70);
+  vmemkv::write_manifest(path, 7, 7, 70);
 
   {
     const auto offset = static_cast<std::streamoff>(offsetof(vmemkv::ManifestHeader, checksum));

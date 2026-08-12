@@ -137,7 +137,7 @@ VMemKV が解消したい断片化は 2 種類ある。
 - T2の reorganize:
   - T1 の live entry 順に T2 からデータをコピーし，新しい単一 byte array を構築する．
   - コピー先 offset を T1 に書き戻す．
-  - これらの処理において，かつての tombstone はT1にはすでに含まれず，また，参照offsetが切れているT2のrecordはコピーされないため，Storage Fragmentation が解消される．
+  - これらの処理において，tombstone 化されたエントリは新しい T1 に含まれず，また，参照offsetが切れているT2のrecordはコピーされないため，Storage Fragmentation が解消される．
 
 T1 の reorganize はT2とは独立して実行できる．すなわち，T1の `reorganize()` を高頻度で実施してもよい．しかし，T2の `reorganize` はオフセット（位置）の変更を伴うため，T1の `reorganize` とセットで実行しなければならない．この時の並行処理については，6.2節で詳しく述べる．
 
@@ -193,7 +193,7 @@ VMemKVの `reorganize` の一連の処理の結果として，T1 については
 詳細は [low_level_design.md](./low_level_design.md) を参照。
 
 - Tier 1 `mlock` / `MADV_HUGEPAGE` / 一時的 `MADV_SEQUENTIAL`（未実装・将来検討）
-- Tier 1 `madvise(MADV_RANDOM)`（Baselineにて常時有効。アブレーション検証により In-Memory 読出で約5%の有意な性能向上に貢献していることを実証。非適用版は `NoMadvise` バリアントとして定義）
+- Tier 1 `madvise(MADV_RANDOM)`（常時有効。In-Memory 読出で約5%の性能向上に貢献する）
 - Group Commit / Early Lock Release / Flush Pipelining（未実装・将来検討）
 - SIMD による Tier 1 scan 高速化
 - entry-level adaptive covering

@@ -27,13 +27,14 @@
 #include <vector>
 #include <wal/wal.hpp>
 
+#include "test_support.hpp"
+
 namespace {
 
 // Runs `fn` on a background thread; returns true if it finishes within `timeout`, in which case
-// the thread is join()ed. An earlier version unconditionally detached, which TSan caught as a
-// false data race: a detached thread's TLS teardown can still be in flight after its work becomes
-// visible, aliasing a later TEST_CASE's reused stack address. Only detaches on timeout, since by
-// then the test under it has already failed.
+// the thread is join()ed. Only detaches on timeout (the test under it has already failed by
+// then): unconditionally detaching would let a detached thread's TLS teardown still be in flight
+// after its work becomes visible, aliasing a later TEST_CASE's reused stack address.
 template <typename Fn>
 auto run_with_timeout(Fn &&fn, std::chrono::milliseconds timeout) -> bool {
   auto promise = std::make_shared<std::promise<void>>();
@@ -54,9 +55,9 @@ auto run_with_timeout(Fn &&fn, std::chrono::milliseconds timeout) -> bool {
 // Joins every thread in `threads` (left empty, moved-from, on return), waiting up to `timeout`
 // total; returns true if all joined in time. The threads are moved into a shared_ptr the worker
 // captures by value, so on timeout the worker keeps them alive and keeps joining on its own after
-// this function detaches and returns. This ownership transfer is deliberate: an earlier version
-// had the caller detach stragglers itself after a timeout, which raced the worker's own .join()
-// calls on the same objects (a TSan-caught bug) -- now only the worker ever touches them.
+// this function detaches and returns -- only the worker ever touches them. Having the caller
+// detach stragglers itself after a timeout would race the worker's own .join() calls on the same
+// objects.
 auto join_all_with_timeout(std::vector<std::thread> &threads, std::chrono::milliseconds timeout) -> bool {
   auto promise = std::make_shared<std::promise<void>>();
   std::future<void> future = promise->get_future();
@@ -76,29 +77,25 @@ auto join_all_with_timeout(std::vector<std::thread> &threads, std::chrono::milli
   return completed;
 }
 
-auto reserve_wal_path() -> std::filesystem::path {
-  static std::atomic<uint64_t> counter{0};
-  const uint64_t sequence_number = counter.fetch_add(1, std::memory_order_relaxed);
-  std::filesystem::path temp_path =
-      std::filesystem::temp_directory_path() /
-      ("vmemkv_wal_test_" + std::to_string(static_cast<long>(::getpid())) + "_" + std::to_string(sequence_number));
-  std::error_code ignored;
-  std::filesystem::remove(temp_path, ignored);
-  return temp_path;
+auto reserve_wal_path() -> std::filesystem::path { return vmemkv_test::reserve_unique_temp_path("vmemkv_wal_test"); }
+
+using vmemkv_test::as_span;
+using vmemkv_test::bytes_of;
+using vmemkv_test::span_to_string;
+
+// Thin wrappers around the split reserve_*()/await_durable() API for tests below that only care
+// about a record being durably appended, not about separating reservation from the durability
+// wait itself.
+auto append_insert(vmemkv::Wal &wal, std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t {
+  return wal.await_durable(wal.reserve_insert(key, value));
 }
 
-auto bytes_of(std::string_view value) -> std::vector<std::byte> {
-  std::vector<std::byte> out(value.size());
-  std::memcpy(out.data(), value.data(), value.size());
-  return out;
+auto append_update(vmemkv::Wal &wal, std::span<const std::byte> key, std::span<const std::byte> value) -> uint64_t {
+  return wal.await_durable(wal.reserve_update(key, value));
 }
 
-auto as_span(const std::vector<std::byte> &value) -> std::span<const std::byte> {
-  return std::span<const std::byte>(value.data(), value.size());
-}
-
-auto span_to_string(std::span<const std::byte> value) -> std::string {
-  return {reinterpret_cast<const char *>(value.data()), value.size()};
+auto append_delete(vmemkv::Wal &wal, std::span<const std::byte> key) -> uint64_t {
+  return wal.await_durable(wal.reserve_delete(key));
 }
 
 struct ReplayedRecord {
@@ -124,7 +121,7 @@ TEST_CASE("Wal: fresh file starts at LSN 1 with empty replay") {
   std::filesystem::remove(path);
 }
 
-TEST_CASE("Wal: append_insert/update/delete assign strictly increasing LSNs") {
+TEST_CASE("Wal: insert/update/delete assign strictly increasing LSNs") {
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
 
@@ -134,9 +131,9 @@ TEST_CASE("Wal: append_insert/update/delete assign strictly increasing LSNs") {
   // Checks relative ordering rather than exact numbers: LSN assignment strictly increasing (and
   // therefore unique) per call is the actual contract callers depend on, not any particular
   // starting value or step size.
-  const uint64_t lsn1 = wal.append_insert(as_span(key), as_span(val));
-  const uint64_t lsn2 = wal.append_update(as_span(key), as_span(val));
-  const uint64_t lsn3 = wal.append_delete(as_span(key));
+  const uint64_t lsn1 = append_insert(wal, as_span(key), as_span(val));
+  const uint64_t lsn2 = append_update(wal, as_span(key), as_span(val));
+  const uint64_t lsn3 = append_delete(wal, as_span(key));
 
   CHECK(lsn1 < lsn2);
   CHECK(lsn2 < lsn3);
@@ -149,9 +146,9 @@ TEST_CASE("Wal: replay after reopen round-trips type/key/value/order") {
   const auto path = reserve_wal_path();
   {
     vmemkv::Wal wal(path);
-    wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
-    wal.append_update(as_span(bytes_of("b")), as_span(bytes_of("22")));
-    wal.append_delete(as_span(bytes_of("c")));
+    append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
+    append_update(wal, as_span(bytes_of("b")), as_span(bytes_of("22")));
+    append_delete(wal, as_span(bytes_of("c")));
   }
 
   vmemkv::Wal wal(path);
@@ -187,7 +184,7 @@ TEST_CASE("Wal: replay after reopen round-trips type/key/value/order") {
 TEST_CASE("Wal: delete record replays with empty value span") {
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
-  wal.append_delete(as_span(bytes_of("gone")));
+  append_delete(wal, as_span(bytes_of("gone")));
 
   bool saw_record = false;
   wal.replay([&](vmemkv::WalRecordType type,
@@ -209,13 +206,13 @@ TEST_CASE("Wal: LSN numbering continues across reopen, does not reset") {
   uint64_t last_lsn_before_reopen = 0;
   {
     vmemkv::Wal wal(path);
-    wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
-    last_lsn_before_reopen = wal.append_insert(as_span(bytes_of("b")), as_span(bytes_of("2")));
+    append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
+    last_lsn_before_reopen = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
   }
 
   vmemkv::Wal wal(path);
   CHECK(wal.next_lsn() > last_lsn_before_reopen);
-  const uint64_t lsn = wal.append_insert(as_span(bytes_of("c")), as_span(bytes_of("3")));
+  const uint64_t lsn = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
   CHECK(lsn > last_lsn_before_reopen);
 
   std::filesystem::remove(path);
@@ -245,7 +242,7 @@ TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
   uint64_t first_lsn = 0;
   {
     vmemkv::Wal wal(path);
-    first_lsn = wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
+    first_lsn = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
     valid_end = std::filesystem::file_size(path);
   }
 
@@ -261,7 +258,7 @@ TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
   CHECK(std::filesystem::file_size(path) == valid_end);
   CHECK(wal.next_lsn() == first_lsn + 1);
 
-  const uint64_t lsn = wal.append_insert(as_span(bytes_of("b")), as_span(bytes_of("2")));
+  const uint64_t lsn = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
   CHECK(lsn == first_lsn + 1);
 
   std::vector<std::string> keys;
@@ -282,7 +279,7 @@ TEST_CASE("Wal: torn trailing record with full header but truncated payload is d
   uint64_t first_lsn = 0;
   {
     vmemkv::Wal wal(path);
-    first_lsn = wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
+    first_lsn = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
     valid_end = std::filesystem::file_size(path);
   }
 
@@ -317,9 +314,9 @@ TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier reco
   uint64_t first_lsn = 0;
   {
     vmemkv::Wal wal(path);
-    first_lsn = wal.append_insert(as_span(bytes_of("keep")), as_span(bytes_of("v1")));
+    first_lsn = append_insert(wal, as_span(bytes_of("keep")), as_span(bytes_of("v1")));
     after_first = std::filesystem::file_size(path);
-    wal.append_insert(as_span(bytes_of("corrupt")), as_span(bytes_of("v2")));
+    append_insert(wal, as_span(bytes_of("corrupt")), as_span(bytes_of("v2")));
   }
 
   {
@@ -371,7 +368,7 @@ TEST_CASE("Wal: concurrent appends from multiple threads yield unique LSNs that 
       for (int i = 0; i < kPerThread; ++i) {
         const auto key = bytes_of("t" + std::to_string(thread_index) + "_" + std::to_string(i));
         const auto val = bytes_of("v");
-        lsns.push_back(wal.append_insert(as_span(key), as_span(val)));
+        lsns.push_back(append_insert(wal, as_span(key), as_span(val)));
       }
     });
   }
@@ -407,7 +404,7 @@ TEST_CASE("Wal: zero-length value on Insert round-trips distinctly from Delete")
   {
     vmemkv::Wal wal(path);
     const std::vector<std::byte> empty_value;
-    wal.append_insert(as_span(bytes_of("emptyval")), as_span(empty_value));
+    append_insert(wal, as_span(bytes_of("emptyval")), as_span(empty_value));
   }
 
   vmemkv::Wal wal(path);
@@ -433,7 +430,7 @@ TEST_CASE("Wal: large (>64KB) key/value payloads round-trip") {
   const std::vector<std::byte> big_value(kLargeSize, std::byte{0xCD});
   {
     vmemkv::Wal wal(path);
-    wal.append_insert(as_span(big_key), as_span(big_value));
+    append_insert(wal, as_span(big_key), as_span(big_value));
   }
 
   vmemkv::Wal wal(path);
@@ -458,9 +455,9 @@ TEST_CASE("Wal: rotate() drops records at or before checkpoint_lsn, keeps the ta
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
 
-  const uint64_t lsn_a = wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
-  const uint64_t lsn_b = wal.append_insert(as_span(bytes_of("b")), as_span(bytes_of("2")));
-  const uint64_t lsn_c = wal.append_insert(as_span(bytes_of("c")), as_span(bytes_of("3")));
+  const uint64_t lsn_a = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
+  const uint64_t lsn_b = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
+  const uint64_t lsn_c = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
 
   wal.rotate(lsn_b);  // Keep only records with lsn > lsn_b, i.e. just "c".
 
@@ -483,13 +480,13 @@ TEST_CASE("Wal: rotate() keeps LSN numbering continuous, does not reset") {
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
 
-  wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
-  const uint64_t lsn_b = wal.append_insert(as_span(bytes_of("b")), as_span(bytes_of("2")));
+  append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
+  const uint64_t lsn_b = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
 
   wal.rotate(lsn_b);
   CHECK(wal.next_lsn() > lsn_b);
 
-  const uint64_t lsn_after = wal.append_insert(as_span(bytes_of("c")), as_span(bytes_of("3")));
+  const uint64_t lsn_after = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
   CHECK(lsn_after > lsn_b);
 
   std::filesystem::remove(path);
@@ -499,7 +496,7 @@ TEST_CASE("Wal: rotate() with an empty tail (checkpoint_lsn == latest) still pre
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
 
-  const uint64_t lsn_a = wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
+  const uint64_t lsn_a = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
   wal.rotate(lsn_a);  // Nothing has a higher lsn -- the rotated file is empty.
 
   CHECK(wal.next_lsn() > lsn_a);
@@ -510,7 +507,7 @@ TEST_CASE("Wal: rotate() with an empty tail (checkpoint_lsn == latest) still pre
                                        uint64_t /*lsn*/) { FAIL("replay callback invoked on empty rotated WAL"); });
   CHECK(count == 0);
 
-  const uint64_t lsn_after = wal.append_insert(as_span(bytes_of("b")), as_span(bytes_of("2")));
+  const uint64_t lsn_after = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
   CHECK(lsn_after > lsn_a);
 
   std::filesystem::remove(path);
@@ -522,10 +519,10 @@ TEST_CASE("Wal: rotate() shrinks the on-disk file size, not just what replay() r
   uint64_t lsn_first = 0;
   {
     vmemkv::Wal wal(path);
-    lsn_first = wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
+    lsn_first = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
     size_after_one_record = std::filesystem::file_size(path);
     for (int i = 0; i < 50; ++i) {
-      wal.append_insert(as_span(bytes_of("k" + std::to_string(i))), as_span(bytes_of("v")));
+      append_insert(wal, as_span(bytes_of("k" + std::to_string(i))), as_span(bytes_of("v")));
     }
     REQUIRE(std::filesystem::file_size(path) > size_after_one_record);
 
@@ -551,9 +548,9 @@ TEST_CASE("Wal: rotate() survives reopen -- rotated file replays correctly from 
   uint64_t lsn_c = 0;
   {
     vmemkv::Wal wal(path);
-    wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
-    lsn_b = wal.append_insert(as_span(bytes_of("b")), as_span(bytes_of("2")));
-    lsn_c = wal.append_insert(as_span(bytes_of("c")), as_span(bytes_of("3")));
+    append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
+    lsn_b = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
+    lsn_c = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
     wal.rotate(lsn_b);
   }
 
@@ -582,13 +579,13 @@ TEST_CASE("Wal: append after reopening a non-empty WAL does not hang") {
   const auto path = reserve_wal_path();
   {
     vmemkv::Wal wal(path);
-    wal.append_insert(as_span(bytes_of("a")), as_span(bytes_of("1")));
-    wal.append_insert(as_span(bytes_of("b")), as_span(bytes_of("2")));
+    append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
+    append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
   }
 
   vmemkv::Wal wal(path);
   const bool completed = run_with_timeout(
-      [&wal]() { wal.append_insert(as_span(bytes_of("c")), as_span(bytes_of("3"))); }, std::chrono::seconds(5));
+      [&wal]() { append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3"))); }, std::chrono::seconds(5));
   REQUIRE(completed);
 
   std::vector<std::string> keys;
@@ -623,7 +620,7 @@ TEST_CASE("Wal: concurrent appends replay with exactly the content each thread w
         const std::string value_str = "v" + std::to_string(thread_index) + "_" + std::to_string(i);
         const auto key = bytes_of(key_str);
         const auto val = bytes_of(value_str);
-        const uint64_t lsn = wal.append_insert(as_span(key), as_span(val));
+        const uint64_t lsn = append_insert(wal, as_span(key), as_span(val));
         std::lock_guard<std::mutex> lock(recorded_mutex);
         recorded_by_lsn[lsn] = ReplayedRecord{vmemkv::WalRecordType::Insert, key_str, value_str, lsn};
       }
@@ -678,7 +675,7 @@ TEST_CASE("Wal: append storm exceeding ring capacity does not corrupt or duplica
       const std::string key_str = "k" + std::to_string(i);
       const auto key = bytes_of(key_str);
       const auto val = bytes_of("v");
-      const uint64_t lsn = wal.append_insert(as_span(key), as_span(val));
+      const uint64_t lsn = append_insert(wal, as_span(key), as_span(val));
       std::lock_guard<std::mutex> lock(recorded_mutex);
       recorded_by_lsn[lsn] = key_str;
     });
@@ -724,7 +721,7 @@ TEST_CASE("Wal: rotate() under concurrent appends returns promptly and preserves
     while (!stop.load(std::memory_order_relaxed)) {
       const auto key = bytes_of("k" + std::to_string(i));
       const auto val = bytes_of("v");
-      const uint64_t lsn = wal.append_insert(as_span(key), as_span(val));
+      const uint64_t lsn = append_insert(wal, as_span(key), as_span(val));
       {
         std::lock_guard<std::mutex> lock(recorded_mutex);
         all_lsns.push_back(lsn);
@@ -775,7 +772,7 @@ TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding caller
   vmemkv::Wal wal(path);
 
   // Establish a small baseline so later writes past this size trigger EFBIG.
-  wal.append_insert(as_span(bytes_of("seed")), as_span(bytes_of("1")));
+  append_insert(wal, as_span(bytes_of("seed")), as_span(bytes_of("1")));
   const auto size_after_seed = static_cast<rlim_t>(std::filesystem::file_size(path));
 
   struct rlimit original_limit {};
@@ -812,7 +809,7 @@ TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding caller
   for (int i = 0; i < kThreadCount; ++i) {
     threads.emplace_back([&, i]() {
       try {
-        wal.append_insert(as_span(bytes_of("x" + std::to_string(i))), as_span(bytes_of("y")));
+        append_insert(wal, as_span(bytes_of("x" + std::to_string(i))), as_span(bytes_of("y")));
       } catch (...) {
         threw.fetch_add(1, std::memory_order_relaxed);
       }
@@ -827,7 +824,7 @@ TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding caller
 
   // The Wal must now be permanently poisoned: any further append fails immediately, without
   // attempting another syscall.
-  CHECK_THROWS(wal.append_insert(as_span(bytes_of("after")), as_span(bytes_of("z"))));
+  CHECK_THROWS(append_insert(wal, as_span(bytes_of("after")), as_span(bytes_of("z"))));
 
   std::filesystem::remove(path);
 }

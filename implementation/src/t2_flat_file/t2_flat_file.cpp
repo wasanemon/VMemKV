@@ -147,21 +147,10 @@ auto T2FlatFile::append_prefault(const T2Memory *mem,
   return offset;
 }
 
-auto T2FlatFile::acquire_write_handle() const noexcept -> T2MemoryHandle {
-  // Single check-then-register, no re-check after: a writer that registers a handle to `mem`
-  // right as draining_ flips true isn't a correctness problem, only a (self-limiting) source of
-  // extra latency for begin_draining_and_wait_for_writers()'s wait below -- that call's spin-wait
-  // scans every slot, so it simply waits for this writer to finish (append + T1 publish) like any
-  // other straggler. What actually bounds the wait is that no *new* caller can start this loop
-  // and reach get_memory_handle() once draining_ is visibly true, since they spin here instead.
-  while (draining_.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  return get_memory_handle();
-}
-
 void T2FlatFile::begin_draining_and_wait_for_writers(const T2Memory *mem) const noexcept {
-  draining_.store(true, std::memory_order_release);
+  // seq_cst: paired with acquire_write_handle()'s seq_cst draining_ load and
+  // ThreadReferenceTracker::acquire()'s seq_cst store -- see acquire_write_handle()'s comment.
+  draining_.store(true, std::memory_order_seq_cst);
   active_readers_.wait_until_retired(mem);
 }
 

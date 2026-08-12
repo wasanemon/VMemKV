@@ -9,12 +9,6 @@
 //
 // ─── OPTIMIZATION TAGS (TECHNICAL SPECIFICATION) ──────────────────────────────
 //
-// * AppendMap:
-//   - [EN]: Ensures deterministic lock-free index updates by preventing write-path
-//           degradation under multi-threaded concurrency.
-//   - [JP]: 複数スレッドの並行書き込み時におけるハッシュ衝突と性能低下を防止し、
-//           T1への確実なロックフリー書き込みを保証する補助マップ。
-//
 // * BloomFilter:
 //   - [EN]: Prevents unnecessary flash storage access (random read I/O) for non-existent
 //           keys using an in-memory mmap filter.
@@ -27,22 +21,11 @@
 //   - [JP]: T1インデックス上の16バイトのキープレフィックスをベクトルレジスタに載せ、
 //           レンジスキャンや衝突探索時の線形走査を並列に一括高速化するSIMD命令最適化。
 //
-// * MemoryHints:
-//   - [EN]: Uses active OS prefetching policies (madvise sequential/willneed) to ensure
-//           uninterrupted throughput during background compaction.
-//   - [JP]: Reorganize（メモリ圧縮・断片化解消）時などに、カーネルに対して動的に
-//           プリフェッチ（madvise）を適用し、ページフォールトによる性能低下を極小化するヒント。
-//
 // * T1InlineValue:
 //   - [EN]: Inlines values (1-8 bytes) directly in the T1 index slot by reclaiming unused
 //           bits of the hash field for inline metadata, skipping T2.
 //   - [JP]: ハッシュフィールドの空きビット（上位4ビット）を利用して、1〜8バイトの値を
 //           T1スロット内に直接インライン格納する最適化。T2への書き込みをバイパスする。
-//
-// * CompetitorRocksDB:
-//   - [EN]: Tag to swap the storage backend to RocksDB for academic performance comparison.
-//   - [JP]: バックエンドのストレージ実装を RocksDB に差し替え、VMemKV 本体と
-//           同一の統一インターフェース上で学術的性能比較（ベンチマーク）を行うためのタグ。
 
 #pragma once
 
@@ -57,7 +40,41 @@ struct BloomFilter {};
 struct SimdScan {};
 struct T1InlineValue {};
 struct Prefaulting {};
-struct DisableMadviseRandom {};
+
+// * GetPopulateRead (measured no signal, kept for future re-verification -- not in the ablation
+//   stack; see SimdScan's identical disposition below):
+//   - [EN]: For a T2 value spanning more than one page, batch-faults its full page range with one
+//           madvise(MADV_POPULATE_READ) call before copying it out, instead of letting each page
+//           fault in one at a time as the copy touches it -- collapses many page-fault exceptions
+//           into one syscall without leaving the mmap (an fd-based read instead would race T2's
+//           in-place updates, which are MAP_PRIVATE and never reach the underlying file). Measured
+//           on a 64KB/LTM Get/Hit workload (docs/benchmark/20260809_ltm_64kb_get_hit_profiling.md,
+//           docs/benchmark/20260809_get_populate_read_prototype.md): major-faults dropped 16.6x
+//           (311,864 -> 18,819) but throughput was unchanged (within noise) -- /proc/diskstats
+//           showed the same ~4KB average read size and the same total read count either way, so
+//           the kernel issues the same number of small disk reads regardless of how many
+//           user-space fault exceptions requested them. The bottleneck is disk I/O granularity,
+//           not fault-handling overhead, so this optimization doesn't address it.
+struct GetPopulateRead {};
+
+// * ScanBaseSequential:
+//   - [EN]: T2's "base" region (offsets below the boundary written by the last full T1+T2
+//           reorganize) gets its own separate, read-only mmap -- distinct from the main
+//           MADV_RANDOM mapping Get/Update use -- advised MADV_SEQUENTIAL (plus MAP_POPULATE
+//           under Prefaulting, to eagerly warm it before publishing). In-place updates to base
+//           offsets are redirected out-of-place (see update_impl()) so the region stays immutable
+//           and this second mapping never needs a seqlock. See
+//           docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md for the original io_uring
+//           design this replaces: an isolation sweep there had already shown the win was
+//           per-file readahead policy, not io_uring's async multiplexing -- a second madvise'd
+//           mmap gets the same readahead benefit directly, measured within ~4% of the io_uring
+//           read it replaces when cold, and 6-26% *faster* once warm (no per-read syscall floor).
+//   - [JP]: T2の「base」領域(直近のT1+T2フルreorganizeが書いた境界より下のオフセット)専用に、
+//           Get/Updateが使うMADV_RANDOMの主mmapとは別の、読み取り専用mmapを用意し
+//           MADV_SEQUENTIAL(Prefaulting併用時はMAP_POPULATEで事前ウォームアップ)を与える。
+//           baseオフセットへのin-place更新はout-of-placeへリダイレクトされ(update_impl参照)、
+//           領域が不変であり続けるためこの第二のmmapはseqlockを一切必要としない。
+struct ScanBaseSequential {};
 
 // ─── Unified System Config Template (Tag-List Pattern) ──────────────────────
 template <typename... Opts>
@@ -69,7 +86,8 @@ struct Config {
   static constexpr bool UseSimdScan = has_opt<SimdScan>;
   static constexpr bool UseT1InlineValue = has_opt<T1InlineValue>;
   static constexpr bool UsePrefaulting = has_opt<Prefaulting>;
-  static constexpr bool UseMadviseRandom = !has_opt<DisableMadviseRandom>;
+  static constexpr bool UseScanBaseSequential = has_opt<ScanBaseSequential>;
+  static constexpr bool UseGetPopulateRead = has_opt<GetPopulateRead>;
 
   // Reorganize thresholds for append-region usage.
   // These are intentionally conservative defaults to avoid hitting APPEND_CAP.
@@ -78,7 +96,6 @@ struct Config {
   static constexpr size_t T1ReorganizeSoftThresholdPercent = 50;
   static constexpr size_t T1ReorganizeHardThresholdPercent = 95;
   static constexpr size_t T2StorageFragmentationThresholdPercent = 30;
-  static constexpr size_t T2OrderingFragmentationThresholdPercent = 50;
 
   // T1 append region capacity (ablation knob).
   // Keep this as a power of two to preserve cache-friendly masking behavior.
@@ -106,8 +123,8 @@ struct Config {
 
 namespace detail {
 using T1_AllOff = Config<>;
-using T1_AllOn = Config<BloomFilter, SimdScan>;
-using System_AllOn = Config<BloomFilter, SimdScan, T1InlineValue, Prefaulting>;
+using T1_AllOn = Config<BloomFilter>;
+using System_AllOn = Config<BloomFilter, T1InlineValue, Prefaulting, ScanBaseSequential>;
 }  // namespace detail
 
 struct VMemKVStatistics {

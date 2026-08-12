@@ -6,8 +6,8 @@
 #
 # Not part of the Google Benchmark-registered matrix: reorganize() is a single, possibly very
 # slow blocking call (LTM's cgroup memory constraint can make even a T1-only reorganize run
-# "well past a minute" -- see bench_kv.cpp's make_vmemkv_clone_from_t1only_snapshot() comment),
-# not a repeatable operation GB's timing-loop model expects. Each data point instead runs
+# "well past a minute"), not a repeatable operation GB's timing-loop model expects. Each data
+# point instead runs
 # bench_kv's standalone `--reorg-probe` CLI mode as its own process, wrapped in `timeout` twice:
 #   - bench_kv's own internal 60s cap on the reorganize() call itself (see kReorgTimeoutSeconds
 #     in bench_kv.cpp) -- this is what actually bounds the interesting measurement.

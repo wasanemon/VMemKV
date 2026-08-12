@@ -23,7 +23,7 @@
 #include <lmdb.h>
 #endif
 
-#include "../t1_index/t1_index.hpp"  // For STORE_NOT_FOUND definition
+#include "rival_store_disabled_stub.hpp"
 
 class LMDBStore {
  public:
@@ -411,71 +411,6 @@ class LMDBStore {
   MDB_dbi dbi_ = 0;
   std::string path_;
 #else
-  // Dummy stub implementation when LMDB is disabled.
-  explicit LMDBStore(const std::string &unused_path) {
-    (void)unused_path;
-    throw std::runtime_error("LMDB not enabled in this build");
-  }
-
-  ~LMDBStore() = default;
-
-  LMDBStore(const LMDBStore &) = delete;
-  auto operator=(const LMDBStore &) -> LMDBStore & = delete;
-
-  struct CloneFromMasterTag {};
-  template <typename KeyFn, typename ValueFn>
-  LMDBStore(CloneFromMasterTag /*tag*/,
-            const std::string &master_path,
-            std::size_t key_count,
-            KeyFn &&make_key,
-            ValueFn &&make_value) {
-    (void)master_path;
-    (void)key_count;
-    (void)make_key;
-    (void)make_value;
-    throw std::runtime_error("LMDB not enabled in this build");
-  }
-
-  void reorganize() {}
-
-  template <typename Callback>
-  auto get_impl(std::span<const std::byte> key, Callback callback) const -> bool {
-    (void)key;
-    (void)callback;
-    return false;
-  }
-  // NOLINTNEXTLINE(readability-convert-member-functions-to-static,bugprone-easily-swappable-parameters)
-  auto insert_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-    (void)key;
-    (void)value;
-    return false;
-  }
-  // NOLINTNEXTLINE(readability-convert-member-functions-to-static,bugprone-easily-swappable-parameters)
-  auto update_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-    (void)key;
-    (void)value;
-    return false;
-  }
-  // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-  auto remove_impl(std::span<const std::byte> key) -> bool {
-    (void)key;
-    return false;
-  }
-  template <typename KeyFn, typename ValueFn>
-  void bulk_load_impl(std::size_t key_count, KeyFn &&make_key, ValueFn &&make_value) {
-    (void)key_count;
-    (void)make_key;
-    (void)make_value;
-    throw std::runtime_error("LMDB not enabled in this build");
-  }
-
-  template <typename Cb>
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  auto scan_impl(std::span<const std::byte> low, std::span<const std::byte> high, Cb callback) const -> size_t {
-    (void)low;
-    (void)high;
-    (void)callback;
-    return 0;
-  }
+  VMEMKV_RIVAL_DISABLED_STUB(LMDBStore, "LMDB")
 #endif
 };
