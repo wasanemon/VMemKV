@@ -699,6 +699,33 @@ class VMemKVImpl {
     Wal::PendingRecord *pending = nullptr;
   };
 
+  // Bounded spin-then-sleep backoff for get_impl()/try_in_place_update()'s "T2 hasn't caught up
+  // to what T1 already reflects yet" retry branch: a bare `continue` (pure busy-spin, no yield)
+  // converges quickly on an under-subscribed machine but is not safe to assume converges *at
+  // all* once real thread contention is involved -- reproduced on CI (4 vCPUs, plus leftover
+  // RocksDB threadpool threads from earlier test cases still competing for them) as a genuine,
+  // sustained starvation of the waiting thread by whichever thread is actually advancing T2's
+  // generation, even though the same test passed extensively under much lighter local
+  // contention. yield() alone is only a scheduler hint (some schedulers may treat it as a
+  // no-op); sleep_for() forces an actual, real-time descheduling, which is what actually
+  // guarantees the other thread gets to run.
+  struct SpinBackoff {
+    int spin_count = 0;
+    static constexpr int kYieldSpinsBeforeSleep = 32;
+    static constexpr auto kBackoffSleep = std::chrono::milliseconds(1);
+
+    void wait() {
+      ++spin_count;
+      if (spin_count <= kYieldSpinsBeforeSleep) {
+        std::this_thread::yield();
+      } else {
+        std::this_thread::sleep_for(kBackoffSleep);
+      }
+    }
+
+    void reset() { spin_count = 0; }
+  };
+
   // update_impl()'s in-place-update decision for a non-inline entry: retries under the same
   // generation-pairing dance as get_impl() -- see get_impl()'s comment for the full "why" -- until
   // it can either apply the update in place or conclusively decide it must fall through to
@@ -709,6 +736,7 @@ class VMemKVImpl {
   auto try_in_place_update(std::span<const std::byte> full_key,
                            std::span<const std::byte> value) -> InPlaceUpdateResult {
     auto res = t1_.get_with_hash(full_key);
+    SpinBackoff backoff;
     while (true) {
       if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
         return {InPlaceOutcome::Aborted};
@@ -719,8 +747,10 @@ class VMemKVImpl {
 
       T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
       if (mem->generation < res.generation) {
-        continue;  // T2 hasn't caught up to what T1 already reflects -- retry (no T1 re-read).
+        backoff.wait();  // T2 hasn't caught up to what T1 already reflects -- retry (no T1 re-read).
+        continue;
       }
+      backoff.reset();
       if (mem->generation > res.generation) {
         res = t1_.get_with_hash(full_key);  // Overshot -- res is stale, take a fresh T1 read.
         continue;
@@ -1015,6 +1045,7 @@ class VMemKVImpl {
   template <typename Callback>
   auto get_impl(std::span<const std::byte> full_key, Callback callback) const -> bool {
     auto res = t1_.get_with_hash(full_key);
+    SpinBackoff backoff;
     while (true) {
       if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
         return false;
@@ -1032,8 +1063,10 @@ class VMemKVImpl {
 
       T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
       if (mem->generation < res.generation) {
-        continue;  // T2 hasn't caught up to what T1 already reflects -- retry (no T1 re-read).
+        backoff.wait();  // T2 hasn't caught up to what T1 already reflects -- retry (no T1 re-read).
+        continue;
       }
+      backoff.reset();
       if (mem->generation > res.generation) {
         res = t1_.get_with_hash(full_key);  // Overshot -- res is stale, take a fresh T1 read.
         continue;
