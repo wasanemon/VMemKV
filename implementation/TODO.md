@@ -16,7 +16,7 @@ This document outlines the roadmap to implement the full, robust architecture of
 
 Source: `benchmark_results/pages/2026081000_charts.html` Winners Matrix (threads:32, fixed vs. fastest rival). Analysis done 2026-08-11; no AWS work started yet on any of these.
 
-* **Status**: 🔴 **Not Started** (analysis only so far)
+* **Status**: 🟡 **In Progress** -- 4.2 improved (see below), 4.1/4.3/4.4/4.5 still analysis only.
 
 ### 4.1 Get (Hit) 64KB LTM -- 0.38x-0.51x vs RocksDB / RocksDB-BlobDB
 * Likely cause: RocksDB-BlobDB stores large values in a dedicated blob file and reaches them via a single direct `pread` at a known offset -- effectively the same idea `base_mmap` is going for, but purpose-built. VMemKV still pays ~16 page faults per 64KB record via mmap even with the `ScanBaseSequential`/base_mmap fast path.
@@ -26,10 +26,11 @@ Source: `benchmark_results/pages/2026081000_charts.html` Winners Matrix (threads
   - Dedicated large-value file/mapping designed like BlobDB's blob files.
 
 ### 4.2 Scan (Zipf/Uniform) 8B In-Memory -- 0.63x-0.64x vs LMDB
-* Likely cause: no swap involved here, so this is pure CPU/algorithmic overhead, not I/O. LMDB's B+tree leaf scan is very cache-efficient; VMemKV likely pays per-record overhead (seqlock retry, function-call overhead) that dominates when records are only 8B.
-* Candidate countermeasures:
-  - Re-verify the `SimdScan` config tag (currently kept but measured "no signal" -- see `config.hpp`) specifically for tiny fixed-size records.
-  - A batched small-record scan fast path that skips the generic seqlock retry loop when scanning the immutable base region.
+* **Status**: 🟢 **Improved, not fully closed** (commit 7991345 on main, 2026-08-12)
+* Root cause confirmed: SimdScan is a red herring (only accelerates T1's small append region, never the sorted region range scans dominate). The real asymmetry vs Get (which already beats LMDB here) is that Scan must reconstruct and *deliver* the key per record, while Get doesn't (caller already has it) -- plus `T1Index::scan()` unconditionally buffered every sorted-region match into a `candidates` vector for a merge/dedup pass even when there was nothing to merge (no concurrent append-region writes in range).
+* Fix applied: (1) bit_width-based key trim instead of a byte loop, one key copy instead of two (`vmemkv_impl.hpp`); (2) `T1Index::scan()` streams directly from the sorted region when append regions can't overlap the query range, skipping the candidates buffer entirely, via a new shared `walk_sorted_region()` helper (no code duplication vs the existing slow path).
+* Measured (local, alternating A/B, threads:20): Zipf +25-29%, Uniform +4-11%. Local ratio vs LMDB: Zipf 0.65x -> 0.81x. Gap not fully closed -- Uniform's smaller gain suggests memory-latency (cache-miss-bound random access), not CPU overhead, dominates there, which this fix doesn't address.
+* Not yet verified on AWS/real concurrency scale (local dev box, threads:20 not 32).
 
 ### 4.3 Scan (Zipf) 64KB LTM -- 0.49x vs LMDB
 * Likely cause: LMDB's B+tree keeps range-scan order close to physical order (including overflow pages), while VMemKV's base_mmap `MADV_SEQUENTIAL` readahead window may not be sized well for 64KB records under real I/O pressure.
@@ -44,7 +45,7 @@ Source: `benchmark_results/pages/2026081000_charts.html` Winners Matrix (threads
 * Scan (Zipf) 1KB LTM -- 0.88x vs RocksDB (light lose)
 * YCSB-E 1KB LTM -- 0.91x vs RocksDB (light lose)
 
-**Suggested order**: start with 4.3 (Scan 64KB LTM vs LMDB) since it reuses the existing `base_mmap` infrastructure and may also fix 4.4 for free; 4.1 next (structurally harder -- BlobDB's design is purpose-built for this).
+**Suggested order**: 4.3 (Scan 64KB LTM vs LMDB) next -- note the 4.2 fix's `walk_sorted_region()` fast path is in the *shared* `T1Index::scan()` code path, so it already applies to every value size, not just 8B. Worth re-measuring 4.3/4.4's current gap before investing in I/O-specific tuning (madvise/readahead), since some of it may already be closed for free. Then 4.1 (structurally harder -- BlobDB's design is purpose-built for this).
 
 ---
 
