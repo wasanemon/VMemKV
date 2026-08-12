@@ -60,7 +60,7 @@ class YCSBTimelineCollector {
   // Separate from t1_reorg_counts: counts reorgs the benchmark itself forced via
   // store.reorganize() (see the t=15s hook below), as opposed to ones VMemKV triggered
   // organically. Kept apart so a future report pass can render these as a differently-colored
-  // vertical line (see TODO.md).
+  // vertical line.
   std::array<std::atomic<uint64_t>, kDurationSeconds> t1_forced_reorg_counts{};
   std::atomic<uint64_t> last_recorded_t1{0};
   std::atomic<uint64_t> last_recorded_t2{0};
@@ -1314,7 +1314,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
               // those scenarios. Forcing one deterministically here guarantees at least one
               // reorg data point per run. Recorded into a separate counter (not
               // t1_reorg_counts) so it can later be told apart from organically-triggered
-              // reorgs -- see TODO.md for the deferred report-side (chart coloring) follow-up.
+              // reorgs; the report-side (chart coloring) half of this is not yet implemented.
               if (!forced_reorg_done && elapsed >= 15) {
                 store.reorganize();  // T1-only, zero I/O
                 uint64_t post_t1 = store.get_statistics().t1_reorg_count;

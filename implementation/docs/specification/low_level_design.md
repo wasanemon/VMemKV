@@ -99,10 +99,10 @@ Tier 1 の `payload_bits` が Tier 2 offset を表す場合(2.1 節)、T2 への
 
 **Base/Tail Split（`ScanBaseSequential` アブレーション時のみ）**
 
-`ScanBaseSequential`(7.9節)が有効な場合、`T2Store` は `base_boundary` を追加で保持する: `[0, base_boundary)` の範囲が、専用の第二の read-only mmap(`base_mmap`)経由で seqlock なしに安全に読める、という不変条件を表す境界値である。`base_boundary` は full reorganize(4.3節)完了時にその時点の `bytes_used` へスナップショットされるのに加えて、**5.2bis 節の T1-only checkpoint(T2 再構築を伴わない安いパス)によっても、新たに耐久化された差分バイト数ぶんインクリメンタルに伸長される** -- `base_mmap` 自体は毎回張り直さず(`capacity` 分あらかじめ確保済み)、有効とみなす範囲(`base_boundary` の値)だけが伸びる。これにより、insert-only ワークロード(4.4 節、空間増幅率が常に低くフル reorganize が自然発火しない)でも、`base_mmap` のカバレッジが最初の1回で凍結されず、コーパスの成長に追従できる。
+`ScanBaseSequential`(7.9節)が有効な場合、`T2Store` は `base_boundary` を追加で保持する: `[0, base_boundary)` の範囲が、baseリージョン専用の読み取り経路(7.9節 -- 用途・レコードサイズ別に3つある)経由で seqlock なしに安全に読める、という不変条件を表す境界値である。`base_boundary` は full reorganize(4.3節)完了時にその時点の `bytes_used` へスナップショットされるのに加えて、**5.2bis 節の T1-only checkpoint(T2 再構築を伴わない安いパス)によっても、新たに耐久化された差分バイト数ぶんインクリメンタルに伸長される** -- これらの mmap 自体は毎回張り直さず(`capacity` 分あらかじめ確保済み)、有効とみなす範囲(`base_boundary` の値)だけが伸びる。これにより、insert-only ワークロード(4.4 節、空間増幅率が常に低くフル reorganize が自然発火しない)でも、カバレッジが最初の1回で凍結されず、コーパスの成長に追従できる。
 
 - `offset < base_boundary` の record を **base** 領域、`offset >= base_boundary` の record を **tail** 領域と呼ぶ。
-- base 領域は、一度 `base_boundary` に含まれた後は二度と in-place では書き換えられない(3.3節)。そのため base 領域は、mmap の `MADV_RANDOM`(7.7節)を経由しない `base_mmap`(`MADV_SEQUENTIAL`)で読んでも安全であり、seqlock も不要になる。
+- base 領域は、一度 `base_boundary` に含まれた後は二度と in-place では書き換えられない(3.3節)。そのため base 領域は、mmap の `MADV_RANDOM`(7.7節)を経由しない専用の読み取り経路で読んでも安全であり、seqlock も不要になる(経路の選び方は7.9節)。
 - tail 領域は通常通り in-place 更新の対象になり得るため、主 mmap 経由(COW反映済みの最新ビュー、seqlock保護)でしか安全に読めない。
 - `base_boundary` とは別に、`write_gate_boundary` という内部フィールドも保持する: in-place 更新を禁止する境界(3.3節)であり、常に `base_boundary` と同じか、それより先に(=より早いタイミングで)伸長される。両者を分けるのは、「新規の in-place 更新を締め出す」タイミングと「読み取りを許可する」タイミングが、T1-only checkpoint の差分 flush を挟んで異なる必要があるため -- 詳細と正しい順序は 5.2bis 節。
 - `base_boundary`/`write_gate_boundary` はこのアブレーションが無効なら常に `0`(base 領域が存在しない=全域が tail)として扱われ、既存の read/write パスに一切影響しない。
@@ -606,13 +606,17 @@ T1インデックスに対して、仮想メモリマップ時のReadahead（カ
 
 `madvise(MADV_POPULATE_READ)` によるページキャッシュ温めは所有権のあるコピーを伴わないため、cgroup の継続的な回収圧力下では読み取り前に再度追い出される(prefetch-then-evict)。Scan の高速化は 7.9 節の base 専用 mmap(所有権付きの実データ読み取り)によって行う。詳細は `implementation/docs/benchmark/20260806_scan_madvise_tradeoff.md` を参照。
 
-### 7.9 Scan の base 領域専用 mmap 実データ読み取り(`ScanBaseSequential`)
+### 7.9 Scan/Get の base 領域専用読み取り経路(`ScanBaseSequential`)
 
-T2 の「base」領域(2.2節)は書き込み後二度と変更されないため、専用の**第二の read-only mmap**(主 mmap とは別 VMA、`MADV_SEQUENTIAL`)から直接読み取ることができ、seqlockによる再試行は不要になる(3.3節の in-place 更新の base 領域への強制迂回がこの不変性を保証する)。madvise は VMA 単位でしか設定できない(inode単位ではない)ため、Get/Update が使う主 mmap の `MADV_RANDOM`(7.7節)に手を触れずに、Scan だけ別ポリシーを与えられる。
+T2 の「base」領域(2.2節)は書き込み後二度と変更されないため、主 mmap の `MADV_RANDOM`(7.7節)を経由しない専用の読み取り経路から直接読み取ることができ、seqlockによる再試行は不要になる(3.3節の in-place 更新の base 領域への強制迂回がこの不変性を保証する)。
 
 - **前提となる T2 の変更**: base/tail split(2.2節)と、in-place 更新の base 領域への強制迂回(3.3節)。
-- **Prefaulting との連携**: `Prefaulting`(7.4節、値のinsert時プリフォルト最適化)が同時に有効な場合、この第二の mmap は `MAP_POPULATE` で作成時に即座にウォームアップされる(reorganize直後の初回Scanがコールドフォルトの嵐で不安定になるのを防ぐ)。
-- **測定方法・結果**: `implementation/docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md` を参照。
+- **3つの読み取り経路を、レコードごとにそのレコード自身の長さ(2.1節の Embedded Block Count)で選ぶ**。madvise は VMA(マッピング全体)単位の属性であり、個々の読み取り単位のものではないため、小さいレコードと大きいレコードの両方にうまく対応するには複数の経路が要る。どの経路を選んでも指す先は同一のバイト列なので、選択を誤ってもreadahead方針のミスマッチにしかならず、データが誤ることはない:
+  - `base_mmap_scan_seq`(read-only mmap、`MADV_SEQUENTIAL`): 埋め込みサイズヒントが1ページ以下のレコード用。広い先読み窓で多数の小さいレコードのフォルトを少数の major fault にまとめられる。`scan_impl()`・`get_impl()`双方の小レコード読み取りで使う。
+  - `base_mmap_scan`(read-only mmap、カーネルのデフォルト(適応的)readahead方針): それより大きいレコード用。`scan_impl()`の大レコード読み取りと、`get_impl()`の大レコード読み取りのうちページキャッシュ常駐が確認できた場合(`mincore()`)に使う。無条件に`MADV_SEQUENTIAL`を付けると、大きいレコードのコーパスをZipfのような偏ったアクセスで読む場合に読み取りバイト数が余分に増えることが測定で判明したため、こちらは意図的に控えめな方針にしてある。
+  - `read_fd`(`dup()`したファイルディスクリプタ経由の`pread()`): `get_impl()`の大レコード読み取りで、上記のページキャッシュ常駐確認が取れなかった場合に、そのレコード1つぶんにサイズを絞って読む。
+- **Prefaulting との連携**: `Prefaulting`(7.4節、値のinsert時プリフォルト最適化)が同時に有効な場合、`base_mmap_scan`・`base_mmap_scan_seq`の両方が `MAP_POPULATE` 相当で作成時に即座にウォームアップされる(reorganize直後の初回アクセスがコールドフォルトの嵐で不安定になるのを防ぐ)。
+- **測定方法・結果**: `implementation/docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md`(base/tail split と実データ読み取りの元設計)、`implementation/docs/benchmark/20260810_t2_no_madvise_random.md`を参照。
 - **ベンチマークでの測定方法**: `Scan` は他の Op と共通のマスターコーパスを使用する。`ScanBaseSequential` の効果は `AllPossibleTypes`(累積アブレーション variant 列)における variant 間比較として測定する。
 
 ## 8. Parameters

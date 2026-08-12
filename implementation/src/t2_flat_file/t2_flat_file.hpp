@@ -93,34 +93,52 @@ struct T2Memory {
   mutable std::atomic<uint64_t> write_gate_boundary{0};
 
   // A second, read-only mmap covering [0, capacity) of this exact generation's file -- distinct
-  // from `base`'s MAP_PRIVATE|MADV_RANDOM mapping used everywhere else, so ScanBaseSequential can
-  // advise it MADV_SEQUENTIAL (and MAP_POPULATE-equivalent warm the currently-valid prefix under
-  // Prefaulting) without disturbing Get/Update's random-access policy on the same underlying
-  // file. Mapped full-capacity (not just bytes_used-at-creation-time) specifically so that
+  // from `base`'s MAP_PRIVATE|MADV_RANDOM mapping used everywhere else, left at the kernel's
+  // default readahead policy (no madvise call). Read by scan_impl() (and get_impl()'s
+  // large-record path, via try_read_resident_base_record()) for records whose embedded size
+  // hint is larger than one page -- see `base_mmap_scan_seq` below for the small-record
+  // counterpart and ScanBaseSequential's doc comment in config.hpp for why there are two.
+  // Mapped full-capacity (not just bytes_used-at-creation-time) specifically so that
   // base_boundary can grow via a T1-only checkpoint's incremental promotion without ever needing
-  // to remap: since this mapping is PROT_READ-only, it never triggers copy-on-write, so it always
-  // transparently reflects whatever the backing file's current page-cache content is, including
-  // bytes written by a later pwrite() through a different fd -- reads are only ever gated by the
-  // `offset < base_boundary` check (scan_impl()), never by whether this specific mapping has
-  // "seen" a write, so nothing beyond that gate needs to change when base_boundary grows. Its
-  // lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based retirement scheme
-  // that already protects `base`/`capacity`. nullptr unless explicitly set by the caller
-  // (mmap_t2_memory() in vmemkv_impl.hpp, only under that ablation, and only best-effort -- a
-  // failure to create it just means the reader falls back to the always-correct `base` + seqlock
-  // path) -- the plain T2FlatFile-owned initial mapping never sets this, since a fresh store has
-  // base_boundary == 0 and thus nothing to map yet. `mutable` only so the destructor (a
-  // const-safe operation) can unmap it through the same `const T2Memory *` pattern bytes_used
-  // already uses; never mutated after construction otherwise. Read by get_impl() (per-record
-  // access -- wants MADV_SEQUENTIAL's multi-page readahead batching, see
-  // docs/benchmark/20260810_t2_no_madvise_random.md).
-  mutable std::byte *base_mmap = nullptr;
-
-  // A third mapping of the identical [0, capacity) region as `base_mmap` above -- same
-  // immutability/lifetime/retirement story, but left at the kernel's default readahead policy
-  // (no madvise call) instead of MADV_SEQUENTIAL, and read only by scan_impl(). See
-  // ScanBaseSequential's doc comment in config.hpp for why Get and Scan need different policies on
-  // the same bytes (madvise is per-VMA, hence the second mapping rather than a second policy).
+  // to remap: since this mapping is PROT_READ-only, it never triggers copy-on-write, so it
+  // always transparently reflects whatever the backing file's current page-cache content is,
+  // including bytes written by a later pwrite() through a different fd -- reads are only ever
+  // gated by the `offset < base_boundary` check (scan_impl()), never by whether this specific
+  // mapping has "seen" a write, so nothing beyond that gate needs to change when base_boundary
+  // grows. Its lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based
+  // retirement scheme that already protects `base`/`capacity`. nullptr unless explicitly set by
+  // the caller (mmap_t2_memory() in vmemkv_impl.hpp, only under that ablation, and only
+  // best-effort -- a failure to create it just means the reader falls back to the
+  // always-correct `base` + seqlock path) -- the plain T2FlatFile-owned initial mapping never
+  // sets this, since a fresh store has base_boundary == 0 and thus nothing to map yet.
+  // `mutable` only so the destructor (a const-safe operation) can unmap it through the same
+  // `const T2Memory *` pattern bytes_used already uses; never mutated after construction
+  // otherwise.
   mutable std::byte *base_mmap_scan = nullptr;
+
+  // A third mapping of the identical [0, capacity) region as `base_mmap_scan` above, advised
+  // MADV_SEQUENTIAL, for records whose embedded size hint is one page or smaller. madvise is a
+  // property of the whole mapping, not of an individual read, so serving both small- and
+  // large-record reads well requires two separately-advised mappings of the same bytes rather
+  // than one shared policy -- which record actually gets read through which mapping is decided
+  // per record (try_scan_base_record()/try_get_base_record() in vmemkv_impl.hpp), not once per
+  // generation, so a corpus with genuinely mixed record sizes is still handled correctly (just a
+  // readahead-policy choice, never a correctness one -- both mappings cover identical bytes).
+  // Same lifetime/retirement/best-effort/nullptr-by-default story as base_mmap_scan.
+  mutable std::byte *base_mmap_scan_seq = nullptr;
+
+  // A `dup()`'d file descriptor onto the same base-region file `base_mmap_scan`/
+  // `base_mmap_scan_seq` above map, used by get_impl() for a bounded `pread()` of one
+  // larger-than-one-page record instead of a page-fault-driven mmap read -- see
+  // ScanBaseSequential's doc comment in config.hpp for why Get's large-record path and Scan want
+  // different read mechanisms on the same immutable bytes. `dup()`'d (not the original fd, which
+  // mmap_t2_memory() always closes right after mapping) so this handle's lifetime is self-
+  // contained and tied to this T2Memory, matching the two mappings' own retirement story. -1
+  // unless explicitly set by the caller (mmap_t2_memory(), only under that ablation, and only
+  // best-effort -- a dup() failure just means get_impl() falls back to the always-correct
+  // `base` + seqlock path) -- the plain T2FlatFile-owned initial mapping never sets this, for the
+  // same reason it never sets base_mmap_scan. `mutable` for the same reason as base_mmap_scan.
+  mutable int read_fd = -1;
 
   // Auto-assigns a fresh, process-global-unique generation. Used where no caller needs to know
   // the value in advance (e.g. tests exercising the ABA-detection field directly).
@@ -144,13 +162,16 @@ struct T2Memory {
     if ((base != nullptr) && capacity > 0) {
       ::munmap(base, static_cast<size_t>(capacity));
     }
-    if (base_mmap != nullptr) {
-      // Mapped to `capacity` (see base_mmap's own comment above), not base_boundary -- the
-      // mapping's length never changes after creation even though base_boundary grows in place.
-      ::munmap(base_mmap, static_cast<size_t>(capacity));
-    }
     if (base_mmap_scan != nullptr) {
+      // Mapped to `capacity` (see base_mmap_scan's own comment above), not base_boundary -- the
+      // mapping's length never changes after creation even though base_boundary grows in place.
       ::munmap(base_mmap_scan, static_cast<size_t>(capacity));
+    }
+    if (base_mmap_scan_seq != nullptr) {
+      ::munmap(base_mmap_scan_seq, static_cast<size_t>(capacity));
+    }
+    if (read_fd >= 0) {
+      ::close(read_fd);
     }
   }
 

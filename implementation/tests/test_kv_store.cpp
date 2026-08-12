@@ -421,13 +421,12 @@ TEST_CASE("VMemKV: manual reorganize forces physical storage garbage collection"
   }
 }
 
-// Regression test for the no-sort compaction redesign (implementation/TODO.md's "Resolved
-// (analytically)" entry): a full T1+T2 reorganize used to lay T2 out in *key* order (a byproduct
-// of offset_mapper being invoked in T1's key-merge order); it now relocates entries in *old
-// physical offset* order instead (see offset_mapper_fn's batch implementation in
-// vmemkv_impl.hpp), producing a T2 file that's compacted (dead space dropped) but not key-sorted.
-// This directly proves both halves of that claim: the new physical offsets preserve the *old*
-// offsets' relative order, and that order does not coincide with key order.
+// Regression test for the no-sort compaction redesign: a full T1+T2 reorganize used to lay T2
+// out in *key* order (a byproduct of offset_mapper being invoked in T1's key-merge order); it
+// now relocates entries in *old physical offset* order instead (see offset_mapper_fn's batch
+// implementation in vmemkv_impl.hpp), producing a T2 file that's compacted (dead space dropped)
+// but not key-sorted. This directly proves both halves of that claim: the new physical offsets
+// preserve the *old* offsets' relative order, and that order does not coincide with key order.
 TEST_CASE("VMemKV: reorganize compacts T2 in old-physical-offset order, not key order") {
   auto store = StoreFactory<vmemkv::variants::VMemKV_Baseline>::make();
   using ImplType = std::remove_reference_t<decltype(store->impl())>;
@@ -502,7 +501,7 @@ TEST_CASE("VMemKV: reorganize compacts T2 in old-physical-offset order, not key 
 // declaration for why an in-place write there would never be visible through the base region's
 // own separate, seqlock-free mmap (T2's main mapping is MAP_PRIVATE; only this process's own
 // writes exist anywhere). If that redirect were missing or wrong, this test would observe Scan
-// (base_mmap-served) and Get (main-mmap-served) silently disagreeing on "key_a"'s value.
+// (base_mmap_scan-served) and Get (main-mmap-served) silently disagreeing on "key_a"'s value.
 TEST_CASE("VMemKV ScanBaseSequential: update after reorganize redirects out-of-place, Scan sees fresh value") {
   auto store = StoreFactory<vmemkv::variants::VMemKV_ScanBaseSequential>::make();
 
@@ -528,7 +527,7 @@ TEST_CASE("VMemKV ScanBaseSequential: update after reorganize redirects out-of-p
   REQUIRE(seen.count("key_b") == 1);
   CHECK(seen.at("key_b") == value_b);
 
-  // Get (main mmap path) must agree with Scan (base_mmap path) on the same key.
+  // Get (main mmap path) must agree with Scan (base_mmap_scan path) on the same key.
   const auto get_result = test_util::get_bytes_sync(store, "key_a");
   REQUIRE(get_result.has_value());
   CHECK(std::string(reinterpret_cast<const char *>(get_result->data()), get_result->size()) == value_a_updated);
@@ -548,11 +547,11 @@ TEST_CASE("VMemKV ScanBaseSequential: update after reorganize redirects out-of-p
 }
 
 // Stress/regression test for ScanBaseSequential: update() (base-region redirect decision) races
-// scan() (base_mmap read path) races repeated defragment() (moves base_boundary, swaps
-// T2Memory generations, remaps base_mmap) -- the three-way race the base/tail split's correctness
-// depends on. Run under ThreadSanitizer for direct race detection; also self-checks independent of
-// TSan, since every value written here is `kStressValueBytes` copies of one repeated character, so
-// a torn read shows up directly as a non-uniform byte value.
+// scan() (base_mmap_scan read path) races repeated defragment() (moves base_boundary, swaps
+// T2Memory generations, remaps base_mmap_scan) -- the three-way race the base/tail split's
+// correctness depends on. Run under ThreadSanitizer for direct race detection; also self-checks
+// independent of TSan, since every value written here is `kStressValueBytes` copies of one
+// repeated character, so a torn read shows up directly as a non-uniform byte value.
 //
 // kReorgCycles is capped well below what a "why not more?" instinct would suggest: this store's
 // underlying reorganize_internal() has a separate, pre-existing, already-documented race (see its
@@ -627,11 +626,11 @@ TEST_CASE("VMemKV ScanBaseSequential: concurrent update+scan survive repeated re
 
 // Regression test for incremental base_boundary promotion: a cheap T1-only checkpoint() (the
 // WAL-size-triggered path, distinct from defragment()'s full T2 rebuild) now also extends
-// base_boundary/base_mmap coverage in place -- see reorganize_internal()'s T1-only-checkpoint
-// branch and T2Memory::write_gate_boundary's comment. Without this, a long-running insert-only
-// process (space_amp stays ~1.0 forever with no deletes, so defragment() never fires
-// organically) would have base_mmap's coverage frozen forever at whatever the first forced
-// checkpoint() established, even as the live corpus kept growing past it.
+// base_boundary/base_mmap_scan/read_fd coverage in place -- see reorganize_internal()'s
+// T1-only-checkpoint branch and T2Memory::write_gate_boundary's comment. Without this, a
+// long-running insert-only process (space_amp stays ~1.0 forever with no deletes, so
+// defragment() never fires organically) would have this coverage frozen forever at whatever the
+// first forced checkpoint() established, even as the live corpus kept growing past it.
 TEST_CASE("VMemKV ScanBaseSequential: cheap checkpoint() incrementally promotes base_boundary") {
   using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
@@ -646,7 +645,9 @@ TEST_CASE("VMemKV ScanBaseSequential: cheap checkpoint() incrementally promotes 
 
   const uint64_t boundary_after_first = store->impl().t2().get_memory()->base_boundary.load();
   CHECK(boundary_after_first > 0);
-  CHECK(store->impl().t2().get_memory()->base_mmap != nullptr);
+  CHECK(store->impl().t2().get_memory()->base_mmap_scan != nullptr);
+  CHECK(store->impl().t2().get_memory()->base_mmap_scan_seq != nullptr);
+  CHECK(store->impl().t2().get_memory()->read_fd >= 0);
 
   // Insert more without ever deleting anything: space_amp stays ~1.0, so this insert-only
   // workload never crosses T2_Rebuild_Trigger -- checkpoint() below must take the cheap path.
@@ -658,8 +659,8 @@ TEST_CASE("VMemKV ScanBaseSequential: cheap checkpoint() incrementally promotes 
   const uint64_t boundary_after_second = store->impl().t2().get_memory()->base_boundary.load();
   CHECK(boundary_after_second > boundary_after_first);
 
-  // Confirm the newly-promoted range is actually reachable and correct via the base_mmap path
-  // (Scan), not just the always-correct fallback (Get).
+  // Confirm the newly-promoted range is actually reachable and correct via the base_mmap_scan
+  // path (Scan), not just the always-correct fallback (Get).
   std::map<std::string, std::string> seen;
   std::ignore =
       store->scan(padded_key(0), "key19~", [&](std::span<const std::byte> key, std::span<const std::byte> val) {
@@ -683,11 +684,12 @@ TEST_CASE("VMemKV ScanBaseSequential: cheap checkpoint() incrementally promotes 
 // write_gate_boundary bump -> epoch drain -> publish sequence), not something that needs
 // sustained throughput to expose -- a handful of concurrent attempts per cycle, 60 times over,
 // is enough to give it a fair chance. Free-spinning threads were tried first and run into a
-// separate, already-known, already-documented bug instead (see TODO.md, "get_impl()/scan_impl()
-// expose torn, mid-write T2 records to the caller's callback"): at millions of scan calls, that
-// unrelated race in the ordinary seqlock-protected read path reproduces on its own, with zero
-// checkpoint()/reorganize() activity at all, and would make this test flaky for a reason that has
-// nothing to do with what it's actually trying to catch. Run under ThreadSanitizer for direct
+// separate, already-fixed bug instead (get_impl()/scan_impl() exposing torn, mid-write T2
+// records to the caller's callback -- see the "Torn-read fix" comments in get_impl()/scan_impl()
+// in vmemkv_impl.hpp): at millions of scan calls, that unrelated race in the ordinary
+// seqlock-protected read path reproduces on its own, with zero checkpoint()/reorganize() activity
+// at all, and would make this test flaky for a reason that has nothing to do with what it's
+// actually trying to catch. Run under ThreadSanitizer for direct
 // race detection where available; also self-checks independent of TSan via the same
 // uniform-byte-value technique as the "...repeated reorganize" test above.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -760,24 +762,26 @@ TEST_CASE(
 
 // Edge case: checkpoint() called on a store that has never had a single insert (append_size()==0,
 // bytes_used()==0 at rebuild time). Per checkpoint()'s no_t2_checkpoint_yet fallback this still
-// forces a full rebuild -- mmap_t2_memory() must establish a real (non-null) base_mmap even
-// though bytes_used==0 at that moment, or the incremental-promotion mechanism above would never
-// have anything to extend for a store built this way (see mmap_t2_memory()'s comment for why the
-// earlier `if (bytes_used > 0)` guard was removed).
-TEST_CASE("VMemKV ScanBaseSequential: checkpoint() on an empty store still establishes base_mmap") {
+// forces a full rebuild -- mmap_t2_memory() must establish a real (non-null) base_mmap_scan and
+// a real (>=0) read_fd even though bytes_used==0 at that moment, or the incremental-promotion
+// mechanism above would never have anything to extend for a store built this way (see
+// mmap_t2_memory()'s comment for why the earlier `if (bytes_used > 0)` guard was removed).
+TEST_CASE("VMemKV ScanBaseSequential: checkpoint() on an empty store still establishes base_mmap_scan/read_fd") {
   using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
   store->checkpoint();  // Forced full rebuild via no_t2_checkpoint_yet, with zero live entries.
-  CHECK(store->impl().t2().get_memory()->base_mmap != nullptr);
+  CHECK(store->impl().t2().get_memory()->base_mmap_scan != nullptr);
+  CHECK(store->impl().t2().get_memory()->base_mmap_scan_seq != nullptr);
+  CHECK(store->impl().t2().get_memory()->read_fd >= 0);
   CHECK(store->impl().t2().get_memory()->base_boundary.load() == 0);
 
   const std::string value(kValue200Bytes, 'a');
   for (int i = 0; i < 10; ++i) {
     REQUIRE(store->insert("key" + std::to_string(i), value));
   }
-  store->checkpoint();  // Cheap path now: base_mmap already existed, just needs promoting.
+  store->checkpoint();  // Cheap path now: base_mmap_scan/read_fd already existed, just needs promoting.
 
   CHECK(store->impl().t2().get_memory()->base_boundary.load() > 0);
 
@@ -1190,8 +1194,7 @@ TEST_CASE("VMemKV: reorganize's T2 record read survives a concurrent in-place up
   CHECK(final_value->size() == value.size());
 }
 
-// Regression tests for the formerly-open "torn read via user callback" bug (TODO.md,
-// "get_impl()/scan_impl() expose torn, mid-write T2 records to the caller's callback"):
+// Regression tests for the formerly-open "torn read via user callback" bug:
 // get_impl()/scan_impl() used to invoke the caller-supplied callback directly from inside
 // read_t2_record_seqlock()'s copy_func, handing it a std::span into T2Memory::base -- live,
 // concurrently update_value_at()-writable memory -- *before* the seqlock's version re-check had
@@ -1543,9 +1546,9 @@ using VMemKV_TinyWalCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyWal
 }  // namespace
 
 // Regression test for the T1-only-checkpoint path's KNOWN OPEN ISSUE mitigation
-// (reorganize_internal()'s new T1-only-with-checkpoint branch, see implementation/TODO.md-adjacent
-// design notes): that branch's offset_mapper is a pure passthrough (same as the plain T1-only
-// branch), so it never validates generations the way the T2-rebuild branch's offset_mapper does.
+// (reorganize_internal()'s T1-only-with-checkpoint branch): that branch's offset_mapper is a
+// pure passthrough (same as the plain T1-only branch), so it never validates generations the way
+// the T2-rebuild branch's offset_mapper does.
 // Without a check, a straggler entry left stamped with an already-retired T2 generation by the
 // still-open, separately-tracked residual-window race would be persisted into a T1-only
 // checkpoint completely unvalidated -- load_checkpoint_if_present() re-stamps every loaded entry

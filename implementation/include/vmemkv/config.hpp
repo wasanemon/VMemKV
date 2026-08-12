@@ -59,45 +59,76 @@ struct GetPopulateRead {};
 
 // * ScanBaseSequential:
 //   - [EN]: T2's "base" region (offsets below the boundary written by the last full T1+T2
-//           reorganize) gets two of its own separate, read-only mmaps -- distinct from the main
-//           MADV_RANDOM mapping Get/Update use for offsets outside the base region. In-place
-//           updates to base offsets are redirected out-of-place (see update_impl()) so the region
-//           stays immutable and neither mapping ever needs a seqlock. See
-//           docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md for the original io_uring
-//           design this replaces: an isolation sweep there had already shown the win was
-//           per-file readahead policy, not io_uring's async multiplexing -- a second madvise'd
-//           mmap gets the same readahead benefit directly, measured within ~4% of the io_uring
-//           read it replaces when cold, and 6-26% *faster* once warm (no per-read syscall floor).
-//           The two base mappings carry deliberately different readahead policies, because
-//           get_impl() and scan_impl() want opposite things from the same underlying bytes under
-//           memory pressure (TODO.md Sec.4.3): `base_mmap` (get_impl(), one record at a time)
-//           keeps MADV_SEQUENTIAL plus MAP_POPULATE-equivalent Prefaulting warm-up, since a 64KB
-//           record spans many pages and wants that read batched in one go
-//           (docs/benchmark/20260810_t2_no_madvise_random.md). `base_mmap_scan` (scan_impl(),
-//           ranges of records) is left at the kernel's default (adaptive) policy instead: an
-//           explicit MADV_SEQUENTIAL there was measured to fetch ~25-30% more bytes per major
-//           fault than needed, which is close to free under cold/uniform access but pure waste
-//           under skewed (Zipf-like) reuse, where a narrow hot range staying page-cache-resident
-//           is the actual source of the speedup. madvise is per-VMA, so splitting into two
-//           mappings of the identical region lets each policy apply independently without
-//           affecting the other.
-//   - [JP]: T2の「base」領域(直近のT1+T2フルreorganizeが書いた境界より下のオフセット)専用に、
-//           Get/Updateが使うMADV_RANDOMの主mmapとは別の、読み取り専用mmapを2つ用意する。
-//           baseオフセットへのin-place更新はout-of-placeへリダイレクトされ(update_impl参照)、
-//           領域が不変であり続けるためどちらのmmapもseqlockを一切必要としない。
-//           2つのbaseマッピングは意図的に異なるreadahead方針を持つ -- メモリ圧下では、
-//           get_impl()とscan_impl()が同じバイト列に対して逆の性質を求めることが判明したため
-//           (TODO.md §4.3)。`base_mmap`(get_impl()、1レコードずつ)はMADV_SEQUENTIALと
-//           Prefaulting併用時のMAP_POPULATE的事前ウォームアップを維持する -- 64KBのレコードは
-//           複数ページにまたがり、それを一括で読み込みたいため
-//           (docs/benchmark/20260810_t2_no_madvise_random.md)。`base_mmap_scan`
-//           (scan_impl()、複数レコードの範囲)はカーネルのデフォルト(適応的)方針のままにする --
-//           MADV_SEQUENTIALを明示すると1 major faultあたり約25-30%余分にバイトを読み込むことが
-//           判明し、これはUniform(ほぼ毎回コールド)ではほぼ無害だが、Zipfのような偏った
-//           アクセスでは、狭いホット範囲がページキャッシュに残ることこそが速度向上の源泉であり、
-//           この余分な先読みはそれを圧迫するだけの無駄になる。madvise はVMA単位なので、
-//           同一領域を2つのマッピングに分けることで、互いに影響し合わずそれぞれの方針を
-//           適用できる。
+//           reorganize) is read through three mappings/handles, chosen per record from that
+//           record's own length (the T1 index's embedded size hint, `kSizeEmbeddingShift`), not
+//           once per generation -- since in-place updates to base offsets are redirected
+//           out-of-place (see update_impl()), the region stays immutable and none of the three
+//           ever needs a seqlock, and picking the "wrong" one for a given record is only ever a
+//           readahead-policy mismatch, never incorrect data (all three cover the identical
+//           bytes). Two are mmaps distinct from the main MADV_RANDOM mapping Get/Update use --
+//           madvise is a property of a whole mapping, not of an individual read, so serving both
+//           small- and large-record reads well requires two separately-advised mappings rather
+//           than one shared policy:
+//             - `base_mmap_scan_seq`, advised MADV_SEQUENTIAL, for records whose embedded size
+//               hint is one page or smaller: a wide readahead window batches many small records'
+//               worth of faults into few major faults (a 2.2x win measured at 1KB Scan).
+//             - `base_mmap_scan`, left at the kernel's default (adaptive) policy, for larger
+//               records: an unconditional MADV_SEQUENTIAL was measured to fetch ~25-30% more
+//               bytes per major fault than needed for these: close to free under cold/uniform
+//               access, but pure waste under skewed (Zipf-like) reuse of a large-record corpus,
+//               where a narrow hot range staying page-cache-resident is the actual source of the
+//               speedup -- a 2x loss measured at 64KB Scan if MADV_SEQUENTIAL is kept.
+//           See docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md for the original
+//           io_uring design these replace (a per-file readahead policy was the actual win, not
+//           io_uring's async multiplexing -- a plain mmap gets the same benefit, measured within
+//           ~4% of the io_uring read it replaces when cold and 6-26% *faster* once warm, no
+//           per-read syscall floor). scan_impl() always reads through one of these two mmaps;
+//           get_impl() reads small records (one page or smaller) through `base_mmap_scan_seq`
+//           too, but larger records through the third handle instead:
+//             - `read_fd`, a `dup()`'d file descriptor, with a bounded `pread()` sized to that
+//               one record. get_impl() used to share `base_mmap_scan`'s large-record mmap
+//               approach too (a since-removed policy on that same mapping), which suited its
+//               one-record reads about as poorly as an unconditional MADV_SEQUENTIAL suited Scan
+//               under skew, for the identical reason: mmap readahead speculatively pulls in
+//               neighboring records nobody asked for, wasting disk bandwidth Get never gets to
+//               reuse (unlike Scan's own multi-record window, where reused bytes at least
+//               sometimes pay off). A bounded pread() reads exactly what's needed instead.
+//           All three are best-effort: a failure to establish any one of them just means the
+//           corresponding read falls back to the always-correct main-mmap-plus-seqlock path.
+//   - [JP]: T2の「base」領域(直近のT1+T2フルreorganizeが書いた境界より下のオフセット)は、
+//           世代ごとに1回ではなく、**レコードごとに、そのレコード自身の長さ**(T1インデックス
+//           に埋め込まれたサイズヒント`kSizeEmbeddingShift`)から選ばれる3つのマッピング/
+//           ハンドルのいずれかで読む。baseオフセットへのin-place更新はout-of-placeへ
+//           リダイレクトされる(update_impl参照)ため領域は不変であり続け、どれもseqlockを
+//           一切必要としない。あるレコードに「間違った」経路を選んでも、3つとも同一のバイト列
+//           を指しているため、readahead方針の選択ミスにしかならず、データが誤ることはない。
+//           そのうち2つは、Get/Updateが使うMADV_RANDOMの主mmapとは別のmmapである --
+//           madviseはマッピング全体の属性であり個々の読み取り単位のものではないため、小さい
+//           レコードと大きいレコードの両方にうまく対応するには、1つの共有方針ではなく別々に
+//           advise済みの2つのマッピングが要る:
+//             - `base_mmap_scan_seq`(`MADV_SEQUENTIAL`付き): 埋め込みサイズヒントが1ページ
+//               以下のレコード用。広いreadahead窓で多数の小さいレコードのフォルトを少数の
+//               major faultにまとめられる(1KB Scanで2.2倍の改善を実測)。
+//             - `base_mmap_scan`(カーネルのデフォルト(適応的)方針のまま): それより大きい
+//               レコード用。無条件に`MADV_SEQUENTIAL`を付けると、こちらでは1 major fault
+//               あたり約25-30%余分にバイトを読み込むことが判明した -- Uniform(ほぼ毎回
+//               コールド)ではほぼ無害だが、大きいレコードのコーパスをZipfのような偏った
+//               アクセスで読む場合、狭いホット範囲がページキャッシュに残ることこそが速度
+//               向上の源泉であり、この余分な先読みはそれを圧迫するだけの無駄になる --
+//               `MADV_SEQUENTIAL`のままだと64KB Scanで2倍の悪化を実測。
+//           scan_impl()は常にこの2つのmmapのどちらかを読む。get_impl()も小さいレコード
+//           (1ページ以下)は同じ`base_mmap_scan_seq`を読むが、大きいレコードは3つ目の
+//           ハンドルを使う:
+//             - `read_fd`(`dup()`したファイルディスクリプタ): そのレコード1つぶんに
+//               サイズを絞った`pread()`で読む。以前はget_impl()の大きいレコードも
+//               `base_mmap_scan`と同じmmap方式(そのマッピング上の、廃止済みの方針)を
+//               共用していたが、これはScanがskew下で無条件`MADV_SEQUENTIAL`によって
+//               抱えていたのと全く同じ理由で不向きだった: mmapのreadaheadは頼んでもいない
+//               隣のレコードまで投機的に読み込んでしまい、Getはそれを再利用する機会が
+//               (Scanの複数レコード窓と違って)一切ないため、ディスク帯域を純粋に無駄に
+//               する。境界を絞った`pread()`なら必要な分だけを読める。
+//           3つともbest-effort -- 確立に失敗しても、対応する読み取りは常に正しい
+//           主mmap+seqlock経路にフォールバックするだけである。
 struct ScanBaseSequential {};
 
 // ─── Unified System Config Template (Tag-List Pattern) ──────────────────────
