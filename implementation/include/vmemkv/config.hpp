@@ -82,17 +82,24 @@ struct GetPopulateRead {};
 //           io_uring design these replace (a per-file readahead policy was the actual win, not
 //           io_uring's async multiplexing -- a plain mmap gets the same benefit, measured within
 //           ~4% of the io_uring read it replaces when cold and 6-26% *faster* once warm, no
-//           per-read syscall floor). scan_impl() always reads through one of these two mmaps;
-//           get_impl() reads small records (one page or smaller) through `base_mmap_scan_seq`
-//           too, but larger records through the third handle instead:
-//             - `read_fd`, a `dup()`'d file descriptor, with a bounded `pread()` sized to that
-//               one record. get_impl() used to share `base_mmap_scan`'s large-record mmap
-//               approach too (a since-removed policy on that same mapping), which suited its
-//               one-record reads about as poorly as an unconditional MADV_SEQUENTIAL suited Scan
-//               under skew, for the identical reason: mmap readahead speculatively pulls in
-//               neighboring records nobody asked for, wasting disk bandwidth Get never gets to
-//               reuse (unlike Scan's own multi-record window, where reused bytes at least
-//               sometimes pay off). A bounded pread() reads exactly what's needed instead.
+//           per-read syscall floor). scan_impl() always reads through one of these two mmaps.
+//           get_impl() never touches either one -- its access pattern is always effectively
+//           random (one record per call, no batching), so neither readahead policy pays off for
+//           it, regardless of size:
+//             - Small records (one page or smaller) read the *main* MADV_RANDOM mapping
+//               directly, seqlock-free (safe: offset < base_boundary already proves the bytes
+//               are immutable) -- that mapping already carries exactly the policy Get wants, so
+//               no dedicated base-region mapping is needed for this case at all. An earlier
+//               version routed this through `base_mmap_scan_seq` instead (reusing Scan's own
+//               small-record mapping); under real LTM memory pressure that cost ~10x more kernel
+//               time per major page fault than the main mapping does, since MADV_SEQUENTIAL's
+//               wider readahead + drop-behind actively hurts a genuinely random access pattern.
+//             - Larger records check residency first (`mincore()`, never blocking on a fault
+//               itself) against `base_mmap_scan`: resident, a free mmap read; not resident, a
+//               bounded `pread()` via `read_fd` (a `dup()`'d file descriptor) instead of an mmap
+//               read, which would speculatively pull in neighboring records nobody asked for --
+//               wasted disk bandwidth Get never gets to reuse (unlike Scan's own multi-record
+//               window, where reused bytes at least sometimes pay off).
 //           All three are best-effort: a failure to establish any one of them just means the
 //           corresponding read falls back to the always-correct main-mmap-plus-seqlock path.
 //   - [JP]: T2の「base」領域(直近のT1+T2フルreorganizeが書いた境界より下のオフセット)は、
@@ -116,17 +123,25 @@ struct GetPopulateRead {};
 //               アクセスで読む場合、狭いホット範囲がページキャッシュに残ることこそが速度
 //               向上の源泉であり、この余分な先読みはそれを圧迫するだけの無駄になる --
 //               `MADV_SEQUENTIAL`のままだと64KB Scanで2倍の悪化を実測。
-//           scan_impl()は常にこの2つのmmapのどちらかを読む。get_impl()も小さいレコード
-//           (1ページ以下)は同じ`base_mmap_scan_seq`を読むが、大きいレコードは3つ目の
-//           ハンドルを使う:
-//             - `read_fd`(`dup()`したファイルディスクリプタ): そのレコード1つぶんに
-//               サイズを絞った`pread()`で読む。以前はget_impl()の大きいレコードも
-//               `base_mmap_scan`と同じmmap方式(そのマッピング上の、廃止済みの方針)を
-//               共用していたが、これはScanがskew下で無条件`MADV_SEQUENTIAL`によって
-//               抱えていたのと全く同じ理由で不向きだった: mmapのreadaheadは頼んでもいない
-//               隣のレコードまで投機的に読み込んでしまい、Getはそれを再利用する機会が
-//               (Scanの複数レコード窓と違って)一切ないため、ディスク帯域を純粋に無駄に
-//               する。境界を絞った`pread()`なら必要な分だけを読める。
+//           scan_impl()は常にこの2つのmmapのどちらかを読む。get_impl()はどちらも一切
+//           使わない -- Getのアクセスパターンはサイズに関わらず常に事実上ランダム
+//           (1回の呼び出しで1レコードだけ、バッチ化の余地なし)なので、どちらの
+//           readahead方針もGetには効かない:
+//             - 小さいレコード(1ページ以下)は、Get/Updateが使う*主*mmap(`MADV_RANDOM`)を
+//               直接、seqlock無しで読む(安全: offset < base_boundaryが既にそのバイト列の
+//               不変性を証明済み) -- この主mmapは既にGetが望む方針そのものを持っているため、
+//               この場合は専用のbase領域マッピングを新設する必要が一切ない。以前のバージョンは
+//               ここをScan専用の`base_mmap_scan_seq`経由にしていたが、実LTMメモリ圧下では
+//               `MADV_SEQUENTIAL`の広いreadahead+drop-behindが、本質的にランダムな
+//               アクセスパターンに対してむしろ悪影響となり、主mmap経由に比べて
+//               1 major faultあたり約10倍のカーネル時間を要することが判明した。
+//             - 大きいレコードはまず`base_mmap_scan`に対して`mincore()`(フォルト自体は
+//               絶対に発生させない)でresident判定を行う: residentなら無料のmmap読み取り、
+//               residentでなければ`read_fd`(`dup()`したファイルディスクリプタ)経由の
+//               範囲を絞った`pread()`を使う(mmap読み取りではない) -- mmapのreadaheadは
+//               頼んでもいない隣のレコードまで投機的に読み込んでしまい、Getはそれを
+//               再利用する機会が(Scanの複数レコード窓と違って)一切ないため、ディスク帯域を
+//               純粋に無駄にする。
 //           3つともbest-effort -- 確立に失敗しても、対応する読み取りは常に正しい
 //           主mmap+seqlock経路にフォールバックするだけである。
 struct ScanBaseSequential {};

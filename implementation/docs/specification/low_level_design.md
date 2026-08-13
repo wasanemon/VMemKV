@@ -379,11 +379,11 @@ T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時�
 1. 上記手順 1〜3 と同様(`checkpoint_lsn` の確定、T1 の凍結・merge、T1 checkpoint 一時ファイルへの書き出し)。ただし世代番号は T1 側専用のもの(`t1_generation = checkpoint_lsn`)として確定し、T2 checkpoint ファイルの世代番号(`t2_generation`)は直前の値のまま変えない(manifest の世代番号を T1/T2 で分離する理由、後述)。
 2. **T2 差分の耐久化(このフロー固有の手順)**: T2 の稼働中 mmap は `MAP_PRIVATE`(5.1 節の NOTE参照、書き込みはプロセス内 COW ページに留まりファイルへは反映されない)であるため、直前の T2 checkpoint(フルリビルド、または以前の T1-only checkpoint の差分フラッシュ)以降に通常の Insert / Update が T2 へ書き込んだバイトは、まだディスク上のどこにも存在しない。これらを WAL に頼らず失わずに済ませるには、このタイミングで実際にディスクへ書く必要がある。直前に耐久化済みのバイト数(`t2_durable_bytes_`)から現在の `bytes_used` までの範囲を、稼働中 mmap 上の該当バイト列から `pwrite()` で **同じ T2 checkpoint ファイルの同じオフセット** へ追記し、`fsync()` する(この範囲より前のバイトは T1-only checkpoint では一切移動しないため、そのままで良い)。コストは O(直前の checkpoint 以降に増えた T2 バイト数) であり、O(生存コーパス全体) のフルリビルドより大幅に安いが、ゼロではない。
    - **`ScanBaseSequential` 有効時: `base_boundary` のインクリメンタル昇格(2.2節)**。この手順の `pwrite()`/`fsync()` を挟んで、以下の順序を厳守する:
-     1. まず `write_gate_boundary` を今回の昇格対象範囲の上端(= この手順で `pwrite()` する `bytes_used`)へ bump する。この時点で、新たにこの範囲を対象とする in-place 更新(3.3節)は締め出される。ただし `base_boundary` はまだ動かさないため、読み取り側(`base_mmap` 経由)には一切影響しない。
+     1. まず `write_gate_boundary` を今回の昇格対象範囲の上端(= この手順で `pwrite()` する `bytes_used`)へ bump する。この時点で、新たにこの範囲を対象とする in-place 更新(3.3節)は締め出される。ただし `base_boundary` はまだ動かさないため、読み取り側(base領域用の読み取り専用mmap群、2.2節/7.9節)には一切影響しない。
      2. 上記の締め出しより*前*に、既に古い `write_gate_boundary` を見て in-place 書き込み中だったスレッドが残っていないことを保証する必要がある。専用の epoch ベースの reference tracker(`update_epoch_tracker_`)を使い、epoch をひとつ進めたうえで、当該 in-place 更新のクリティカルセクションが epoch 登録済みだった全スレッドの完了を待つ。`T2FlatFile::begin_draining_and_wait_for_writers()`(6章)は新規 append だけをゲートする別機構であり、in-place 更新はこの待機の対象外なので流用できない。
      3. この待機が完了して初めて、対象範囲は「二度と in-place で変わらない」ことが確定する。ここで初めて上記の `pwrite()`/`fsync()` を実行する。
-     4. `pwrite()`/`fsync()` が成功した後(耐久化完了後)、初めて `base_boundary` を同じ値まで bump して公開する。読み取り可否の公開を書き込みの締め出しより*後*に行うのは、`base_mmap` は別 fd 経由の書き込みも透過的に反映する(7.9節、`MAP_PRIVATE` かつ一度も書き込まれないマッピングは COW が発動しないため)ので、`base_boundary` を先に公開してしまうと、まだディスクに届いていないバイトを読者に見せてしまう(stale read)ためである。
-   - `base_mmap` 自体は毎回張り直さない(2.2節)ので、この昇格はこの手順の外側にある通常の delta flush と同程度のコストで完結する -- 新たな一時ファイルの作成や `swap_memory()` は発生しない。
+     4. `pwrite()`/`fsync()` が成功した後(耐久化完了後)、初めて `base_boundary` を同じ値まで bump して公開する。読み取り可否の公開を書き込みの締め出しより*後*に行うのは、base領域用の読み取り専用mmap群は別 fd 経由の書き込みも透過的に反映する(7.9節、`MAP_PRIVATE` かつ一度も書き込まれないマッピングは COW が発動しないため)ので、`base_boundary` を先に公開してしまうと、まだディスクに届いていないバイトを読者に見せてしまう(stale read)ためである。
+   - これらのmmap自体は毎回張り直さない(2.2節)ので、この昇格はこの手順の外側にある通常の delta flush と同程度のコストで完結する -- 新たな一時ファイルの作成や `swap_memory()` は発生しない。
 3. manifest 一時ファイルへ `t1_generation`(新)・`t2_generation`(不変)・耐久化後の `t2_bytes_used` を書き、`fsync` し、`rename()` でアトミックに正式パスへ差し替える。
 4. WAL をローテーションする(5.5 節)。
 5. 不要になった旧世代の T1 checkpoint ファイルのみ削除する。**T2 checkpoint ファイルは削除しない**(複数サイクルにわたって参照され続けるため)。

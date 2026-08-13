@@ -117,12 +117,13 @@ struct T2Memory {
   mutable std::byte *base_mmap_scan = nullptr;
 
   // A third mapping of the identical [0, capacity) region as `base_mmap_scan` above, advised
-  // MADV_SEQUENTIAL, for records whose embedded size hint is one page or smaller. madvise is a
-  // property of the whole mapping, not of an individual read, so serving both small- and
-  // large-record reads well requires two separately-advised mappings of the same bytes rather
-  // than one shared policy -- which record actually gets read through which mapping is decided
-  // per record (try_scan_base_record()/try_get_base_record() in vmemkv_impl.hpp), not once per
-  // generation, so a corpus with genuinely mixed record sizes is still handled correctly (just a
+  // MADV_SEQUENTIAL. Read only by scan_impl(), for records whose embedded size hint is one page
+  // or smaller -- get_impl() reads records this small through the primary `base` mapping
+  // instead (see ScanBaseSequential's doc comment in config.hpp for why). madvise is a property
+  // of the whole mapping, not of an individual read, so Scan's own two size classes need
+  // separately-advised mappings rather than one shared policy; which one a given record uses is
+  // decided per record (try_read_base_record() in vmemkv_impl.hpp), not once per generation, so
+  // a corpus with genuinely mixed record sizes is still handled correctly (just a
   // readahead-policy choice, never a correctness one -- both mappings cover identical bytes).
   // Same lifetime/retirement/best-effort/nullptr-by-default story as base_mmap_scan.
   mutable std::byte *base_mmap_scan_seq = nullptr;
