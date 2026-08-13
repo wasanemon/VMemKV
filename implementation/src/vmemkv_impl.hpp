@@ -56,6 +56,7 @@
 #include <vmemkv/config.hpp>
 
 #include "checkpoint/checkpoint.hpp"
+#include "core/spin_backoff.hpp"
 #include "t1_index/t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
 #include "wal/wal.hpp"
@@ -706,33 +707,6 @@ class VMemKVImpl {
   struct InPlaceUpdateResult {
     InPlaceOutcome outcome;
     Wal::PendingRecord *pending = nullptr;
-  };
-
-  // Bounded spin-then-sleep backoff for get_impl()/try_in_place_update()'s "T2 hasn't caught up
-  // to what T1 already reflects yet" retry branch: a bare `continue` (pure busy-spin, no yield)
-  // converges quickly on an under-subscribed machine but is not safe to assume converges *at
-  // all* once real thread contention is involved -- reproduced on CI (4 vCPUs, plus leftover
-  // RocksDB threadpool threads from earlier test cases still competing for them) as a genuine,
-  // sustained starvation of the waiting thread by whichever thread is actually advancing T2's
-  // generation, even though the same test passed extensively under much lighter local
-  // contention. yield() alone is only a scheduler hint (some schedulers may treat it as a
-  // no-op); sleep_for() forces an actual, real-time descheduling, which is what actually
-  // guarantees the other thread gets to run.
-  struct SpinBackoff {
-    int spin_count = 0;
-    static constexpr int kYieldSpinsBeforeSleep = 32;
-    static constexpr auto kBackoffSleep = std::chrono::milliseconds(1);
-
-    void wait() {
-      ++spin_count;
-      if (spin_count <= kYieldSpinsBeforeSleep) {
-        std::this_thread::yield();
-      } else {
-        std::this_thread::sleep_for(kBackoffSleep);
-      }
-    }
-
-    void reset() { spin_count = 0; }
   };
 
   // update_impl()'s in-place-update decision for a non-inline entry: retries under the same

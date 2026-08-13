@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <thread>
 
+#include "core/spin_backoff.hpp"
+
 namespace vmemkv {
 
 inline constexpr size_t kDefaultMaxThreads = 256;
@@ -60,24 +62,31 @@ class ThreadReferenceTracker {
 
   // Waits (spins/yields) until all thread slots no longer reference the specified old value.
   // Useful for Hazard-pointer-like pointer retired validation. seq_cst load: see acquire()'s comment.
+  // SpinBackoff (not a bare yield()): a pure yield-spin here converges quickly on an
+  // under-subscribed machine but reproduced as genuine, sustained starvation on CI's real
+  // low-core-count, contended runner (see SpinBackoff's own doc comment for the precedent this
+  // repeats -- the same fix already applied to VMemKVImpl::get_impl()/try_in_place_update()'s
+  // retry loops for the identical reason).
   void wait_until_retired(T old_val) const noexcept {
     for (size_t i = 0; i < MaxThreads; ++i) {
+      SpinBackoff backoff;
       while (slots_[i].value.load(std::memory_order_seq_cst) == old_val) {
-        std::this_thread::yield();
+        backoff.wait();
       }
     }
   }
 
   // Waits until all thread slots have cleared (are T{}) or have advanced beyond the target epoch value.
-  // Useful for Epoch-based Reclamation.
+  // Useful for Epoch-based Reclamation. SpinBackoff -- see wait_until_retired()'s identical comment.
   void wait_until_epoch(T target_epoch) const noexcept {
     for (size_t i = 0; i < MaxThreads; ++i) {
+      SpinBackoff backoff;
       while (true) {
         T epoch_val = slots_[i].value.load(std::memory_order_acquire);
         if (epoch_val == T{} || epoch_val >= target_epoch) {
           break;
         }
-        std::this_thread::yield();
+        backoff.wait();
       }
     }
   }
