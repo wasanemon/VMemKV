@@ -1,0 +1,8 @@
+{"scenario":"ltm","value_size":1024,"mode":"t1only","ratio":0.25,"key_count":2064888,"elapsed_sec":1.00474,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"t1only","ratio":0.5,"key_count":4129776,"elapsed_sec":1.32489,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"t1only","ratio":0.75,"key_count":6194664,"elapsed_sec":1.37971,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"t1only","ratio":1,"key_count":8259552,"elapsed_sec":1.53446,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"t1t2","ratio":0.25,"key_count":2064888,"elapsed_sec":16.7895,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"t1t2","ratio":0.5,"key_count":4129776,"elapsed_sec":41.6588,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"t1t2","ratio":0.75,"key_count":6194664,"elapsed_sec":51.7192,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"t1t2","ratio":1,"key_count":8259552,"elapsed_sec":60,"timed_out":true}
