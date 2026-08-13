@@ -1414,6 +1414,13 @@ class VMemKVImpl {
     size_t total_count = 0;
     std::array<std::byte, kStoreKeyBytes> resume_key{};
     bool have_resume_key = false;
+    // Same SpinBackoff as get_impl()/try_in_place_update()'s retry loops -- a bare immediate
+    // retry here (no backoff) is the identical anti-pattern already found, twice, to cause
+    // genuine sustained CI-runner starvation: a concurrent defragment() cycling generations
+    // faster than one t1_.scan() pass can complete under real contention could otherwise retry
+    // this loop indefinitely without ever yielding real CPU time to whichever thread is actually
+    // advancing T2's generation. See SpinBackoff's doc comment.
+    SpinBackoff backoff;
 
     while (true) {
       std::span<const std::byte> current_lower =
@@ -1538,6 +1545,7 @@ class VMemKVImpl {
       }
       // else: the mismatch fired on the very first (non-skipped) candidate this pass -- retry the
       // exact same range under a fresh handle/snapshot pairing.
+      backoff.wait();
     }
 
     return total_count;
