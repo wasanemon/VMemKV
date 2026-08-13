@@ -176,6 +176,8 @@ auto T2FlatFile::update_value_at(uint64_t payload,
   atomic_version.store(ver + 1, std::memory_order_release);
   std::atomic_thread_fence(std::memory_order_release);
 
+  // This memcpy (and value_len below) plain-races a concurrent reader's plain reads of the same
+  // bytes -- benign by design, see read_t2_record_seqlock()'s doc comment in vmemkv_impl.hpp.
   if (!value.empty()) {
     std::memcpy(value_begin, value.data(), value.size());
   }

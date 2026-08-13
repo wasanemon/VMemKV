@@ -75,6 +75,15 @@ namespace vmemkv {
 // built once and reused across retries can carry a stale span size that the version check
 // afterward can't catch, since the size was already wrong before the loop started. See
 // tests/test_t2_flat_file.cpp for a deterministic regression demonstrating the resulting hang.
+//
+// CopyFunc's plain (non-atomic) reads of a record's key/value bytes race, in the C++
+// abstract-machine sense, with T2FlatFile::update_value_at()'s plain memcpy of the same bytes --
+// ThreadSanitizer reports this. It's benign by construction: the version check below discards any
+// read that overlapped a concurrent write, so a torn read here is never actually used, only
+// retried (same principle as a Linux kernel seqlock). Verified empirically, not just assumed:
+// sustained concurrent stress at 64KB values (widening the memcpy race window well past this
+// project's usual 200B test size) found zero torn reads across many runs, plain and under this
+// same sanitizer. See tsan_suppressions.txt for the suppression and the full verification note.
 template <typename AtFunc, typename CopyFunc>
 inline auto read_t2_record_seqlock(AtFunc &&at_func, CopyFunc &&copy_func) {
   while (true) {
