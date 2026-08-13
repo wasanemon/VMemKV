@@ -66,6 +66,23 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-13</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026081303_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/13)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <p class="mb-1.5">(<a href="2026081000_charts.html" class="text-indigo-600 hover:underline">08/10</a>時点比、要点のみ):</p>
+                <ul class="list-disc pl-4 space-y-1">
+                  <li><code>ScanBaseSequential</code>のbase領域読み取りを、単一固定madviseからレコードサイズ別3経路(<code>base_mmap_scan_seq</code>/<code>base_mmap_scan</code>/<code>read_fd</code>)のper-record動的選択へ変更。</li>
+                  <li>旧方式(コーパス先頭レコードのサイズをサンプリングして方針決定)が引き起こしていた1KB LTM Scanの退行(0.40〜0.78x)を解消。</li>
+                  <li>64KB LTMのGet/Hitが2.0〜3.3x、Scan(Zipf)が2.2x改善。</li>
+                  <li>ソースコード中のTODO.md参照を全廃(頻繁に編集・削除される開発メモへの参照は陳腐化するため)。</li>
+                </ul>
+              </td>
+              </tr>
+            <tr>
               <td class="py-4 pr-4 text-slate-400">2026-08-10</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026081000_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
