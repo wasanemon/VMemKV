@@ -984,76 +984,51 @@ class VMemKVImpl {
     return inserted;
   }
 
-  // Attempts a seqlock-free read of the T2 record at `payload_bits`'s offset straight from one
-  // of the two Scan base mappings (`base_mmap_scan_seq` or `base_mmap_scan`). Valid exactly when
-  // ScanBaseSequential is enabled and the offset falls in the immutable "base" region (below
-  // `base_boundary` -- update_impl() redirects in-place updates targeting that range
-  // out-of-place instead, so unlike `base`'s primary MADV_RANDOM mapping, these bytes can never
-  // change out from under a reader and no seqlock retry is needed). Returns std::nullopt when
-  // unavailable (ablation off, offset is still in the mutable tail, or a defense-in-depth bounds
-  // check fails) -- callers must fall back to t2_.at() + read_t2_record_seqlock() in that case.
-  // scan_impl()-only: get_impl() reads the same region via try_get_base_record() below instead
-  // -- see T2Memory::base_mmap_scan/read_fd's doc comments for why.
-  //
-  // Which of the two mappings to read through is decided per record, not once per generation:
-  // madvise is a property of a whole mapping, not of one read, so two mappings of the identical
-  // region exist with opposite readahead policies (config.hpp's ScanBaseSequential doc comment),
-  // and this picks between them using the same T1-embedded block-count size hint get_impl() uses
-  // to size its pread()s. Per-record dispatch (rather than sampling one record's size for the
-  // whole generation, which an earlier version of this did) is required for correctness on a
-  // corpus with genuinely mixed record sizes, not just for the uniform-value-size scenarios this
-  // project happens to benchmark -- picking the "wrong" mapping for a given record is only ever
-  // a readahead-policy mismatch, never incorrect data, since both mappings cover the identical
-  // bytes; but a real production corpus isn't guaranteed uniform the way a single benchmark
-  // scenario is.
-  auto try_scan_base_record(const T2FlatFile::T2MemoryHandle &mem,
-                            uint64_t payload_bits) const -> std::optional<T2RecordView> {
-    if constexpr (!ConfigT::UseScanBaseSequential) {
+  // -------------------------------------------------------------------------------------------
+  // T2 base-region reads (the ScanBaseSequential ablation). Once a record's offset is below
+  // `base_boundary`, its bytes are immutable forever (update_impl() redirects in-place updates
+  // targeting that range out-of-place instead -- see write_gate_boundary's comment), so a reader
+  // doesn't need the seqlock protecting the mutable tail and can read straight out of a mapping.
+  // Get and Scan want *different* readahead policies for that read though (madvise is a property
+  // of the whole mapping, not of one read), so several distinct mappings of the identical bytes
+  // exist -- which one a given call should use is decided per record (never once per generation:
+  // a real corpus isn't guaranteed uniform record sizes even though this project's benchmarks
+  // happen to use one size per run) by try_read_base_record()'s switch below. That switch is the
+  // single place this decision is made, and callers never choose a mapping themselves.
+  // -------------------------------------------------------------------------------------------
+
+  // Blind (no mincore, no fallback) direct read through a given base-region mapping -- the
+  // common tail end of every path in try_read_base_record() below.
+  auto read_base_record_via(std::byte *mapping,
+                            uint64_t offset,
+                            uint64_t base_boundary) const -> std::optional<T2RecordView> {
+    if (mapping == nullptr) {
       return std::nullopt;
-    } else {
-      const uint64_t offset = payload_bits & kOffsetMask;
-      // Single read: base_boundary can grow concurrently (a T1-only checkpoint's incremental
-      // promotion, see T2Memory's comment), but never shrinks, so a torn/inconsistent read here
-      // could only be *more* conservative than reality, never less -- reading once is just
-      // cheaper, not required for safety.
-      const uint64_t base_boundary = mem->base_boundary.load(std::memory_order_acquire);
-      if (offset >= base_boundary) {
-        return std::nullopt;
-      }
-      // Same size-hint-with-margin derivation as try_get_base_record() -- see that function's
-      // comment for why the +16 margin is required, not just the raw embedded hint.
-      constexpr uint64_t kSizeHintMargin = 16;
-      const uint64_t size_hint = ((payload_bits >> kSizeEmbeddingShift) * kBlockAlignment) + kSizeHintMargin;
-      constexpr uint64_t kPageSize = 4096;
-      std::byte *const mapping = (size_hint <= kPageSize) ? mem->base_mmap_scan_seq : mem->base_mmap_scan;
-      if (mapping == nullptr) {
-        return std::nullopt;
-      }
-      const std::byte *record_base = mapping + offset;
-      const auto *header = reinterpret_cast<const ValueRecordHeader *>(record_base);
-      const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
-      // Should always hold for a record reorganize() actually wrote here -- kept as a
-      // defense-in-depth backstop, not a routine path: falls through to the always-correct
-      // mmap+seqlock path when it doesn't.
-      if (offset + needed > base_boundary) {
-        return std::nullopt;
-      }
-      std::span<const std::byte> key(record_base + sizeof(ValueRecordHeader), header->key_len);
-      std::span<const std::byte> value(key.data() + header->key_len, header->value_len);
-      return T2RecordView{header, key, value};
     }
+    const std::byte *record_base = mapping + offset;
+    const auto *header = reinterpret_cast<const ValueRecordHeader *>(record_base);
+    const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
+    // Should always hold for a record reorganize() actually wrote here -- kept as a
+    // defense-in-depth backstop, not a routine path: falls through to the always-correct
+    // mmap+seqlock path when it doesn't.
+    if (offset + needed > base_boundary) {
+      return std::nullopt;
+    }
+    std::span<const std::byte> key(record_base + sizeof(ValueRecordHeader), header->key_len);
+    std::span<const std::byte> value(key.data() + header->key_len, header->value_len);
+    return T2RecordView{header, key, value};
   }
 
-  // Warm-path half of try_get_base_record() below: if `[offset, offset+read_len)` in
-  // `base_mmap_scan` is entirely page-cache resident (checked via mincore(), which -- unlike an
-  // actual read -- never blocks on a fault itself), reads a live span straight out of the mmap
-  // for free (no syscall, no copy), exactly matching what a plain mmap-based Get would have cost
-  // before this ablation existed. Returns std::nullopt on any doubt (mincore() unavailable/failed,
-  // or any page not resident) -- caller falls back to a bounded pread() instead of risking a
-  // page-fault-driven block here. A page could in theory be evicted between this check and the
-  // caller reading through the returned span (base_mmap_scan isn't pinned), but base-region
-  // bytes are immutable, so that only costs an ordinary page fault on the read -- never wrong
-  // data.
+  // Warm-path half of BaseReader::kGet's large-record case below: if `[offset, offset+read_len)`
+  // in `base_mmap_scan` is entirely page-cache resident (checked via mincore(), which -- unlike
+  // an actual read -- never blocks on a fault itself), reads a live span straight out of the
+  // mmap for free (no syscall, no copy), exactly matching what a plain mmap-based Get would have
+  // cost before this ablation existed. Returns std::nullopt on any doubt (mincore()
+  // unavailable/failed, or any page not resident) -- caller falls back to a bounded pread()
+  // instead of risking a page-fault-driven block here. A page could in theory be evicted between
+  // this check and the caller reading through the returned span (base_mmap_scan isn't pinned),
+  // but base-region bytes are immutable, so that only costs an ordinary page fault on the read --
+  // never wrong data.
   auto try_read_resident_base_record(std::byte *mapping,
                                      uint64_t offset,
                                      uint64_t read_len,
@@ -1078,7 +1053,7 @@ class VMemKVImpl {
 
     const auto *header = reinterpret_cast<const ValueRecordHeader *>(record_base);
     const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
-    // Defense-in-depth, same role as try_scan_base_record()'s identical check.
+    // Defense-in-depth, same role as read_base_record_via()'s identical check.
     if (offset + needed > base_boundary) {
       return std::nullopt;
     }
@@ -1087,88 +1062,130 @@ class VMemKVImpl {
     return T2RecordView{header, key, value};
   }
 
-  // Reads the T2 record at `payload_bits`'s offset from the immutable "base" region: a warm
-  // record (see try_read_resident_base_record() above) costs nothing extra beyond a plain mmap
-  // read; a cold one falls back to a bounded pread() into `buf` (resized as needed; caller must
-  // keep `buf` alive for as long as the returned view is used). get_impl()-only counterpart to
-  // try_scan_base_record() above -- a Get reads one record per call and never gets to reuse mmap
-  // readahead's speculative neighboring bytes the way a multi-record Scan window can, so a cold
-  // Get wants a bounded read instead. Same validity/fallback contract as try_scan_base_record().
+  // Which caller is asking try_read_base_record() below for a base-region record. The only
+  // thing that determines the mapping/strategy choice in that function's switch.
+  enum class BaseReader : uint8_t {
+    kGet,   // One record per call, effectively random access -- never wants readahead.
+    kScan,  // ~100 records per call in roughly ascending offset order -- benefits from it.
+  };
+
+  // Single entry point for every T2 base-region read. Computes the shared preamble (offset,
+  // base_boundary check, embedded size hint) once, then the switch below picks the mapping and
+  // read strategy for the given reader -- see each case for why it picks what it does.
+  //
+  // This is deliberately ONE function with the reader/size decision laid out explicitly in one
+  // place, not two similar functions that happen to share a helper: an earlier version had Get's
+  // small-record path silently reuse Scan's own function (and thus Scan's MADV_SEQUENTIAL
+  // mapping), which under real LTM memory pressure cost ~10x more kernel time per major page
+  // fault than Get's ideal policy -- a genuinely random access pattern paying for readahead +
+  // drop-behind it never benefits from (see the kGet case below for the fix and measurements).
+  // Consolidating the decision here means changing a reader's policy, or adding a new reader,
+  // only ever touches one switch, not two functions that need to be kept in sync by hand.
+  //
+  // Callers must guard their call with `if constexpr (ConfigT::UseScanBaseSequential)` (see the
+  // assert below) -- get_impl()/scan_impl() do this rather than this function checking the
+  // ablation flag itself, so that calling it when the ablation is off is a caught implementation
+  // mistake, not a silently-absorbed no-op.
+  //
   // `payload_bits` (not pre-masked to an offset) is required so the T1 index's embedded
   // block-count size hint (kSizeEmbeddingShift) can size the read -- see the margin comment
-  // below for why that hint alone isn't quite enough.
-  //
-  // Single-page records skip both mincore/mmap-with-check and pread, reading straight through
-  // try_scan_base_record() instead (which reads records this small via `base_mmap_scan_seq`, no
-  // residency check needed): mincore()/pread() both cost one syscall regardless of record size,
-  // negligible next to a 64KB record's copy but dominating a 1KB one's ~2us *total* pre-existing
-  // cost -- 1KB In-Memory Get/Hit regressed 90-98% before this guard was added. Falling back to
-  // the caller's seqlock path for this case (an earlier version of this guard did that) measured
-  // ~11x slower than a direct base-mmap read for base-region records, for reasons still
-  // unexplained and orthogonal to this ablation -- so this reuses try_scan_base_record()
-  // rather than depending on that path.
-  auto try_get_base_record(const T2FlatFile::T2MemoryHandle &mem,
-                           uint64_t payload_bits,
-                           std::vector<std::byte> &buf) const -> std::optional<T2RecordView> {
-    if constexpr (!ConfigT::UseScanBaseSequential) {
+  // below for why that hint alone isn't quite enough. `cold_buf`: only used by BaseReader::kGet's
+  // large, non-resident case (a bounded pread() destination, resized as needed; caller must keep
+  // it alive as long as the returned view is used) -- pass nullptr for BaseReader::kScan, which
+  // never needs it. Returns std::nullopt whenever this fast path isn't available (offset still
+  // in the mutable tail, a mapping/fd wasn't created, mincore()/pread() failed, or a
+  // defense-in-depth bounds check fails) -- callers fall back to t2_.at() +
+  // read_t2_record_seqlock() in that case. Picking the "wrong" mapping for a record's size is
+  // only ever a readahead-policy mismatch, never incorrect data: every mapping here covers the
+  // identical underlying bytes.
+  auto try_read_base_record(const T2FlatFile::T2MemoryHandle &mem,
+                            uint64_t payload_bits,
+                            BaseReader reader,
+                            std::vector<std::byte> *cold_buf) const -> std::optional<T2RecordView> {
+    assert(ConfigT::UseScanBaseSequential &&
+           "try_read_base_record() requires callers to guard with "
+           "`if constexpr (ConfigT::UseScanBaseSequential)`");
+
+    const uint64_t offset = payload_bits & kOffsetMask;
+    // Single read: base_boundary can grow concurrently (a T1-only checkpoint's incremental
+    // promotion, see T2Memory's comment), but never shrinks, so a torn/inconsistent read here
+    // could only be *more* conservative than reality, never less -- reading once is just
+    // cheaper, not required for safety.
+    const uint64_t base_boundary = mem->base_boundary.load(std::memory_order_acquire);
+    if (offset >= base_boundary) {
       return std::nullopt;
-    } else {
-      const uint64_t offset = payload_bits & kOffsetMask;
-      // Single read -- see try_scan_base_record()'s identical comment on base_boundary.
-      const uint64_t base_boundary = mem->base_boundary.load(std::memory_order_acquire);
-      if (offset >= base_boundary) {
-        return std::nullopt;
-      }
-      // The embedded block-count size hint is 16-byte-granular while records are only 8-byte
-      // aligned (align_up()), so it can undershoot the true aligned length by up to 8 bytes --
-      // the same margin the retired IoUringScanRealRead ablation needed for this identical
-      // "read exactly this many bytes" problem
-      // (docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md, "バグ1"). A read sized to
-      // (hint + margin), clamped to base_boundary, covers every record this store can produce --
-      // no second read is needed, whether resident (mincore/mmap path) or not (pread path).
-      constexpr uint64_t kSizeHintMargin = 16;
-      const uint64_t size_hint = ((payload_bits >> kSizeEmbeddingShift) * kBlockAlignment) + kSizeHintMargin;
-      const uint64_t read_len = std::min(size_hint, base_boundary - offset);
-
-      // Single-page records skip mincore/pread entirely and read straight through
-      // try_scan_base_record() (which routes a same-size-hint record to base_mmap_scan_seq, its
-      // own small-record mapping -- see that function's comment) instead: a 1-page record has
-      // nothing to gain from mincore's residency check or a bounded pread -- both cost a syscall
-      // a plain warm mmap read doesn't pay, and a cold single-page fault here costs the same
-      // either way, mmap or pread. Falling back to the seqlock path instead (an earlier version
-      // of this guard did that) turned out to be no better: that path is ~11x slower than a
-      // direct base-mmap read for base-region records, for reasons still unexplained and
-      // orthogonal to this ablation.
-      constexpr uint64_t kPageSize = 4096;
-      if (read_len <= kPageSize) {
-        return try_scan_base_record(mem, payload_bits);
-      }
-
-      if (mem->base_mmap_scan != nullptr) {
-        if (auto resident = try_read_resident_base_record(mem->base_mmap_scan, offset, read_len, base_boundary);
-            resident.has_value()) {
-          return resident;
-        }
-      }
-
-      if (mem->read_fd < 0) {
-        return std::nullopt;
-      }
-      buf.resize(read_len);
-      const ssize_t bytes_read = ::pread(mem->read_fd, buf.data(), read_len, static_cast<off_t>(offset));
-      if (bytes_read < static_cast<ssize_t>(sizeof(ValueRecordHeader))) {
-        return std::nullopt;  // Short read or error -- fall back to the always-correct seqlock path.
-      }
-      const auto *header = reinterpret_cast<const ValueRecordHeader *>(buf.data());
-      const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
-      // Defense-in-depth, same role as try_scan_base_record()'s identical check.
-      if (needed > static_cast<uint64_t>(bytes_read)) {
-        return std::nullopt;
-      }
-      std::span<const std::byte> key(buf.data() + sizeof(ValueRecordHeader), header->key_len);
-      std::span<const std::byte> value(key.data() + header->key_len, header->value_len);
-      return T2RecordView{header, key, value};
     }
+
+    // The embedded block-count size hint is 16-byte-granular while records are only 8-byte
+    // aligned (align_up()), so it can undershoot the true aligned length by up to 8 bytes -- the
+    // same margin the retired IoUringScanRealRead ablation needed for this identical "read
+    // exactly this many bytes" problem. A read sized to (hint + margin) covers every record this
+    // store can produce, whether resident (mmap path) or not (pread path).
+    constexpr uint64_t kSizeHintMargin = 16;
+    const uint64_t size_hint = ((payload_bits >> kSizeEmbeddingShift) * kBlockAlignment) + kSizeHintMargin;
+    constexpr uint64_t kPageSize = 4096;
+    const bool is_small = size_hint <= kPageSize;
+
+    switch (reader) {
+      case BaseReader::kScan:
+        // Scan reads ~100 records per call in roughly ascending offset order, so unlike Get it
+        // benefits from kernel readahead: small records (many faults per call) want
+        // MADV_SEQUENTIAL's wider window; large records would have one call's readahead
+        // overshoot into unrelated neighboring records, so they use the plain/no-advise mapping
+        // instead.
+        return read_base_record_via(is_small ? mem->base_mmap_scan_seq : mem->base_mmap_scan, offset, base_boundary);
+
+      case BaseReader::kGet:
+        if (is_small) {
+          // Get reads one record per call and is always effectively random access, regardless
+          // of size -- speculative readahead never pays off for it. `base` (the primary
+          // mapping, already MADV_RANDOM everywhere -- see its own doc comment) already carries
+          // exactly that policy, so small records read it directly and skip the seqlock too
+          // (safe: offset < base_boundary already proves these bytes are immutable). Also skips
+          // mincore()/pread(): both cost one syscall regardless of record size, negligible next
+          // to a 64KB record's copy but dominating a 1KB one's ~2us *total* pre-existing cost --
+          // 1KB In-Memory Get/Hit regressed 90-98% before this guard was added. Measured
+          // directly: routing this through base_mmap_scan (no madvise, some readahead -- an
+          // earlier version of this did) still cost ~4.4x more kernel time per major fault than
+          // `base` does, and through base_mmap_scan_seq (Scan's mapping, MADV_SEQUENTIAL -- the
+          // original bug this consolidation exists to prevent a repeat of) ~10x more,
+          // LTM/1KB Get/Hit/Zipf/threads:32.
+          return read_base_record_via(mem->base, offset, base_boundary);
+        }
+        {
+          // Large records: check residency first (mincore(), which never blocks on a fault
+          // itself) before committing to a read -- if resident, base_mmap_scan gives a free
+          // mmap read costing nothing beyond what a plain mmap-based Get would have paid before
+          // this ablation existed; if not, one bounded pread() beats the N separate page faults
+          // an mmap read of a multi-page cold record would trigger.
+          const uint64_t read_len = std::min(size_hint, base_boundary - offset);
+          if (mem->base_mmap_scan != nullptr) {
+            if (auto resident = try_read_resident_base_record(mem->base_mmap_scan, offset, read_len, base_boundary);
+                resident.has_value()) {
+              return resident;
+            }
+          }
+          if (mem->read_fd < 0 || cold_buf == nullptr) {
+            return std::nullopt;
+          }
+          cold_buf->resize(read_len);
+          const ssize_t bytes_read = ::pread(mem->read_fd, cold_buf->data(), read_len, static_cast<off_t>(offset));
+          if (bytes_read < static_cast<ssize_t>(sizeof(ValueRecordHeader))) {
+            return std::nullopt;  // Short read or error -- fall back to the always-correct seqlock path.
+          }
+          const auto *header = reinterpret_cast<const ValueRecordHeader *>(cold_buf->data());
+          const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
+          // Defense-in-depth, same role as read_base_record_via()'s identical check.
+          if (needed > static_cast<uint64_t>(bytes_read)) {
+            return std::nullopt;
+          }
+          std::span<const std::byte> key(cold_buf->data() + sizeof(ValueRecordHeader), header->key_len);
+          std::span<const std::byte> value(key.data() + header->key_len, header->value_len);
+          return T2RecordView{header, key, value};
+        }
+    }
+    assert(false && "unhandled BaseReader");
+    return std::nullopt;
   }
 
   // Retrieves a value and invokes callback with its raw bytes.
@@ -1217,20 +1234,23 @@ class VMemKVImpl {
 
       const uint64_t offset = res.payload_bits & kOffsetMask;
 
-      // Base-region fast path: see try_get_base_record()'s doc comment. Bytes are immutable once
-      // written, so callback can safely receive a span straight into the pread'd buffer -- no
-      // torn-read risk, no extra copy beyond what pread() itself did. thread_local/static for the
-      // same reason as tl_get_value_buf below (per-thread reuse, no per-call heap allocation).
-      thread_local static std::vector<std::byte> tl_get_base_buf;
-      if (const auto base_record = try_get_base_record(mem, res.payload_bits, tl_get_base_buf);
-          base_record.has_value()) {
-        if (byte_span_equal(base_record->key, full_key)) {
-          callback(base_record->value);
-          return true;
+      // Base-region fast path: see try_read_base_record()'s doc comment. Bytes are immutable
+      // once written, so callback can safely receive a span straight into the pread'd buffer --
+      // no torn-read risk, no extra copy beyond what pread() itself did. thread_local/static for
+      // the same reason as tl_get_value_buf below (per-thread reuse, no per-call heap
+      // allocation).
+      if constexpr (ConfigT::UseScanBaseSequential) {
+        thread_local static std::vector<std::byte> tl_get_base_buf;
+        if (const auto base_record = try_read_base_record(mem, res.payload_bits, BaseReader::kGet, &tl_get_base_buf);
+            base_record.has_value()) {
+          if (byte_span_equal(base_record->key, full_key)) {
+            callback(base_record->value);
+            return true;
+          }
+          // Defensive mismatch (should not happen -- try_read_base_record()'s own bounds check
+          // already guards against reading garbage): fall through to the always-correct seqlock
+          // path below instead of trusting this read.
         }
-        // Defensive mismatch (should not happen -- try_get_base_record()'s own bounds check
-        // already guards against reading garbage): fall through to the always-correct seqlock
-        // path below instead of trusting this read.
       }
 
       // Torn-read fix: copy_func below must only *copy* the record's bytes into an owned buffer
@@ -1484,15 +1504,18 @@ class VMemKVImpl {
                  std::memcpy(last_key.data(), index_key.data(), kStoreKeyBytes);
                  advanced = true;
 
-                 // Base-region fast path: see try_scan_base_record()'s doc comment. No seqlock
+                 // Base-region fast path: see try_read_base_record()'s doc comment. No seqlock
                  // needed -- the base mappings' bytes are immutable once written, so callback can
                  // safely receive live spans straight into them.
-                 if (const auto base_record = try_scan_base_record(mem, payload); base_record.has_value()) {
-                   if (key_in_range(base_record->key, lower_bound, upper_bound)) {
-                     callback(base_record->key, base_record->value);
+                 if constexpr (ConfigT::UseScanBaseSequential) {
+                   if (const auto base_record = try_read_base_record(mem, payload, BaseReader::kScan, nullptr);
+                       base_record.has_value()) {
+                     if (key_in_range(base_record->key, lower_bound, upper_bound)) {
+                       callback(base_record->key, base_record->value);
+                     }
+                     ++pass_count;
+                     return;
                    }
-                   ++pass_count;
-                   return;
                  }
 
                  // t2_.at() called inside read_t2_record_seqlock() (as AtFunc), matching get_impl() --
@@ -1590,16 +1613,14 @@ class VMemKVImpl {
       throw std::system_error(errno, std::generic_category(), "madvise MADV_RANDOM (checkpoint/reorg)");
     }
 
-    // Best-effort second and third mappings for ScanBaseSequential, read only by scan_impl()
-    // (and, for small records, get_impl()'s small-record path -- try_get_base_record()'s
-    // comment) -- see ScanBaseSequential's doc comment in config.hpp for why these get their own
-    // mappings rather than sharing the main mapping's MADV_RANDOM (madvise is per-VMA;
-    // Get/Update need MADV_RANDOM everywhere, including base offsets, so it can't also serve
-    // Scan's bulk-range pattern), why there are *two* of them (`base_mmap_scan_seq`,
-    // MADV_SEQUENTIAL, for small records; `base_mmap_scan`, kernel default, for large ones --
-    // the two want opposite readahead policies and madvise is a whole-mapping property, not a
-    // per-read one), and why Get's large-record path reads the same bytes via pread instead
-    // (below). Both mapped to the *full* `capacity`, not just `bytes_used` -- unlike the main
+    // Best-effort second and third mappings for ScanBaseSequential -- see try_read_base_record()
+    // above for who reads which: `base_mmap_scan_seq` (MADV_SEQUENTIAL) is Scan's small-record
+    // mapping only; `base_mmap_scan` (kernel default) is shared by Scan's large-record path and
+    // Get's large-record warm path (Get's small-record path reads the *main* mapping directly,
+    // since that's already MADV_RANDOM -- exactly what Get wants regardless of size). Both exist
+    // because madvise is a per-VMA property, not a per-read one, so Scan's own two size classes
+    // need genuinely different mappings; Get's large-record cold case reads the same bytes via
+    // pread instead (below). Both mapped to the *full* `capacity`, not just `bytes_used` -- unlike the main
     // mapping, unwritten/never-promoted pages here are simply never touched (every read is
     // gated by offset < base_boundary), so over-mapping costs nothing and lets a T1-only
     // checkpoint's incremental base_boundary promotion (reorganize_internal()) grow their

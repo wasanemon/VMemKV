@@ -78,7 +78,6 @@
                   <li><code>ScanBaseSequential</code>のbase領域読み取りを、単一固定madviseからレコードサイズ別3経路(<code>base_mmap_scan_seq</code>/<code>base_mmap_scan</code>/<code>read_fd</code>)のper-record動的選択へ変更。</li>
                   <li>旧方式(コーパス先頭レコードのサイズをサンプリングして方針決定)が引き起こしていた1KB LTM Scanの退行(0.40〜0.78x)を解消。</li>
                   <li>64KB LTMのGet/Hitが2.0〜3.3x、Scan(Zipf)が2.2x改善。</li>
-                  <li>ソースコード中のTODO.md参照を全廃(頻繁に編集・削除される開発メモへの参照は陳腐化するため)。</li>
                 </ul>
               </td>
               </tr>
