@@ -80,18 +80,17 @@ struct GetPopulateRead {};
 //           than one shared policy:
 //             - `base_mmap_scan_seq`, advised MADV_SEQUENTIAL, for records whose embedded size
 //               hint is one page or smaller: a wide readahead window batches many small records'
-//               worth of faults into few major faults (a 2.2x win measured at 1KB Scan).
+//               worth of faults into few major faults.
 //             - `base_mmap_scan`, left at the kernel's default (adaptive) policy, for larger
-//               records: an unconditional MADV_SEQUENTIAL was measured to fetch ~25-30% more
-//               bytes per major fault than needed for these: close to free under cold/uniform
-//               access, but pure waste under skewed (Zipf-like) reuse of a large-record corpus,
-//               where a narrow hot range staying page-cache-resident is the actual source of the
-//               speedup -- a 2x loss measured at 64KB Scan if MADV_SEQUENTIAL is kept.
+//               records: an unconditional MADV_SEQUENTIAL fetches more bytes per major fault than
+//               these need: close to free under cold/uniform access, but pure waste under skewed
+//               (Zipf-like) reuse of a large-record corpus, where a narrow hot range staying
+//               page-cache-resident is the actual source of the speedup, which an unconditional
+//               MADV_SEQUENTIAL undermines.
 //           See docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md for the original
-//           io_uring design these replace (a per-file readahead policy was the actual win, not
-//           io_uring's async multiplexing -- a plain mmap gets the same benefit, measured within
-//           ~4% of the io_uring read it replaces when cold and 6-26% *faster* once warm, no
-//           per-read syscall floor). scan_impl() always reads through one of these two mmaps.
+//           io_uring design these replace and why a per-file readahead policy turned out to be
+//           the actual win (a plain mmap gets the same benefit as the io_uring read it replaces,
+//           no per-read syscall floor). scan_impl() always reads through one of these two mmaps.
 //           get_impl() never touches either one -- its access pattern is always effectively
 //           random (one record per call, no batching), so neither readahead policy pays off for
 //           it, regardless of size:
@@ -100,9 +99,10 @@ struct GetPopulateRead {};
 //               are immutable) -- that mapping already carries exactly the policy Get wants, so
 //               no dedicated base-region mapping is needed for this case at all. An earlier
 //               version routed this through `base_mmap_scan_seq` instead (reusing Scan's own
-//               small-record mapping); under real LTM memory pressure that cost ~10x more kernel
-//               time per major page fault than the main mapping does, since MADV_SEQUENTIAL's
-//               wider readahead + drop-behind actively hurts a genuinely random access pattern.
+//               small-record mapping); under real LTM memory pressure that cost substantially
+//               more kernel time per major page fault than the main mapping does, since
+//               MADV_SEQUENTIAL's wider readahead + drop-behind actively hurts a genuinely random
+//               access pattern.
 //             - Larger records check residency first (`mincore()`, never blocking on a fault
 //               itself) against `base_mmap_scan`: resident, a free mmap read; not resident, a
 //               bounded `pread()` via `read_fd` (a `dup()`'d file descriptor) instead of an mmap
@@ -124,14 +124,13 @@ struct GetPopulateRead {};
 //           advise済みの2つのマッピングが要る:
 //             - `base_mmap_scan_seq`(`MADV_SEQUENTIAL`付き): 埋め込みサイズヒントが1ページ
 //               以下のレコード用。広いreadahead窓で多数の小さいレコードのフォルトを少数の
-//               major faultにまとめられる(1KB Scanで2.2倍の改善を実測)。
+//               major faultにまとめられる。
 //             - `base_mmap_scan`(カーネルのデフォルト(適応的)方針のまま): それより大きい
-//               レコード用。無条件に`MADV_SEQUENTIAL`を付けると、こちらでは1 major fault
-//               あたり約25-30%余分にバイトを読み込むことが判明した -- Uniform(ほぼ毎回
-//               コールド)ではほぼ無害だが、大きいレコードのコーパスをZipfのような偏った
-//               アクセスで読む場合、狭いホット範囲がページキャッシュに残ることこそが速度
-//               向上の源泉であり、この余分な先読みはそれを圧迫するだけの無駄になる --
-//               `MADV_SEQUENTIAL`のままだと64KB Scanで2倍の悪化を実測。
+//               レコード用。無条件に`MADV_SEQUENTIAL`を付けると、1 major faultあたり必要以上に
+//               バイトを読み込んでしまう -- Uniform(ほぼ毎回コールド)ではほぼ無害だが、大きい
+//               レコードのコーパスをZipfのような偏ったアクセスで読む場合、狭いホット範囲が
+//               ページキャッシュに残ることこそが速度向上の源泉であり、この余分な先読みは
+//               それを圧迫するだけの無駄になる。
 //           scan_impl()は常にこの2つのmmapのどちらかを読む。get_impl()はどちらも一切
 //           使わない -- Getのアクセスパターンはサイズに関わらず常に事実上ランダム
 //           (1回の呼び出しで1レコードだけ、バッチ化の余地なし)なので、どちらの
@@ -143,7 +142,7 @@ struct GetPopulateRead {};
 //               ここをScan専用の`base_mmap_scan_seq`経由にしていたが、実LTMメモリ圧下では
 //               `MADV_SEQUENTIAL`の広いreadahead+drop-behindが、本質的にランダムな
 //               アクセスパターンに対してむしろ悪影響となり、主mmap経由に比べて
-//               1 major faultあたり約10倍のカーネル時間を要することが判明した。
+//               1 major faultあたりのカーネル時間が大幅に増加することが判明した。
 //             - 大きいレコードはまず`base_mmap_scan`に対して`mincore()`(フォルト自体は
 //               絶対に発生させない)でresident判定を行う: residentなら無料のmmap読み取り、
 //               residentでなければ`read_fd`(`dup()`したファイルディスクリプタ)経由の
