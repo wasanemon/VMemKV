@@ -52,6 +52,8 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 #include <vmemkv/config.hpp>
 
@@ -106,31 +108,24 @@ inline auto read_t2_record_seqlock(AtFunc &&at_func, CopyFunc &&copy_func) {
   }
 }
 
-// Test-only seam: fires once inside reorganize_internal(), right before
-// begin_draining_and_wait_for_writers() is called (i.e. while the about-to-be-retired generation
-// is still handed out normally by acquire_write_handle()). Lets a test deterministically get a
-// writer's T2MemoryHandle registered *before* the drain flag goes up, so the subsequent drain-wait
-// has a real, still-in-flight writer to wait for -- exercising the exact handshake that closes the
-// residual-window race (see begin_draining_and_wait_for_writers()'s declaration). No-op in
-// production.
-struct NoOpPreDrainHook {
+// Test-only seam: fires once inside rebuild_t2_and_maybe_checkpoint(), right before
+// T2FlatFile::stop_writers_and_wait() is called (i.e. while the about-to-be-retired generation is
+// still handed out normally by acquire_write_handle()). Lets a test deterministically get a
+// writer's T2MemoryHandle registered *before* the stop flag goes up, so the subsequent
+// stop-and-wait has a real, still-in-flight writer to wait for -- exercising the exact handshake
+// that closes the residual-window race (see T2FlatFile::stop_writers_and_wait()'s declaration).
+// No-op in production.
+struct NoOpPreStopHook {
   void operator()() const noexcept {}
 };
 
-// Test-only seam: fires once inside reorganize_internal(), right after the drain above has
-// completed (t1_.append_size() has just been proven 0 with no writer able to land another entry)
-// and before the close()/truncate()/open()/mmap()/swap_memory() sequence. No-op in production.
-struct NoOpPostConvergenceHook {
-  void operator()() const noexcept {}
-};
-
-// Test-only seam: called from reorganize_internal()'s offset_mapper right before the KNOWN OPEN
-// ISSUE assert (see that call site). Returning true skips the now-unsafe T2 dereference instead
-// of proceeding, letting a test observe the issue firing without needing a non-NDEBUG build or
-// risking an actual out-of-bounds read. Defaults to a no-op returning false; production behavior
-// is unchanged either way.
-struct NoOpGenerationMismatchHook {
-  auto operator()(uint64_t /*old_generation*/, uint64_t /*live_generation*/) const noexcept -> bool { return false; }
+// Test-only seam: fires once inside rebuild_t2_and_maybe_checkpoint(), right before the
+// close()/truncate()/open()/mmap() sequence that finishes the new T2 file -- strictly before T1 is
+// ever touched (T1 is only published once, later, from a single I/O-free t1_.reorganize() call).
+// Lets a test throw here to verify that any failure up to and including this point leaves T1
+// completely untouched, with nothing to roll back. No-op in production.
+struct NoOpPreFinishHook {
+  void operator()() const {}
 };
 
 // ─── VMemKVImpl Layer Coordination Overview ──────────────────────────────────
@@ -245,14 +240,11 @@ class VMemKVImpl {
   // regions, writes live records to a temp T2 file, hot-swaps the T2 mapping and republishes T1,
   // then (unless recovering) persists the result as a manifest-committed checkpoint and rotates
   // the WAL. Called under reorg_running_'s CAS guard (see reorganize()).
-  template <typename PostConvergenceHook = NoOpPostConvergenceHook,
-            typename GenerationMismatchHook = NoOpGenerationMismatchHook,
-            typename PreDrainHook = NoOpPreDrainHook>
+  template <typename PreStopHook = NoOpPreStopHook, typename PreFinishHook = NoOpPreFinishHook>
   void reorganize_internal(bool do_t2_rebuild,
                            bool do_checkpoint,
-                           PostConvergenceHook post_convergence_hook = PostConvergenceHook{},
-                           GenerationMismatchHook generation_mismatch_hook = GenerationMismatchHook{},
-                           PreDrainHook pre_drain_hook = PreDrainHook{}) {
+                           PreStopHook pre_stop_hook = PreStopHook{},
+                           PreFinishHook pre_finish_hook = PreFinishHook{}) {
     // Checkpointing during WAL replay is unsafe: recover_from_wal() runs inside
     // wal_.replay()'s callback, whose read loop keeps using an offset/file_size computed against
     // the pre-checkpoint file. Calling wal_.rotate() reentrantly from inside that same callback
@@ -265,7 +257,7 @@ class VMemKVImpl {
            "must not request a checkpoint while recovering_ -- see recover_from_wal()'s call site");
 
     if (do_t2_rebuild) {
-      rebuild_t2_and_maybe_checkpoint(do_checkpoint, post_convergence_hook, generation_mismatch_hook, pre_drain_hook);
+      rebuild_t2_and_maybe_checkpoint(do_checkpoint, pre_stop_hook, pre_finish_hook);
     } else if (do_checkpoint) {
       checkpoint_t1_only_with_delta_flush();
     } else {
@@ -284,17 +276,22 @@ class VMemKVImpl {
  private:
   // reorganize_internal()'s do_t2_rebuild=true branch: performs a full T2 GC/rebuild (dead
   // entries dropped, live entries relocated to a fresh temp file in old-physical-offset order),
-  // hot-swaps T2's mapping, and republishes T1 with the new offsets. When do_checkpoint is true
-  // this also persists the result as a manifest-committed checkpoint and rotates the WAL;
+  // then republishes T1 with the new offsets and hot-swaps T2's mapping. When do_checkpoint is
+  // true this also persists the result as a manifest-committed checkpoint and rotates the WAL;
   // recover_from_wal()'s livelock-avoidance rebuild (reclaiming T1 append-region capacity so
   // replay can continue) always passes do_checkpoint=false, which reorganize_internal() asserts.
-  template <typename PostConvergenceHook = NoOpPostConvergenceHook,
-            typename GenerationMismatchHook = NoOpGenerationMismatchHook,
-            typename PreDrainHook = NoOpPreDrainHook>
+  //
+  // Structure: everything that can fail (real syscalls: open/write/truncate/mmap) runs strictly
+  // *before* T1 is ever touched. T1 is published exactly once, at the very end, via a single
+  // t1_.reorganize() call whose offset_mapper does nothing but look up already-computed results
+  // -- so it cannot itself fail for any reason this function needs to guard against. This means
+  // any exception anywhere above that point leaves T1 completely untouched: there is nothing to
+  // roll back, and the existing run_reorganize()/reorg_worker_loop() catch/retry machinery is
+  // already correct as-is (see their own comments).
+  template <typename PreStopHook = NoOpPreStopHook, typename PreFinishHook = NoOpPreFinishHook>
   void rebuild_t2_and_maybe_checkpoint(bool do_checkpoint,
-                                       PostConvergenceHook post_convergence_hook = PostConvergenceHook{},
-                                       GenerationMismatchHook generation_mismatch_hook = GenerationMismatchHook{},
-                                       PreDrainHook pre_drain_hook = PreDrainHook{}) {
+                                       PreStopHook pre_stop_hook = PreStopHook{},
+                                       PreFinishHook pre_finish_hook = PreFinishHook{}) {
     using EntrySnapshot = typename T1IndexT::EntrySnapshot;
     const uint64_t checkpoint_lsn = do_checkpoint ? wal_.next_lsn() - 1 : 0;
     const uint64_t t1_generation = checkpoint_lsn;
@@ -313,10 +310,10 @@ class VMemKVImpl {
     }
 
     uint64_t next_bytes_used = 0;
-    // Tracks how far maybe_sync_and_drop_checkpoint_cache() has flushed+dropped, so the
-    // offset_mapper callback below can periodically bound the temp T2 file's page cache
-    // footprint instead of letting it grow unbounded until the commit-time fsync -- that growth
-    // would otherwise compete with the live T2 mmap's resident pages for the same RAM.
+    // Tracks how far the periodic sync below has flushed+dropped, so the copy loop can bound the
+    // temp T2 file's page cache footprint instead of letting it grow unbounded until the final
+    // fsync -- that growth would otherwise compete with the live T2 mmap's resident pages for the
+    // same RAM.
     uint64_t next_bytes_synced = 0;
     struct FDGuard {
       int fd;
@@ -332,197 +329,147 @@ class VMemKVImpl {
     // validate against T2Memory::generation to detect a reorganize landing mid-read.
     const uint64_t t2_pair_generation = vmemkv::T2Memory::allocate_generation();
 
-    // Reused across offset_mapper calls to avoid a per-record heap allocation; safe since
-    // offset_mapper runs strictly sequentially.
+    // Maps a live entry's (T1 key prefix, hash) -- the same pair EntrySnapshot itself carries --
+    // to where its bytes ended up in the temp file below. Built entirely by copy_live_entries()
+    // (read-only from T1's perspective) before T1 is ever touched; consulted by the single,
+    // I/O-free offset_mapper passed to t1_.reorganize() at the very end. `hash` alone drives
+    // hashing here (it's already a well-distributed hash of the real key); the prefix is only
+    // needed for equality, to disambiguate the astronomically rare case of two different keys
+    // sharing both a 16-byte prefix and a hash collision.
+    struct RelocationKeyHash {
+      auto operator()(const std::pair<StoreKey, uint64_t> &k) const noexcept -> size_t {
+        return std::hash<uint64_t>{}(k.second);
+      }
+    };
+    std::unordered_map<std::pair<StoreKey, uint64_t>, uint64_t, RelocationKeyHash> relocated;
+
+    // Reused across copy_live_entries() calls to avoid a per-record heap allocation.
     std::vector<std::byte> key_copy;
     std::vector<std::byte> value_copy;
 
+    // Reads every currently-live, non-inline entry via the public, lock-free t1_.scan() API and
+    // copies any not already in `relocated` into the temp file -- in old-physical-offset order,
+    // not `merged`'s key order, for the same reason the old per-entry code sorted: T2 physical
+    // offset is unrelated to key order, so reading in key order is an effectively-random access
+    // pattern under an LTM-scale mmap; old-offset order is monotonically increasing and
+    // kernel/madvise-readahead-friendly. Purely read-only from T1's perspective -- does not
+    // publish anything, does not touch T1 at all.
+    static constexpr std::array<std::byte, kStoreKeyBytes> kMaxKeyBytes = [] {
+      std::array<std::byte, kStoreKeyBytes> bytes{};
+      bytes.fill(std::byte{0xFF});
+      return bytes;
+    }();
+    auto copy_live_entries = [&] {
+      struct Candidate {
+        StoreKey prefix;
+        uint64_t hash;
+        uint64_t old_offset;
+      };
+      std::vector<Candidate> candidates;
+      t1_.scan(std::span<const std::byte>{},
+               std::span<const std::byte>(kMaxKeyBytes),
+               [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash, uint64_t /*t2_generation*/) {
+                 if (payload == vmemkv::STORE_NOT_FOUND) {
+                   return;
+                 }
+                 if constexpr (ConfigT::UseT1InlineValue) {
+                   if (t1_detail::is_inline(hash)) {
+                     return;
+                   }
+                 }
+                 StoreKey prefix;
+                 std::copy(index_key.begin(), index_key.end(), prefix.begin());
+                 if (relocated.contains({prefix, hash})) {
+                   return;  // Already copied by an earlier call to copy_live_entries().
+                 }
+                 candidates.push_back({prefix, hash, payload & kOffsetMask});
+               });
+
+      if (candidates.empty()) {
+        return;
+      }
+
+      std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) {
+        return a.old_offset < b.old_offset;
+      });
+
+      T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+      for (const auto &candidate : candidates) {
+        // Copy key+value out under the seqlock: this record can be concurrently mutated by
+        // update_impl()'s in-place T2 path (key_lock does not serialize against reorganize(), by
+        // design). t2_.at() is called inside read_t2_record_seqlock() (as AtFunc) rather than
+        // once beforehand, since key_len/value_len are unsynchronized and a stale size read once
+        // wouldn't be caught by the version recheck -- see that function's comment. key_copy/
+        // value_copy are reused across calls purely to avoid a per-record heap allocation.
+        read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(candidate.old_offset, mem); },
+                               [&](const T2RecordView &record) -> bool {
+                                 key_copy.assign(record.key.begin(), record.key.end());
+                                 value_copy.assign(record.value.begin(), record.value.end());
+                                 return true;
+                               });
+
+        const uint64_t new_offset = write_record_to_temp_fd(fd_guard.fd, key_copy, value_copy, next_bytes_used);
+        maybe_sync_and_drop_checkpoint_cache(fd_guard.fd, next_bytes_used, next_bytes_synced);
+
+        const uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_copy.size() + value_copy.size());
+        const uint64_t block_count = aligned_len / kBlockAlignment;
+        assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
+        relocated[{candidate.prefix, candidate.hash}] = new_offset | (block_count << kSizeEmbeddingShift);
+      }
+    };
+
     try {
-      // Convergence loop: a writer can publish a fresh entry into T1's active append region
-      // while this reorg's merge runs, stamped with whatever T2 generation it wrote against
-      // (write_entry_lockfree() doesn't check for a racing rebuild). Such an entry isn't part
-      // of `merged` and survives into whatever's active when t1_.reorganize() returns -- fine
-      // on its own (the next cycle's freeze picks it up), unless this cycle retires that
-      // entry's T2 generation via swap_memory() first, leaving it pointing at an unmapped file
-      // with no way to recover its data. Draining append_size() to empty before swap_memory()
-      // closes that: every entry gets frozen and mapped against the T2 generation still live
-      // throughout the loop. Re-processing an entry an earlier pass already remapped is a cheap
-      // pass-through (see offset_mapper's `old_generation == t2_pair_generation` check).
+      // Pre-stop pass: a pure performance optimization, not a correctness requirement -- see
+      // stop_writers_and_wait() below for why the amount of work left for the post-stop pass
+      // matters. Safe to run any number of times (including zero); T1 is not touched.
+      copy_live_entries();
+
+      // Closes the residual window between here and T1's publish at the very end: while
+      // writer_stop_ is set, acquire_write_handle() defers new writers instead of handing out a
+      // handle to this about-to-retire generation, so no new T1 entry naming it can appear from
+      // here on -- guaranteeing the post-stop pass below sees the complete, final live set.
+      // stop_writers_and_wait() blocks until every writer that already held a handle -- i.e.
+      // started before the flag went up -- has released it, which per that handle's contract only
+      // happens after its T1 publish attempt has returned; that straggler's entry is then simply
+      // part of what the post-stop scan below observes, needing no special handling.
       //
-      // Deliberately unconditional (no pass cap): a small fixed cap is insufficient under
-      // sustained write pressure. What actually bounds this loop is
-      // maybe_reorganize_if_needed()'s hard-threshold backpressure: once append_size() crosses
-      // the hard limit, every other writer blocks until this call returns, so the pass that
-      // freezes the triggering write sees nothing more arrive and converges next check.
-      // Named (not inline) so the final gate below can reuse the same callbacks.
-      //
-      // Batch relocation, not per-entry: rather than reading T2 in `merged`'s key order (which
-      // is unrelated to T2 physical offset, making that an effectively-random read
-      // pattern -- the actual bottleneck under LTM, not the sort itself), collect the entries that
-      // need relocating, sort THOSE by old physical offset, then read/copy in that order. This
-      // keeps every existing safety property (same seqlock-protected read via
-      // read_t2_record_seqlock(), same write_record_to_temp_fd() sequential append) and only
-      // changes iteration order, converting scattered access into a monotonically increasing
-      // one -- friendlier to the kernel's/madvise's readahead under an LTM-scale mmap. The
-      // resulting T2 file ends up compacted (dead entries dropped) but in old-physical-offset
-      // order, not key order -- this is the deliberate "no-sort" redesign; `merged` itself
-      // (and thus T1's own sorted_region_) stays key-ordered throughout, since only
-      // `.payload_bits`/`.generation` fields are mutated in place, never `merged`'s element
-      // order (see reorganize()'s OffsetMapper contract in t1_index.hpp).
-      auto offset_mapper_fn = [&](std::span<EntrySnapshot> merged) {
-        // Collect indices of entries that actually need a T2 relocation this pass -- mirrors
-        // the same three passthrough cases the old per-entry code checked inline.
-        std::vector<size_t> order;
-        order.reserve(merged.size());
-        for (size_t i = 0; i < merged.size(); ++i) {
-          const uint64_t old_payload = merged[i].payload_bits;
-          if (old_payload == vmemkv::STORE_NOT_FOUND) {
-            continue;
-          }
-          if constexpr (ConfigT::UseT1InlineValue) {
-            if (t1_detail::is_inline(merged[i].hash)) {
-              continue;
-            }
-          }
-          // Already remapped by an earlier convergence pass this cycle -- its offset is
-          // already relative to the temp file being built, not to `mem` below.
-          if (merged[i].generation == t2_pair_generation) {
-            continue;
-          }
-          order.push_back(i);
-        }
-
-        if (order.empty()) {
-          return;
-        }
-
-        // Sort by old physical T2 offset ascending -- pure in-memory work over the full live
-        // set, same order of magnitude as T1-only reorganize's own already-fast work (no I/O
-        // here), so this isn't expected to reintroduce the scaling problem being fixed.
-        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-          return (merged[a].payload_bits & kOffsetMask) < (merged[b].payload_bits & kOffsetMask);
-        });
-
-        // `mem` must stay scoped to this call: reorganize_internal() later calls
-        // t2_.begin_draining_and_wait_for_writers(pre_swap_mem) from this same thread, which
-        // scans this thread's own held handles too -- holding `mem` past this function's return
-        // would self-deadlock that wait. Do not hoist this above the offset_mapper_fn lambda.
-        T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-        const uint64_t live_generation = static_cast<const vmemkv::T2Memory *>(mem)->generation;
-
-        for (size_t idx : order) {
-          EntrySnapshot &entry = merged[idx];
-          const uint64_t old_generation = entry.generation;
-
-          // T2FlatFile::acquire_write_handle() guarantees no writer ever receives a handle to a
-          // T2 generation that begin_draining_and_wait_for_writers() might already consider
-          // quiesced (see that function's contract comment in t2_flat_file.hpp). This assert is
-          // defense-in-depth against that invariant. Deterministic regression test:
-          // test_kv_store.cpp, "VMemKV: acquire_write_handle()'s register-then-check-retry
-          // survives a writer racing the drain scan (regression)".
-          if (old_generation != live_generation) {
-            assert(false &&
-                   "T1 entry's stamped T2 generation does not match the T2 generation currently "
-                   "being rebuilt from -- see reorganize_internal()'s convergence-loop comment "
-                   "and this call site's own \"KNOWN OPEN ISSUE\" note");
-            if (generation_mismatch_hook(old_generation, live_generation)) {
-              // TEST-ONLY escape hatch, not a fix -- entry passes through with its stale
-              // generation intact. Production falls through below unchanged either way.
-              continue;
-            }
-          }
-
-          const uint64_t pure_offset = entry.payload_bits & kOffsetMask;
-
-          // Copy key+value out under the seqlock: this record can be concurrently mutated by
-          // update_impl()'s in-place T2 path (key_lock does not serialize against reorganize(),
-          // by design). t2_.at() is called inside read_t2_record_seqlock() (as AtFunc) rather
-          // than once beforehand, since key_len/value_len are unsynchronized and a stale size
-          // read once wouldn't be caught by the version recheck -- see that function's comment.
-          // A garbage size here would propagate: write_record_to_temp_fd() writes exactly that
-          // many bytes, and capacity computation below keeps the inflated size forever (T2
-          // capacity only grows). key_copy/value_copy are reused across calls purely to avoid a
-          // per-record heap allocation; fully overwritten by assign() before every use.
-          read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(pure_offset, mem); },
-                                 [&](const T2RecordView &record) -> bool {
-                                   key_copy.assign(record.key.begin(), record.key.end());
-                                   value_copy.assign(record.value.begin(), record.value.end());
-                                   return true;
-                                 });
-
-          const uint64_t new_offset = write_record_to_temp_fd(fd_guard.fd, key_copy, value_copy, next_bytes_used);
-          maybe_sync_and_drop_checkpoint_cache(fd_guard.fd, next_bytes_used, next_bytes_synced);
-
-          const uint64_t aligned_len =
-              vmemkv::align_up(sizeof(ValueRecordHeader) + key_copy.size() + value_copy.size());
-          const uint64_t block_count = aligned_len / kBlockAlignment;
-          assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
-          entry.payload_bits = new_offset | (block_count << kSizeEmbeddingShift);
-          entry.generation = t2_pair_generation;
-        }
-      };
-      auto chk_writer_fn = [&](std::span<const EntrySnapshot> merged) {
-        // Runs after every offset_mapper call has finished writing T2's records, so this is
-        // the last chance to reclaim T2's checkpoint page cache before T1's own checkpoint
-        // write below needs headroom.
-        if (next_bytes_used > next_bytes_synced && ::fdatasync(fd_guard.fd) == 0) {
-          ::posix_fadvise(fd_guard.fd,
-                          static_cast<off_t>(next_bytes_synced),
-                          static_cast<off_t>(next_bytes_used - next_bytes_synced),
-                          POSIX_FADV_DONTNEED);
-          next_bytes_synced = next_bytes_used;
-        }
-        if (do_checkpoint) {
-          vmemkv::write_t1_checkpoint(vmemkv::derive_t1_chk_path(t2_path(), t1_generation), merged);
-        }
-      };
-
-      while (true) {
-        t1_.reorganize(offset_mapper_fn, chk_writer_fn, t2_pair_generation);
-
-        // Deliberately re-checked again right before swap_memory() -- see below.
-        if (t1_.append_size() == 0) {
-          break;
-        }
-      }
-
-      // Closes the residual window between here and swap_memory(): truncate()/open()/mmap()
-      // below are genuine syscalls, during which a writer could otherwise publish a T1 entry
-      // naming the about-to-be-retired generation, surviving to be examined against the wrong
-      // T2 memory one cycle later. begin_draining_and_wait_for_writers() marks that generation draining
-      // (write_entry_lockfree()'s acquire_write_handle() then defers instead of writing into
-      // it) and blocks until every writer that already held a handle -- i.e. started before the
-      // flag went up -- has released it, which per that handle's contract only happens after
-      // its T1 publish attempt has returned. A bounded, one-time batch of such stragglers can
-      // still land during the wait; the single pass below sweeps them up. From here on,
-      // t1_.append_size() cannot change again until end_draining() runs (paired via
-      // DrainGuard, including on the exception path below), so this is the first point in the
-      // function where "no more writes are coming" is actually proven, not just observed.
+      // Deliberately kept as short as possible: writer_stop_ blocks new writes to *any* key in
+      // the store, not just ones being relocated (see acquire_write_handle()'s contract), so
+      // everything between here and resume_writers() below should be as fast as possible -- which
+      // is exactly why the pre-stop pass above exists, to shrink how much the post-stop pass still
+      // has to do.
       const vmemkv::T2Memory *pre_swap_mem = t2_.get_memory();
-      // TEST-ONLY: lets a test register a writer's handle to pre_swap_mem before the drain
-      // flag goes up. No-op in production -- see NoOpPreDrainHook.
-      pre_drain_hook();
-      t2_.begin_draining_and_wait_for_writers(pre_swap_mem);
-      struct DrainGuard {
+      // TEST-ONLY: lets a test register a writer's handle to pre_swap_mem before the stop flag
+      // goes up. No-op in production -- see NoOpPreStopHook.
+      pre_stop_hook();
+      t2_.stop_writers_and_wait(pre_swap_mem);
+      struct WriterResumeGuard {
         vmemkv::T2FlatFile *t2;
-        ~DrainGuard() { t2->end_draining(); }
-      } drain_guard{&t2_};
+        ~WriterResumeGuard() { t2->resume_writers(); }
+      } resume_guard{&t2_};
 
-      if (t1_.append_size() != 0) {
-        t1_.reorganize(offset_mapper_fn, chk_writer_fn, t2_pair_generation);
-      }
-      assert(t1_.append_size() == 0 &&
-             "begin_draining_and_wait_for_writers() guarantees no writer can still be "
-             "publishing against pre_swap_mem at this point");
+      // Post-stop pass: guaranteed complete -- nothing more can appear until resume_writers()
+      // runs, below.
+      copy_live_entries();
 
       uint64_t new_capacity = t2_.bytes_capacity();
       if (next_bytes_used > new_capacity) {
         new_capacity = next_bytes_used;
       }
 
-      // TEST-ONLY: simulates a writer landing in the residual window closed above.
-      // No-op in production -- see NoOpPostConvergenceHook.
-      post_convergence_hook();
+      // Last chance to reclaim the temp file's page cache before T1's own checkpoint write
+      // (inside the offset_mapper call at the very end) needs headroom.
+      if (next_bytes_used > next_bytes_synced && ::fdatasync(fd_guard.fd) == 0) {
+        ::posix_fadvise(fd_guard.fd,
+                        static_cast<off_t>(next_bytes_synced),
+                        static_cast<off_t>(next_bytes_used - next_bytes_synced),
+                        POSIX_FADV_DONTNEED);
+        next_bytes_synced = next_bytes_used;
+      }
+
+      // TEST-ONLY: lets a test throw here, strictly before T1 is ever touched. No-op in
+      // production -- see NoOpPreFinishHook.
+      pre_finish_hook();
 
       ::close(fd_guard.fd);
       fd_guard.fd = -1;
@@ -536,18 +483,52 @@ class VMemKVImpl {
         throw std::system_error(errno, std::generic_category(), "open temp file for mmap");
       }
 
-      // mmap_t2_memory() is itself a syscall, but unlike before the drain above, append_size()
-      // going non-zero here is no longer possible: no writer can hold a handle to pre_swap_mem
-      // (drained), and none can be issued a new one until end_draining() runs after swap_memory()
-      // below.
+      // Fully constructed and ready, just not yet installed as live -- everything from here on
+      // (the offset_mapper below, and swap_memory() after it) is I/O-free and cannot throw.
       std::unique_ptr<vmemkv::T2Memory> new_mem =
           mmap_t2_memory(map_fd, new_capacity, "mmap temp file", t2_pair_generation, next_bytes_used);
+
+      // The only place T1 gets published this cycle. offset_mapper is a pure lookup into
+      // `relocated` -- everything it needs was already computed and durably written above. Every
+      // entry `merged` (T1's own fresh Sorted+Append merge, taken fresh right now) can possibly
+      // contain is guaranteed to already be in `relocated`: nothing can have been added since the
+      // post-stop pass (writer_stop_ still set), and the two ways an entry could otherwise change
+      // without going through acquire_write_handle() -- an in-place update's value bytes, a
+      // delete's tombstone -- don't affect payload_bits/generation identity, or are skipped below.
+      auto offset_mapper_fn = [&](std::span<EntrySnapshot> merged) {
+        for (auto &entry : merged) {
+          if (entry.payload_bits == vmemkv::STORE_NOT_FOUND) {
+            continue;
+          }
+          if constexpr (ConfigT::UseT1InlineValue) {
+            if (t1_detail::is_inline(entry.hash)) {
+              continue;
+            }
+          }
+          auto it = relocated.find({entry.key, entry.hash});
+          assert(it != relocated.end() &&
+                 "live T1 entry missing from this cycle's relocation map -- stop_writers_and_wait() "
+                 "should make this impossible, see this function's own comment");
+          if (it == relocated.end()) {
+            continue;  // Defense in depth only -- unreachable if the invariant above holds.
+          }
+          entry.payload_bits = it->second;
+          entry.generation = t2_pair_generation;
+        }
+      };
+      auto chk_writer_fn = [&](std::span<const EntrySnapshot> merged) {
+        if (do_checkpoint) {
+          vmemkv::write_t1_checkpoint(vmemkv::derive_t1_chk_path(t2_path(), t1_generation), merged);
+        }
+      };
+      t1_.reorganize(offset_mapper_fn, chk_writer_fn, t2_pair_generation);
+
       t2_.swap_memory(std::move(new_mem));
-      // Ends the drain as soon as the new generation is live, rather than leaving writers
-      // blocked through commit_checkpoint()'s fsync/rename/cleanup below -- DrainGuard's
-      // destructor still covers the exception path (e.g. if swap_memory() itself throws), and
-      // a redundant end_draining() there is harmless (plain store(false)).
-      t2_.end_draining();
+      // Resumes writers as soon as the new generation is live, rather than leaving them blocked
+      // through commit_checkpoint()'s fsync/rename/cleanup below -- WriterResumeGuard's destructor
+      // still covers the exception path (e.g. if swap_memory() itself throws), and a redundant
+      // resume_writers() there is harmless (plain store(false)).
+      t2_.resume_writers();
 
       if (do_checkpoint) {
         commit_checkpoint(
@@ -582,12 +563,12 @@ class VMemKVImpl {
   // rebuild (or T1-only delta flush) exist only in this process's memory, never on disk on their
   // own -- see the delta-flush block below. Still strictly cheaper than a full rebuild, which
   // also re-reads and rewrites every already-durable live byte, not just the new ones.
-  // No convergence loop or drain barrier needed here, unlike reorganize_internal()'s T2-rebuild
-  // branch: write_entry_lockfree() always publishes to T1 before it reserves the write's WAL LSN,
-  // so every record at or before checkpoint_lsn is already visible to a single t1_.reorganize()
-  // freeze taken after checkpoint_lsn is captured -- and since this branch never calls
-  // swap_memory(), the T2-generation-retirement hazard the drain barrier exists for doesn't apply
-  // here at all.
+  // No pre/post-stop scan passes or writer-stop barrier needed here, unlike
+  // rebuild_t2_and_maybe_checkpoint(): write_entry_lockfree() always publishes to T1 before it
+  // reserves the write's WAL LSN, so every record at or before checkpoint_lsn is already visible
+  // to a single t1_.reorganize() freeze taken after checkpoint_lsn is captured -- and since this
+  // branch never calls swap_memory(), the T2-generation-retirement hazard the writer-stop barrier
+  // exists for doesn't apply here at all.
   void checkpoint_t1_only_with_delta_flush() {
     using EntrySnapshot = typename T1IndexT::EntrySnapshot;
     const uint64_t checkpoint_lsn = wal_.next_lsn() - 1;
@@ -639,7 +620,7 @@ class VMemKVImpl {
           // before the pwrite below -- see T2Memory::write_gate_boundary's comment for why a
           // single boundary field can't safely serve both this and base_boundary's role, and
           // update_epoch_tracker_'s declaration for why this drain (not
-          // T2FlatFile::begin_draining_and_wait_for_writers(), which only gates new appends) is
+          // T2FlatFile::stop_writers_and_wait(), which only gates new appends) is
           // needed here.
           mem->write_gate_boundary.store(current_t2_bytes, std::memory_order_release);
           const uint64_t new_epoch = update_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -889,14 +870,15 @@ class VMemKVImpl {
         continue;
       }
 
-      // acquire_write_handle() (not a plain get_memory_handle()) defers while a reorganize() is
-      // draining its final pre-swap window, and -- critically -- `mem` is held alive across both
-      // the T2 append below and the T1 publish attempt, not released in between. That pairing is
-      // what closes reorganize_internal()'s residual-window race: as long as this handle is live,
-      // begin_draining_and_wait_for_writers() can't conclude that `mem`'s generation is safe to
-      // retire, so a straggler entry naming it can never survive past the reorg that's currently
-      // running. write_generation is simply `mem->generation` -- the exact generation this write
-      // landed in, since we never let go of `mem` between writing and publishing.
+      // acquire_write_handle() (not a plain get_memory_handle()) defers while a reorganize() has
+      // new writers stopped for its final pre-swap window, and -- critically -- `mem` is held
+      // alive across both the T2 append below and the T1 publish attempt, not released in
+      // between. That pairing is what closes reorganize_internal()'s residual-window race: as
+      // long as this handle is live, stop_writers_and_wait() can't conclude that `mem`'s
+      // generation is safe to retire, so a straggler entry naming it can never survive past the
+      // reorg that's currently running. write_generation is simply `mem->generation` -- the exact
+      // generation this write landed in, since we never let go of `mem` between writing and
+      // publishing.
       typename T1IndexT::PutResult put_result;
       {
         T2FlatFile::T2MemoryHandle mem = t2_.acquire_write_handle();

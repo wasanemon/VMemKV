@@ -146,10 +146,10 @@ auto T2FlatFile::append_prefault(const T2Memory *mem,
   return offset;
 }
 
-void T2FlatFile::begin_draining_and_wait_for_writers(const T2Memory *mem) const noexcept {
-  // seq_cst: paired with acquire_write_handle()'s seq_cst draining_ load and
+void T2FlatFile::stop_writers_and_wait(const T2Memory *mem) const noexcept {
+  // seq_cst: paired with acquire_write_handle()'s seq_cst writer_stop_ load and
   // ThreadReferenceTracker::acquire()'s seq_cst store -- see acquire_write_handle()'s comment.
-  draining_.store(true, std::memory_order_seq_cst);
+  writer_stop_.store(true, std::memory_order_seq_cst);
   active_readers_.wait_until_retired(mem);
 }
 

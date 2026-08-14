@@ -275,6 +275,12 @@ $$\text{Checkpoint\_Trigger} = \text{T2\_Rebuild\_Trigger} \lor \text{WAL\_Bytes
 * **`WAL_MAX_BYTES_SINCE_CHECKPOINT`**: 直前 checkpoint の checkpoint LSN 以降に WAL へ append されたバイト数の上限。Checkpoint はこのサイズベースのトリガーのみで判定し、書き込みレートに関わらず起動時の WAL replay 時間を有界に保つ。
 * **`Force`**: `defragment()` の明示呼び出し、あるいは参照可能な T2 checkpoint ファイルがまだ存在しない状態での `checkpoint()` 呼び出し(初回、`no_t2_checkpoint_yet`)。
 * この 2 つの判定式自体は単一の内部関数の分岐にはせず、公開 API を **`reorganize()`**(T1-only インメモリマージ、T2 に触れず checkpoint もしない)・**`defragment()`**(常に T2 をフル再構築(GC)し checkpoint を永続化する)・**`checkpoint()`**(参照可能な T2 checkpoint が無ければ `defragment()` 相当、あれば T1 マージ + T2 差分 pwrite/fsync という最も安いパスで checkpoint を永続化する)の 3 つに分割する。しきい値の評価とどのメソッドを呼ぶかの決定は、呼び出し側(バックグラウンドワーカー `reorg_worker_loop()` および起動時 `recover_from_wal()`)の責務とする。判定結果は 3 通り: **(1)** `T2_Rebuild_Trigger` 成立 -- `defragment()`(GC + checkpoint、4.3 節・5 章)。**(2)** `T2_Rebuild_Trigger` 不成立かつ `Checkpoint_Trigger` 成立 -- `checkpoint()` の安いパス、すなわち **T1-only checkpoint**(5.2 節後半)、T2 は再構築せず既存の checkpoint ファイルを参照したまま checkpoint のみ行う。**(3)** どちらも不成立 -- `reorganize()`(T1-only、checkpoint なし)。
+
+| API | do_t2_rebuild | do_checkpoint | 目的 |
+|---|---|---|---|
+| `reorganize()` | false | false | T1 の Append→Sorted マージのみ。T2/ディスク非関与 |
+| `checkpoint()` | 既存 T2 checkpoint の有無で分岐 | true | 耐久性の確保。安いパス優先、初回のみフルリビルド |
+| `defragment()` | true | true | T2 の断片化解消(GC)。常にフルリビルド |
 * **初期挿入 (Insert-only) ワークロード:** ゴミデータが発生しないため $A$ は常に $1.0 < 1.3$ に保たれ、`WAL_MAX_BYTES_SINCE_CHECKPOINT` 到達は(初回を除き)常に (2) `checkpoint()` の T1-only パスに帰着する。
 
 **Input**
@@ -379,7 +385,7 @@ T2 `reorganize` は full scan + full copy を伴うため、in-memory で同時�
 2. **T2 差分の耐久化(このフロー固有の手順)**: T2 の稼働中 mmap は `MAP_PRIVATE`(5.1 節の NOTE参照、書き込みはプロセス内 COW ページに留まりファイルへは反映されない)であるため、直前の T2 checkpoint(フルリビルド、または以前の T1-only checkpoint の差分フラッシュ)以降に通常の Insert / Update が T2 へ書き込んだバイトは、まだディスク上のどこにも存在しない。これらを WAL に頼らず失わずに済ませるには、このタイミングで実際にディスクへ書く必要がある。直前に耐久化済みのバイト数(`t2_durable_bytes_`)から現在の `bytes_used` までの範囲を、稼働中 mmap 上の該当バイト列から `pwrite()` で **同じ T2 checkpoint ファイルの同じオフセット** へ追記し、`fsync()` する(この範囲より前のバイトは T1-only checkpoint では一切移動しないため、そのままで良い)。コストは O(直前の checkpoint 以降に増えた T2 バイト数) であり、O(生存コーパス全体) のフルリビルドより大幅に安いが、ゼロではない。
    - **`ScanBaseSequential` 有効時: `base_boundary` のインクリメンタル昇格(2.2節)**。この手順の `pwrite()`/`fsync()` を挟んで、以下の順序を厳守する:
      1. まず `write_gate_boundary` を今回の昇格対象範囲の上端(= この手順で `pwrite()` する `bytes_used`)へ bump する。この時点で、新たにこの範囲を対象とする in-place 更新(3.3節)は締め出される。ただし `base_boundary` はまだ動かさないため、読み取り側(base領域用の読み取り専用mmap群、2.2節/7.9節)には一切影響しない。
-     2. 上記の締め出しより*前*に、既に古い `write_gate_boundary` を見て in-place 書き込み中だったスレッドが残っていないことを保証する必要がある。専用の epoch ベースの reference tracker(`update_epoch_tracker_`)を使い、epoch をひとつ進めたうえで、当該 in-place 更新のクリティカルセクションが epoch 登録済みだった全スレッドの完了を待つ。`T2FlatFile::begin_draining_and_wait_for_writers()`(6章)は新規 append だけをゲートする別機構であり、in-place 更新はこの待機の対象外なので流用できない。
+     2. 上記の締め出しより*前*に、既に古い `write_gate_boundary` を見て in-place 書き込み中だったスレッドが残っていないことを保証する必要がある。専用の epoch ベースの reference tracker(`update_epoch_tracker_`)を使い、epoch をひとつ進めたうえで、当該 in-place 更新のクリティカルセクションが epoch 登録済みだった全スレッドの完了を待つ。`T2FlatFile::stop_writers_and_wait()`(6章)は新規 append だけをゲートする別機構であり、in-place 更新はこの待機の対象外なので流用できない。
      3. この待機が完了して初めて、対象範囲は「二度と in-place で変わらない」ことが確定する。ここで初めて上記の `pwrite()`/`fsync()` を実行する。
      4. `pwrite()`/`fsync()` が成功した後(耐久化完了後)、初めて `base_boundary` を同じ値まで bump して公開する。読み取り可否の公開を書き込みの締め出しより*後*に行うのは、base領域用の読み取り専用mmap群は別 fd 経由の書き込みも透過的に反映する(7.9節、`MAP_PRIVATE` かつ一度も書き込まれないマッピングは COW が発動しないため)ので、`base_boundary` を先に公開してしまうと、まだディスクに届いていないバイトを読者に見せてしまう(stale read)ためである。
    - これらのmmap自体は毎回張り直さない(2.2節)ので、この昇格はこの手順の外側にある通常の delta flush と同程度のコストで完結する -- 新たな一時ファイルの作成や `swap_memory()` は発生しない。

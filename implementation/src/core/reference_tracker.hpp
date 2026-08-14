@@ -52,7 +52,7 @@ class ThreadReferenceTracker {
 
   // Registers the current thread's reference. seq_cst (not release): paired with
   // wait_until_retired()'s seq_cst load below to close a store-buffering race where a writer's
-  // "is draining_ set?" check and the drain scan's "has this slot registered?" check could each
+  // "is writer_stop_ set?" check and the stop scan's "has this slot registered?" check could each
   // observe the other's pre-update value -- acquire/release alone doesn't rule that out for two
   // independent atomics read/written by both sides. See T2FlatFile::acquire_write_handle().
   void acquire(T val) const noexcept { slots_[get_thread_id()].value.store(val, std::memory_order_seq_cst); }

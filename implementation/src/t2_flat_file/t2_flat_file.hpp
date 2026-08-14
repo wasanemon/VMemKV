@@ -192,7 +192,7 @@ struct T2Memory {
 };
 
 // Test-only seam for T2FlatFile::acquire_write_handle(); fires once, right after registering the
-// handle and before checking `draining_`. No-op in production.
+// handle and before checking `writer_stop_`. No-op in production.
 struct NoOpAcquireWriteHandleHook {
   void operator()() const noexcept {}
 };
@@ -235,22 +235,22 @@ class T2FlatFile {
 
   auto get_memory_handle() const noexcept -> T2MemoryHandle { return {active_readers_, get_memory()}; }
 
-  // Write-side half of the residual-window fix (see begin_draining_and_wait_for_writers() for
-  // the reorganize side): acquires a handle for appending a brand-new T2 record, deferring while
-  // a reorganize() is draining its final pre-swap window so no writer ever starts writing into a
+  // Write-side half of the residual-window fix (see stop_writers_and_wait() for the reorganize
+  // side): acquires a handle for appending a brand-new T2 record, deferring while a reorganize()
+  // has new writers stopped for its final pre-swap window so no writer ever starts writing into a
   // generation that's about to be retired. Callers appending a new record must hold the returned
   // handle until their T1 publish (T1Index::put()) attempt has returned -- releasing it earlier
-  // would let this same generation look "drained" to begin_draining_and_wait_for_writers() before
-  // the T1 entry naming it actually exists, reopening the exact race this pairing closes.
+  // would let this same generation look "stopped" to stop_writers_and_wait() before the T1 entry
+  // naming it actually exists, reopening the exact race this pairing closes.
   //
-  // Registers first, then checks `draining_` -- checking first would leave a gap: a writer whose
-  // check saw draining_==false, but who hadn't registered yet, could still be missed by
+  // Registers first, then checks `writer_stop_` -- checking first would leave a gap: a writer
+  // whose check saw writer_stop_==false, but who hadn't registered yet, could still be missed by
   // wait_until_retired()'s single index-ordered pass (it never revisits a slot once past it), so
-  // the drain could complete while the writer went on to write into a generation about to be
-  // retired. Registering first closes this: if draining_ turns out to already be true, this
-  // handle is dropped and retried, so no caller ever receives a handle to a generation the drain
+  // the stop could complete while the writer went on to write into a generation about to be
+  // retired. Registering first closes this: if writer_stop_ turns out to already be true, this
+  // handle is dropped and retried, so no caller ever receives a handle to a generation the stop
   // might have already (or might be about to) declare fully quiesced. `hook` is a test-only seam,
-  // firing once right after registering and before the draining_ check -- lets a test pause a
+  // firing once right after registering and before the writer_stop_ check -- lets a test pause a
   // writer in exactly that window to reproduce the race deterministically; no-op in production.
   //
   // Registers/releases through active_readers_ directly (rather than a named T2MemoryHandle
@@ -264,7 +264,7 @@ class T2FlatFile {
       const T2Memory *mem = get_memory();
       active_readers_.acquire(mem);
       hook();
-      if (!draining_.load(std::memory_order_seq_cst)) {
+      if (!writer_stop_.load(std::memory_order_seq_cst)) {
         return {active_readers_, mem};  // re-acquire()s the same value; harmless.
       }
       active_readers_.release();
@@ -273,15 +273,16 @@ class T2FlatFile {
   }
 
   // Reorganize-side half: marks `mem` (the still-live generation about to be retired) as
-  // draining, so acquire_write_handle() stops handing it to new callers, then blocks until every
-  // writer that already holds a handle to it -- i.e. started before the flag went up -- has
-  // released it. Per acquire_write_handle()'s contract that only happens after that writer's T1
-  // publish attempt returns, so once this call returns, T1's append_region cannot receive another
-  // entry naming `mem`'s generation. Must be paired with end_draining(), including on the
-  // exception path (the caller's try/catch already covers this; see reorganize_internal()).
-  void begin_draining_and_wait_for_writers(const T2Memory *mem) const noexcept;
-  // Un-pairs begin_draining_and_wait_for_writers(); safe to call even if no drain is active.
-  void end_draining() const noexcept { draining_.store(false, std::memory_order_release); }
+  // stopped-for-writers, so acquire_write_handle() stops handing it to new callers, then blocks
+  // until every writer that already holds a handle to it -- i.e. started before the flag went
+  // up -- has released it. Per acquire_write_handle()'s contract that only happens after that
+  // writer's T1 publish attempt returns, so once this call returns, T1's append_region cannot
+  // receive another entry naming `mem`'s generation. Must be paired with resume_writers(),
+  // including on the exception path (the caller's try/catch already covers this; see
+  // reorganize_internal()).
+  void stop_writers_and_wait(const T2Memory *mem) const noexcept;
+  // Un-pairs stop_writers_and_wait(); safe to call even if writers aren't currently stopped.
+  void resume_writers() const noexcept { writer_stop_.store(false, std::memory_order_release); }
 
   // Resolves a record at the given payload offset into a structured view.
   // - Contract: The offset must be within bounds. The returned view references the memory base,
@@ -349,10 +350,10 @@ class T2FlatFile {
 
   mutable ThreadReferenceTracker<const T2Memory *> active_readers_;
 
-  // Set by begin_draining_and_wait_for_writers(), cleared by end_draining(); gates
-  // acquire_write_handle() so no new writer starts against a generation reorganize_internal() is
-  // about to retire. See acquire_write_handle()'s declaration for the full contract.
-  mutable std::atomic<bool> draining_{false};
+  // Set by stop_writers_and_wait(), cleared by resume_writers(); gates acquire_write_handle() so
+  // no new writer starts against a generation reorganize_internal() is about to retire. See
+  // acquire_write_handle()'s declaration for the full contract.
+  mutable std::atomic<bool> writer_stop_{false};
 };
 
 }  // namespace vmemkv

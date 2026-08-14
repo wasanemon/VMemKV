@@ -1352,35 +1352,36 @@ TEST_CASE(
 }
 
 // Regression test for reorganize_internal()'s formerly-open "residual window" race: even with
-// its convergence loop and final pre-swap_memory() gate, a writer used to be able to land a fresh
-// entry into T1's active region during the truncate()/open()/mmap()/swap_memory() syscalls. That
-// entry would surface one cycle later, when the *next* reorganize() examined it: its stamped
-// generation still named the T2Memory the previous cycle's swap_memory() had just retired, but
-// offset_mapper resolved it against whatever T2Memory was live at that point -- either a crash, a
-// hang (read_t2_record_seqlock spinning on a version field that never settles), or silently wrong
-// data.
+// its pre/post-stop scan passes and final pre-swap_memory() gate, a writer used to be able to
+// land a fresh entry into T1's active region during the truncate()/open()/mmap()/swap_memory()
+// syscalls. That entry would surface one cycle later, when the *next* reorganize() examined it:
+// its stamped generation still named the T2Memory the previous cycle's swap_memory() had just
+// retired, but offset_mapper resolved it against whatever T2Memory was live at that point --
+// either a crash, a hang (read_t2_record_seqlock spinning on a version field that never
+// settles), or silently wrong data.
 //
 // Fixed in t2_flat_file.hpp by pairing acquire_write_handle() (write_entry_lockfree()'s only way
 // to get a T2 write handle, held across both the T2 append and the T1 publish attempt) with
-// begin_draining_and_wait_for_writers() (called here right before the
-// truncate()/open()/mmap()/swap_memory() sequence): it marks the still-live generation draining,
-// so acquire_write_handle() stops handing it to *new* callers, then blocks until every writer that
-// already held a handle -- i.e. started before the flag went up -- has released it, which only
-// happens after that writer's T1 publish attempt has returned.
+// stop_writers_and_wait() (called here right before the post-stop scan pass): it marks the
+// still-live generation stopped-for-writers, so acquire_write_handle() stops handing it to *new*
+// callers, then blocks until every writer that already held a handle -- i.e. started before the
+// flag went up -- has released it, which only happens after that writer's T1 publish attempt has
+// returned.
 //
 // This test proves exactly that handshake, deterministically, using a real writer thread (not a
 // synchronous hook simulating the old race, which would now just deadlock: by the time
-// post_convergence_hook fires, draining_ is already true, and nothing but this same call's own
-// later swap_memory()/end_draining() would ever clear it -- a hook-spawned writer would spin
-// forever waiting for a flag its own spawning call is blocking on). Instead, pre_drain_hook fires
-// *before* the drain flag goes up, spawning a thread that registers a real T2MemoryHandle to the
+// pre_finish_hook fires, writer_stop_ is already true, and nothing but this same call's own later
+// swap_memory()/resume_writers() would ever clear it -- a hook-spawned writer would spin forever
+// waiting for a flag its own spawning call is blocking on). Instead, pre_stop_hook fires *before*
+// the stop flag goes up, spawning a thread that registers a real T2MemoryHandle to the
 // about-to-be-retired generation and pauses briefly before publishing -- exercising the "writer
-// already in flight when the drain starts" case that used to be lost. The drain must block until
-// this thread finishes, sweep its entry up, and the following cycle must never see a generation
-// mismatch for it.
+// already in flight when the stop starts" case that used to be lost. stop_writers_and_wait() must
+// block until this thread finishes, and this *same* cycle's post-stop scan pass must then pick
+// its entry up -- unlike the old design, there is no separate "next cycle" where a stale
+// generation could ever surface.
 TEST_CASE(
-    "VMemKV: reorganize_internal()'s drain barrier waits for an in-flight writer instead of "
-    "retiring its generation underneath it (regression)") {
+    "VMemKV: rebuild's writer-stop barrier waits for an in-flight writer instead of retiring "
+    "its generation underneath it (regression)") {
   using TestStore = vmemkv::variants::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
@@ -1393,23 +1394,21 @@ TEST_CASE(
   const std::string straggler_value(200, 's');
   std::thread straggler_writer;
 
-  // Cycle 1: force a full T2 rebuild. pre_drain_hook fires strictly before the drain flag goes
-  // up, so the spawned thread's acquire_write_handle() call is guaranteed to land against the
-  // still-current (about-to-be-retired) generation, registering it with the reference tracker
-  // before begin_draining_and_wait_for_writers() ever scans it.
+  // pre_stop_hook fires strictly before the stop flag goes up, so the spawned thread's
+  // acquire_write_handle() call is guaranteed to land against the still-current
+  // (about-to-be-retired) generation, registering it with the reference tracker before
+  // stop_writers_and_wait() ever scans it.
   store->impl().reorganize_internal(
-      /*do_t2_rebuild=*/
-      true,
+      /*do_t2_rebuild=*/true,
       /*do_checkpoint=*/true,
-      /*post_convergence_hook=*/[] {},
-      /*generation_mismatch_hook=*/vmemkv::NoOpGenerationMismatchHook{},
-      /*pre_drain_hook=*/
+      /*pre_stop_hook=*/
       [&] {
         using ImplT = std::decay_t<decltype(store->impl())>;
         straggler_writer = std::thread([&] {
           vmemkv::T2FlatFile::T2MemoryHandle mem = store->impl().t2().acquire_write_handle();
-          // Simulates being "mid-write": long enough that, absent the drain-wait, cycle 1 would
-          // very likely have already retired this generation by the time this thread publishes.
+          // Simulates being "mid-write": long enough that, absent the stop-and-wait, the rebuild
+          // would very likely have already retired this generation by the time this thread
+          // publishes.
           std::this_thread::sleep_for(std::chrono::milliseconds(20));
           kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
             kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
@@ -1421,55 +1420,41 @@ TEST_CASE(
                       ImplT::T1IndexT::PutResult::Applied);
             });
           });
-          // mem released here -- only now can begin_draining_and_wait_for_writers() (blocked on
-          // this exact handle since before this thread even started sleeping) proceed.
+          // mem released here -- only now can stop_writers_and_wait() (blocked on this exact
+          // handle since before this thread even started sleeping) proceed.
         });
       });
   straggler_writer.join();
 
-  // Cycle 2: examines "straggler" against the T2Memory cycle 1 published. If the drain barrier
-  // held, its stamped generation must equal cycle 1's, so the mismatch hook must never fire.
-  bool mismatch_detected = false;
-  store->impl().reorganize_internal(
-      /*do_t2_rebuild=*/
-      true,
-      /*do_checkpoint=*/true,
-      /*post_convergence_hook=*/[] {},
-      /*generation_mismatch_hook=*/
-      [&](uint64_t /*old_generation*/, uint64_t /*live_generation*/) {
-        mismatch_detected = true;
-        return true;  // Skip the unsafe dereference -- see this test's header comment.
-      });
-
-  CHECK_FALSE(mismatch_detected);
-
+  // This same rebuild cycle's post-stop scan pass must have picked up "straggler" and relocated
+  // it with the new generation -- reading it back must work immediately, no second cycle needed.
   const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
   REQUIRE(straggler_readback.has_value());
   CHECK(straggler_readback->size() == straggler_value.size());
 }
 
 // Regression test for the formerly-open "residual window" race described in
-// reorganize_internal()'s offset_mapper_fn comment: T2FlatFile::acquire_write_handle() used to
-// check draining_ *before* registering with the reference tracker, which
+// rebuild_t2_and_maybe_checkpoint()'s comment: T2FlatFile::acquire_write_handle() used to check
+// writer_stop_ *before* registering with the reference tracker, which
 // ThreadReferenceTracker::wait_until_retired()'s single index-ordered scan (it never re-examines
-// a slot once past it) could race -- a writer whose check saw draining_==false, but who hadn't
-// registered yet, could still be missed by an already-in-progress scan, so the drain could
-// complete and the writer would go on to write into a generation the next cycle no longer
-// recognizes. Fixed by registering first and only then checking draining_, retrying if it turns
+// a slot once past it) could race -- a writer whose check saw the flag false, but who hadn't
+// registered yet, could still be missed by an already-in-progress scan, so the stop-and-wait
+// could complete and the writer would go on to write into a generation this same cycle no longer
+// recognizes. Fixed by registering first and only then checking the flag, retrying if it turns
 // out to already be true.
 //
 // Reproduces the adversarial timing deterministically via acquire_write_handle()'s hook seam
-// (fires once, right after registering and before the draining_ check): the writer thread
-// registers, signals pre_drain_hook that it has done so, then sleeps -- guaranteeing
-// begin_draining_and_wait_for_writers() (called on the main thread right after pre_drain_hook
-// returns) sets draining_=true and starts scanning while this thread is still paused, already
-// registered but not yet having checked draining_. Under the fix, the writer's own check must
-// then see draining_==true and back out/retry rather than proceed with a handle that might be to
-// an about-to-retire generation -- exactly the guarantee the old check-then-register order could
-// not make.
+// (fires once, right after registering and before the writer_stop_ check): the writer thread
+// registers, signals pre_stop_hook that it has done so, then sleeps -- guaranteeing
+// stop_writers_and_wait() (called on the main thread right after pre_stop_hook returns) sets
+// writer_stop_=true and starts scanning while this thread is still paused, already registered but
+// not yet having checked the flag. Under the fix, the writer's own check must then see
+// writer_stop_==true and back out/retry rather than proceed with a handle that might be to an
+// about-to-retire generation -- exactly the guarantee the old check-then-register order could not
+// make.
 TEST_CASE(
     "VMemKV: acquire_write_handle()'s register-then-check-retry survives a writer racing the "
-    "drain scan (regression)") {
+    "writer-stop scan (regression)") {
   using TestStore = vmemkv::variants::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
@@ -1482,21 +1467,32 @@ TEST_CASE(
   std::atomic<bool> writer_registered{false};
 
   store->impl().reorganize_internal(
-      /*do_t2_rebuild=*/
-      true,
+      /*do_t2_rebuild=*/true,
       /*do_checkpoint=*/true,
-      /*post_convergence_hook=*/[] {},
-      /*generation_mismatch_hook=*/vmemkv::NoOpGenerationMismatchHook{},
-      /*pre_drain_hook=*/
+      /*pre_stop_hook=*/
       [&] {
         using ImplT = std::decay_t<decltype(store->impl())>;
         straggler_writer = std::thread([&] {
+          // Only the *first* acquire_write_handle() attempt needs to pause here -- that's the one
+          // stop_writers_and_wait() (below) is guaranteed to observe as "already registered,
+          // haven't checked the flag yet" (the exact window this test targets). A production
+          // caller's retries carry no such delay (NoOpAcquireWriteHandleHook is instant), so they
+          // re-check writer_stop_ within nanoseconds of it clearing; re-pausing on every retry
+          // here would be purely a test-harness artifact -- and a bad one: it can stretch the
+          // *net* time this slot spends showing a stale value far past what
+          // ThreadReferenceTracker::wait_until_retired()'s SpinBackoff (yields, then 1ms polls)
+          // is tuned to catch quickly, since each retry reopens only a sub-microsecond release
+          // window against a 30ms-wide observation stride.
+          bool first_attempt = true;
           vmemkv::T2FlatFile::T2MemoryHandle mem = store->impl().t2().acquire_write_handle([&] {
             writer_registered.store(true, std::memory_order_release);
-            // Long enough that begin_draining_and_wait_for_writers() below is guaranteed to have
-            // set draining_=true and started its scan (finding this thread's slot registered,
-            // hence blocking on it) before this thread wakes up and checks draining_ itself.
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            if (first_attempt) {
+              first_attempt = false;
+              // Long enough that stop_writers_and_wait() below is guaranteed to have set
+              // writer_stop_=true and started its scan (finding this thread's slot registered,
+              // hence blocking on it) before this thread wakes up and checks the flag itself.
+              std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            }
           });
           kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
             kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
@@ -1509,33 +1505,68 @@ TEST_CASE(
             });
           });
         });
-        // Don't let pre_drain_hook return until the writer has registered -- otherwise
-        // begin_draining_and_wait_for_writers() might start scanning before the writer's slot is
-        // set at all, which wouldn't exercise the "scan already saw/blocked on a registered slot,
-        // writer only then wakes up and self-checks" path this test targets.
+        // Don't let pre_stop_hook return until the writer has registered -- otherwise
+        // stop_writers_and_wait() might start scanning before the writer's slot is set at all,
+        // which wouldn't exercise the "scan already saw/blocked on a registered slot, writer only
+        // then wakes up and self-checks" path this test targets.
         while (!writer_registered.load(std::memory_order_acquire)) {
           std::this_thread::yield();
         }
       });
   straggler_writer.join();
 
-  bool mismatch_detected = false;
-  store->impl().reorganize_internal(
-      /*do_t2_rebuild=*/
-      true,
-      /*do_checkpoint=*/true,
-      /*post_convergence_hook=*/[] {},
-      /*generation_mismatch_hook=*/
-      [&](uint64_t /*old_generation*/, uint64_t /*live_generation*/) {
-        mismatch_detected = true;
-        return true;
-      });
-
-  CHECK_FALSE(mismatch_detected);
-
   const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
   REQUIRE(straggler_readback.has_value());
   CHECK(straggler_readback->size() == straggler_value.size());
+}
+
+// Regression test for a design this codebase used to have: an earlier version of
+// rebuild_t2_and_maybe_checkpoint() published T1's new generation incrementally, mid-rebuild,
+// before T2 was ready. An exception there (e.g. from truncate()/mmap() under real
+// ENOSPC/EMFILE/ENOMEM pressure) could leave a T1 entry permanently naming a T2 generation that
+// would never be published, hanging get()/update() on that key forever inside
+// try_in_place_update()'s/get_impl()'s `mem->generation < res.generation` retry loop --
+// reproduced via fault injection during that redesign, which is what motivated moving T1's
+// publish to a single, I/O-free call at the very end (see rebuild_t2_and_maybe_checkpoint()'s own
+// comment). This test proves the current design instead: injecting a fault at the last possible
+// moment before T1 could ever be touched (NoOpPreFinishHook's seam) still leaves the store fully
+// functional afterward -- no hang, correct data, and a subsequent defragment() succeeds normally.
+TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the store fully usable") {
+  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
+
+  const std::string value(200, 'v');
+  REQUIRE(store->insert("key", value));
+
+  struct InjectedFault : std::runtime_error {
+    InjectedFault() : std::runtime_error("injected fault before T1 publish") {}
+  };
+
+  bool threw = false;
+  try {
+    store->impl().reorganize_internal(
+        /*do_t2_rebuild=*/true,
+        /*do_checkpoint=*/true,
+        /*pre_stop_hook=*/vmemkv::NoOpPreStopHook{},
+        /*pre_finish_hook=*/[] { throw InjectedFault{}; });
+  } catch (const InjectedFault &) {
+    threw = true;  // Mirrors reorg_worker_loop()'s catch (...) {} -- swallow and move on.
+  }
+  REQUIRE(threw);
+
+  // No hang, no rollback needed: T1 was never touched, so the store is immediately usable.
+  const auto readback = test_util::get_bytes_sync(store, "key");
+  REQUIRE(readback.has_value());
+  CHECK(std::string(reinterpret_cast<const char *>(readback->data()), readback->size()) == value);
+
+  REQUIRE(store->update("key", std::string(200, 'w')));
+
+  // A subsequent, unfaulted rebuild must still succeed normally.
+  store->defragment();
+  const auto final_readback = test_util::get_bytes_sync(store, "key");
+  REQUIRE(final_readback.has_value());
+  CHECK(final_readback->size() == 200);
 }
 
 namespace {

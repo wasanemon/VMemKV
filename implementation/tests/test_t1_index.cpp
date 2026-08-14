@@ -454,17 +454,23 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
   }
 }
 
-// Deterministic regression test for a still-open gap: reorganize_internal()'s convergence loop
-// (see its "KNOWN OPEN ISSUE" comment in vmemkv_impl.hpp) re-loops while t1_.append_size() != 0 to
-// stop an entry surviving into a later reorganize() cycle stamped with a T2 generation the caller
-// has already moved past -- but it can't close the gap between the loop's final "is it empty"
-// check and the caller's T2Memory::swap_memory() actually advancing. Hitting that gap via real
-// concurrency needs many threads and a lucky interleaving; this test reproduces it deterministically
-// instead, using reorganize()'s post_freeze_hook (a test-only seam) to land a fresh entry in the
-// post-freeze active region on demand, then simulating the caller's generation bump before the next
-// reorganize() examines it. This documents that the gap is real and reachable, not how production
-// concurrency hits it (see the vmemkv_impl.hpp comment for that) -- it isn't a fix, and this test
-// passes today.
+// Deterministic regression test for a T1Index::reorganize()-level property: an entry that lands in
+// the fresh post-freeze active region during one reorganize() call is not part of that call's
+// `merged`, and survives -- still stamped with whatever generation it was written under -- into
+// whatever's active when the call returns. A *second* reorganize() call that then examines this
+// entry sees it paired with its original, now possibly-stale generation, not whatever generation
+// that second call itself was invoked with.
+//
+// This was reachable from vmemkv_impl.hpp's rebuild_t2_and_maybe_checkpoint() in an earlier design,
+// which called t1_.reorganize() repeatedly (a "convergence loop") to sweep up stragglers, risking
+// exactly this mismatch on a later pass -- hence that design's now-removed generation-mismatch
+// assert/hook escape hatch. The current design calls t1_.reorganize() exactly once per rebuild
+// cycle, only after T2FlatFile::stop_writers_and_wait() has already guaranteed no new T2-append-
+// backed entry can appear, so this property is no longer reachable from that call site at all; it
+// remains true and worth guarding here purely as T1Index's own contract, verified in isolation via
+// reorganize()'s post_freeze_hook (a test-only seam) to land a fresh entry in the post-freeze
+// active region on demand, then simulating a generation bump before the next reorganize() examines
+// it.
 TEST_CASE(
     "T1Index: an entry inserted right after reorganize()'s freeze can still be examined by a "
     "later cycle stamped with a T2 generation the caller has already moved past") {
@@ -482,9 +488,9 @@ TEST_CASE(
       [&] { REQUIRE(idx->put(to_span("k"), 111, false, 0, kGenBeforeRebuild) == TestIndex::PutResult::Applied); });
   REQUIRE(idx->append_size() == 1);  // "k" is live in the active region, untouched by pass 1.
 
-  // The real convergence loop would re-loop here, still paired with kGenBeforeRebuild. This test
-  // skips to the one case it can't rule out: the pass that finally freezes "k" runs after the
-  // caller has already committed to kGenAfterRebuild.
+  // A second reorganize() call is where this would surface -- "k" is still paired with
+  // kGenBeforeRebuild going into it, regardless of what generation that second call itself runs
+  // under.
   uint64_t observed_generation = 0;
   std::vector<TestIndex::EntrySnapshot> merged_out;
   idx->reorganize(
@@ -498,6 +504,6 @@ TEST_CASE(
 
   REQUIRE(merged_out.size() == 1);
   // The gap: the caller believes it's pairing this read against kGenAfterRebuild, but "k"'s own
-  // stamp is still kGenBeforeRebuild -- the mismatch offset_mapper's assert exists to catch.
+  // stamp is still kGenBeforeRebuild.
   CHECK(observed_generation == kGenBeforeRebuild);
 }
