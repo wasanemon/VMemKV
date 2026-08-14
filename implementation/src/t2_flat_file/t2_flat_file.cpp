@@ -29,7 +29,6 @@ void write_record(std::byte *record_base, std::span<const std::byte> key, std::s
   header->key_len = static_cast<uint32_t>(key.size());
   header->value_len = static_cast<uint32_t>(value.size());
   header->alloc_len = static_cast<uint32_t>(value.size());
-  header->flags = 0;
   header->version = 0;
 
   auto *cursor = reinterpret_cast<std::byte *>(header + 1);

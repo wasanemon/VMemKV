@@ -66,7 +66,6 @@ struct ValueRecordHeader {
     uint32_t key_len;
     uint32_t value_len;
     uint32_t alloc_len;     // allocated bytes for value payload
-    uint32_t flags;         // reserved
     uint64_t version;       // optional: debug / validation use
 };
 

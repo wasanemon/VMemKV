@@ -26,7 +26,6 @@ struct ValueRecordHeader {
   uint32_t key_len;
   uint32_t value_len;
   uint32_t alloc_len;
-  uint32_t flags;
   uint64_t version;
 };
 
@@ -145,6 +144,7 @@ struct T2Memory {
   // the value in advance (e.g. tests exercising the ABA-detection field directly).
   T2Memory(std::byte *base_ptr, uint64_t capacity_bytes) noexcept
       : base(base_ptr), capacity(capacity_bytes), generation(allocate_generation()) {}
+
   // Uses a caller-supplied generation -- e.g. to tag a paired T1Index::SortedSnapshot with an
   // identical id before this T2Memory exists. `initial_bytes_used`: for a rebuilt/adopted mapping
   // with live records already at construction time; 0 for a brand-new empty file.

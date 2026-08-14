@@ -25,7 +25,6 @@
 #include "../core/lock_free_hash_table.hpp"
 #include "../core/reference_tracker.hpp"
 #include "../optimizations/bloom_filter.hpp"
-#include "../optimizations/simd_scan.hpp"
 
 inline constexpr std::size_t kStoreKeyBytes = 16;
 
@@ -973,11 +972,6 @@ class T1Index {
         return nullptr;
       }
       return (slot.key == key && slot.clean_hash() == hash) ? &slot : nullptr;
-    }
-
-    template <bool UseSimdScan, typename Callback>
-    auto scan(Key lower_bound, Key upper_bound, Callback &callback) const -> size_t {
-      return t1_detail::scan_append<UseSimdScan>(slots_, size(), lower_bound, upper_bound, callback, is_live);
     }
 
     void collect_live_entries(std::vector<EntrySnapshot> &out, size_t count) const {

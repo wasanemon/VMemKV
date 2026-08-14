@@ -1457,9 +1457,8 @@ class VMemKVImpl {
                      // is exactly two uint64_t's worth of bytes, so the last non-zero byte's position
                      // comes directly from whichever half is nonzero, no per-byte branching needed.
                      // Requires little-endian (memcpy'd byte 0 must land in the least-significant
-                     // position) -- true for every platform this codebase targets (see simd_scan.hpp's
-                     // identical x86_64-only assumption) but asserted here since it's not obvious from
-                     // the arithmetic alone.
+                     // position) -- true for every platform this codebase targets, but asserted here
+                     // since it's not obvious from the arithmetic alone.
                      static_assert(kStoreKeyBytes == 2 * sizeof(uint64_t));
                      static_assert(std::endian::native == std::endian::little);
                      uint64_t lo_word;
@@ -1865,7 +1864,6 @@ class VMemKVImpl {
     header.key_len = static_cast<uint32_t>(key.size());
     header.value_len = static_cast<uint32_t>(value.size());
     header.alloc_len = static_cast<uint32_t>(value.size());
-    header.flags = 0;
     header.version = 0;
 
     uint64_t offset = bytes_used;

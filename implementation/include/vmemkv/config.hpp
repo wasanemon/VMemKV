@@ -15,11 +15,20 @@
 //   - [JP]: 存在しないキーの探索（Get/Update ミス）時に、T2（フラッシュSSD/NVMe）への
 //           不要なランダムリードディスクI/Oが発生するのをメモリ上で回避するフィルタ。
 //
-// * SimdScan:
-//   - [EN]: Accelerates search paths and range queries by matching 16-byte key prefixes
-//           concurrently using CPU vector registers.
-//   - [JP]: T1インデックス上の16バイトのキープレフィックスをベクトルレジスタに載せ、
-//           レンジスキャンや衝突探索時の線形走査を並列に一括高速化するSIMD命令最適化。
+// * SimdScan (measured no signal, kept as a tag only -- not in the ablation stack; see
+//   vmemkv.hpp's SimdScan comment for the measurement):
+//   - [EN]: Would accelerate the T1 append region's linear scan by matching 16-byte key
+//           prefixes concurrently using CPU vector registers. The tag remains for future
+//           re-verification, but its implementation (AppendRegion::scan(), the sole caller of
+//           the now-removed optimizations/simd_scan.hpp) was dead code -- t1_index.hpp's actual
+//           range scan never called it -- so it was deleted; re-adding it is a prerequisite for
+//           actually re-testing this tag.
+//   - [JP]: T1インデックス上の16バイトのキープレフィックスをベクトルレジスタに載せ、T1
+//           append領域の線形走査を並列に一括高速化する*はずだった*最適化。タグ自体は将来の
+//           再検証のために残すが、その実装(AppendRegion::scan()、削除済みの
+//           optimizations/simd_scan.hppの唯一の呼び出し元)はデッドコードだった
+//           (t1_index.hppの実際のレンジスキャンは一度もこれを呼んでいなかった)ため削除済み。
+//           再検証するには実装からやり直す必要がある。
 //
 // * T1InlineValue:
 //   - [EN]: Inlines values (1-8 bytes) directly in the T1 index slot by reclaiming unused
@@ -42,7 +51,7 @@ struct T1InlineValue {};
 struct Prefaulting {};
 
 // * GetPopulateRead (measured no signal, kept for future re-verification -- not in the ablation
-//   stack; see SimdScan's identical disposition below):
+//   stack; see SimdScan's identical disposition above):
 //   - [EN]: For a T2 value spanning more than one page, batch-faults its full page range with one
 //           madvise(MADV_POPULATE_READ) call before copying it out, instead of letting each page
 //           fault in one at a time as the copy touches it -- collapses many page-fault exceptions
