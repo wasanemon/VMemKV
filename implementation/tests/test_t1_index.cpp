@@ -461,16 +461,12 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
 // entry sees it paired with its original, now possibly-stale generation, not whatever generation
 // that second call itself was invoked with.
 //
-// This was reachable from vmemkv_impl.hpp's rebuild_t2_and_maybe_checkpoint() in an earlier design,
-// which called t1_.reorganize() repeatedly (a "convergence loop") to sweep up stragglers, risking
-// exactly this mismatch on a later pass -- hence that design's now-removed generation-mismatch
-// assert/hook escape hatch. The current design calls t1_.reorganize() exactly once per rebuild
-// cycle, only after T2FlatFile::stop_writers_and_wait() has already guaranteed no new T2-append-
-// backed entry can appear, so this property is no longer reachable from that call site at all; it
-// remains true and worth guarding here purely as T1Index's own contract, verified in isolation via
-// reorganize()'s post_freeze_hook (a test-only seam) to land a fresh entry in the post-freeze
-// active region on demand, then simulating a generation bump before the next reorganize() examines
-// it.
+// Not reachable from vmemkv_impl.hpp's rebuild_t2_and_maybe_checkpoint(), which calls
+// t1_.reorganize() exactly once per rebuild cycle, only after T2FlatFile::stop_writers_and_wait()
+// has already guaranteed no new T2-append-backed entry can appear. The property remains true and
+// worth guarding here purely as T1Index's own contract, verified in isolation via reorganize()'s
+// post_freeze_hook (a test-only seam) to land a fresh entry in the post-freeze active region on
+// demand, then simulating a generation bump before the next reorganize() examines it.
 TEST_CASE(
     "T1Index: an entry inserted right after reorganize()'s freeze can still be examined by a "
     "later cycle stamped with a T2 generation the caller has already moved past") {

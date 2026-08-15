@@ -143,9 +143,8 @@ vmemkv_matrix::ltm_priming_filter() {
   # to build the one shared master corpus every other scenario needs. Get/Update/Delete/YCSB-E/
   # Scan/Insert's LTM pre-populate all clone from this same (val_size, corpus_size) master (see
   # make_fresh_corpus_checkpoint()'s comment in bench_kv.cpp). Scan does not need a second,
-  # separately-populated master: base_mmap -- the only thing that could genuinely differ between
-  # two Scan variants -- is already established on this ordinary shared master for any variant
-  # with ScanBaseSequential enabled (see bench_kv.cpp's Scan registration comment).
+  # separately-populated master: base_mmap is already established on this ordinary shared master
+  # for every VMemKV variant (see bench_kv.cpp's Scan registration comment).
   # Used to "prime" this master at full, unconstrained disk speed before a cgroup-wrapped LTM run
   # (see run_bench.sh's --cgroup path): a real per-master populate under that same cgroup was
   # measured at 200-1200s, vs. ~20-30s unconstrained.

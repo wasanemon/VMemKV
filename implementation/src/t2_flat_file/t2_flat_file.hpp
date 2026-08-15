@@ -66,16 +66,17 @@ struct T2Memory {
   mutable std::atomic<uint64_t> bytes_used{0};
 
   // The offset below which every byte is (a) durably on disk and (b) guaranteed never to be
-  // touched by an in-place update again, and is thus safe to read seqlock-free via `base_mmap`
-  // below. Unlike `write_gate_boundary` below, this is only ever advanced *after* the
-  // corresponding bytes have actually been made durable (a full T1+T2 reorganize, a checkpoint
-  // load, or a T1-only checkpoint's incremental delta flush -- see
-  // VMemKVImpl::reorganize_internal()'s T1-only-checkpoint branch) -- publishing it any earlier
-  // would let a base_mmap reader observe bytes that haven't reached disk yet. `mutable`/atomic
-  // for the same reason as `bytes_used`: a T1-only checkpoint extends it in place, without a full
-  // swap_memory(), so concurrent scan_impl() readers of this exact generation must see it grow
-  // safely. Offsets >= base_boundary (the tail, may still receive in-place updates) must still go
-  // through `base`'s COW-current, seqlock-protected view.
+  // touched by an in-place update again, and is thus safe to read seqlock-free via the
+  // base-region mappings below (`base_mmap_scan`/`base_mmap_scan_seq`/`read_fd`). Unlike
+  // `write_gate_boundary` below, this is only ever advanced *after* the corresponding bytes have
+  // actually been made durable (a full T1+T2 reorganize, a checkpoint load, or a T1-only
+  // checkpoint's incremental delta flush -- see VMemKVImpl::reorganize_internal()'s
+  // T1-only-checkpoint branch) -- publishing it any earlier would let a base-region reader
+  // observe bytes that haven't reached disk yet. `mutable`/atomic for the same reason as
+  // `bytes_used`: a T1-only checkpoint extends it in place, without a full swap_memory(), so
+  // concurrent scan_impl() readers of this exact generation must see it grow safely. Offsets >=
+  // base_boundary (the tail, may still receive in-place updates) must still go through `base`'s
+  // COW-current, seqlock-protected view.
   mutable std::atomic<uint64_t> base_boundary{0};
 
   // The offset below which an in-place update is forbidden (update_impl() checks this, not
@@ -83,7 +84,7 @@ struct T2Memory {
   // check there). Distinct from base_boundary because the two must be published at different
   // times relative to a T1-only checkpoint's delta flush: this one is bumped *before* the flush
   // (closing off new in-place writes to the range about to be promoted), while base_boundary is
-  // only bumped *after* the flush's bytes are durably on disk (so base_mmap readers never see a
+  // only bumped *after* the flush's bytes are durably on disk (so base-region readers never see a
   // boundary that outruns what's actually been written). Between those two points, any updater
   // that already read the *old* write_gate_boundary and is still mid-write is drained via
   // VMemKVImpl::update_epoch_tracker_ before the flush proceeds. Always >= 0 and <= base_boundary
@@ -96,7 +97,7 @@ struct T2Memory {
   // default readahead policy (no madvise call). Read by scan_impl() (and get_impl()'s
   // large-record path, via try_read_resident_base_record()) for records whose embedded size
   // hint is larger than one page -- see `base_mmap_scan_seq` below for the small-record
-  // counterpart and ScanBaseSequential's doc comment in config.hpp for why there are two.
+  // counterpart and the "T2 base-region reads" comment in vmemkv_impl.hpp for why there are two.
   // Mapped full-capacity (not just bytes_used-at-creation-time) specifically so that
   // base_boundary can grow via a T1-only checkpoint's incremental promotion without ever needing
   // to remap: since this mapping is PROT_READ-only, it never triggers copy-on-write, so it
@@ -106,8 +107,8 @@ struct T2Memory {
   // mapping has "seen" a write, so nothing beyond that gate needs to change when base_boundary
   // grows. Its lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based
   // retirement scheme that already protects `base`/`capacity`. nullptr unless explicitly set by
-  // the caller (mmap_t2_memory() in vmemkv_impl.hpp, only under that ablation, and only
-  // best-effort -- a failure to create it just means the reader falls back to the
+  // the caller (mmap_t2_memory() in vmemkv_impl.hpp -- best-effort -- a failure to create it just
+  // means the reader falls back to the
   // always-correct `base` + seqlock path) -- the plain T2FlatFile-owned initial mapping never
   // sets this, since a fresh store has base_boundary == 0 and thus nothing to map yet.
   // `mutable` only so the destructor (a const-safe operation) can unmap it through the same
@@ -118,7 +119,7 @@ struct T2Memory {
   // A third mapping of the identical [0, capacity) region as `base_mmap_scan` above, advised
   // MADV_SEQUENTIAL. Read only by scan_impl(), for records whose embedded size hint is one page
   // or smaller -- get_impl() reads records this small through the primary `base` mapping
-  // instead (see ScanBaseSequential's doc comment in config.hpp for why). madvise is a property
+  // instead (see the "T2 base-region reads" comment in vmemkv_impl.hpp for why). madvise is a property
   // of the whole mapping, not of an individual read, so Scan's own two size classes need
   // separately-advised mappings rather than one shared policy; which one a given record uses is
   // decided per record (try_read_base_record() in vmemkv_impl.hpp), not once per generation, so
@@ -129,13 +130,13 @@ struct T2Memory {
 
   // A `dup()`'d file descriptor onto the same base-region file `base_mmap_scan`/
   // `base_mmap_scan_seq` above map, used by get_impl() for a bounded `pread()` of one
-  // larger-than-one-page record instead of a page-fault-driven mmap read -- see
-  // ScanBaseSequential's doc comment in config.hpp for why Get's large-record path and Scan want
+  // larger-than-one-page record instead of a page-fault-driven mmap read -- see the "T2
+  // base-region reads" comment in vmemkv_impl.hpp for why Get's large-record path and Scan want
   // different read mechanisms on the same immutable bytes. `dup()`'d (not the original fd, which
   // mmap_t2_memory() always closes right after mapping) so this handle's lifetime is self-
   // contained and tied to this T2Memory, matching the two mappings' own retirement story. -1
-  // unless explicitly set by the caller (mmap_t2_memory(), only under that ablation, and only
-  // best-effort -- a dup() failure just means get_impl() falls back to the always-correct
+  // unless explicitly set by the caller (mmap_t2_memory() -- best-effort -- a dup() failure
+  // just means get_impl() falls back to the always-correct
   // `base` + seqlock path) -- the plain T2FlatFile-owned initial mapping never sets this, for the
   // same reason it never sets base_mmap_scan. `mutable` for the same reason as base_mmap_scan.
   mutable int read_fd = -1;
@@ -291,7 +292,7 @@ class T2FlatFile {
 
   // ─── Storage Operations ───
   // `mem` must come from acquire_write_handle() (not a plain get_memory_handle()), so the
-  // draining check above actually gates new writes -- see that method's contract. The generation
+  // writer_stop_ check above actually gates new writes -- see that method's contract. The generation
   // to stamp on a T1 entry (see SortedSlot::generation) is simply `mem->generation`, since the
   // caller already holds the exact handle the write lands in.
   //

@@ -52,16 +52,15 @@ using VMemKVRocksDBBlobDB = StoreAdapter<::RocksDBBlobDBStore>;
 using VMemKVLMDB = StoreAdapter<::LMDBStore>;
 
 // ─── 1. Core Stacked Ablation Variants ───
-using VMemKV_ScanBaseSequential = StoreAdapter<VMemKVImpl<Config<ScanBaseSequential>>>;
 // Isolated (non-cumulative) prototype variant for one-off measurement of GetPopulateRead alone --
 // see docs/benchmark/20260809_ltm_64kb_get_hit_profiling.md. Deliberately not in
-// AllPossibleTypes below, same reasoning as VMemKV_ScanBaseSequential above.
+// AllPossibleTypes below: it served its purpose as an isolation-sweep diagnostic, and a
+// standalone entry there would just be a redundant benchmark cell.
 using VMemKV_GetPopulateRead = StoreAdapter<VMemKVImpl<Config<GetPopulateRead>>>;
 using VMemKV_Var0_Baseline = VMemKV_Baseline;
 using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
 using VMemKV_Var2_Inline = StoreAdapter<VMemKVImpl<Config<BloomFilter, T1InlineValue>>>;
-using VMemKV_Var3_Prefault = StoreAdapter<VMemKVImpl<Config<BloomFilter, T1InlineValue, Prefaulting>>>;
-using VMemKV_Var4_ScanBaseSequential = VMemKVStore;  // Fully optimized production configuration
+using VMemKV_Var3_Prefault = VMemKVStore;  // Fully optimized production configuration
 using VMemKVStore = VMemKVStore;
 
 using VMemKV_RocksDB = VMemKVRocksDB;
@@ -69,14 +68,6 @@ using VMemKV_RocksDBBlobDB = VMemKVRocksDBBlobDB;
 using VMemKV_LMDB = VMemKVLMDB;
 
 // ─── 2. Unified Benchmark Registration Tuple ───
-// VMemKV_ScanBaseSequential (the isolated, non-cumulative Config<ScanBaseSequential> variant) is
-// deliberately NOT registered here: it served its purpose as the isolation-sweep diagnostic that
-// pinned the win on per-file readahead policy, not io_uring's async multiplexing (see
-// docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md). The optimization itself is now
-// exercised cumulatively as VMemKV_Var4_ScanBaseSequential / VMemKVStore below, so a standalone
-// entry here would just be a redundant benchmark cell. The alias is kept for one-off
-// re-isolation if needed.
-//
 // SimdScan is intentionally absent from every variant below: measured against real benchmark
 // data it contributed no measurable signal even in its own target scenario (Scan), so it was
 // dropped from the stack to reduce ablation noise. The tag and Config machinery remain in
@@ -85,7 +76,6 @@ using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
                                     VMemKV_Var1_Bloom,
                                     VMemKV_Var2_Inline,
                                     VMemKV_Var3_Prefault,
-                                    VMemKV_Var4_ScanBaseSequential,
                                     VMemKV_RocksDB,
                                     VMemKV_RocksDBBlobDB,
                                     VMemKV_LMDB>;

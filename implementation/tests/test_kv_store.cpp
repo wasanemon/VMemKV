@@ -149,8 +149,7 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 // VMemKV 自体のバリエーション（Baseline, Cumulative Steps, Ablations, Inlining）
 #define VMemKVStores                                                                                                 \
   vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Inline, \
-      vmemkv::variants::VMemKV_Var3_Prefault, vmemkv::variants::VMemKV_Var4_ScanBaseSequential,                      \
-      vmemkv::variants::VMemKV_ScanBaseSequential
+      vmemkv::variants::VMemKV_Var3_Prefault
 
 // 競合バックエンドのバリエーション（RocksDBStore, LMDBStoreなど）
 #ifdef ENABLE_ROCKSDB
@@ -495,15 +494,15 @@ TEST_CASE("VMemKV: reorganize compacts T2 in old-physical-offset order, not key 
   }
 }
 
-// Regression test for ScanBaseSequential: a same-size update targeting a record in T2's "base"
-// region (written by the last full reorganize) must be redirected out-of-place instead of taking
-// the in-place fast path -- see update_impl()'s base_boundary check and T2Memory::base_boundary's
-// declaration for why an in-place write there would never be visible through the base region's
-// own separate, seqlock-free mmap (T2's main mapping is MAP_PRIVATE; only this process's own
-// writes exist anywhere). If that redirect were missing or wrong, this test would observe Scan
+// Regression test: a same-size update targeting a record in T2's "base" region (written by the
+// last full reorganize) must be redirected out-of-place instead of taking the in-place fast path
+// -- see update_impl()'s base_boundary check and T2Memory::base_boundary's declaration for why an
+// in-place write there would never be visible through the base region's own separate,
+// seqlock-free mmap (T2's main mapping is MAP_PRIVATE; only this process's own writes exist
+// anywhere). If that redirect were missing or wrong, this test would observe Scan
 // (base_mmap_scan-served) and Get (main-mmap-served) silently disagreeing on "key_a"'s value.
-TEST_CASE("VMemKV ScanBaseSequential: update after reorganize redirects out-of-place, Scan sees fresh value") {
-  auto store = StoreFactory<vmemkv::variants::VMemKV_ScanBaseSequential>::make();
+TEST_CASE("VMemKV: update after reorganize redirects out-of-place, Scan sees fresh value") {
+  auto store = StoreFactory<vmemkv::variants::VMemKV_Baseline>::make();
 
   const std::string value_a(kValue200Bytes, 'a');
   const std::string value_b(kValue200Bytes, 'b');
@@ -546,24 +545,22 @@ TEST_CASE("VMemKV ScanBaseSequential: update after reorganize redirects out-of-p
   CHECK(seen2.at("key_a") == value_a_updated2);
 }
 
-// Stress/regression test for ScanBaseSequential: update() (base-region redirect decision) races
-// scan() (base_mmap_scan read path) races repeated defragment() (moves base_boundary, swaps
-// T2Memory generations, remaps base_mmap_scan) -- the three-way race the base/tail split's
-// correctness depends on. Run under ThreadSanitizer for direct race detection; also self-checks
-// independent of TSan, since every value written here is `kStressValueBytes` copies of one
-// repeated character, so a torn read shows up directly as a non-uniform byte value.
+// Stress/regression test: update() (base-region redirect decision) races scan() (base_mmap_scan
+// read path) races repeated defragment() (moves base_boundary, swaps T2Memory generations, remaps
+// base_mmap_scan) -- the three-way race the base/tail split's correctness depends on. Run under
+// ThreadSanitizer for direct race detection; also self-checks independent of TSan, since every
+// value written here is `kStressValueBytes` copies of one repeated character, so a torn read shows
+// up directly as a non-uniform byte value.
 //
 // kReorgCycles is capped well below what a "why not more?" instinct would suggest: this store's
 // underlying reorganize_internal() has a separate, pre-existing, already-documented race (see its
 // "KNOWN OPEN ISSUE" assert and test_kv_store's own deliberately-failing repro for it) that
-// sustained concurrent reorganize+write pressure can trip regardless of ScanBaseSequential --
-// confirmed unrelated to this branch by reproducing the same TSan report on unmodified
-// `VMemKVStore`. 60 cycles cleared 8/8 TSan runs without tripping it; raising this constant is
-// likely to make this test flaky on that unrelated, unfixed issue rather than exercise more of
-// the code this test actually targets.
+// sustained concurrent reorganize+write pressure can trip. 60 cycles cleared 8/8 TSan runs without
+// tripping it; raising this constant is likely to make this test flaky on that unrelated, unfixed
+// issue rather than exercise more of the code this test actually targets.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("VMemKV ScanBaseSequential: concurrent update+scan survive repeated reorganize (stress)") {
-  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+TEST_CASE("VMemKV: concurrent update+scan survive repeated reorganize (stress)") {
+  using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   constexpr int kKeyCount = 50;
   constexpr std::size_t kStressValueBytes = 200;  // Non-inline; see other tests' same-size note.
@@ -631,8 +628,8 @@ TEST_CASE("VMemKV ScanBaseSequential: concurrent update+scan survive repeated re
 // long-running insert-only process (space_amp stays ~1.0 forever with no deletes, so
 // defragment() never fires organically) would have this coverage frozen forever at whatever the
 // first forced checkpoint() established, even as the live corpus kept growing past it.
-TEST_CASE("VMemKV ScanBaseSequential: cheap checkpoint() incrementally promotes base_boundary") {
-  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+TEST_CASE("VMemKV: cheap checkpoint() incrementally promotes base_boundary") {
+  using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
@@ -694,9 +691,9 @@ TEST_CASE("VMemKV ScanBaseSequential: cheap checkpoint() incrementally promotes 
 // uniform-byte-value technique as the "...repeated reorganize" test above.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE(
-    "VMemKV ScanBaseSequential: concurrent update+scan survive repeated cheap checkpoint() "
+    "VMemKV: concurrent update+scan survive repeated cheap checkpoint() "
     "promotions (stress)") {
-  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   constexpr int kKeyCount = 50;
   constexpr std::size_t kStressValueBytes = 200;
@@ -766,8 +763,8 @@ TEST_CASE(
 // a real (>=0) read_fd even though bytes_used==0 at that moment, or the incremental-promotion
 // mechanism above would never have anything to extend for a store built this way (see
 // mmap_t2_memory()'s comment for why the earlier `if (bytes_used > 0)` guard was removed).
-TEST_CASE("VMemKV ScanBaseSequential: checkpoint() on an empty store still establishes base_mmap_scan/read_fd") {
-  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+TEST_CASE("VMemKV: checkpoint() on an empty store still establishes base_mmap_scan/read_fd") {
+  using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
@@ -1204,7 +1201,7 @@ TEST_CASE("VMemKV: reorganize's T2 record read survives a concurrent in-place up
 // callback after read_t2_record_seqlock() returns (see get_impl()/scan_impl()'s own comments).
 //
 // Deliberately no reorganize()/checkpoint()/defragment() anywhere in either test below: unlike
-// the drain-barrier/residual-window tests elsewhere in this file, this race needed nothing but
+// the writer-stop-barrier/residual-window tests elsewhere in this file, this race needed nothing but
 // plain concurrent update()+scan() (or update()+get()) on a single key -- proving the fix holds
 // even in that minimal case is the point.
 TEST_CASE("VMemKV: scan callback never observes a torn read across a concurrent update (regression)") {
@@ -1298,16 +1295,15 @@ TEST_CASE("VMemKV: get callback never observes a torn read across a concurrent u
   CHECK_FALSE(torn_read_found.load());
 }
 
-// ScanBaseSequential-specific variant of the same regression, free-spinning and with no
-// reorganize()/checkpoint() at all: prior to the fix above, this exact shape (see the
-// "...repeated cheap checkpoint() promotions (stress)" test's own comment elsewhere in this file)
-// had to be deliberately avoided because it reliably tripped this bug on its own, independent of
-// anything ScanBaseSequential-specific. Now that the underlying bug is fixed, confirm the
-// simplest possible free-spinning form is safe under this ablation too.
+// Free-spinning variant of the same regression, with no reorganize()/checkpoint() at all: prior
+// to the fix above, this exact shape (see the "...repeated cheap checkpoint() promotions
+// (stress)" test's own comment elsewhere in this file) had to be deliberately avoided because it
+// reliably tripped this bug on its own. Now that the underlying bug is fixed, confirm the
+// simplest possible free-spinning form is safe too.
 TEST_CASE(
-    "VMemKV ScanBaseSequential: free-spinning update+scan survive with no reorganize/checkpoint "
+    "VMemKV: free-spinning update+scan survive with no reorganize/checkpoint "
     "at all (regression)") {
-  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   constexpr std::size_t kValueBytes = 200;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
@@ -1532,7 +1528,7 @@ TEST_CASE(
 // moment before T1 could ever be touched (NoOpPreFinishHook's seam) still leaves the store fully
 // functional afterward -- no hang, correct data, and a subsequent defragment() succeeds normally.
 TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the store fully usable") {
-  using TestStore = vmemkv::variants::VMemKV_ScanBaseSequential;
+  using TestStore = vmemkv::variants::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
@@ -1597,7 +1593,7 @@ TEST_CASE("VMemKV: T1-only checkpoint refuses to persist a straggler stamped wit
 
   // Uses the gated public defragment() (reorg_running_ CAS), not reorganize_internal() directly:
   // TinyWalCheckpointConfig's tiny threshold means the background reorg_worker_ thread is a real,
-  // active competitor here (unlike the drain-barrier regression test above, whose default 64MiB
+  // active competitor here (unlike the writer-stop-barrier regression test above, whose default 64MiB
   // threshold never lets the worker fire during a short test) -- bypassing the gate would let this
   // test's direct calls race the worker's own reorganize_internal() calls.
 
@@ -1615,8 +1611,8 @@ TEST_CASE("VMemKV: T1-only checkpoint refuses to persist a straggler stamped wit
   REQUIRE(manifest_before.has_value());
 
   // Directly inject a "straggler": an entry stamped with the now-retired G1, simulating exactly
-  // what the residual-window race would leave behind (same technique the drain-barrier regression
-  // test above uses -- T1Index::put()'s explicit-generation overload, no new test seam needed).
+  // what the residual-window race would leave behind (same technique the writer-stop-barrier
+  // regression test above uses -- T1Index::put()'s explicit-generation overload, no new test seam needed).
   // Deliberately not read back afterward: get_impl()/update_impl() retry-loop on a generation
   // mismatch until a future full T2 rebuild's offset_mapper_fn relocates and re-stamps it (see
   // that retry's own comment) -- this test's cycle 3 never performs one, by design (that's the

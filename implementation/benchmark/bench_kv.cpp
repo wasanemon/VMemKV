@@ -921,13 +921,10 @@ static auto make_bench_fresh_corpus(const std::string &filename, std::size_t val
 // corpus_size -- they transparently share one on-disk master and its build cost is paid at most
 // once per (variant, val_size), no matter which scenario happens to trigger it first. For rival
 // backends, this is exactly make_bench_fresh_corpus() above (already clone-based for them
-// regardless of which reorganize-state concept applies, since they have none). Scan's dependence
-// on whether ScanBaseSequential's base_mmap fast path is active is measured by comparing store
-// *variants* (Var3_Prefault vs Var4_ScanBaseSequential in vmemkv.hpp's AllPossibleTypes), not by
-// a separate corpus here -- base_mmap is (re-)established by mmap_t2_memory() on every full T2
-// rebuild *and* on every fresh construction from an existing checkpoint (see
-// load_checkpoint_if_present()), so this one shared, checkpoint-cloned master already carries it
-// for any variant with the feature enabled.
+// regardless of which reorganize-state concept applies, since they have none). base_mmap is
+// (re-)established by mmap_t2_memory() on every full T2 rebuild *and* on every fresh construction
+// from an existing checkpoint (see load_checkpoint_if_present()), so this one shared,
+// checkpoint-cloned master already carries it for every VMemKV variant.
 template <typename Store>
 static auto make_bench_fresh_corpus_checkpoint(const std::string &filename,
                                                std::size_t val_size,
