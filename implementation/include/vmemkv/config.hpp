@@ -91,6 +91,14 @@ struct Config {
   static constexpr size_t T1AppendCapacityLog2 = 22;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
+  // Capacity of the dead old-base offset-range tracker that feeds checkpoint_and_defragment()'s
+  // hole-punch targets (TODO.md item 5) -- one entry per out-of-place-redirected update or delete
+  // whose superseded offset was in the old-base region. Nearing capacity forces an earlier cycle
+  // (see space_amp_over_threshold()'s sibling check), same role T1ReorganizeHardThresholdPercent
+  // plays for T1AppendCapacityEntries.
+  static constexpr size_t DeadRangeCapacityLog2 = 20;
+  static constexpr size_t DeadRangeCapacityEntries = size_t{1} << DeadRangeCapacityLog2;
+
   // Default Tier 2 (T2) file storage capacity: 1 TiB.
   static constexpr size_t DefaultT2CapacityBytes = 1ULL << 40;
 

@@ -67,30 +67,15 @@ struct T2Memory {
 
   // The offset below which every byte is (a) durably on disk and (b) guaranteed never to be
   // touched by an in-place update again, and is thus safe to read seqlock-free via the
-  // base-region mappings below (`base_mmap_scan`/`base_mmap_scan_seq`/`read_fd`). Unlike
-  // `write_gate_boundary` below, this is only ever advanced *after* the corresponding bytes have
-  // actually been made durable (a full T1+T2 reorganize, a checkpoint load, or a T1-only
-  // checkpoint's incremental delta flush -- see VMemKVImpl::reorganize_internal()'s
-  // T1-only-checkpoint branch) -- publishing it any earlier would let a base-region reader
-  // observe bytes that haven't reached disk yet. `mutable`/atomic for the same reason as
-  // `bytes_used`: a T1-only checkpoint extends it in place, without a full swap_memory(), so
-  // concurrent scan_impl() readers of this exact generation must see it grow safely. Offsets >=
-  // base_boundary (the tail, may still receive in-place updates) must still go through `base`'s
-  // COW-current, seqlock-protected view.
-  mutable std::atomic<uint64_t> base_boundary{0};
-
-  // The offset below which an in-place update is forbidden (update_impl() checks this, not
-  // base_boundary, to decide whether to redirect out-of-place -- see kOffsetMask/write_gate_boundary
-  // check there). Distinct from base_boundary because the two must be published at different
-  // times relative to a T1-only checkpoint's delta flush: this one is bumped *before* the flush
-  // (closing off new in-place writes to the range about to be promoted), while base_boundary is
-  // only bumped *after* the flush's bytes are durably on disk (so base-region readers never see a
-  // boundary that outruns what's actually been written). Between those two points, any updater
-  // that already read the *old* write_gate_boundary and is still mid-write is drained via
-  // VMemKVImpl::update_epoch_tracker_ before the flush proceeds. Always >= 0 and <= base_boundary
-  // is not guaranteed at every instant (write_gate_boundary leads base_boundary during the brief
-  // promotion window), but both converge to the same value once a promotion completes.
-  mutable std::atomic<uint64_t> write_gate_boundary{0};
+  // base-region mappings below (`base_mmap_scan`/`base_mmap_scan_seq`/`read_fd`). update_impl()
+  // checks this directly to decide whether an in-place update must redirect out-of-place instead
+  // (see kOffsetMask's use there). Constant for this T2Memory's entire lifetime, set once at
+  // construction from `initial_bytes_used` -- checkpoint_and_defragment() (TODO.md item 5) only
+  // ever grows it by publishing a whole new generation (a fresh T2Memory) via swap_memory(), never
+  // by mutating an existing one in place, so no atomic/synchronization is needed here: publication
+  // of the new T2Memory itself (via T2FlatFile's atomic pointer swap) already establishes the
+  // necessary happens-before relationship for every plain field in it, this one included.
+  uint64_t base_boundary = 0;
 
   // A second, read-only mmap covering [0, capacity) of this exact generation's file -- distinct
   // from `base`'s MAP_PRIVATE|MADV_RANDOM mapping used everywhere else, left at the kernel's
@@ -158,8 +143,7 @@ struct T2Memory {
         capacity(capacity_bytes),
         generation(explicit_generation),
         bytes_used(initial_bytes_used),
-        base_boundary(initial_bytes_used),
-        write_gate_boundary(initial_bytes_used) {}
+        base_boundary(initial_bytes_used) {}
   ~T2Memory() noexcept {
     if ((base != nullptr) && capacity > 0) {
       ::munmap(base, static_cast<size_t>(capacity));

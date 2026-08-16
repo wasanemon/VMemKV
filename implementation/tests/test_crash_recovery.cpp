@@ -570,12 +570,8 @@ TEST_CASE("checkpoint: a second checkpoint deletes the previous generation's fil
   store->defragment();
   const auto manifest1 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest1.has_value());
-  // defragment() both times, so t1_generation and t2_generation stay equal throughout --
-  // see "T1-only checkpoints reuse the T2 checkpoint file across multiple cycles" below for the
-  // case where they diverge.
-  CHECK(manifest1->t1_generation == manifest1->t2_generation);
-  const auto gen1_t1 = vmemkv::derive_t1_chk_path(path, manifest1->t1_generation);
-  const auto gen1_t2 = vmemkv::derive_t2_chk_path(path, manifest1->t2_generation);
+  const auto gen1_t1 = vmemkv::derive_t1_chk_path(path, manifest1->generation);
+  const auto gen1_t2 = vmemkv::derive_t2_chk_path(path, manifest1->generation);
   REQUIRE(std::filesystem::exists(gen1_t1));
   REQUIRE(std::filesystem::exists(gen1_t2));
 
@@ -585,13 +581,12 @@ TEST_CASE("checkpoint: a second checkpoint deletes the previous generation's fil
   store->defragment();
   const auto manifest2 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest2.has_value());
-  CHECK(manifest2->t1_generation != manifest1->t1_generation);
-  CHECK(manifest2->t1_generation == manifest2->t2_generation);
+  CHECK(manifest2->generation != manifest1->generation);
 
   CHECK_FALSE(std::filesystem::exists(gen1_t1));  // Previous generation cleaned up.
   CHECK_FALSE(std::filesystem::exists(gen1_t2));
-  CHECK(std::filesystem::exists(vmemkv::derive_t1_chk_path(path, manifest2->t1_generation)));
-  CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path, manifest2->t2_generation)));
+  CHECK(std::filesystem::exists(vmemkv::derive_t1_chk_path(path, manifest2->generation)));
+  CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path, manifest2->generation)));
 
   cleanup_store_files(path);
 }
@@ -670,7 +665,7 @@ TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file
   // Simulate loss/corruption of the checkpointed generation's T1 chk file. Since the WAL has
   // already been rotated down to the tail, falling back to full replay would silently lose the
   // pre-checkpoint key -- construction must fail loudly instead (see load_checkpoint_if_present).
-  std::filesystem::remove(vmemkv::derive_t1_chk_path(path, manifest->t1_generation));
+  std::filesystem::remove(vmemkv::derive_t1_chk_path(path, manifest->generation));
 
   CHECK_THROWS(std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes));
 
@@ -684,12 +679,11 @@ struct TinyWalCheckpointConfig : vmemkv::Config<> {
 using VMemKV_TinyWalCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyWalCheckpointConfig>>;
 }  // namespace
 
-// Regression test for checkpoint()'s no_t2_checkpoint_yet fallback (low_level_design.md 4.4):
-// this store has never committed a checkpoint before, so there's no existing T2 checkpoint file
-// yet for the cheap T1-only path to reference -- checkpoint()'s very first call on a fresh store
-// must still be a full T2 rebuild, even for an insert-only workload that never generates
-// fragmentation on its own (so space_amp alone would never trigger one).
-TEST_CASE("checkpoint(): first call on a fresh store forces a full rebuild (no_t2_checkpoint_yet)") {
+// Regression test for checkpoint()'s first-ever call: this store has never committed a checkpoint
+// before, so there's no existing T2 checkpoint file to reflink-clone from -- checkpoint_and_
+// defragment() (TODO.md item 5) must fall back to starting a genuinely fresh file instead, even
+// for an insert-only workload that never generates fragmentation on its own.
+TEST_CASE("checkpoint(): first call on a fresh store starts a fresh T2 generation (no clone source)") {
   const auto path = reserve_crash_temp_path();
   auto store = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
   for (int i = 0; i < 200; ++i) {
@@ -700,12 +694,10 @@ TEST_CASE("checkpoint(): first call on a fresh store forces a full rebuild (no_t
   const auto stats_after = store->impl().get_statistics();
 
   CHECK(std::filesystem::exists(vmemkv::derive_manifest_path(path)));
-
-  // no_t2_checkpoint_yet forced a full rebuild even though checkpoint() alone never GCs.
   CHECK(stats_after.t2_reorg_count == stats_before.t2_reorg_count + 1);
   const auto manifest = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest.has_value());
-  CHECK(manifest->t1_generation == manifest->t2_generation);
+  CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path, manifest->generation)));
 
   for (int i = 0; i < 200; ++i) {
     const auto val = get_bytes(store, "k" + std::to_string(i));
@@ -716,47 +708,47 @@ TEST_CASE("checkpoint(): first call on a fresh store forces a full rebuild (no_t
   cleanup_store_files(path);
 }
 
-// Regression test proving the actual point of the T1-only checkpoint path: once a T2 checkpoint
-// exists, repeated checkpoint() calls must keep reusing it (T2 chk file unchanged, never
-// deleted) rather than paying for a full T2 rebuild every time.
-TEST_CASE("checkpoint: T1-only checkpoints reuse one T2 generation across multiple checkpoint() calls") {
+// Regression test proving checkpoint() and defragment() are the same mechanism now (TODO.md item
+// 5): repeated checkpoint() calls each produce a genuinely new T2 generation via reflink clone +
+// swap, with the previous cycle's T2 checkpoint file cleaned up every time -- not reused the way
+// the old, now-removed T1-only checkpoint path used to.
+TEST_CASE("checkpoint: repeated checkpoint() calls each rebuild T2 via a fresh generation") {
   const auto path = reserve_crash_temp_path();
   auto store = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
 
-  // Cycle 1: force the very first checkpoint (a full rebuild, per no_t2_checkpoint_yet above) so
-  // current_t2_generation_ is set before any subsequent checkpoint() call can take the cheap path.
   REQUIRE(store->insert("seed", make_value(-1)));
-  store->impl().defragment();
+  store->impl().checkpoint();
   const auto manifest1 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest1.has_value());
-  CHECK(manifest1->t1_generation == manifest1->t2_generation);
-  const auto t2_chk_path = vmemkv::derive_t2_chk_path(path, manifest1->t2_generation);
-  REQUIRE(std::filesystem::exists(t2_chk_path));
+  auto last_t2_chk_path = vmemkv::derive_t2_chk_path(path, manifest1->generation);
+  REQUIRE(std::filesystem::exists(last_t2_chk_path));
 
   const auto stats_after_seed = store->impl().get_statistics();
 
   // Cycles 2-4: insert-only, then an explicit checkpoint() call each round.
   constexpr int kCycles = 3;
   constexpr int kKeysPerCycle = 200;
+  uint64_t last_generation = manifest1->generation;
   for (int cycle = 0; cycle < kCycles; ++cycle) {
     for (int i = 0; i < kKeysPerCycle; ++i) {
       REQUIRE(store->insert("c" + std::to_string(cycle) + "_" + std::to_string(i), make_value(i)));
     }
     store->impl().checkpoint();
+
+    const auto manifest_now = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
+    REQUIRE(manifest_now.has_value());
+    CHECK(manifest_now->generation != last_generation);      // A fresh generation every cycle.
+    CHECK_FALSE(std::filesystem::exists(last_t2_chk_path));  // Old T2 file cleaned up.
+    last_generation = manifest_now->generation;
+    last_t2_chk_path = vmemkv::derive_t2_chk_path(path, manifest_now->generation);
+    REQUIRE(std::filesystem::exists(last_t2_chk_path));
   }
 
   const auto stats_after_cycles = store->impl().get_statistics();
-  CHECK(stats_after_cycles.t2_reorg_count == stats_after_seed.t2_reorg_count);  // T2 never rebuilt again.
-  CHECK(stats_after_cycles.t1_reorg_count > stats_after_seed.t1_reorg_count);   // But T1 checkpoints did fire.
+  CHECK(stats_after_cycles.t2_reorg_count ==
+        stats_after_seed.t2_reorg_count + kCycles);  // Every checkpoint() rebuilt T2.
 
-  const auto manifest_final = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
-  REQUIRE(manifest_final.has_value());
-  CHECK(manifest_final->t2_generation == manifest1->t2_generation);  // Same T2 file, still referenced.
-  CHECK(manifest_final->t1_generation != manifest1->t1_generation);  // T1 checkpoint did advance.
-  CHECK(std::filesystem::exists(t2_chk_path));                       // Never deleted out from under it.
-
-  // A genuine restart adopts this final checkpoint correctly, deriving T1/T2 from their now-
-  // divergent generation fields.
+  // A genuine restart adopts the final checkpoint correctly.
   store.reset();
   auto restarted = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
   CHECK(get_bytes(restarted, "seed").has_value());

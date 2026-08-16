@@ -621,14 +621,15 @@ TEST_CASE("VMemKV: concurrent update+scan survive repeated reorganize (stress)")
   }
 }
 
-// Regression test for incremental base_boundary promotion: a cheap T1-only checkpoint() (the
-// WAL-size-triggered path, distinct from defragment()'s full T2 rebuild) now also extends
-// base_boundary/base_mmap_scan/read_fd coverage in place -- see reorganize_internal()'s
-// T1-only-checkpoint branch and T2Memory::write_gate_boundary's comment. Without this, a
-// long-running insert-only process (space_amp stays ~1.0 forever with no deletes, so
-// defragment() never fires organically) would have this coverage frozen forever at whatever the
-// first forced checkpoint() established, even as the live corpus kept growing past it.
-TEST_CASE("VMemKV: cheap checkpoint() incrementally promotes base_boundary") {
+// Regression test for base_boundary coverage across repeated checkpoint() cycles: checkpoint()
+// and defragment() now share the same reflink+punch mechanism (TODO.md item 5) -- each cycle
+// produces a whole new generation (via checkpoint_and_defragment()) whose base_boundary covers
+// everything live at that point, not just an in-place extension of the previous generation's.
+// Without this, a long-running insert-only process (space_amp stays ~1.0 forever with no
+// deletes, so defragment() never fires organically) would have base_mmap/read_fd coverage frozen
+// forever at whatever the first forced checkpoint() established, even as the live corpus kept
+// growing past it.
+TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated cycles") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
@@ -638,22 +639,22 @@ TEST_CASE("VMemKV: cheap checkpoint() incrementally promotes base_boundary") {
   for (int i = 0; i < 10; ++i) {
     REQUIRE(store->insert(padded_key(i), value));
   }
-  store->checkpoint();  // First checkpoint: no_t2_checkpoint_yet forces a full rebuild.
+  store->checkpoint();  // First checkpoint: no prior generation to clone from, starts fresh.
 
-  const uint64_t boundary_after_first = store->impl().t2().get_memory()->base_boundary.load();
+  const uint64_t boundary_after_first = store->impl().t2().get_memory()->base_boundary;
   CHECK(boundary_after_first > 0);
   CHECK(store->impl().t2().get_memory()->base_mmap_scan != nullptr);
   CHECK(store->impl().t2().get_memory()->base_mmap_scan_seq != nullptr);
   CHECK(store->impl().t2().get_memory()->read_fd >= 0);
 
-  // Insert more without ever deleting anything: space_amp stays ~1.0, so this insert-only
-  // workload never crosses T2_Rebuild_Trigger -- checkpoint() below must take the cheap path.
+  // Insert more, then checkpoint again -- a fresh reflink+swap cycle regardless of fragmentation,
+  // since checkpoint() and defragment() are the same mechanism now (TODO.md item 5).
   for (int i = 10; i < 20; ++i) {
     REQUIRE(store->insert(padded_key(i), value));
   }
   store->checkpoint();
 
-  const uint64_t boundary_after_second = store->impl().t2().get_memory()->base_boundary.load();
+  const uint64_t boundary_after_second = store->impl().t2().get_memory()->base_boundary;
   CHECK(boundary_after_second > boundary_after_first);
 
   // Confirm the newly-promoted range is actually reachable and correct via the base_mmap_scan
@@ -670,17 +671,16 @@ TEST_CASE("VMemKV: cheap checkpoint() incrementally promotes base_boundary") {
   }
 }
 
-// Stress/regression test: update()'s in-place path racing repeated cheap checkpoint()
-// promotions -- distinct from the "...repeated reorganize (stress)" test above, which only
-// exercises full defragment()-driven base_boundary changes and thus never touches
-// update_epoch_tracker_'s drain at all.
+// Stress/regression test: update()'s in-place path racing repeated checkpoint() cycles, entered
+// via the checkpoint() API specifically (as opposed to the "...repeated reorganize (stress)"
+// test above, which uses defragment()) -- checkpoint() and defragment() now share the same
+// underlying checkpoint_and_defragment() mechanism (TODO.md item 5), so this exercises the same
+// generation-swap/writer-stop machinery through a second public entry point.
 //
 // Deliberately bounded (kOpsPerCycle updates/scans per cycle, spawned and joined once per
 // checkpoint() call) rather than free-spinning update/scan threads for the whole test duration:
-// the race this test targets is narrow and one-shot per promotion (the window around a single
-// write_gate_boundary bump -> epoch drain -> publish sequence), not something that needs
-// sustained throughput to expose -- a handful of concurrent attempts per cycle, 60 times over,
-// is enough to give it a fair chance. Free-spinning threads were tried first and run into a
+// a handful of concurrent attempts per cycle, 60 times over, is enough to give any race a fair
+// chance without needing sustained throughput. Free-spinning threads were tried first and run into a
 // separate, already-fixed bug instead (get_impl()/scan_impl() exposing torn, mid-write T2
 // records to the caller's callback -- see the "Torn-read fix" comments in get_impl()/scan_impl()
 // in vmemkv_impl.hpp): at millions of scan calls, that unrelated race in the ordinary
@@ -772,7 +772,7 @@ TEST_CASE("VMemKV: checkpoint() on an empty store still establishes base_mmap_sc
   CHECK(store->impl().t2().get_memory()->base_mmap_scan != nullptr);
   CHECK(store->impl().t2().get_memory()->base_mmap_scan_seq != nullptr);
   CHECK(store->impl().t2().get_memory()->read_fd >= 0);
-  CHECK(store->impl().t2().get_memory()->base_boundary.load() == 0);
+  CHECK(store->impl().t2().get_memory()->base_boundary == 0);
 
   const std::string value(kValue200Bytes, 'a');
   for (int i = 0; i < 10; ++i) {
@@ -780,7 +780,7 @@ TEST_CASE("VMemKV: checkpoint() on an empty store still establishes base_mmap_sc
   }
   store->checkpoint();  // Cheap path now: base_mmap_scan/read_fd already existed, just needs promoting.
 
-  CHECK(store->impl().t2().get_memory()->base_boundary.load() > 0);
+  CHECK(store->impl().t2().get_memory()->base_boundary > 0);
 
   std::map<std::string, std::string> seen;
   std::ignore = store->scan("key0", "key9~", [&](std::span<const std::byte> key, std::span<const std::byte> val) {
@@ -1430,7 +1430,7 @@ TEST_CASE(
 }
 
 // Regression test for the formerly-open "residual window" race described in
-// rebuild_t2_and_maybe_checkpoint()'s comment: T2FlatFile::acquire_write_handle() used to check
+// checkpoint_and_defragment()'s comment: T2FlatFile::acquire_write_handle() used to check
 // writer_stop_ *before* registering with the reference tracker, which
 // ThreadReferenceTracker::wait_until_retired()'s single index-ordered scan (it never re-examines
 // a slot once past it) could race -- a writer whose check saw the flag false, but who hadn't
@@ -1517,13 +1517,13 @@ TEST_CASE(
 }
 
 // Regression test for a design this codebase used to have: an earlier version of
-// rebuild_t2_and_maybe_checkpoint() published T1's new generation incrementally, mid-rebuild,
+// checkpoint_and_defragment() published T1's new generation incrementally, mid-rebuild,
 // before T2 was ready. An exception there (e.g. from truncate()/mmap() under real
 // ENOSPC/EMFILE/ENOMEM pressure) could leave a T1 entry permanently naming a T2 generation that
 // would never be published, hanging get()/update() on that key forever inside
 // try_in_place_update()'s/get_impl()'s `mem->generation < res.generation` retry loop --
 // reproduced via fault injection during that redesign, which is what motivated moving T1's
-// publish to a single, I/O-free call at the very end (see rebuild_t2_and_maybe_checkpoint()'s own
+// publish to a single, I/O-free call at the very end (see checkpoint_and_defragment()'s own
 // comment). This test proves the current design instead: injecting a fault at the last possible
 // moment before T1 could ever be touched (NoOpPreFinishHook's seam) still leaves the store fully
 // functional afterward -- no hang, correct data, and a subsequent defragment() succeeds normally.
@@ -1572,17 +1572,17 @@ struct TinyWalCheckpointConfig : vmemkv::Config<> {
 using VMemKV_TinyWalCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyWalCheckpointConfig>>;
 }  // namespace
 
-// Regression test for the T1-only-checkpoint path's KNOWN OPEN ISSUE mitigation
-// (reorganize_internal()'s T1-only-with-checkpoint branch): that branch's offset_mapper is a
-// pure passthrough (same as the plain T1-only branch), so it never validates generations the way
-// the T2-rebuild branch's offset_mapper does.
-// Without a check, a straggler entry left stamped with an already-retired T2 generation by the
-// still-open, separately-tracked residual-window race would be persisted into a T1-only
-// checkpoint completely unvalidated -- load_checkpoint_if_present() re-stamps every loaded entry
-// uniformly with zero per-entry checking, so this would silently resolve to the wrong T2 file
-// after a restart. This test proves the chk_writer_fn precondition check catches it instead: no
-// checkpoint gets committed this cycle, exactly as if the WAL trigger hadn't fired at all.
-TEST_CASE("VMemKV: T1-only checkpoint refuses to persist a straggler stamped with a retired T2 generation") {
+// Regression test for how checkpoint_and_defragment() (TODO.md item 5) handles a straggler entry
+// left stamped with an already-retired T2 generation by the still-open, separately-tracked
+// residual-window race (see T2FlatFile::acquire_write_handle()'s contract). Unlike the old
+// T1-only checkpoint path (removed -- its offset_mapper was a pure passthrough that never
+// validated generations, unlike the full-rebuild path's), checkpoint() now always goes through
+// the same relocation/validation offset_mapper_fn defragment() uses. So a straggler like this is
+// silently healed by the very next checkpoint() cycle: T1's scan finds it by its live key/hash
+// regardless of what generation it was stamped with, its bytes (really, physically written
+// against the current generation -- only its T1 stamp lies about that) get copied forward
+// normally, and its generation stamp gets corrected to match.
+TEST_CASE("VMemKV: checkpoint() heals a straggler entry stamped with a stale T2 generation") {
   using TestStore = VMemKV_TinyWalCheckpoint;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
@@ -1606,18 +1606,12 @@ TEST_CASE("VMemKV: T1-only checkpoint refuses to persist a straggler stamped wit
   const uint64_t g2 = store->impl().t2().get_memory()->generation;
   REQUIRE(g2 != g1);
 
-  const auto manifest_path = vmemkv::derive_manifest_path(store->impl().t2().path());
-  const auto manifest_before = vmemkv::read_manifest(manifest_path);
-  REQUIRE(manifest_before.has_value());
-
-  // Directly inject a "straggler": an entry stamped with the now-retired G1, simulating exactly
-  // what the residual-window race would leave behind (same technique the writer-stop-barrier
-  // regression test above uses -- T1Index::put()'s explicit-generation overload, no new test seam needed).
-  // Deliberately not read back afterward: get_impl()/update_impl() retry-loop on a generation
-  // mismatch until a future full T2 rebuild's offset_mapper_fn relocates and re-stamps it (see
-  // that retry's own comment) -- this test's cycle 3 never performs one, by design (that's the
-  // whole point of the T1-only checkpoint path), so reading "straggler" back here would just hit
-  // that same pre-existing, separately-tracked livelock, unrelated to what this test verifies.
+  // Directly inject a "straggler": a record really, physically appended to the CURRENT (G2)
+  // generation (via the same acquire_write_handle()/append_default() path a normal insert uses),
+  // but with its T1 entry deliberately stamped with the retired G1 instead -- simulating exactly
+  // what the residual-window race would leave behind (T1Index::put()'s explicit-generation
+  // overload, no new test seam needed). Only the T1 stamp lies; the bytes themselves are valid
+  // and resolvable in G2 right now.
   const std::string straggler_value(200, 's');
   kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
     kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
@@ -1631,21 +1625,21 @@ TEST_CASE("VMemKV: T1-only checkpoint refuses to persist a straggler stamped wit
     });
   });
 
-  // Cycle 3: checkpoint() takes the T1-only-with-checkpoint path (T2 isn't fragmented, and
-  // current_t2_generation_ is already set from cycle 2, so its no_t2_checkpoint_yet fallback
-  // doesn't force a full rebuild either). The straggler's stale generation must make
-  // chk_writer_fn refuse to persist.
+  // Cycle 3: an ordinary checkpoint() -- the same mechanism as defragment() now (TODO.md item 5)
+  // -- must both succeed and correctly heal the straggler.
   const auto stats_before = store->impl().get_statistics();
   store->impl().checkpoint();
   const auto stats_after = store->impl().get_statistics();
+  CHECK(stats_after.t2_reorg_count > stats_before.t2_reorg_count);  // A real cycle ran.
 
-  CHECK(stats_after.t2_reorg_count == stats_before.t2_reorg_count);  // T2 was never rebuilt.
+  const uint64_t g3 = store->impl().t2().get_memory()->generation;
+  REQUIRE(g3 != g2);
 
-  const auto manifest_after = vmemkv::read_manifest(manifest_path);
-  REQUIRE(manifest_after.has_value());
-  CHECK(manifest_after->t1_generation == manifest_before->t1_generation);  // No new checkpoint committed.
-  CHECK(manifest_after->t2_generation == manifest_before->t2_generation);
+  // The straggler is now correctly resolvable and re-stamped to the current generation.
+  const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
+  REQUIRE(straggler_readback.has_value());
+  CHECK(straggler_readback->size() == straggler_value.size());
 
-  // Unrelated keys remain readable via the normal (non-checkpoint) path throughout.
+  // Unrelated keys remain readable throughout.
   CHECK(test_util::get_sync(store, "baseline") != vmemkv::STORE_NOT_FOUND);
 }

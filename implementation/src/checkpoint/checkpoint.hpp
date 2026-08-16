@@ -118,40 +118,36 @@ class T1CheckpointFile {
 // (5.2/5.3).
 
 inline constexpr uint32_t kManifestMagic = 0x314B4D56;  // ASCII "VMK1"
-// v2: split the single `generation` field into `t1_generation`/`t2_generation` -- see their
-// declarations below. A v1 manifest fails both the format_version check and the file-size check
-// in read_manifest(), so it's treated identically to "no checkpoint exists yet" (same contract
-// as any other corrupt/missing manifest); no on-disk migration path exists or is needed.
-inline constexpr uint8_t kManifestFormatVersion = 2;
+// v3: collapsed back to a single `generation` field. v2 had split it into separate
+// `t1_generation`/`t2_generation` fields specifically to support a checkpoint that advanced T1's
+// checkpoint file without touching T2 (VMemKVImpl::checkpoint_t1_only_with_delta_flush()) --
+// checkpoint_and_defragment() (TODO.md item 5) always rebuilds both together now, so the two
+// values are never distinct and the split field serves no purpose. A v1 or v2 manifest fails both
+// the format_version check and the file-size check in read_manifest(), so it's treated identically
+// to "no checkpoint exists yet" (same contract as any other corrupt/missing manifest); no on-disk
+// migration path exists or is needed.
+inline constexpr uint8_t kManifestFormatVersion = 3;
 
 struct ManifestHeader {
   uint32_t magic = kManifestMagic;
   uint8_t format_version = kManifestFormatVersion;
   // NOLINTNEXTLINE(modernize-avoid-c-arrays)
   uint8_t reserved[3] = {};
-  // == checkpoint_lsn of the cycle that committed this manifest. Always advances on every
-  // committed checkpoint (T2-rebuild or T1-only) and names the T1 checkpoint file
-  // (derive_t1_chk_path). Distinct from `t2_generation` below since a T1-only checkpoint (see
-  // VMemKVImpl::reorganize_internal()'s T1-only-with-checkpoint branch) advances this without
-  // touching T2 at all.
-  uint64_t t1_generation = 0;
-  // == checkpoint_lsn of whichever cycle most recently actually rebuilt T2. Names the T2
-  // checkpoint file (derive_t2_chk_path); stays unchanged across any number of subsequent
-  // T1-only checkpoints, since those reference the same, still-valid T2 file. Equal to
-  // t1_generation whenever this checkpoint itself rebuilt T2.
-  uint64_t t2_generation = 0;
-  uint64_t t2_bytes_used = 0;  // Logical bytes used in t2_generation's T2 checkpoint file --
-                               // not recoverable from that file's size alone (it may be
-                               // truncated to a larger capacity than its live data occupies).
+  // == checkpoint_lsn of the cycle that committed this manifest. Names both the T1 checkpoint
+  // file (derive_t1_chk_path) and the T2 checkpoint file (derive_t2_chk_path) -- every committed
+  // checkpoint rebuilds both together.
+  uint64_t generation = 0;
+  uint64_t t2_bytes_used = 0;  // Logical bytes used in `generation`'s T2 checkpoint file -- not
+                               // recoverable from that file's size alone (it may be truncated to
+                               // a larger capacity than its live data occupies).
   uint64_t checksum = 0;       // FNV-1a64 over the header with checksum zeroed.
 };
-inline constexpr size_t kManifestHeaderBytes = 40;
+inline constexpr size_t kManifestHeaderBytes = 32;
 static_assert(sizeof(ManifestHeader) == kManifestHeaderBytes);
 static_assert(std::is_standard_layout_v<ManifestHeader>);
 
 struct ManifestData {
-  uint64_t t1_generation = 0;
-  uint64_t t2_generation = 0;
+  uint64_t generation = 0;
   uint64_t t2_bytes_used = 0;
 };
 
@@ -171,13 +167,9 @@ inline auto derive_t2_chk_path(const std::filesystem::path &t2_path, uint64_t ge
 }
 
 // Writes the manifest to a temp file beside `manifest_path` and renames it atomically onto
-// `manifest_path`. Call only after t1_generation's T1 checkpoint file, and (if this checkpoint
-// actually rebuilt T2) t2_generation's T2 checkpoint file, are already fully written and fsynced.
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-void write_manifest(const std::filesystem::path &manifest_path,
-                    uint64_t t1_generation,
-                    uint64_t t2_generation,
-                    uint64_t t2_bytes_used);
+// `manifest_path`. Call only after `generation`'s T1 and T2 checkpoint files are already fully
+// written and fsynced.
+void write_manifest(const std::filesystem::path &manifest_path, uint64_t generation, uint64_t t2_bytes_used);
 
 // Reads and validates the manifest at `manifest_path`. Returns the generation/t2_bytes_used on
 // success; std::nullopt if the file does not exist or fails validation (bad magic,

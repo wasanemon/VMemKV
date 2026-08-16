@@ -152,14 +152,9 @@ T1CheckpointFile::~T1CheckpointFile() noexcept {
 
 auto T1CheckpointFile::entries() const noexcept -> std::span<const T1ChkEntry> { return {entries_, entry_count_}; }
 
-void write_manifest(const std::filesystem::path &manifest_path,
-                    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-                    uint64_t t1_generation,
-                    uint64_t t2_generation,
-                    uint64_t t2_bytes_used) {
+void write_manifest(const std::filesystem::path &manifest_path, uint64_t generation, uint64_t t2_bytes_used) {
   ManifestHeader header;
-  header.t1_generation = t1_generation;
-  header.t2_generation = t2_generation;
+  header.generation = generation;
   header.t2_bytes_used = t2_bytes_used;
   header.checksum = checksum_header(header);
 
@@ -189,7 +184,7 @@ auto read_manifest(const std::filesystem::path &manifest_path) -> std::optional<
     return std::nullopt;
   }
 
-  return ManifestData{header.t1_generation, header.t2_generation, header.t2_bytes_used};
+  return ManifestData{header.generation, header.t2_bytes_used};
 }
 
 }  // namespace vmemkv

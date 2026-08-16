@@ -821,10 +821,10 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
   std::filesystem::remove(vmemkv::derive_wal_path(instance_path), ignored);
   std::filesystem::remove(vmemkv::derive_manifest_path(instance_path), ignored);
 
-  const auto master_t1 = vmemkv::derive_t1_chk_path(master_path, manifest->t1_generation);
-  const auto master_t2 = vmemkv::derive_t2_chk_path(master_path, manifest->t2_generation);
-  const auto instance_t1 = vmemkv::derive_t1_chk_path(instance_path, manifest->t1_generation);
-  const auto instance_t2 = vmemkv::derive_t2_chk_path(instance_path, manifest->t2_generation);
+  const auto master_t1 = vmemkv::derive_t1_chk_path(master_path, manifest->generation);
+  const auto master_t2 = vmemkv::derive_t2_chk_path(master_path, manifest->generation);
+  const auto instance_t1 = vmemkv::derive_t1_chk_path(instance_path, manifest->generation);
+  const auto instance_t2 = vmemkv::derive_t2_chk_path(instance_path, manifest->generation);
   std::filesystem::remove(instance_t1, ignored);
   std::filesystem::remove(instance_t2, ignored);
   std::error_code link_error;
@@ -836,10 +836,7 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
   if (link_error) {
     throw std::runtime_error("Failed to hardlink T2 checkpoint for clone: " + link_error.message());
   }
-  vmemkv::write_manifest(vmemkv::derive_manifest_path(instance_path),
-                         manifest->t1_generation,
-                         manifest->t2_generation,
-                         manifest->t2_bytes_used);
+  vmemkv::write_manifest(vmemkv::derive_manifest_path(instance_path), manifest->generation, manifest->t2_bytes_used);
 
   return std::make_unique<Store>(instance_path, Store::ConfigType::DefaultT2CapacityBytes);
 }
