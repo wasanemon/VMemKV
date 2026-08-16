@@ -4,15 +4,30 @@
 # (scenario, value_size) combinations already used by the main benchmark matrix
 # (in_memory/8B, in_memory/1KB, ltm/1KB, ltm/64KB).
 #
-# Not part of the Google Benchmark-registered matrix: reorganize() is a single, possibly very
-# slow blocking call (LTM's cgroup memory constraint can make even a T1-only reorganize run
-# "well past a minute"), not a repeatable operation GB's timing-loop model expects. Each data
-# point instead runs
+# Also runs the "Corpus-Size Invariance across Generations" experiment (--mode=t1t2_steady, see
+# bench_kv.cpp's reorg_probe namespace comment): unlike t1only/t1t2 above, which always measure a
+# first-ever (bootstrap, O(N)) checkpoint, this sweeps the same 4 ratios but measures a *second*
+# defragment() call after one churn round, against a corpus that already has a prior generation to
+# reflink from -- the O(diff) steady-state path checkpoint_and_defragment() actually optimizes for.
+# Scoped to ltm:1KB only (the combo the original O(N)-scaling pathology was found in -- see TODO.md
+# item 4's resolution): unlike t1only/t1t2, which want the full comparison matrix, this experiment
+# only needs to demonstrate the effect where it matters most. Reuses one corpus across all 4 ratio
+# points (bulk_load()ing just the incremental delta each time -- see run_steady()'s own comment in
+# bench_kv.cpp) rather than rebuilding independently at each point, so its total populate cost is
+# ~100% of a full corpus instead of t1only/t1t2's 250% (25+50+75+100% built independently) -- see
+# run_churn_scaling_probe.sh's header for the companion "Churn-Ratio Scaling" experiment, which
+# sweeps --churn-ratio instead of --ratio and shares this same t1t2_steady mode.
+#
+# Not part of the Google Benchmark-registered matrix: reorganize()/defragment() is a single,
+# possibly very slow blocking call (LTM's cgroup memory constraint can make even a T1-only
+# reorganize run "well past a minute"), not a repeatable operation GB's timing-loop model expects.
+# Each data point instead runs
 # bench_kv's standalone `--reorg-probe` CLI mode as its own process, wrapped in `timeout` twice:
-#   - bench_kv's own internal 60s cap on the reorganize() call itself (see kReorgTimeoutSeconds
-#     in bench_kv.cpp) -- this is what actually bounds the interesting measurement.
-#   - this script's outer OUTER_TIMEOUT_SECONDS, a generous backstop covering populate too (which
-#     the internal cap deliberately excludes), in case populate itself hangs.
+#   - bench_kv's own internal 60s cap on the reorganize()/defragment() call itself (see
+#     kReorgTimeoutSeconds in bench_kv.cpp) -- this is what actually bounds the interesting
+#     measurement.
+#   - this script's outer OUTER_TIMEOUT_SECONDS, a generous backstop covering setup too (which
+#     the internal cap deliberately excludes), in case populate/checkpoint/churn itself hangs.
 # Ratios are swept ascending (25%/50%/75%/100% of the scenario's normal target size); as soon as
 # one ratio times out (internally or via the outer backstop) or errors, escalation to larger
 # ratios stops for that (combo, mode) pair -- there is no reason to expect a larger corpus to be
@@ -51,49 +66,39 @@ MODES=("t1only" "t1t2")
 
 log() { echo "[reorg-scaling-probe] $*" >&2; }
 
+# shellcheck source=common/reorg_probe_common.sh
+source "$SCRIPT_DIR/common/reorg_probe_common.sh"
+
 for combo in "${COMBOS[@]}"; do
   scenario="${combo%%:*}"
   value_size="${combo##*:}"
   for mode in "${MODES[@]}"; do
     log "=== ${scenario}/${value_size}/${mode} ==="
     for ratio in "${RATIOS[@]}"; do
-      stdout_file="$(mktemp)"
-      stderr_file="$(mktemp)"
-      VMEMKV_DB_DIR="$DB_DIR" timeout "${OUTER_TIMEOUT_SECONDS}s" "$BENCH_KV_BIN" \
-        --reorg-probe --scenario="$scenario" --value-size="$value_size" --mode="$mode" --ratio="$ratio" \
-        >"$stdout_file" 2>"$stderr_file"
-      exit_code=$?
-
-      line="$(tail -n 1 "$stdout_file")"
-      if [[ $exit_code -eq 0 && -n "$line" ]]; then
-        log "ratio=${ratio}: $line"
-        echo "$line" >> "$OUTPUT_PATH"
-        rm -f "$stdout_file" "$stderr_file"
-        continue
+      if ! run_probe_point "$scenario" "$value_size" "$mode" "$ratio" "ratio=${ratio}"; then
+        log "ratio=${ratio} did not complete cleanly -- stopping escalation for ${scenario}/${value_size}/${mode}"
+        break
       fi
-
-      if [[ -n "$line" ]] && echo "$line" | python3 -c "import json,sys; json.load(sys.stdin)" >/dev/null 2>&1; then
-        # The probe's own internal reorganize()-timeout fired: it still printed a JSON line
-        # (timed_out:true) before exiting 124. Trust that over synthesizing our own record.
-        log "ratio=${ratio}: internal timeout -- $line"
-        echo "$line" >> "$OUTPUT_PATH"
-      else
-        # The outer backstop killed the process before it could print anything (e.g. populate
-        # itself never finished), or it crashed/errored some other way.
-        reason="outer_timeout"
-        if [[ $exit_code -ne 124 ]]; then
-          reason="error_exit_${exit_code}"
-        fi
-        log "ratio=${ratio}: ${reason} (exit=${exit_code}); stderr: $(tail -n 5 "$stderr_file")"
-        printf '{"scenario":"%s","value_size":"%s","mode":"%s","ratio":%s,"key_count":null,"elapsed_sec":%s,"timed_out":true,"failure_reason":"%s"}\n' \
-          "$scenario" "$value_size" "$mode" "$ratio" "$OUTER_TIMEOUT_SECONDS" "$reason" >> "$OUTPUT_PATH"
-      fi
-      rm -f "$stdout_file" "$stderr_file"
-
-      log "ratio=${ratio} did not complete cleanly -- stopping escalation for ${scenario}/${value_size}/${mode}"
-      break
     done
   done
 done
+
+# "Corpus-Size Invariance across Generations" -- see the file header comment above. Scoped to
+# ltm:1KB only, and deliberately run *after* the t1only/t1t2 sweep above so a mid-sweep failure in
+# the (unrelated) bootstrap measurements doesn't cost this one its own results.
+STEADY_CHURN_RATIO=0.01
+STEADY_COMBO="ltm:1KB"
+if [[ -z "$COMBO_FILTER" || "$COMBO_FILTER" == "ltm" || "$COMBO_FILTER" == "$STEADY_COMBO" ]]; then
+  scenario="${STEADY_COMBO%%:*}"
+  value_size="${STEADY_COMBO##*:}"
+  log "=== ${scenario}/${value_size}/t1t2_steady (churn_ratio=${STEADY_CHURN_RATIO}) ==="
+  for ratio in "${RATIOS[@]}"; do
+    if ! run_probe_point "$scenario" "$value_size" "t1t2_steady" "$ratio" "ratio=${ratio}" \
+      --churn-ratio="$STEADY_CHURN_RATIO" --sweep-tag=corpus_scaling; then
+      log "ratio=${ratio} did not complete cleanly -- stopping escalation for ${scenario}/${value_size}/t1t2_steady"
+      break
+    fi
+  done
+fi
 
 log "done. Results written to $OUTPUT_PATH"

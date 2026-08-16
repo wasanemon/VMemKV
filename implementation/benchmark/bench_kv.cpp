@@ -1698,20 +1698,38 @@ void register_all_benchmarks() {
 // through a 1GiB-constrained page cache is where reorganize() actually becomes impractical, not
 // the T1-only merge itself.
 //
-// populate_random_order() is deliberately NOT time-limited here -- only the outer shell driver's
-// own generous backstop timeout (wrapping this whole process) covers it. Only the reorganize()
-// call itself is capped, via a background thread plus future::wait_for(), so a runaway
-// reorganize() is reported on its own without also charging populate's time against the same
-// budget (conflating the two would make a timeout ambiguous: slow populate, or slow reorganize?).
+// Population/checkpoint/churn are deliberately NOT time-limited here -- only the outer shell
+// driver's own generous backstop timeout (wrapping this whole process) covers them. Only the
+// reorganize()/defragment() call itself is capped (timed_run(), below), via a background thread
+// plus future::wait_for(), so a runaway call is reported on its own without also charging setup
+// time against the same budget (conflating the two would make a timeout ambiguous: slow setup, or
+// slow reorganize/defragment?).
+//
+// Three modes, selected via --mode:
+//   t1only / t1t2 (run_bootstrap(), below): the original design -- a single fresh populate
+//     followed by exactly one timed reorganize()/defragment() call. Always O(N): there's no prior
+//     generation to reflink from, so this measures checkpoint_and_defragment()'s bootstrap cost.
+//   t1t2_steady (run_steady(), below): measures a *second* (or later) defragment() call against a
+//     corpus that already has one checkpointed generation -- this is what exercises the
+//     reflink+punch O(diff) path. Used by two experiments that share this same mechanism, only
+//     differing in which axis (--ratio or --churn-ratio) they sweep: "Churn-Ratio Scaling" (fixed
+//     --ratio, varies --churn-ratio) and "Corpus-Size Invariance across Generations" (fixed
+//     --churn-ratio, varies --ratio, relying on run_steady()'s incremental corpus growth to avoid
+//     re-populating from scratch at each point). See run_churn_scaling_probe.sh and
+//     run_reorg_scaling_probe.sh's t1t2_steady sweep, respectively.
 namespace reorg_probe {
 
 constexpr int kReorgTimeoutSeconds = 60;
 
+enum class ProbeMode { kT1Only, kT1T2, kT1T2Steady };
+
 struct ProbeArgs {
   bool is_ltm = false;
   std::size_t val_size = 0;
-  bool force_t2_gc = false;
+  ProbeMode mode = ProbeMode::kT1Only;
   double ratio = 1.0;
+  double churn_ratio = 0.0;
+  std::string sweep_tag = "default";
 };
 
 [[noreturn]] void fail(const std::string &msg) {
@@ -1757,58 +1775,49 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
       has_value_size = true;
     } else if (key == "--mode") {
       if (value == "t1only") {
-        args.force_t2_gc = false;
+        args.mode = ProbeMode::kT1Only;
       } else if (value == "t1t2") {
-        args.force_t2_gc = true;
+        args.mode = ProbeMode::kT1T2;
+      } else if (value == "t1t2_steady") {
+        args.mode = ProbeMode::kT1T2Steady;
       } else {
         fail("unknown --mode: " + std::string(value));
       }
       has_mode = true;
     } else if (key == "--ratio") {
       args.ratio = std::stod(std::string(value));
+    } else if (key == "--churn-ratio") {
+      args.churn_ratio = std::stod(std::string(value));
+    } else if (key == "--sweep-tag") {
+      args.sweep_tag = std::string(value);
     }
   }
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
-        "--mode=<t1only|t1t2> --ratio=<0.0-1.0>");
+        "--mode=<t1only|t1t2|t1t2_steady> --ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] "
+        "[--sweep-tag=<name>]");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
     fail("--ratio must be in (0.0, 1.0]");
   }
+  if (args.churn_ratio < 0.0 || args.churn_ratio > 1.0) {
+    fail("--churn-ratio must be in [0.0, 1.0]");
+  }
   return args;
 }
 
-[[noreturn]] void run(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKV_Baseline;
-
-  if (args.is_ltm) {
-    // Matches benchmark_matrix.sh's real scenario_env_prefix() for "ltm" -- corpus_size_for_value()
-    // below only scales with VMEMKV_BENCH_TARGET_RATIO when VMEMKV_BENCH_LTM is set (see that
-    // function's in-memory fixed-constant branches), so both must be set before it's first called.
-    ::setenv("VMEMKV_BENCH_LTM", "1", 1);
-    ::setenv("VMEMKV_BENCH_TARGET_RATIO", "8.0", 1);
-  }
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_" + (args.force_t2_gc ? "t1t2" : "t1only") + "_" +
-                           std::to_string(static_cast<int>(args.ratio * 100));
-
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  populate_random_order(*store, {key_count, args.val_size});
-
+// Times a single call to `fn` (reorganize()/defragment()) in a detached background thread capped
+// at kReorgTimeoutSeconds -- see the file-level comment above this namespace for why
+// google-benchmark's iteration model doesn't fit timing exactly one, possibly very slow, blocking
+// call.
+template <typename Fn>
+auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   std::promise<void> done_promise;
   auto done_future = done_promise.get_future();
   const auto t0 = std::chrono::steady_clock::now();
-  std::thread worker([&store, force_t2_gc = args.force_t2_gc, promise = std::move(done_promise)]() mutable {
-    if (force_t2_gc) {
-      store->defragment();
-    } else {
-      store->reorganize();
-    }
+  std::thread worker([fn = std::forward<Fn>(fn), promise = std::move(done_promise)]() mutable {
+    fn();
     promise.set_value();
   });
   worker.detach();
@@ -1817,19 +1826,164 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
   const bool timed_out = status != std::future_status::ready;
   const double elapsed_sec = timed_out ? static_cast<double>(kReorgTimeoutSeconds)
                                        : std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  return {elapsed_sec, timed_out};
+}
 
+// _Exit(), not return: on timeout, timed_run()'s worker thread is still inside reorganize()/
+// defragment() touching `store` -- abandoning it via detach() and terminating without running
+// destructors (skipping `store`'s ~VMemKVImpl(), which would otherwise join reorg_worker_ and
+// could itself block forever) is what makes this process's exit actually bounded. On success,
+// _Exit() is just the simplest way to avoid the same destructor path racing the
+// now-finished-but-still-detached worker thread.
+[[noreturn]] void report_and_exit(const ProbeArgs &args, std::size_t key_count, double elapsed_sec, bool timed_out) {
+  const char *mode_name =
+      args.mode == ProbeMode::kT1Only ? "t1only" : (args.mode == ProbeMode::kT1T2 ? "t1t2" : "t1t2_steady");
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"" << (args.force_t2_gc ? "t1t2" : "t1only") << "\"," << "\"ratio\":" << args.ratio
-            << "," << "\"key_count\":" << key_count << "," << "\"elapsed_sec\":" << elapsed_sec << ","
-            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
-
-  // _Exit(), not return: on timeout, the worker thread is still inside reorganize() touching
-  // `store` -- abandoning it via detach() and terminating without running destructors (skipping
-  // `store`'s ~VMemKVImpl(), which would otherwise join reorg_worker_ and could itself block
-  // forever) is what makes this process's exit actually bounded. On success, _Exit() is just the
-  // simplest way to avoid the same destructor path racing the now-finished-but-still-detached
-  // worker thread.
+            << "," << "\"mode\":\"" << mode_name << "\"," << "\"ratio\":" << args.ratio << ","
+            << "\"churn_ratio\":" << args.churn_ratio << "," << "\"key_count\":" << key_count << ","
+            << "\"elapsed_sec\":" << elapsed_sec << "," << "\"timed_out\":" << (timed_out ? "true" : "false") << "}"
+            << std::endl;
   std::_Exit(timed_out ? 124 : 0);
+}
+
+// T1-only / T1+T2 bootstrap modes: a single fresh populate (scattered insert order, see
+// populate_random_order()'s comment) followed by exactly one timed reorganize()/defragment()
+// call. Always O(N) regardless of the checkpoint_and_defragment() reflink+punch redesign --
+// there is no prior generation to reflink from -- so this remains the bootstrap-cost baseline
+// (see run_reorg_scaling_probe.sh's own comment).
+[[noreturn]] void run_bootstrap(const ProbeArgs &args) {
+  using Store = vmemkv::variants::VMemKVStore;
+
+  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
+  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
+  const bool force_t2_gc = args.mode == ProbeMode::kT1T2;
+
+  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
+                           std::to_string(args.val_size) + "_" + (force_t2_gc ? "t1t2" : "t1only") + "_" +
+                           std::to_string(static_cast<int>(args.ratio * 100));
+
+  auto store = make_vmemkv_fresh(
+      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+  populate_random_order(*store, {key_count, args.val_size});
+
+  auto [elapsed_sec, timed_out] = timed_run([&store, force_t2_gc]() {
+    if (force_t2_gc) {
+      store->defragment();
+    } else {
+      store->reorganize();
+    }
+  });
+  report_and_exit(args, key_count, elapsed_sec, timed_out);
+}
+
+// Steady-state mode: measures a *second* (or later) defragment() call, after the corpus already
+// has one checkpointed generation to reflink from -- this is what actually exercises
+// checkpoint_and_defragment()'s O(diff) path, unlike run_bootstrap() above which always measures
+// the O(N) first-ever-checkpoint case.
+//
+// Persists across invocations at a fixed, ratio/churn-independent path (keyed only by
+// --sweep-tag/scenario/value-size) so a driver script can call this repeatedly -- with an
+// ascending --ratio sequence ("Corpus-Size Invariance across Generations") or a fixed --ratio and
+// varying --churn-ratio ("Churn-Ratio Scaling") -- and have each call reuse/grow the *same*
+// on-disk corpus instead of re-populating it from scratch every time: populating 25/50/75/100%
+// independently costs 250% of a full corpus in total insert work, growing incrementally costs
+// 100%. A sidecar "<path>.steady_count" file tracks how many keys are already durably populated
+// at `path` so this process (a fresh one each invocation, same as the bootstrap modes) knows how
+// much delta to load.
+[[noreturn]] void run_steady(const ProbeArgs &args) {
+  using Store = vmemkv::variants::VMemKVStore;
+
+  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
+  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
+
+  const std::string path = get_db_dir() + "/reorg_probe_steady_" + args.sweep_tag + "_" +
+                           (args.is_ltm ? "ltm" : "inmem") + "_" + std::to_string(args.val_size);
+  const std::string count_marker_path = path + ".steady_count";
+
+  const bool manifest_exists = std::filesystem::exists(vmemkv::derive_manifest_path(path));
+  std::size_t prev_count = 0;
+  if (manifest_exists) {
+    if (std::ifstream marker(count_marker_path); marker) {
+      marker >> prev_count;
+    }
+  }
+
+  std::unique_ptr<Store> store;
+  if (manifest_exists) {
+    store = std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes);
+  } else {
+    store = make_vmemkv_fresh(
+        path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+  }
+
+  if (key_count > prev_count) {
+    const std::size_t delta = key_count - prev_count;
+    store->bulk_load(
+        delta,
+        [prev_count](std::size_t i) { return make_key(prev_count + i); },
+        [prev_count, val_size = args.val_size](std::size_t i) { return make_value_for_key(prev_count + i, val_size); });
+  }
+
+  // Untimed: establishes a clean single-generation baseline before churn, same as any real
+  // caller would do -- not part of what this experiment measures.
+  store->checkpoint();
+
+  // Untimed, and deliberately multi-threaded: update() is WAL-durable (an fsync-equivalent wait
+  // per call, see update_impl()'s comment), so a single sequential thread issuing hundreds of
+  // thousands of them serializes on fsync latency alone -- observed locally taking >300s for
+  // 400K updates regardless of corpus size or churn ratio, i.e. a property of this churn-
+  // application loop, not of the defragment() call being measured. Splitting across threads lets
+  // concurrent WAL appends benefit from group commit (see wal.cpp) the same way a real concurrent
+  // write workload would.
+  const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * args.churn_ratio));
+  std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000) +
+                            static_cast<uint64_t>(args.churn_ratio * 1000000));
+  std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
+  std::vector<std::size_t> churn_indices(churn_count);
+  for (auto &idx : churn_indices) {
+    idx = churn_index_dist(churn_rng);
+  }
+  const std::size_t churn_threads =
+      std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
+  {
+    std::vector<std::thread> workers;
+    workers.reserve(churn_threads);
+    for (std::size_t t = 0; t < churn_threads; ++t) {
+      workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
+        for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
+          const std::size_t idx = churn_indices[i];
+          store->update(make_key(idx), make_value_for_key(idx, val_size));
+        }
+      });
+    }
+    for (auto &worker : workers) {
+      worker.join();
+    }
+  }
+
+  auto [elapsed_sec, timed_out] = timed_run([&store]() { store->defragment(); });
+
+  if (!timed_out) {
+    std::ofstream marker(count_marker_path, std::ios::trunc);
+    marker << key_count;
+  }
+
+  report_and_exit(args, key_count, elapsed_sec, timed_out);
+}
+
+[[noreturn]] void run(const ProbeArgs &args) {
+  if (args.is_ltm) {
+    // Matches benchmark_matrix.sh's real scenario_env_prefix() for "ltm" -- corpus_size_for_value()
+    // below only scales with VMEMKV_BENCH_TARGET_RATIO when VMEMKV_BENCH_LTM is set (see that
+    // function's in-memory fixed-constant branches), so both must be set before it's first called.
+    ::setenv("VMEMKV_BENCH_LTM", "1", 1);
+    ::setenv("VMEMKV_BENCH_TARGET_RATIO", "8.0", 1);
+  }
+  if (args.mode == ProbeMode::kT1T2Steady) {
+    run_steady(args);
+  } else {
+    run_bootstrap(args);
+  }
 }
 
 }  // namespace reorg_probe
