@@ -42,7 +42,12 @@ jobs:
         # to use (see tests/CMakeLists.txt's VMEMKV_TEST_XFS_MOUNT / test_temp_root()). The script's
         # sudo calls run unattended here since GitHub-hosted runners grant the runner user
         # passwordless sudo (unlike a typical interactive dev machine).
-        implementation/scripts/ensure_xfs_dev_volume.sh
+        #
+        # 4G, not the 20G local-dev default: the runner only has ~14G free total, and
+        # `fallocate` reserves real space up front on ext4 (the runner's root fs), so a 20G image
+        # exhausts the disk outright (this crashed the runner process itself, not just the build,
+        # the first time this step was added). Unit tests never touch more than a few hundred MB.
+        implementation/scripts/ensure_xfs_dev_volume.sh /mnt/vmemkv-xfs 4G
 
     - name: Configure CMake
       run: |
