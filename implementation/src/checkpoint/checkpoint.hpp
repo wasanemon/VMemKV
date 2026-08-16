@@ -169,6 +169,7 @@ inline auto derive_t2_chk_path(const std::filesystem::path &t2_path, uint64_t ge
 // Writes the manifest to a temp file beside `manifest_path` and renames it atomically onto
 // `manifest_path`. Call only after `generation`'s T1 and T2 checkpoint files are already fully
 // written and fsynced.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void write_manifest(const std::filesystem::path &manifest_path, uint64_t generation, uint64_t t2_bytes_used);
 
 // Reads and validates the manifest at `manifest_path`. Returns the generation/t2_bytes_used on

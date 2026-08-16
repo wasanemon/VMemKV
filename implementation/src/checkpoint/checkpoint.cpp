@@ -152,6 +152,7 @@ T1CheckpointFile::~T1CheckpointFile() noexcept {
 
 auto T1CheckpointFile::entries() const noexcept -> std::span<const T1ChkEntry> { return {entries_, entry_count_}; }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void write_manifest(const std::filesystem::path &manifest_path, uint64_t generation, uint64_t t2_bytes_used) {
   ManifestHeader header;
   header.generation = generation;
