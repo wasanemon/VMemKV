@@ -1,0 +1,42 @@
+{
+  "store": "VMemKV-Bloom",
+  "variant": "Bloom",
+  "value_size": "64KB_20__8B_",
+  "timeline": [
+    {"sec": 1, "scan_ops": 2475, "insert_ops": 114, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 2, "scan_ops": 2570, "insert_ops": 146, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 3, "scan_ops": 2711, "insert_ops": 137, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 4, "scan_ops": 2573, "insert_ops": 129, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 5, "scan_ops": 2765, "insert_ops": 142, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 6, "scan_ops": 2535, "insert_ops": 123, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 1, "t2_forced_reorg_ops": 0},
+    {"sec": 7, "scan_ops": 2624, "insert_ops": 122, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 8, "scan_ops": 2584, "insert_ops": 140, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 9, "scan_ops": 2555, "insert_ops": 145, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 10, "scan_ops": 2646, "insert_ops": 158, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 11, "scan_ops": 2490, "insert_ops": 141, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 12, "scan_ops": 1769, "insert_ops": 92, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 13, "scan_ops": 1303, "insert_ops": 95, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 1, "t2_forced_reorg_ops": 1},
+    {"sec": 14, "scan_ops": 2574, "insert_ops": 124, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 15, "scan_ops": 2673, "insert_ops": 135, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 16, "scan_ops": 2615, "insert_ops": 134, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 17, "scan_ops": 2565, "insert_ops": 127, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 18, "scan_ops": 2587, "insert_ops": 137, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 19, "scan_ops": 2625, "insert_ops": 153, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 20, "scan_ops": 2374, "insert_ops": 144, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 21, "scan_ops": 2506, "insert_ops": 124, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 22, "scan_ops": 2293, "insert_ops": 125, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 23, "scan_ops": 2370, "insert_ops": 150, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 24, "scan_ops": 2234, "insert_ops": 117, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 25, "scan_ops": 2321, "insert_ops": 112, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 26, "scan_ops": 2410, "insert_ops": 142, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 27, "scan_ops": 2379, "insert_ops": 108, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 28, "scan_ops": 1202, "insert_ops": 67, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 1, "t2_forced_reorg_ops": 1},
+    {"sec": 29, "scan_ops": 2561, "insert_ops": 136, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0},
+    {"sec": 30, "scan_ops": 2680, "insert_ops": 123, "t1_reorg_ops": 0, "t2_reorg_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_reorg_ops": 0}
+  ],
+  "forced_events": [
+    {"scheduled_sec": 5, "fired_sec": 5, "kind": "reorganize", "elapsed_sec": 0.210122},
+    {"scheduled_sec": 10, "fired_sec": 12, "kind": "defragment", "elapsed_sec": 2.64606},
+    {"scheduled_sec": 25, "fired_sec": 27, "kind": "defragment", "elapsed_sec": 2.98814}
+  ]
+}

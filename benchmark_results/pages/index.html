@@ -66,6 +66,22 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-17</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026081711_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/17)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <p class="mb-1.5">(<a href="2026081313_charts.html" class="text-indigo-600 hover:underline">08/13</a>時点比、要点のみ):</p>
+                <ul class="list-disc pl-4 space-y-1">
+                  <li><code>checkpoint()</code>/<code>defragment()</code>をreflink clone + hole punchで統一する再設計を実施(O(N)コピーからO(diff)へ)。実測3件のライブロック(<code>run_reorganize()</code>の自己競合ループ、<code>acquire_write_handle()</code>のバックオフ無しリトライストーム、<code>Wal::drain_pending()</code>のLSN追いかけっこ)を発見・修正し、32並列での正しい動作を確認。</li>
+                  <li>新実験2件を追加: Churn-Ratio Scaling(churn_ratio&ge;0.05で定常defragment()が60秒キャップに到達)、Corpus-Size Invariance across Generations(定常状態のreflink/punch経路をコーパスサイズに対してスイープ)。</li>
+                  <li><code>--without-rivals</code>モードでVMemKVのみ再計測し、RocksDB/RocksDB-BlobDB/LMDBは08/13の数値を再利用してマージ(コスト削減)。</li>
+                </ul>
+              </td>
+              </tr>
+            <tr>
               <td class="py-4 pr-4 text-slate-400">2026-08-13</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026081313_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">

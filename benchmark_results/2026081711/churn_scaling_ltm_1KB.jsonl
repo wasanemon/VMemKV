@@ -1,0 +1,1 @@
+{"scenario":"ltm","value_size":1024,"mode":"t1t2_steady","ratio":1,"churn_ratio":0.01,"key_count":8259552,"elapsed_sec":41.9197,"timed_out":false}

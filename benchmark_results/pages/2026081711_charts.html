@@ -1,0 +1,4989 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VMemKV Performance Charts (2026081711)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['Inter','sans-serif'] } } }
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .tab-btn.active { border-color: #4f46e5; color: #4f46e5; font-weight: 600; }
+    code { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+  </style>
+</head>
+<body class="bg-white text-slate-900 font-sans min-h-screen antialiased selection:bg-slate-100">
+
+  <nav class="border-b border-slate-200 bg-white sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+      <a href="index.html" class="flex items-center gap-2 text-sm font-semibold text-slate-600 hover:text-indigo-600 transition-colors">
+        <i data-lucide="arrow-left" class="w-4 h-4"></i>
+        Back to Portal
+      </a>
+      <div class="text-xs font-bold text-slate-400 tracking-widest">vmemkv</div>
+    </div>
+  </nav>
+
+  <main class="max-w-6xl mx-auto px-6 py-12 space-y-12">
+
+    <header class="space-y-4 border-b border-slate-200 pb-6">
+      <div class="flex items-center justify-between">
+        <h1 class="text-3xl font-bold tracking-tight text-slate-900">AWS i4i.8xlarge x4 (08/17) -- reflink checkpoint/defragment + livelock fixes, without-rivals</h1>
+        <div class="flex flex-wrap gap-2">
+          <a href="../2026081711/results_in_memory_8B.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (In-mem 8B)</a>
+          <a href="../2026081711/results_in_memory_1KB.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (In-mem 1KB)</a>
+          <a href="../2026081711/results_ltm_1KB.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (LTM 1KB)</a>
+          <a href="../2026081711/results_ltm_64KB.json" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSON (LTM 64KB)</a>
+          <a href="../2026081711/reorg_scaling_in_memory_8B.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Reorg Scaling, In-Mem 8B)</a>
+          <a href="../2026081711/reorg_scaling_in_memory_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Reorg Scaling, In-Mem 1KB)</a>
+          <a href="../2026081711/reorg_scaling_ltm_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Reorg Scaling, LTM 1KB)</a>
+          <a href="../2026081711/reorg_scaling_ltm_64KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Reorg Scaling, LTM 64KB)</a>
+          <a href="../2026081711/churn_scaling_in_memory_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Churn Scaling, In-Mem 1KB)</a>
+          <a href="../2026081711/churn_scaling_ltm_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Churn Scaling, LTM 1KB spot check)</a>
+        </div>
+      </div>
+      <p class="text-slate-500 text-sm max-w-3xl">この4並列ラウンドは <code class="bg-slate-100 px-1 rounded text-xs">--without-rivals</code> モードで VMemKV の4バリアント(Baseline/+BF/+Inline/+Prefault)のみを実測し、RocksDB/RocksDB-BlobDB/LMDBの数値は直近の<a href="2026081313_charts.html" class="text-indigo-600 hover:underline">08/13</a>フルランから再利用してマージした(rivalコードは無変更のため数値は不変という前提)。本ラウンドの主な検証対象は、<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>/<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>をreflink clone + hole punchで統一した再設計と、実測で発見・修正した3件の独立したライブロック(<code class="bg-slate-100 px-1 rounded text-xs">run_reorganize()</code>の自己競合ループ、<code class="bg-slate-100 px-1 rounded text-xs">acquire_write_handle()</code>のバックオフ無しリトライストーム、<code class="bg-slate-100 px-1 rounded text-xs">Wal::drain_pending()</code>のLSN追いかけっこ)を、32並列スレッドという実際の高並行度の下で正しく機能することを検証すること。既存のIn-Memory/LTM×8B/1KB/64KBマトリクスに加え、新たに2つの実験を追加: (1) Churn-Ratio Scaling — 固定コーパス(8M件, in_memory/1KB)に対する churn 率(直近世代からの変更割合)を振って定常状態の <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> 所要時間を測定したところ、churn_ratio &gt;= 0.05 で60秒のハードキャップに到達(タイムアウト)することが判明——O(diff)設計でも、変更量そのものが大きければコストは避けられないという妥当な結果。(2) Corpus-Size Invariance across Generations — コーパスサイズを振って定常状態の<code class="bg-slate-100 px-1 rounded text-xs">t1t2_steady</code>所要時間をT1-only/T1+T2(フルコピー)と比較(Reorg Scalingタブのチャートに緑の第3系列として表示)。</p>
+    </header>
+
+    <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
+      <div class="space-y-2 border-r border-slate-200 pr-0 md:pr-6">
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="git-branch" class="w-3.5 h-3.5"></i> Stacking Variants
+        </h2>
+        <p class="text-slate-500">
+          各最適化の詳細は <a href="https://github.com/LineairDB/VMemKV/tree/main/implementation/docs/specification/low_level_design.md" target="_blank" rel="noopener" class="text-indigo-600 hover:underline">Design Document</a> を参照。
+        </p>
+        <ul class="space-y-1.5 text-slate-500 list-disc pl-4">
+          <li><strong>RocksDB</strong>: LSM-Tree のベースライン比較</li>
+          <li><strong>LMDB</strong>: B+Tree / mmap ベースの比較対象</li>
+          <li><strong>RocksDB-BlobDB</strong>: RocksDB の Blob 分離ストレージ変種(大きな Value 向け)</li>
+          <li><strong>Baseline</strong>: vmemkv 最適化なし</li>
+          <li><strong>+BF</strong>: + T1 Bloom Filter</li>
+          <li><strong>+Inline</strong>: +BF + T1 Inline Value(&lt;8B のValueをT1のみで処理)</li>
+          <li><strong>+Prefault</strong>: +Inline + T2 Async Prefaulting(全部盛り、= VMemKVStore)。旧<code class="bg-slate-100 px-1 rounded text-xs">ScanBaseSequential</code>アブレーションは実測の結果撤去され、その最適化(base領域専用mmap経路)はGet/Scan双方の標準パスへ無条件で統合済み。</li>
+        </ul>
+      </div>
+      <div class="space-y-2 pl-0 md:pl-2">
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+          <i data-lucide="cpu" class="w-3.5 h-3.5"></i> Environment
+        </h2>
+        <ul class="space-y-1 text-slate-500"><li><strong>Instance</strong>: AWS i4i.8xlarge (ap-northeast-1) x4 (4並列独立インスタンス、run_4parallel_bench.sh --without-rivals)</li>
+          <li><strong>CPU</strong>: Intel Xeon Platinum 8375C @ 2.90GHz (32 cores)</li>
+          <li><strong>RAM</strong>: 247.7 GiB</li>
+          <li><strong>RAM (Larger-Than-Memory)</strong>: cgroup で DRAM を 1GiB に制限、target_ratio=8.0でコーパスを約8倍の規模に構築後、cgroup内で計測(ストアごとに独立したcgroupスコープ + drop_caches)</li>
+          <li><strong>Disk</strong>: Local NVMe SSD (Swap Media for LTM)</li>
+          <li><strong>Kernel</strong>: 6.17.0-1019-aws</li>
+          <li><strong>Git Rev</strong>: 6421d3b76d32 (clean -- checkpoint/defragment reflink統一 + 3件のライブロック修正を含む)</li></ul>
+        <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5 mt-3">
+          <i data-lucide="briefcase" class="w-3.5 h-3.5"></i> Workloads
+        </h2>
+        <ul class="space-y-1 text-slate-500">
+          <li><strong>Insert</strong>: 順次挿入(1/4/16/32 スレッド)</li>
+          <li><strong>Get Hit/Miss (Zipf/Uniform)</strong>: ポイントルックアップ</li>
+          <li><strong>Update / Delete</strong>: Zipf 分布での更新・削除</li>
+          <li><strong>Scan (Zipf/Uniform)</strong>: レンジスキャン(旧レポートにあった reorganize モード分割は撤去済み)</li>
+          <li><strong>YCSB-E</strong>: 95% Scan + 5% Insert 混合(32スレッド / 30秒タイムライン)</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="border border-slate-200 rounded-xl p-5 bg-slate-50/50 space-y-3">
+      <h2 class="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+        <i data-lucide="notebook" class="w-3.5 h-3.5 text-indigo-500"></i> Overall Notes &amp; Annotations
+      </h2>
+      <textarea id="memo-overall" oninput="saveMemo('overall', this.value)" placeholder="実験全体の総括メモを入力..." class="w-full text-xs p-3 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-white resize-y h-24"></textarea>
+    </section>
+
+    <div class="border-b border-slate-200 sticky top-16 z-40 bg-white shadow-sm py-2 px-1">
+      <nav class="flex gap-x-8 text-sm" aria-label="Tabs">
+        <button onclick="switchTab('tab-summary')" id="btn-tab-summary" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium active">Summary</button>
+        <button onclick="switchTab('tab-8b-inmem')" id="btn-tab-8b-inmem" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium active">8B In-Memory</button>
+        <button onclick="switchTab('tab-1kb-inmem')" id="btn-tab-1kb-inmem" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium ">1KB(20% 8B) In-Memory</button>
+        <button onclick="switchTab('tab-1kb-ltm')" id="btn-tab-1kb-ltm" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium ">1KB(20% 8B) Larger Than Memory</button>
+        <button onclick="switchTab('tab-64kb-ltm')" id="btn-tab-64kb-ltm" class="tab-btn py-4 px-1 border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300 font-medium ">64KB(20% 8B) Larger Than Memory</button>
+      </nav>
+    </div>
+
+    <div id="tab-summary" class="tab-content active space-y-8">
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
+            <i data-lucide="activity" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Churn-Ratio Scaling (new experiment)</h3>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last generation (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01.</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Churn Ratio</th>
+<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>
+<th class="py-2 px-3 font-bold text-slate-700">defragment() steady-state</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">8.21s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">22.73s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.05</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.25</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.5</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">41.92s</td></tr>
+</tbody></table></div>
+      </section>
+
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
+            <i data-lucide="trophy" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Workload Winners &amp; Relative Speedup</h3>
+            <p class="text-xs text-slate-500">Best VMemKV variant vs. whichever rival (RocksDB, LMDB, RocksDB-BlobDB) is FASTEST at that cell, at 32 threads (max concurrency tested) -- not the best-of-any-thread-count-or-rival figure, since both axes are known to shrink (sometimes invert) the ratio if picked favorably. The rival actually being compared against is named in small text under each badge.</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left border-collapse text-xs">
+            <thead>
+              <tr class="border-b border-slate-200 bg-slate-50/50">
+                <th class="py-3 px-4 font-bold text-slate-700 w-1/4">Workload</th>
+                <th class="py-3 px-4 font-bold text-slate-700">8B In-Memory</th>
+                <th class="py-3 px-4 font-bold text-slate-700">1KB In-Memory</th>
+                <th class="py-3 px-4 font-bold text-slate-700">1KB LTM</th>
+                <th class="py-3 px-4 font-bold text-slate-700">64KB LTM</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100">
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Insert</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.36x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.46x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.45x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (2.47x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
+  </div>
+</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Update (Zipf)</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.29x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.45x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.97x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (3.19x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Delete</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.39x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.47x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.52x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (3.14x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Miss)</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (2.71x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (3.06x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (2.80x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (2.56x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Hit, Zipf)</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.39x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.19x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
+      ⚠️ LOSE (0.59x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.27x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
+  </div>
+</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Hit, Uniform)</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.11x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.14x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
+      ⚠️ LOSE (0.80x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.02x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (Zipf)</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
+      ⚠️ LOSE (0.83x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.04x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
+      ⚠️ LOSE (0.99x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.09x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+</tr>
+<tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (Uniform)</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
+      ⚠️ LOSE (0.86x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.11x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs LMDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+      ✅ WIN (1.38x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB</span>
+  </div>
+</td>
+<td class="py-3.5 px-4 transition-colors">
+  <div class="flex flex-col gap-0.5">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
+      ⚠️ LOSE (0.96x)
+    </span>
+    <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
+    <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
+  </div>
+</td>
+</tr>
+</tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 space-y-4">
+          <div class="flex items-center gap-2.5">
+            <div class="p-1.5 bg-indigo-50 text-indigo-600 rounded-lg">
+              <i data-lucide="zap" class="w-5 h-5"></i>
+            </div>
+            <div>
+              <h4 class="text-sm font-bold text-slate-900">Tier 1 Reorganize (T1only)</h4>
+              <p class="text-[11px] text-slate-500">Average and worst-case times to reorganize the active buffer.</p>
+            </div>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr class="border-b border-slate-200 bg-slate-50/50">
+                  <th class="py-2 px-4 font-bold text-slate-700">Scenario</th>
+                  <th class="py-2 px-4 font-bold text-slate-700 text-center">8B</th>
+                  <th class="py-2 px-4 font-bold text-slate-700 text-center">1KB</th>
+                  <th class="py-2 px-4 font-bold text-slate-700 text-center">64KB</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100"><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">In-Memory</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">1.36s</strong><br><span class="text-slate-400 text-[10px]">Max: 2.29s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">0.66s</strong><br><span class="text-slate-400 text-[10px]">Max: 0.73s</span></td><td class="py-2.5 px-4 text-center text-slate-400">-</td></tr><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">LTM</td><td class="py-2.5 px-4 text-center text-slate-400">-</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">1.29s</strong><br><span class="text-slate-400 text-[10px]">Max: 1.48s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">0.10s</strong><br><span class="text-slate-400 text-[10px]">Max: 0.16s</span></td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 space-y-4">
+          <div class="flex items-center gap-2.5">
+            <div class="p-1.5 bg-indigo-50 text-indigo-600 rounded-lg">
+              <i data-lucide="shuffle" class="w-5 h-5"></i>
+            </div>
+            <div>
+              <h4 class="text-sm font-bold text-slate-900">Tier 1+2 Reorganize (Full)</h4>
+              <p class="text-[11px] text-slate-500">Average and worst-case times for a full T1+T2 reorganize / checkpoint.</p>
+            </div>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr class="border-b border-slate-200 bg-slate-50/50">
+                  <th class="py-2 px-4 font-bold text-slate-700">Scenario</th>
+                  <th class="py-2 px-4 font-bold text-slate-700 text-center">8B</th>
+                  <th class="py-2 px-4 font-bold text-slate-700 text-center">1KB</th>
+                  <th class="py-2 px-4 font-bold text-slate-700 text-center">64KB</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100"><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">In-Memory</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">24.48s</strong><br><span class="text-slate-400 text-[10px]">Max: 40.40s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">13.53s</strong><br><span class="text-slate-400 text-[10px]">Max: 21.74s</span></td><td class="py-2.5 px-4 text-center text-slate-400">-</td></tr><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">LTM</td><td class="py-2.5 px-4 text-center text-slate-400">-</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">39.66s</strong><br><span class="text-slate-400 text-[10px]">Max: 60.00s</span><br><span class="text-[9px] text-amber-500 font-medium">*(1/4 points timed out)</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">32.08s</strong><br><span class="text-slate-400 text-[10px]">Max: 58.06s</span></td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div id="tab-8b-inmem" class="tab-content space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-8b_in_memory-insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> ユニークキーを空のストアに順次挿入する際の書き込みスループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-insert" oninput="saveMemo('8b_in_memory-insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーに対する更新スループット(ステートフルな上書き)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-update" oninput="saveMemo('8b_in_memory-update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 Tombstone 付与による並行削除スループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-delete" oninput="saveMemo('8b_in_memory-delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-get-miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-get-miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 存在しないキーへの読み取り。Bloom Filter の偽陽性回避効果を評価。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-get-miss" oninput="saveMemo('8b_in_memory-get-miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-get-hit-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-get-hit-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布(ホットキー偏重)での既存キーに対するポイントルックアップ。get_impl() の base_mmap 高速パス(本ラウンドの主要変更)が最も効くケース。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-get-hit-zipf" oninput="saveMemo('8b_in_memory-get-hit-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-8b_in_memory-get-hit-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-get-hit-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 一様分布での既存キーに対するポイントルックアップ。同上。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-get-hit-uniform" oninput="saveMemo('8b_in_memory-get-hit-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (Zipf) Workload</h3>
+            <span id="badge-8b_in_memory-scan-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-scan-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布で選ばれたレンジのスキャン。現行 bench_kv は reorganize 状態を単一の Scan ベンチマークとして測定する形に統合済み(旧レポートの Scan_WithReorg / Scan_T1T2Reorg モード分割は撤去済み)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-scan-zipf" oninput="saveMemo('8b_in_memory-scan-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (Uniform) Workload</h3>
+            <span id="badge-8b_in_memory-scan-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-8b_in_memory-scan-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 一様分布で選ばれたレンジのスキャン(同上)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-8b_in_memory-scan-uniform" oninput="saveMemo('8b_in_memory-scan-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- YCSB-E Timeline -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-indigo-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">YCSB-E — Scan + Insert 混合スループット(30秒タイムライン)</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
+          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
+          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan QPS タイムライン</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">32 threads / 30 seconds</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-8b_in_memory-ycsb-e-scan"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-8b_in_memory-ycsb-e" oninput="saveMemo('8b_in_memory-ycsb-e', this.value)" placeholder="YCSB-E 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <!-- Reorg Scaling Probe -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
+          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Reorganize Duration</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">single-shot, threads:1</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-8b_in_memory-reorg-scaling"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-8b_in_memory-reorg-scaling" oninput="saveMemo('8b_in_memory-reorg-scaling', this.value)" placeholder="Reorg Scaling 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="tab-1kb-inmem" class="tab-content space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-1kb_in_memory-insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> ユニークキーを空のストアに順次挿入する際の書き込みスループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-insert" oninput="saveMemo('1kb_in_memory-insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーに対する更新スループット(ステートフルな上書き)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-update" oninput="saveMemo('1kb_in_memory-update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 Tombstone 付与による並行削除スループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-delete" oninput="saveMemo('1kb_in_memory-delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-get-miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-get-miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 存在しないキーへの読み取り。Bloom Filter の偽陽性回避効果を評価。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-get-miss" oninput="saveMemo('1kb_in_memory-get-miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-get-hit-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-get-hit-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布(ホットキー偏重)での既存キーに対するポイントルックアップ。get_impl() の base_mmap 高速パス(本ラウンドの主要変更)が最も効くケース。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-get-hit-zipf" oninput="saveMemo('1kb_in_memory-get-hit-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-1kb_in_memory-get-hit-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-get-hit-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 一様分布での既存キーに対するポイントルックアップ。同上。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-get-hit-uniform" oninput="saveMemo('1kb_in_memory-get-hit-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (Zipf) Workload</h3>
+            <span id="badge-1kb_in_memory-scan-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-scan-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布で選ばれたレンジのスキャン。現行 bench_kv は reorganize 状態を単一の Scan ベンチマークとして測定する形に統合済み(旧レポートの Scan_WithReorg / Scan_T1T2Reorg モード分割は撤去済み)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-scan-zipf" oninput="saveMemo('1kb_in_memory-scan-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (Uniform) Workload</h3>
+            <span id="badge-1kb_in_memory-scan-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_in_memory-scan-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 一様分布で選ばれたレンジのスキャン(同上)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_in_memory-scan-uniform" oninput="saveMemo('1kb_in_memory-scan-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- YCSB-E Timeline -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-indigo-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">YCSB-E — Scan + Insert 混合スループット(30秒タイムライン)</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
+          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
+          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan QPS タイムライン</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">32 threads / 30 seconds</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_in_memory-ycsb-e-scan"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_in_memory-ycsb-e" oninput="saveMemo('1kb_in_memory-ycsb-e', this.value)" placeholder="YCSB-E 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <!-- Reorg Scaling Probe -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
+          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Reorganize Duration</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">single-shot, threads:1</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_in_memory-reorg-scaling"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_in_memory-reorg-scaling" oninput="saveMemo('1kb_in_memory-reorg-scaling', this.value)" placeholder="Reorg Scaling 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="tab-1kb-ltm" class="tab-content space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-1kb_ltm-insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> ユニークキーを空のストアに順次挿入する際の書き込みスループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-insert" oninput="saveMemo('1kb_ltm-insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーに対する更新スループット(ステートフルな上書き)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-update" oninput="saveMemo('1kb_ltm-update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 Tombstone 付与による並行削除スループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-delete" oninput="saveMemo('1kb_ltm-delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-get-miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-get-miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 存在しないキーへの読み取り。Bloom Filter の偽陽性回避効果を評価。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-get-miss" oninput="saveMemo('1kb_ltm-get-miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-get-hit-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-get-hit-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布(ホットキー偏重)での既存キーに対するポイントルックアップ。get_impl() の base_mmap 高速パス(本ラウンドの主要変更)が最も効くケース。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-get-hit-zipf" oninput="saveMemo('1kb_ltm-get-hit-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-1kb_ltm-get-hit-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-get-hit-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 一様分布での既存キーに対するポイントルックアップ。同上。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-get-hit-uniform" oninput="saveMemo('1kb_ltm-get-hit-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (Zipf) Workload</h3>
+            <span id="badge-1kb_ltm-scan-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-scan-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布で選ばれたレンジのスキャン。現行 bench_kv は reorganize 状態を単一の Scan ベンチマークとして測定する形に統合済み(旧レポートの Scan_WithReorg / Scan_T1T2Reorg モード分割は撤去済み)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-scan-zipf" oninput="saveMemo('1kb_ltm-scan-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (Uniform) Workload</h3>
+            <span id="badge-1kb_ltm-scan-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-1kb_ltm-scan-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 一様分布で選ばれたレンジのスキャン(同上)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-1kb_ltm-scan-uniform" oninput="saveMemo('1kb_ltm-scan-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- YCSB-E Timeline -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-indigo-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">YCSB-E — Scan + Insert 混合スループット(30秒タイムライン)</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
+          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
+          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan QPS タイムライン</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">32 threads / 30 seconds</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_ltm-ycsb-e-scan"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_ltm-ycsb-e" oninput="saveMemo('1kb_ltm-ycsb-e', this.value)" placeholder="YCSB-E 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <!-- Reorg Scaling Probe -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
+          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Reorganize Duration</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">single-shot, threads:1</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_ltm-reorg-scaling"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_ltm-reorg-scaling" oninput="saveMemo('1kb_ltm-reorg-scaling', this.value)" placeholder="Reorg Scaling 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="tab-64kb-ltm" class="tab-content space-y-12">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Insert Workload</h3>
+            <span id="badge-64kb_ltm-insert" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-insert"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> ユニークキーを空のストアに順次挿入する際の書き込みスループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-insert" oninput="saveMemo('64kb_ltm-insert', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Update (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-update" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-update"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布での既存キーに対する更新スループット(ステートフルな上書き)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-update" oninput="saveMemo('64kb_ltm-update', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Delete (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-delete" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-delete"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> T1 Tombstone 付与による並行削除スループット。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-delete" oninput="saveMemo('64kb_ltm-delete', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Miss (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-get-miss" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-get-miss"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 存在しないキーへの読み取り。Bloom Filter の偽陽性回避効果を評価。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-get-miss" oninput="saveMemo('64kb_ltm-get-miss', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-get-hit-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-get-hit-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布(ホットキー偏重)での既存キーに対するポイントルックアップ。get_impl() の base_mmap 高速パス(本ラウンドの主要変更)が最も効くケース。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-get-hit-zipf" oninput="saveMemo('64kb_ltm-get-hit-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Get Hit (Uniform) Workload</h3>
+            <span id="badge-64kb_ltm-get-hit-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-get-hit-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 一様分布での既存キーに対するポイントルックアップ。同上。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-get-hit-uniform" oninput="saveMemo('64kb_ltm-get-hit-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (Zipf) Workload</h3>
+            <span id="badge-64kb_ltm-scan-zipf" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-scan-zipf"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> Zipf 分布で選ばれたレンジのスキャン。現行 bench_kv は reorganize 状態を単一の Scan ベンチマークとして測定する形に統合済み(旧レポートの Scan_WithReorg / Scan_T1T2Reorg モード分割は撤去済み)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-scan-zipf" oninput="saveMemo('64kb_ltm-scan-zipf', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan (Uniform) Workload</h3>
+            <span id="badge-64kb_ltm-scan-uniform" class="hidden text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5"></span>
+          </div>
+          <div class="h-64 relative"><canvas id="chart-64kb_ltm-scan-uniform"></canvas></div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded">
+            <strong>実験概要:</strong> 一様分布で選ばれたレンジのスキャン(同上)。
+          </div>
+          <div class="space-y-1.5 mt-2">
+            <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+            <textarea id="memo-64kb_ltm-scan-uniform" oninput="saveMemo('64kb_ltm-scan-uniform', this.value)" placeholder="この実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- YCSB-E Timeline -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-indigo-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">YCSB-E — Scan + Insert 混合スループット(30秒タイムライン)</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
+          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
+          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Scan QPS タイムライン</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">32 threads / 30 seconds</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-64kb_ltm-ycsb-e-scan"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-64kb_ltm-ycsb-e" oninput="saveMemo('64kb_ltm-ycsb-e', this.value)" placeholder="YCSB-E 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <!-- Reorg Scaling Probe -->
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
+          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Reorganize Duration</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">single-shot, threads:1</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-64kb_ltm-reorg-scaling"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-64kb_ltm-reorg-scaling" oninput="saveMemo('64kb_ltm-reorg-scaling', this.value)" placeholder="Reorg Scaling 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <script>
+    lucide.createIcons();
+
+            const rawData = {
+  "8B_In-Memory": {
+    "Insert": {
+      "Baseline": [
+        6991.561077979482,
+        11056.769934770942,
+        70227.26268242706,
+        125223.99726545125
+      ],
+      "+BF": [
+        7155.857692889244,
+        10638.575055525811,
+        70239.50427261987,
+        124720.67787792544
+      ],
+      "+Inline": [
+        7153.506781222425,
+        10724.644606870703,
+        70774.64129615082,
+        125887.79254133126
+      ],
+      "+Prefault": [
+        7035.792661668432,
+        10907.818547040772,
+        71634.07934068188,
+        125681.62451046753
+      ],
+      "RocksDB": [
+        7491.151532249568,
+        19506.158301576095,
+        63555.92513670473,
+        91034.28460460884
+      ],
+      "RocksDB-BlobDB": [
+        8092.437510329305,
+        20950.202528629,
+        65036.31324043842,
+        92803.08210045939
+      ],
+      "LMDB": [
+        7643.1088559273185,
+        6684.6054732483435,
+        6856.171537888187,
+        6975.566828544132
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "Baseline": [
+        328297.8169349855,
+        6137605.068691732,
+        27213734.614086445,
+        39804247.00958208
+      ],
+      "+BF": [
+        311589.0539111613,
+        6011357.527311395,
+        24090624.76685173,
+        35554863.35896909
+      ],
+      "+Inline": [
+        1675647.3173942072,
+        6948544.8496259395,
+        28299518.150727566,
+        40547257.13512335
+      ],
+      "+Prefault": [
+        1661528.7313636942,
+        6654009.50383812,
+        28220264.469248377,
+        40233723.0672325
+      ],
+      "RocksDB": [
+        396498.531596525,
+        1409854.2927783001,
+        3977019.095821895,
+        3675598.823408904
+      ],
+      "RocksDB-BlobDB": [
+        399553.83580500906,
+        1440842.7120043344,
+        3977866.8503764695,
+        3581681.7141394364
+      ],
+      "LMDB": [
+        1543023.4544646232,
+        6036534.4419894125,
+        23583755.75908819,
+        29236275.899224766
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "Baseline": [
+        777296.6223931183,
+        3221174.4431968243,
+        12779982.284952613,
+        22109324.76993266
+      ],
+      "+BF": [
+        734257.1572939702,
+        3010848.0882894476,
+        11692955.23051698,
+        19569830.24106737
+      ],
+      "+Inline": [
+        883712.0273574374,
+        3674860.447761592,
+        14211081.698169094,
+        23287363.80152181
+      ],
+      "+Prefault": [
+        905900.3593744318,
+        3683025.861783787,
+        13973016.685734838,
+        22884891.02949048
+      ],
+      "RocksDB": [
+        221429.02385746496,
+        800296.9020123979,
+        3032187.430772162,
+        3532901.356805765
+      ],
+      "RocksDB-BlobDB": [
+        217777.05018121892,
+        792280.7480347545,
+        2992425.072945108,
+        3527380.146994297
+      ],
+      "LMDB": [
+        958451.7777665145,
+        3758431.9356471384,
+        14474836.669147255,
+        20949534.497600235
+      ]
+    },
+    "Get_Miss": {
+      "Baseline": [
+        5215632.909950026,
+        16763458.660536513,
+        83197364.59280664,
+        75233194.17045677
+      ],
+      "+BF": [
+        5574892.287632535,
+        23298881.95215723,
+        102532034.64532828,
+        107289400.88641468
+      ],
+      "+Inline": [
+        5594691.947503334,
+        23933816.863978926,
+        102949383.08038957,
+        109344474.40607888
+      ],
+      "+Prefault": [
+        5585144.448886246,
+        23987307.265509605,
+        102402053.88265723,
+        90087353.15463766
+      ],
+      "RocksDB": [
+        2991709.7420057273,
+        9210795.903006261,
+        47328126.05228933,
+        40380469.444719724
+      ],
+      "RocksDB-BlobDB": [
+        2983703.3058864567,
+        11917906.323280197,
+        47143125.148932755,
+        40266308.14084672
+      ],
+      "LMDB": [
+        3056170.7006802266,
+        8420734.858920375,
+        40641498.797127075,
+        39502044.3900846
+      ]
+    },
+    "Update": {
+      "Baseline": [
+        7003.092502668469,
+        10573.765891471108,
+        69281.17711877346,
+        125434.522541509
+      ],
+      "+BF": [
+        6944.219795181182,
+        10486.404658446934,
+        67205.27609685161,
+        124673.73888279205
+      ],
+      "+Inline": [
+        6987.093666048481,
+        10759.38403447994,
+        68660.83193416774,
+        125334.78587139474
+      ],
+      "+Prefault": [
+        7038.076876506853,
+        10786.342365245002,
+        68593.54947208623,
+        124949.38080750708
+      ],
+      "RocksDB": [
+        7755.752031408326,
+        18994.478499680932,
+        62971.98905399832,
+        97255.69299496134
+      ],
+      "RocksDB-BlobDB": [
+        7779.750467428526,
+        19093.32315980583,
+        62709.11409350469,
+        96879.59589520018
+      ],
+      "LMDB": [
+        10639.499187824102,
+        10656.39685958753,
+        11916.445140363308,
+        12999.21218896922
+      ]
+    },
+    "Delete": {
+      "Baseline": [
+        7014.202177053099,
+        10640.329106383215,
+        70208.93184394356,
+        123236.27867956234
+      ],
+      "+BF": [
+        6977.104907641648,
+        10786.325059770897,
+        69688.17214422398,
+        124154.10757883542
+      ],
+      "+Inline": [
+        6986.900197720154,
+        10950.33253539023,
+        72372.554461355,
+        123974.35831996489
+      ],
+      "+Prefault": [
+        7030.730068140348,
+        10996.185941917118,
+        69403.34063647696,
+        125187.66648500526
+      ],
+      "RocksDB": [
+        7900.169034497461,
+        20937.597960431467,
+        61447.87120999243,
+        89724.51557776978
+      ],
+      "RocksDB-BlobDB": [
+        7861.4350199241035,
+        21279.729546341467,
+        60275.55123191953,
+        89844.06004780675
+      ],
+      "LMDB": [
+        7654.164775270072,
+        7457.3692105258615,
+        7626.906928101743,
+        8157.169089316372
+      ]
+    },
+    "Scan_Zipf": {
+      "Baseline": [
+        290390.781611357,
+        1144782.6496685124,
+        4683969.015185454,
+        4249956.216134412
+      ],
+      "+BF": [
+        289861.8567621243,
+        1146620.8577571262,
+        4666857.506582546,
+        4252294.503368905
+      ],
+      "+Inline": [
+        348161.7849272151,
+        1326430.9817727346,
+        5490420.085237734,
+        5168664.801060963
+      ],
+      "+Prefault": [
+        357070.4179667203,
+        1398081.1976992602,
+        5662180.377842307,
+        5171136.955762911
+      ],
+      "RocksDB": [
+        42410.66479771799,
+        166672.1129433632,
+        651296.2473621652,
+        571942.2506725305
+      ],
+      "RocksDB-BlobDB": [
+        42989.13379395196,
+        169264.15946786595,
+        664228.3159768675,
+        570359.4777075498
+      ],
+      "LMDB": [
+        400004.57605677325,
+        1591295.603364627,
+        6327132.2984142285,
+        6203195.8289414225
+      ]
+    },
+    "Scan_Uniform": {
+      "Baseline": [
+        229394.93973130724,
+        893918.7060821231,
+        3509021.53513188,
+        3914111.9171877094
+      ],
+      "+BF": [
+        229820.9883163723,
+        914622.4543472457,
+        3505279.878709378,
+        3933562.0634824336
+      ],
+      "+Inline": [
+        274476.98880412045,
+        1101433.3181271285,
+        4375697.111814057,
+        4871436.754655278
+      ],
+      "+Prefault": [
+        285969.60904854507,
+        1137275.3204641368,
+        4515747.911639727,
+        4886784.127147592
+      ],
+      "RocksDB": [
+        36764.50646026294,
+        142608.48927787517,
+        568915.9798553876,
+        514654.30071017594
+      ],
+      "RocksDB-BlobDB": [
+        37101.92677516663,
+        146435.17599898725,
+        575290.7990700183,
+        518961.89197054313
+      ],
+      "LMDB": [
+        319216.19031715806,
+        1191217.9731714516,
+        4918037.445089893,
+        5700731.831509919
+      ]
+    }
+  },
+  "1KB_In-Memory": {
+    "Insert": {
+      "Baseline": [
+        6651.730582539625,
+        9638.448810365177,
+        58325.322967782675,
+        106781.29296063904
+      ],
+      "+BF": [
+        6376.455677852789,
+        9090.550195940086,
+        50634.582751408205,
+        95807.06815925748
+      ],
+      "+Inline": [
+        6612.786486109612,
+        9614.693247977648,
+        57543.8601096001,
+        107033.56011979036
+      ],
+      "+Prefault": [
+        6678.863019190906,
+        9248.24716179908,
+        57181.23902253549,
+        102221.42081938636
+      ],
+      "RocksDB": [
+        6972.214280256117,
+        17143.77878335561,
+        47909.708525124144,
+        66858.18595898713
+      ],
+      "RocksDB-BlobDB": [
+        7509.421048994465,
+        18417.20942363295,
+        48980.46066297684,
+        73212.4800559739
+      ],
+      "LMDB": [
+        5895.759823933914,
+        5631.873447081858,
+        5524.702955260886,
+        5677.587463335962
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "Baseline": [
+        22039.475124767407,
+        222626.08532094315,
+        4682977.048812671,
+        17755879.140882015
+      ],
+      "+BF": [
+        22097.382855789416,
+        223507.37275152953,
+        4602618.424768741,
+        17069556.424934622
+      ],
+      "+Inline": [
+        25848.67218792869,
+        245815.69975084817,
+        4792198.62746736,
+        17493717.670604814
+      ],
+      "+Prefault": [
+        651667.0730966143,
+        2689817.210263259,
+        10672284.453686872,
+        18223014.55090922
+      ],
+      "RocksDB": [
+        272980.9244625738,
+        1005478.4047852833,
+        3758827.4101156862,
+        4938250.138554232
+      ],
+      "RocksDB-BlobDB": [
+        205286.99979428144,
+        746101.4915571398,
+        2438638.0241183303,
+        2585215.3635819834
+      ],
+      "LMDB": [
+        41365.29229984787,
+        2269017.125730843,
+        9443657.426460227,
+        15313395.34822015
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "Baseline": [
+        464673.6808759279,
+        1942469.610309737,
+        7654443.206896125,
+        13603088.973985065
+      ],
+      "+BF": [
+        454695.27546148194,
+        1900469.303784484,
+        7481262.123784537,
+        13000023.303007893
+      ],
+      "+Inline": [
+        464748.00807408575,
+        1941066.8088881625,
+        7647800.006041814,
+        13264086.947799437
+      ],
+      "+Prefault": [
+        488899.5695031486,
+        1942686.6208084994,
+        7671543.2701207,
+        13305374.598868396
+      ],
+      "RocksDB": [
+        173186.7659788041,
+        635742.9067571805,
+        2409749.128556414,
+        3239481.119158987
+      ],
+      "RocksDB-BlobDB": [
+        143619.5794017091,
+        516324.78365549934,
+        1977518.6815995383,
+        2683440.2427383084
+      ],
+      "LMDB": [
+        452882.5923499673,
+        1771775.2411378487,
+        7026747.428288888,
+        11980888.714596175
+      ]
+    },
+    "Get_Miss": {
+      "Baseline": [
+        5407267.6037887875,
+        21343764.93117083,
+        86408238.68253416,
+        68500892.62515247
+      ],
+      "+BF": [
+        6997323.037350842,
+        29603875.562408138,
+        119086176.9498264,
+        92098666.51572947
+      ],
+      "+Inline": [
+        7297922.80094571,
+        29590344.99164093,
+        118330896.22786435,
+        113206116.34941654
+      ],
+      "+Prefault": [
+        7243845.356863233,
+        29255770.29879604,
+        118663080.6357863,
+        110367273.5399616
+      ],
+      "RocksDB": [
+        2681235.0526713957,
+        10948815.986023888,
+        42992623.86848919,
+        36842005.36827786
+      ],
+      "RocksDB-BlobDB": [
+        2414728.695352791,
+        9646454.081904331,
+        37965118.69578077,
+        33390369.628516726
+      ],
+      "LMDB": [
+        2877030.569535311,
+        9866196.14107503,
+        38652905.57475978,
+        37049165.53606558
+      ]
+    },
+    "Update": {
+      "Baseline": [
+        6569.619129032519,
+        9907.312110260664,
+        59461.00515397906,
+        106926.47985788037
+      ],
+      "+BF": [
+        6576.839267864061,
+        9934.861852836126,
+        58966.5384239058,
+        106655.51323402837
+      ],
+      "+Inline": [
+        6577.184512995733,
+        10050.657304069002,
+        58734.368827813756,
+        106602.79154482989
+      ],
+      "+Prefault": [
+        6597.216709704968,
+        10023.863074027098,
+        59272.42402506522,
+        106812.2750851094
+      ],
+      "RocksDB": [
+        6968.074610487562,
+        15501.47000608046,
+        46888.498687155385,
+        71654.11822825868
+      ],
+      "RocksDB-BlobDB": [
+        6814.525937156873,
+        15807.236581851943,
+        47993.97492688516,
+        73774.09190542452
+      ],
+      "LMDB": [
+        10737.669562124705,
+        11460.488127201694,
+        12117.134516493168,
+        13410.222518463099
+      ]
+    },
+    "Delete": {
+      "Baseline": [
+        7105.12232396067,
+        11205.754953917089,
+        70891.987834803,
+        123359.9573676909
+      ],
+      "+BF": [
+        7086.50304104805,
+        11299.709246051436,
+        69670.53634537559,
+        126653.31884327708
+      ],
+      "+Inline": [
+        7071.693295219879,
+        11067.903044737413,
+        71521.59269286018,
+        124498.15657629556
+      ],
+      "+Prefault": [
+        7081.896632636873,
+        10989.622826949215,
+        71979.5082670043,
+        125014.53959683604
+      ],
+      "RocksDB": [
+        7908.22294912297,
+        18304.95924403881,
+        59465.105472482894,
+        86346.26773264716
+      ],
+      "RocksDB-BlobDB": [
+        7775.508673540234,
+        18935.841138354117,
+        57837.89162230358,
+        83692.23443129293
+      ],
+      "LMDB": [
+        5302.362395645718,
+        6149.2521549460225,
+        8025.872679443137,
+        8220.815640785226
+      ]
+    },
+    "Scan_Zipf": {
+      "Baseline": [
+        10195.577809264149,
+        41120.03952311879,
+        165073.25340439627,
+        311845.54736786865
+      ],
+      "+BF": [
+        10206.735032881883,
+        41071.25081532912,
+        165008.93621065153,
+        311917.2886521093
+      ],
+      "+Inline": [
+        10225.008211003124,
+        41184.425966178205,
+        165199.49656012282,
+        312328.6817554835
+      ],
+      "+Prefault": [
+        10337.415183027138,
+        41345.85975897981,
+        165523.3568009555,
+        311138.30758575286
+      ],
+      "RocksDB": [
+        6778.971131723461,
+        26012.706153452877,
+        100883.03437496591,
+        155493.70574160467
+      ],
+      "RocksDB-BlobDB": [
+        3618.2227342602423,
+        13064.241655027703,
+        26241.288044716774,
+        22043.077299078508
+      ],
+      "LMDB": [
+        7328.125474077795,
+        30568.967020055457,
+        148165.9838126759,
+        299605.44784738665
+      ]
+    },
+    "Scan_Uniform": {
+      "Baseline": [
+        10188.750164046141,
+        40753.86711266283,
+        163037.91878494684,
+        305496.0616094466
+      ],
+      "+BF": [
+        10191.73962384864,
+        40770.599132123396,
+        162697.06468903355,
+        308530.4016524263
+      ],
+      "+Inline": [
+        10194.443891461233,
+        40868.768571756475,
+        163444.24749575063,
+        309010.48231642635
+      ],
+      "+Prefault": [
+        10217.740075286545,
+        40811.05121445999,
+        163386.42710149774,
+        306430.46282207174
+      ],
+      "RocksDB": [
+        5678.000825605146,
+        21324.66966013372,
+        82614.07293851534,
+        123381.0698634705
+      ],
+      "RocksDB-BlobDB": [
+        3546.961970421478,
+        13869.397506437357,
+        53352.63174363948,
+        76140.5250262898
+      ],
+      "LMDB": [
+        9085.058898104255,
+        37073.93289077236,
+        147578.23349747303,
+        279352.9410432928
+      ]
+    }
+  },
+  "1KB_LTM": {
+    "Insert": {
+      "Baseline": [
+        6430.249991270038,
+        9189.039304018515,
+        50805.040139350414,
+        88891.8336738295
+      ],
+      "+BF": [
+        6322.102850774359,
+        9290.807753212328,
+        53494.44924606749,
+        89368.29839683007
+      ],
+      "+Inline": [
+        6053.901743964031,
+        8558.024803967333,
+        45630.72925771306,
+        85923.0524483453
+      ],
+      "+Prefault": [
+        6405.071243631392,
+        9162.054080332164,
+        56454.41087283804,
+        103944.74361436955
+      ],
+      "LMDB": [
+        6786.23295951676,
+        5498.97774877389,
+        5457.201572929666,
+        5499.37513322575
+      ],
+      "RocksDB-BlobDB": [
+        7609.962111062323,
+        17848.12900929329,
+        50169.05395569056,
+        71616.96228006373
+      ],
+      "RocksDB": [
+        7486.808125086656,
+        18010.176511410853,
+        53249.41196195259,
+        71577.83801622516
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "Baseline": [
+        22385.297980269217,
+        94979.75606874308,
+        317256.645250066,
+        496291.1263213313
+      ],
+      "+BF": [
+        22352.575879802353,
+        93451.14030479467,
+        309254.42600720713,
+        498091.7686432886
+      ],
+      "+Inline": [
+        26016.816093735324,
+        148022.90532917867,
+        373124.6161501356,
+        598725.4585225084
+      ],
+      "+Prefault": [
+        40127.81791452464,
+        111456.77530340654,
+        347470.4663496536,
+        552376.2985160819
+      ],
+      "LMDB": [
+        11577.642344861126,
+        32443.862104568478,
+        67656.82889048633,
+        62784.00712991003
+      ],
+      "RocksDB-BlobDB": [
+        46668.346490823904,
+        264078.95005714626,
+        643821.8409641078,
+        1021487.2023042396
+      ],
+      "RocksDB": [
+        25275.216734865324,
+        122781.55996231003,
+        443840.4142013691,
+        711598.7429120013
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "Baseline": [
+        8828.059655490295,
+        31478.07222952985,
+        92794.07460421823,
+        149702.65226703582
+      ],
+      "+BF": [
+        8787.94821127343,
+        30050.302418301733,
+        92359.45300955781,
+        148684.93623745898
+      ],
+      "+Inline": [
+        10145.978315948774,
+        36954.45497758686,
+        110961.44355817762,
+        178804.87477247402
+      ],
+      "+Prefault": [
+        10144.411911824962,
+        40393.89998564561,
+        112683.59793231488,
+        182611.05026765683
+      ],
+      "LMDB": [
+        2378.1565023020285,
+        7879.064119963768,
+        15333.824973783778,
+        14348.922562389653
+      ],
+      "RocksDB-BlobDB": [
+        12187.59053367451,
+        47841.54828403113,
+        143113.3776475601,
+        229348.93669320177
+      ],
+      "RocksDB": [
+        9560.288923603475,
+        36982.09930772936,
+        104490.61028711569,
+        165335.5677975239
+      ]
+    },
+    "Get_Miss": {
+      "Baseline": [
+        5390963.201426293,
+        21565935.152224578,
+        86233574.02429509,
+        79412125.39545223
+      ],
+      "+BF": [
+        7065461.52808449,
+        27085050.082785994,
+        118202152.19668366,
+        110648781.1749775
+      ],
+      "+Inline": [
+        7313009.90487244,
+        29383801.599892728,
+        117612295.7226302,
+        112606338.60448448
+      ],
+      "+Prefault": [
+        7270213.271219921,
+        29457487.861137327,
+        117171206.2121617,
+        109505815.37158029
+      ],
+      "LMDB": [
+        2813012.6383145987,
+        10651947.968864782,
+        43090204.13994196,
+        40268082.10846019
+      ],
+      "RocksDB-BlobDB": [
+        2399295.2675718446,
+        9648131.003817115,
+        38499300.3173617,
+        33693627.12789707
+      ],
+      "RocksDB": [
+        2765640.446446021,
+        11127265.778459538,
+        44454254.856877014,
+        39272264.39385544
+      ]
+    },
+    "Update": {
+      "Baseline": [
+        5302.715877565183,
+        9330.308333777892,
+        53057.76191797713,
+        95669.21388378595
+      ],
+      "+BF": [
+        5069.050612646342,
+        9692.679458266888,
+        54073.9184383463,
+        101787.5141292841
+      ],
+      "+Inline": [
+        5449.857661019362,
+        9681.6815505858,
+        55071.41806083168,
+        102712.28558955975
+      ],
+      "+Prefault": [
+        5359.829445189343,
+        9667.715586332057,
+        54688.023205327976,
+        101491.5704876618
+      ],
+      "LMDB": [
+        5878.635777986819,
+        5474.012512897717,
+        7060.023439292622,
+        7650.442394735594
+      ],
+      "RocksDB-BlobDB": [
+        6918.221725824393,
+        15048.723210274626,
+        45750.123436889255,
+        52018.79789742209
+      ],
+      "RocksDB": [
+        6137.7917790805,
+        15473.960904514614,
+        37044.0710521903,
+        51997.63453446526
+      ]
+    },
+    "Delete": {
+      "Baseline": [
+        6981.256574272504,
+        11152.71666300756,
+        72070.88081823857,
+        126814.449394871
+      ],
+      "+BF": [
+        6835.255416576323,
+        11318.521714336322,
+        73100.68228110948,
+        126601.49533047651
+      ],
+      "+Inline": [
+        7103.67505630101,
+        11177.829402290885,
+        71297.1449116434,
+        124876.10244824582
+      ],
+      "+Prefault": [
+        6995.3582328841385,
+        11203.309416571363,
+        71012.12912752823,
+        124467.53710401226
+      ],
+      "LMDB": [
+        5303.744860365637,
+        5843.119956350251,
+        7942.945897389191,
+        8185.505958684817
+      ],
+      "RocksDB-BlobDB": [
+        7807.860681218572,
+        18133.366352330508,
+        53908.40260186593,
+        82175.97301105509
+      ],
+      "RocksDB": [
+        7763.8612396137405,
+        18599.15312548463,
+        57999.07112927948,
+        83449.4086384597
+      ]
+    },
+    "Scan_Zipf": {
+      "Baseline": [
+        5093.803320602808,
+        20857.701989338497,
+        64189.800118514526,
+        79194.05738978882
+      ],
+      "+BF": [
+        5353.200033241564,
+        20585.22799586526,
+        62632.9213352544,
+        77571.05263437523
+      ],
+      "+Inline": [
+        5481.697095738251,
+        20687.406463604493,
+        63003.43777219187,
+        78421.62795889215
+      ],
+      "+Prefault": [
+        5470.624975714265,
+        20074.28122623504,
+        52266.792535448905,
+        70974.50578759339
+      ],
+      "LMDB": [
+        4320.076926984078,
+        13054.916218721271,
+        31556.80939674097,
+        31409.117114559274
+      ],
+      "RocksDB-BlobDB": [
+        1651.137549625963,
+        6371.487557651966,
+        20838.650450604815,
+        22305.634375099413
+      ],
+      "RocksDB": [
+        3495.6205791004168,
+        13515.638879413638,
+        48462.09559870642,
+        79837.68320537015
+      ]
+    },
+    "Scan_Uniform": {
+      "Baseline": [
+        2744.860539682565,
+        9835.183572444455,
+        22048.711537012645,
+        24757.113224485212
+      ],
+      "+BF": [
+        2745.128980781621,
+        9750.013347309452,
+        22163.709477086246,
+        25035.696281852164
+      ],
+      "+Inline": [
+        2748.9699825982666,
+        9756.251636328516,
+        22489.65949642846,
+        25519.45952591233
+      ],
+      "+Prefault": [
+        2783.260538562293,
+        9525.24610491805,
+        22928.47047387058,
+        25768.744306714463
+      ],
+      "LMDB": [
+        1376.6518975472034,
+        4117.417231725846,
+        7530.6133760987495,
+        6889.647842352447
+      ],
+      "RocksDB-BlobDB": [
+        568.4149966808803,
+        1613.7210084237606,
+        5330.512748832807,
+        8792.388983484982
+      ],
+      "RocksDB": [
+        1049.8868184803641,
+        3946.579980352566,
+        12438.324340703768,
+        18606.50612983528
+      ]
+    }
+  },
+  "64KB_LTM": {
+    "Insert": {
+      "Baseline": [
+        3080.2074808720213,
+        4793.934835279069,
+        8601.165875812403,
+        10953.016512456112
+      ],
+      "+BF": [
+        2879.8122137811174,
+        4781.1599710921055,
+        8704.573764705354,
+        11043.64000068737
+      ],
+      "+Inline": [
+        3177.359873122154,
+        4642.883003213848,
+        9365.717719450546,
+        10973.173556815538
+      ],
+      "+Prefault": [
+        3031.959237703336,
+        5018.612214565907,
+        9137.476548133498,
+        10617.468633679353
+      ],
+      "LMDB": [
+        3515.7572423689003,
+        3477.331524061248,
+        3432.3719419986137,
+        3408.3171182796627
+      ],
+      "RocksDB-BlobDB": [
+        3792.5774819505923,
+        4034.031698666372,
+        4813.023680362776,
+        4252.879001647514
+      ],
+      "RocksDB": [
+        3731.179157633235,
+        4731.979553374622,
+        4578.671491191281,
+        4468.191642581793
+      ]
+    },
+    "Get_Hit_Zipf": {
+      "Baseline": [
+        9902.619629556326,
+        41552.14315222435,
+        146704.56825132997,
+        240056.15913584904
+      ],
+      "+BF": [
+        9890.865084097726,
+        41536.07282883394,
+        146608.2279475196,
+        232770.79568159644
+      ],
+      "+Inline": [
+        10241.949502789603,
+        43464.22476092802,
+        154410.0563566312,
+        258182.43608951496
+      ],
+      "+Prefault": [
+        9995.339644995443,
+        40720.57566548529,
+        151730.52257842442,
+        256661.0734885301
+      ],
+      "LMDB": [
+        7231.6292059370435,
+        23022.646945660195,
+        52130.300075518775,
+        48461.012746726934
+      ],
+      "RocksDB-BlobDB": [
+        6940.152106535449,
+        29045.109663404484,
+        110306.21558776498,
+        197462.36687831342
+      ],
+      "RocksDB": [
+        8922.646188907693,
+        36027.45332805366,
+        126169.1381723001,
+        202924.71329079446
+      ]
+    },
+    "Get_Hit_Uniform": {
+      "Baseline": [
+        4491.81480128123,
+        17044.58988176223,
+        49552.28077413999,
+        63655.43163871227
+      ],
+      "+BF": [
+        4430.125318368328,
+        16827.6096500949,
+        49096.37463399493,
+        63072.959278905146
+      ],
+      "+Inline": [
+        4862.671979717197,
+        18018.412349951515,
+        52996.4602139897,
+        60794.604685850994
+      ],
+      "+Prefault": [
+        4880.34136382829,
+        18198.175249143904,
+        52658.324335126934,
+        62113.10218604781
+      ],
+      "LMDB": [
+        2545.855662957139,
+        8605.366437266923,
+        14605.70081891725,
+        13083.663287345636
+      ],
+      "RocksDB-BlobDB": [
+        3781.0863240527838,
+        14640.511796841614,
+        47971.221207022325,
+        62105.269362308034
+      ],
+      "RocksDB": [
+        3789.6355135124527,
+        14286.041115360424,
+        42963.813016475746,
+        54173.091775338136
+      ]
+    },
+    "Get_Miss": {
+      "Baseline": [
+        5954801.933771182,
+        23794938.9786295,
+        90240006.94754475,
+        71829475.17202716
+      ],
+      "+BF": [
+        8072677.53430868,
+        32261749.461875334,
+        125172256.10365266,
+        114698236.13672788
+      ],
+      "+Inline": [
+        7918971.203027908,
+        31949679.072799705,
+        128415561.87199803,
+        116790023.60428488
+      ],
+      "+Prefault": [
+        7964209.476296313,
+        31744133.707830466,
+        63482548.02048809,
+        114098125.39493024
+      ],
+      "LMDB": [
+        3404465.6369498395,
+        9576285.088565957,
+        49506722.63055427,
+        45639171.82967408
+      ],
+      "RocksDB-BlobDB": [
+        2323529.8703990695,
+        9256287.628753368,
+        37137341.393473834,
+        33853475.03960394
+      ],
+      "RocksDB": [
+        2834388.6220982047,
+        11292652.48249656,
+        44247959.42768288,
+        38305146.07818235
+      ]
+    },
+    "Update": {
+      "Baseline": [
+        2807.3410733140186,
+        5181.124681367525,
+        10044.138118483552,
+        11671.336184889593
+      ],
+      "+BF": [
+        2548.038257410984,
+        5242.774175100362,
+        8005.465157887434,
+        13334.846061804043
+      ],
+      "+Inline": [
+        2941.536605736306,
+        5471.74437460343,
+        10089.091226390876,
+        11021.77262760457
+      ],
+      "+Prefault": [
+        2790.6980801298396,
+        5427.775577164135,
+        11631.173138831437,
+        10829.633848360927
+      ],
+      "LMDB": [
+        4266.549634998741,
+        3877.0849192492883,
+        4414.25147163417,
+        4182.008960228277
+      ],
+      "RocksDB-BlobDB": [
+        1665.2971672682538,
+        2025.1427201240626,
+        2479.973570040164,
+        2326.439286185971
+      ],
+      "RocksDB": [
+        1519.954654534564,
+        1548.6246605744482,
+        2454.757292748872,
+        2173.1036643159014
+      ]
+    },
+    "Delete": {
+      "Baseline": [
+        7220.364334288411,
+        11320.648880812785,
+        70068.73741268755,
+        125278.32927172407
+      ],
+      "+BF": [
+        7178.673152845309,
+        11049.939246815784,
+        68568.61750030813,
+        121378.67443550775
+      ],
+      "+Inline": [
+        7246.26530786961,
+        11314.720225438903,
+        71073.13877047643,
+        128787.19456300183
+      ],
+      "+Prefault": [
+        7162.832248815329,
+        11151.73650676093,
+        68477.71724314363,
+        118328.26839297963
+      ],
+      "LMDB": [
+        3585.436657707931,
+        3556.035220665498,
+        3499.8695460535196,
+        3013.182808471108
+      ],
+      "RocksDB-BlobDB": [
+        3620.753862906029,
+        10506.184079686212,
+        28087.15008949864,
+        40958.49056309837
+      ],
+      "RocksDB": [
+        3949.545055509045,
+        9845.739185984432,
+        26816.589134060054,
+        39280.16163192998
+      ]
+    },
+    "Scan_Zipf": {
+      "Baseline": [
+        145.11152737110936,
+        524.2586461606945,
+        1740.8228981498737,
+        2729.2270718684713
+      ],
+      "+BF": [
+        144.61168879571963,
+        522.4788342642252,
+        1705.123333152079,
+        2730.512394844753
+      ],
+      "+Inline": [
+        145.7275684964688,
+        521.8688282558658,
+        1741.526481624229,
+        2740.180814199779
+      ],
+      "+Prefault": [
+        145.60499490086687,
+        524.0011700565167,
+        1736.8712608706962,
+        2718.2309736442207
+      ],
+      "LMDB": [
+        142.70736178683262,
+        498.4196126497753,
+        1653.6296060218517,
+        2524.1702972271264
+      ],
+      "RocksDB-BlobDB": [
+        71.13507532771834,
+        288.89582317022166,
+        1073.5434929778894,
+        1973.1271452786907
+      ],
+      "RocksDB": [
+        102.97046217656143,
+        388.3166581070211,
+        1449.2543856588961,
+        2482.5197851300068
+      ]
+    },
+    "Scan_Uniform": {
+      "Baseline": [
+        115.33686515466624,
+        271.67579664184416,
+        685.0369025502598,
+        632.1075332044998
+      ],
+      "+BF": [
+        115.36146213748479,
+        270.94858797387093,
+        687.9739843029434,
+        629.1761456531182
+      ],
+      "+Inline": [
+        115.50150866432922,
+        272.88564670393987,
+        688.5367299221376,
+        632.8105303612416
+      ],
+      "+Prefault": [
+        115.69003208157392,
+        271.7194902688204,
+        691.781554868207,
+        631.0976362214379
+      ],
+      "LMDB": [
+        109.05503572276236,
+        257.087526383016,
+        632.3728623798695,
+        578.1245643488757
+      ],
+      "RocksDB-BlobDB": [
+        47.71944423314892,
+        150.72741356032367,
+        514.4635820958384,
+        662.0115790698763
+      ],
+      "RocksDB": [
+        46.94635174160938,
+        179.0817346969979,
+        551.4363268565722,
+        627.0727883348704
+      ]
+    }
+  }
+};
+    const timelineData = {
+  "8B_In-Memory": {
+    "+Inline": [
+      {
+        "sec": 1,
+        "scan_ops": 1402469,
+        "insert_ops": 73727,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 1502126,
+        "insert_ops": 79006,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 1393711,
+        "insert_ops": 74039,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 1438230,
+        "insert_ops": 76092,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 1379378,
+        "insert_ops": 72935,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 1379386,
+        "insert_ops": 72682,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 1329574,
+        "insert_ops": 69773,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 1372950,
+        "insert_ops": 72518,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 1360116,
+        "insert_ops": 71886,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 1357796,
+        "insert_ops": 71298,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 1374846,
+        "insert_ops": 72260,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1368680,
+        "insert_ops": 72157,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 1394211,
+        "insert_ops": 73370,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 1328801,
+        "insert_ops": 69983,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 1379325,
+        "insert_ops": 72437,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 1329312,
+        "insert_ops": 70332,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 1379875,
+        "insert_ops": 72481,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 1364797,
+        "insert_ops": 71280,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 1370928,
+        "insert_ops": 72259,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 1288242,
+        "insert_ops": 67678,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 1199839,
+        "insert_ops": 62989,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 1112461,
+        "insert_ops": 58882,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 1050669,
+        "insert_ops": 55427,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 972257,
+        "insert_ops": 50973,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 1021828,
+        "insert_ops": 53847,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 745405,
+        "insert_ops": 39315,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 991596,
+        "insert_ops": 51748,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 482321,
+        "insert_ops": 25208,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 650122,
+        "insert_ops": 34127,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 1353632,
+        "insert_ops": 71567,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 9,
+        "t2_forced_reorg_ops": 1
+      }
+    ],
+    "LMDB": [
+      {
+        "sec": 1,
+        "scan_ops": 132057,
+        "insert_ops": 6939,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 142706,
+        "insert_ops": 7615,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 139460,
+        "insert_ops": 7379,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 142794,
+        "insert_ops": 7419,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 147015,
+        "insert_ops": 7780,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 148773,
+        "insert_ops": 7789,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 139737,
+        "insert_ops": 7264,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 121969,
+        "insert_ops": 6536,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 122308,
+        "insert_ops": 6368,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 144933,
+        "insert_ops": 7638,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 139269,
+        "insert_ops": 7289,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 122848,
+        "insert_ops": 6400,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 104948,
+        "insert_ops": 5558,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 119598,
+        "insert_ops": 6274,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 124256,
+        "insert_ops": 6566,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 120153,
+        "insert_ops": 6385,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 103546,
+        "insert_ops": 5386,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 93434,
+        "insert_ops": 4949,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 92750,
+        "insert_ops": 4934,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 103521,
+        "insert_ops": 5360,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 89977,
+        "insert_ops": 4807,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 93051,
+        "insert_ops": 4845,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 90693,
+        "insert_ops": 4710,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 86624,
+        "insert_ops": 4557,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 90275,
+        "insert_ops": 4768,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 88632,
+        "insert_ops": 4730,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 88797,
+        "insert_ops": 4671,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 89428,
+        "insert_ops": 4671,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 90123,
+        "insert_ops": 4703,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 87764,
+        "insert_ops": 4738,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "Baseline": [
+      {
+        "sec": 1,
+        "scan_ops": 1340263,
+        "insert_ops": 70522,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 1392706,
+        "insert_ops": 73217,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 1382692,
+        "insert_ops": 73300,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 1362821,
+        "insert_ops": 72030,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 1364710,
+        "insert_ops": 72245,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 1380082,
+        "insert_ops": 72706,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 1326117,
+        "insert_ops": 69682,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 1325460,
+        "insert_ops": 70212,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 1349744,
+        "insert_ops": 71131,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 1357300,
+        "insert_ops": 71582,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 1335130,
+        "insert_ops": 70158,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1339646,
+        "insert_ops": 70197,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 1362707,
+        "insert_ops": 71868,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 1323475,
+        "insert_ops": 69760,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 1333138,
+        "insert_ops": 70204,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 1374246,
+        "insert_ops": 72138,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 1326703,
+        "insert_ops": 69863,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 1385931,
+        "insert_ops": 72476,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 1346486,
+        "insert_ops": 70839,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 1284948,
+        "insert_ops": 67620,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 1176216,
+        "insert_ops": 61744,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 1083383,
+        "insert_ops": 57195,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 1038516,
+        "insert_ops": 54802,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 920231,
+        "insert_ops": 48664,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 11,
+        "t2_forced_reorg_ops": 1
+      }
+    ],
+    "+BF": [
+      {
+        "sec": 1,
+        "scan_ops": 1319534,
+        "insert_ops": 69477,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 1417477,
+        "insert_ops": 74362,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 1311081,
+        "insert_ops": 69595,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 1337518,
+        "insert_ops": 70771,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 1310385,
+        "insert_ops": 69391,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 1297317,
+        "insert_ops": 68374,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 1306334,
+        "insert_ops": 68668,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 1272193,
+        "insert_ops": 67118,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 1305501,
+        "insert_ops": 68923,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 1275325,
+        "insert_ops": 67245,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 1308447,
+        "insert_ops": 68952,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1279533,
+        "insert_ops": 67166,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 1306330,
+        "insert_ops": 68716,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 1293717,
+        "insert_ops": 68331,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 1283892,
+        "insert_ops": 67504,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 1307986,
+        "insert_ops": 68844,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 1277366,
+        "insert_ops": 67261,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 1321294,
+        "insert_ops": 69328,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 1325737,
+        "insert_ops": 69157,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 1299409,
+        "insert_ops": 68398,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 1227731,
+        "insert_ops": 64534,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 1128335,
+        "insert_ops": 59380,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 1041235,
+        "insert_ops": 54693,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 976721,
+        "insert_ops": 51879,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 931555,
+        "insert_ops": 48962,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 193527,
+        "insert_ops": 10314,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 8,
+        "t2_forced_reorg_ops": 1
+      }
+    ],
+    "RocksDB-BlobDB": [
+      {
+        "sec": 1,
+        "scan_ops": 485359,
+        "insert_ops": 25688,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 482738,
+        "insert_ops": 25290,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 478409,
+        "insert_ops": 25058,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 480880,
+        "insert_ops": 25355,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 478528,
+        "insert_ops": 25235,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 477696,
+        "insert_ops": 25014,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 478255,
+        "insert_ops": 25278,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 478537,
+        "insert_ops": 25351,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 478307,
+        "insert_ops": 25537,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 474728,
+        "insert_ops": 24971,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 480524,
+        "insert_ops": 25476,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 478387,
+        "insert_ops": 25534,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 478079,
+        "insert_ops": 25215,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 476292,
+        "insert_ops": 25122,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 475596,
+        "insert_ops": 25120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 479037,
+        "insert_ops": 25220,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 479018,
+        "insert_ops": 25237,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 478898,
+        "insert_ops": 25283,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 477066,
+        "insert_ops": 25074,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 477120,
+        "insert_ops": 25110,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 476587,
+        "insert_ops": 25112,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 478663,
+        "insert_ops": 25275,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 476404,
+        "insert_ops": 25180,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 473222,
+        "insert_ops": 25096,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 477670,
+        "insert_ops": 24936,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 475013,
+        "insert_ops": 25233,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 473049,
+        "insert_ops": 24960,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 473432,
+        "insert_ops": 24903,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 473230,
+        "insert_ops": 25037,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 474935,
+        "insert_ops": 24853,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "RocksDB": [
+      {
+        "sec": 1,
+        "scan_ops": 489517,
+        "insert_ops": 25887,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 486534,
+        "insert_ops": 25493,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 483225,
+        "insert_ops": 25345,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 481508,
+        "insert_ops": 25371,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 479424,
+        "insert_ops": 25255,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 481220,
+        "insert_ops": 25200,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 479370,
+        "insert_ops": 25382,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 481509,
+        "insert_ops": 25466,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 478695,
+        "insert_ops": 25647,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 478390,
+        "insert_ops": 25150,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 479352,
+        "insert_ops": 25381,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 479460,
+        "insert_ops": 25549,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 469467,
+        "insert_ops": 24823,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 478226,
+        "insert_ops": 25178,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 478694,
+        "insert_ops": 25336,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 475602,
+        "insert_ops": 24949,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 478329,
+        "insert_ops": 25197,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 480231,
+        "insert_ops": 25373,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 477517,
+        "insert_ops": 25119,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 479236,
+        "insert_ops": 25161,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 475388,
+        "insert_ops": 25066,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 477448,
+        "insert_ops": 25272,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 476566,
+        "insert_ops": 25179,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 480214,
+        "insert_ops": 25350,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 477253,
+        "insert_ops": 25017,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 476501,
+        "insert_ops": 25325,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 477455,
+        "insert_ops": 25239,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 474007,
+        "insert_ops": 24856,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 477913,
+        "insert_ops": 25245,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 476275,
+        "insert_ops": 24968,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "+Prefault": [
+      {
+        "sec": 1,
+        "scan_ops": 1416878,
+        "insert_ops": 74447,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 1505406,
+        "insert_ops": 79343,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 1385175,
+        "insert_ops": 73347,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 1400923,
+        "insert_ops": 74206,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 1387540,
+        "insert_ops": 73481,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 1420790,
+        "insert_ops": 74619,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 1368999,
+        "insert_ops": 72194,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 1389464,
+        "insert_ops": 73251,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 1381957,
+        "insert_ops": 73009,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 1365207,
+        "insert_ops": 71865,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 1386916,
+        "insert_ops": 72988,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1353355,
+        "insert_ops": 70969,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 1389283,
+        "insert_ops": 73158,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 1354224,
+        "insert_ops": 71273,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 1420789,
+        "insert_ops": 74959,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 1368398,
+        "insert_ops": 71948,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 1380979,
+        "insert_ops": 72743,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 1382358,
+        "insert_ops": 72093,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 1411534,
+        "insert_ops": 74046,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 1339792,
+        "insert_ops": 70748,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 1242107,
+        "insert_ops": 65226,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 1162771,
+        "insert_ops": 61354,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 1070642,
+        "insert_ops": 56321,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 1012795,
+        "insert_ops": 53585,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 1014881,
+        "insert_ops": 53338,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 752338,
+        "insert_ops": 39395,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 971571,
+        "insert_ops": 50992,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 1076481,
+        "insert_ops": 56395,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 1166152,
+        "insert_ops": 61486,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 9,
+        "t2_forced_reorg_ops": 1
+      }
+    ]
+  },
+  "1KB_In-Memory": {},
+  "1KB_LTM": {},
+  "64KB_LTM": {}
+};
+    const reorgScalingData = {
+  "8B_In-Memory": {
+    "t1only": [
+      {
+        "key_count": 5000000,
+        "elapsed_sec": 1.42887,
+        "timed_out": false
+      },
+      {
+        "key_count": 10000000,
+        "elapsed_sec": 2.11304,
+        "timed_out": false
+      },
+      {
+        "key_count": 15000000,
+        "elapsed_sec": 1.12562,
+        "timed_out": false
+      },
+      {
+        "key_count": 20000000,
+        "elapsed_sec": 3.7529,
+        "timed_out": false
+      }
+    ],
+    "t1t2": [
+      {
+        "key_count": 5000000,
+        "elapsed_sec": 2.12346,
+        "timed_out": false
+      },
+      {
+        "key_count": 10000000,
+        "elapsed_sec": 3.63748,
+        "timed_out": false
+      },
+      {
+        "key_count": 15000000,
+        "elapsed_sec": 5.20235,
+        "timed_out": false
+      },
+      {
+        "key_count": 20000000,
+        "elapsed_sec": 7.08824,
+        "timed_out": false
+      }
+    ]
+  },
+  "1KB_In-Memory": {
+    "t1only": [
+      {
+        "key_count": 2000000,
+        "elapsed_sec": 0.742532,
+        "timed_out": false
+      },
+      {
+        "key_count": 4000000,
+        "elapsed_sec": 0.676002,
+        "timed_out": false
+      },
+      {
+        "key_count": 6000000,
+        "elapsed_sec": 0.73807,
+        "timed_out": false
+      },
+      {
+        "key_count": 8000000,
+        "elapsed_sec": 1.62996,
+        "timed_out": false
+      }
+    ],
+    "t1t2": [
+      {
+        "key_count": 2000000,
+        "elapsed_sec": 10.1043,
+        "timed_out": false
+      },
+      {
+        "key_count": 4000000,
+        "elapsed_sec": 17.7343,
+        "timed_out": false
+      },
+      {
+        "key_count": 6000000,
+        "elapsed_sec": 25.4872,
+        "timed_out": false
+      },
+      {
+        "key_count": 8000000,
+        "elapsed_sec": 33.9388,
+        "timed_out": false
+      }
+    ]
+  },
+  "1KB_LTM": {
+    "t1only": [
+      {
+        "key_count": 2064888,
+        "elapsed_sec": 1.02606,
+        "timed_out": false
+      },
+      {
+        "key_count": 4129776,
+        "elapsed_sec": 1.70698,
+        "timed_out": false
+      },
+      {
+        "key_count": 6194664,
+        "elapsed_sec": 2.2974,
+        "timed_out": false
+      },
+      {
+        "key_count": 8259552,
+        "elapsed_sec": 3.40336,
+        "timed_out": false
+      }
+    ],
+    "t1t2": [
+      {
+        "key_count": 2064888,
+        "elapsed_sec": 32.648,
+        "timed_out": false
+      },
+      {
+        "key_count": 4129776,
+        "elapsed_sec": 56.6177,
+        "timed_out": false
+      },
+      {
+        "key_count": 6194664,
+        "elapsed_sec": 60,
+        "timed_out": true
+      }
+    ],
+    "t1t2_steady": [
+      {
+        "key_count": 2064888,
+        "elapsed_sec": 9.78364,
+        "timed_out": false
+      },
+      {
+        "key_count": 4129776,
+        "elapsed_sec": 20.8498,
+        "timed_out": false
+      },
+      {
+        "key_count": 6194664,
+        "elapsed_sec": 27.1214,
+        "timed_out": false
+      },
+      {
+        "key_count": 8259552,
+        "elapsed_sec": 46.9381,
+        "timed_out": false
+      }
+    ]
+  },
+  "64KB_LTM": {
+    "t1only": [
+      {
+        "key_count": 32760,
+        "elapsed_sec": 0.0378443,
+        "timed_out": false
+      },
+      {
+        "key_count": 65520,
+        "elapsed_sec": 0.0799202,
+        "timed_out": false
+      },
+      {
+        "key_count": 98280,
+        "elapsed_sec": 0.12471,
+        "timed_out": false
+      },
+      {
+        "key_count": 131040,
+        "elapsed_sec": 0.209428,
+        "timed_out": false
+      }
+    ],
+    "t1t2": [
+      {
+        "key_count": 32760,
+        "elapsed_sec": 10.9738,
+        "timed_out": false
+      },
+      {
+        "key_count": 65520,
+        "elapsed_sec": 33.1726,
+        "timed_out": false
+      },
+      {
+        "key_count": 98280,
+        "elapsed_sec": 45.1305,
+        "timed_out": false
+      },
+      {
+        "key_count": 131040,
+        "elapsed_sec": 60,
+        "timed_out": true
+      }
+    ]
+  }
+};
+    const workloads = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"];
+    const valSizes  = ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"];
+
+    const colors = {"RocksDB": "#64748b", "LMDB": "#10b981", "RocksDB-BlobDB": "#a855f7", "Baseline": "#94a3b8", "+BF": "#f59e0b", "+Inline": "#6366f1", "+Prefault": "#ec4899"};
+    const rivalStores = ["RocksDB", "LMDB", "RocksDB-BlobDB"];
+    const variantOrder = ["RocksDB", "LMDB", "RocksDB-BlobDB", "Baseline", "+BF", "+Inline", "+Prefault"];
+    const threadLabels = ['1 Thread','4 Threads','16 Threads','32 Threads'];
+
+    // ── Tab switching ──────────────────────────────────────────────────────────
+    function switchTab(tabId) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+      document.getElementById(tabId).classList.add('active');
+      document.getElementById('btn-' + tabId).classList.add('active');
+    }
+
+    // ── LocalStorage memos ──────────────────────────────────────────────────────
+    function saveMemo(key, val) {
+      try { localStorage.setItem('vmemkv-2026081711-memo-' + key, val); } catch(e) {}
+    }
+    function initMemos() {
+      document.querySelectorAll('textarea[id^="memo-"]').forEach(el => {
+        const key = el.id.replace('memo-', '');
+        try {
+          const saved = localStorage.getItem('vmemkv-2026081711-memo-' + key);
+          if (saved) el.value = saved;
+        } catch(e) {}
+      });
+    }
+
+    // ── Number formatting ──────────────────────────────────────────────────────
+    function formatVal(v) {
+      if (v >= 1e9) return (v/1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
+      if (v >= 1e6) return (v/1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+      if (v >= 1e3) return (v/1e3).toFixed(1).replace(/\.0$/, '') + 'k';
+      return v.toString();
+    }
+
+    // ── Speedup badge ──────────────────────────────────────────────────────────
+    function updateSpeedupBadge(valSize, op) {
+      const badgeKey = valSize.toLowerCase().replace(/-/g,'_') + '-' + op.toLowerCase().replace(/_/g,'-');
+      const badge = document.getElementById('badge-' + badgeKey);
+      if (!badge) return;
+      const opData = (rawData[valSize] || {})[op];
+      if (!opData || !opData['RocksDB']) { badge.classList.add('hidden'); return; }
+      const rocksValues = opData['RocksDB'];
+      let maxSpeedup = 0, bestThread = 0;
+      for (const [variant, values] of Object.entries(opData)) {
+        if (variant === 'RocksDB') continue;
+        values.forEach((v, idx) => {
+          const rv = rocksValues[idx];
+          if (!rv || !v) return;
+          const r = v / rv;
+          if (r > maxSpeedup) { maxSpeedup = r; bestThread = [1,4,16,32][idx]; }
+        });
+      }
+      if (maxSpeedup === 0) { badge.classList.add('hidden'); return; }
+      badge.classList.remove('hidden');
+      if (maxSpeedup >= 1) {
+        badge.className = 'text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-2.5 py-0.5';
+        badge.textContent = `⚡ Max Speedup: ${maxSpeedup.toFixed(1)}x (${bestThread} Thr)`;
+      } else {
+        badge.className = 'text-[11px] font-semibold bg-rose-50 text-rose-700 border border-rose-100 rounded-full px-2.5 py-0.5';
+        badge.textContent = `⚠️ Slowdown: ${(1/maxSpeedup).toFixed(1)}x (${bestThread} Thr)`;
+      }
+    }
+
+    // ── Workload chart config ──────────────────────────────────────────────────
+    function makeChartConfig(valSize, op) {
+      const opData = (rawData[valSize] || {})[op];
+      if (!opData) return null;
+      const rocksData = opData['RocksDB'];
+      const datasets = variantOrder.filter(v => opData[v]).map(variantName => {
+        const isRocks = rivalStores.includes(variantName);
+        const col = colors[variantName] || '#6366f1';
+        return {
+          label: variantName,
+          data: opData[variantName],
+          borderColor: col,
+          backgroundColor: ctx => {
+            const {chartArea, ctx: c} = ctx.chart;
+            if (!chartArea) return null;
+            const g = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+            g.addColorStop(0, col + '25'); g.addColorStop(1, col + '00');
+            return g;
+          },
+          borderWidth: isRocks ? 2.5 : 2,
+          borderDash: isRocks ? [6,6] : [],
+          tension: 0.15, fill: true,
+          pointStyle: isRocks ? 'triangle' : 'circle',
+          pointRadius: isRocks ? 5 : 3.5,
+          pointHoverRadius: isRocks ? 7 : 5.5,
+          hoverBorderWidth: 3
+        };
+      });
+      if (!datasets.length) return null;
+      return {
+        type: 'line',
+        data: { labels: threadLabels, datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          hover: { mode: 'dataset', intersect: false },
+          onHover(event, active, chart) {
+            const ds = chart.data.datasets;
+            if (active.length > 0) {
+              const ai = active[0].datasetIndex;
+              ds.forEach((d, i) => {
+                const bc = colors[d.label] || '#6366f1';
+                const ir = rivalStores.includes(d.label);
+                if (i === ai) { d.borderColor = bc; d.borderWidth = ir ? 3.5 : 3; }
+                else { d.borderColor = bc + '18'; d.borderWidth = ir ? 1.5 : 1; }
+              });
+            } else {
+              ds.forEach(d => {
+                d.borderColor = colors[d.label] || '#6366f1';
+                d.borderWidth = rivalStores.includes(d.label) ? 2.5 : 2;
+              });
+            }
+            chart.update('none');
+          },
+          plugins: {
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode:'index', intersect:false,
+              backgroundColor:'rgba(15,23,42,0.95)',
+              titleFont:{size:12,family:'Inter',weight:'bold'},
+              bodyFont:{size:11,family:'Inter'},
+              padding:10, cornerRadius:8, boxWidth:8, boxHeight:8, usePointStyle:true,
+              callbacks: {
+                label(context) {
+                  const label = context.dataset.label || '';
+                  const v = context.raw || 0;
+                  const fv = formatVal(v);
+                  if (label === 'RocksDB' || !rocksData) return ` ${label}: ${fv}/s`;
+                  const rv = rocksData[context.dataIndex] || 0;
+                  if (!rv) return ` ${label}: ${fv}/s`;
+                  const ratio = v / rv;
+                  const badge = ratio >= 1
+                    ? ` (+${((ratio-1)*100).toFixed(0)}% vs RDB)`
+                    : ` (${((ratio-1)*100).toFixed(0)}% vs RDB)`;
+                  return ` ${label}: ${fv}/s${badge}`;
+                }
+              }
+            }
+          },
+          scales: {
+            x: { grid:{color:'rgba(100,116,139,0.08)'}, ticks:{font:{size:11,family:'Inter'},color:'#94a3b8'} },
+            y: { grid:{color:'rgba(100,116,139,0.08)'}, ticks:{font:{size:11,family:'Inter'},color:'#94a3b8',callback:v=>formatVal(v)} }
+          }
+        }
+      };
+    }
+
+    // ── YCSB-E Reorg vertical-line plugin ──────────────────────────────────────
+    const reorgLinesPlugin = {
+      id: 'reorgLines',
+      afterDraw(chart, _args, opts) {
+        const naturalSecs = opts.reorgSecs || [];
+        const forcedSecs = opts.forcedReorgSecs || [];
+        if (!naturalSecs.length && !forcedSecs.length) return;
+        const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
+        ctx.save();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(99,102,241,0.4)';
+        ctx.setLineDash([5,4]);
+        for (const s of naturalSecs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.strokeStyle = 'rgba(217,119,6,0.55)';
+        ctx.setLineDash([2,3]);
+        for (const s of forcedSecs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.restore();
+      }
+    };
+    Chart.register(reorgLinesPlugin);
+
+    // ── YCSB-E timeline chart config ───────────────────────────────────────────
+    function makeYcsbTimelineConfig(valSizeKey) {
+      const tl = timelineData[valSizeKey];
+      if (!tl || !Object.keys(tl).length) return null;
+      const reorgSecs = [];
+      const forcedReorgSecs = [];
+      for (const data of Object.values(tl)) {
+        data.forEach((d,i) => {
+          if (d.t1_reorg_ops > 0 && !reorgSecs.includes(i+1)) reorgSecs.push(i+1);
+          if (d.t1_forced_reorg_ops > 0 && !forcedReorgSecs.includes(i+1)) forcedReorgSecs.push(i+1);
+        });
+      }
+      reorgSecs.sort((a,b) => a-b);
+      forcedReorgSecs.sort((a,b) => a-b);
+      const datasets = variantOrder.filter(v => tl[v] && tl[v].length).map(v => {
+        const isRocks = rivalStores.includes(v);
+        const col = colors[v] || '#6366f1';
+        return {
+          label: v,
+          data: tl[v].map((d,i) => ({ x: i+1, y: d.scan_ops })),
+          borderColor: col,
+          backgroundColor: 'transparent',
+          borderWidth: isRocks ? 2.5 : 1.8,
+          borderDash: isRocks ? [6,6] : [],
+          tension: 0.25, fill: false,
+          pointStyle: 'circle', pointRadius: 0, pointHoverRadius: 4
+        };
+      });
+      if (!datasets.length) return null;
+      return {
+        type: 'line',
+        data: { datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            reorgLines: { reorgSecs, forcedReorgSecs },
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => {
+                  const s = items[0].raw.x;
+                  let suffix = '';
+                  if (reorgSecs.includes(s)) suffix += '  ⟳ T1 Reorg (natural)';
+                  if (forcedReorgSecs.includes(s)) suffix += '  ⚑ T1 Reorg (forced@15s)';
+                  return `Second ${s}${suffix}`;
+                },
+                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
+              }
+            }
+          },
+          scales: {
+            x: {
+              type: 'linear', min: 1, max: 30,
+              title: { display:true, text:'Elapsed Time (sec)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { stepSize:5, font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            },
+            y: {
+              title: { display:true, text:'Scan Ops / sec', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            }
+          }
+        }
+      };
+    }
+
+    // ── Reorg-scaling probe chart config ───────────────────────────────────────
+    function makeReorgScalingConfig(valSizeKey) {
+      const rs = reorgScalingData[valSizeKey];
+      if (!rs) return null;
+      const modeStyle = {
+        t1only: { label: 'T1-only', color: '#6366f1' },
+        t1t2:   { label: 'T1+T2',   color: '#e11d48' },
+        t1t2_steady: { label: 'T1+T2 steady (reflink/punch)', color: '#059669' },
+      };
+      const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {
+        const style = modeStyle[m];
+        const points = rs[m];
+        return {
+          label: style.label,
+          data: points.map(p => ({ x: p.key_count, y: p.elapsed_sec, timedOut: p.timed_out })),
+          borderColor: style.color,
+          backgroundColor: 'transparent',
+          borderWidth: 2,
+          tension: 0.2, fill: false,
+          pointStyle: points.map(p => p.timed_out ? 'triangle' : 'circle'),
+          pointRadius: points.map(p => p.timed_out ? 7 : 3.5),
+          pointBackgroundColor: points.map(p => p.timed_out ? '#e11d48' : style.color),
+          pointBorderColor: points.map(p => p.timed_out ? '#e11d48' : style.color),
+        };
+      });
+      if (!datasets.length) return null;
+      return {
+        type: 'line',
+        data: { datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'nearest', intersect: true,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => `${formatVal(items[0].raw.x)} keys`,
+                label: ctx => {
+                  const p = ctx.raw;
+                  const suffix = p.timedOut ? ' (timeout, actual ≥ this)' : '';
+                  return ` ${ctx.dataset.label}: ${p.y.toFixed(2)}s${suffix}`;
+                }
+              }
+            }
+          },
+          scales: {
+            x: {
+              type: 'linear',
+              title: { display:true, text:'Corpus Size (keys)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            },
+            y: {
+              type: 'logarithmic',
+              title: { display:true, text:'reorganize() Duration (sec, log scale)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            }
+          }
+        }
+      };
+    }
+
+    function initCharts() {
+      for (const valSize of valSizes) {
+        for (const op of workloads) {
+          const eid = valSize.toLowerCase().replace(/-/g,'_') + '-' + op.toLowerCase().replace(/_/g,'-');
+          const canvas = document.getElementById('chart-' + eid);
+          if (!canvas) continue;
+          const cfg = makeChartConfig(valSize, op);
+          if (!cfg) continue;
+          const chart = new Chart(canvas, cfg);
+          canvas.addEventListener('mouseout', () => {
+            chart.data.datasets.forEach(d => {
+              d.borderColor = colors[d.label] || '#6366f1';
+              d.borderWidth = rivalStores.includes(d.label) ? 2.5 : 2;
+            });
+            chart.update('none');
+          });
+          updateSpeedupBadge(valSize, op);
+        }
+        const yeid = valSize.toLowerCase().replace(/-/g,'_') + '-ycsb-e';
+        const scanCanvas = document.getElementById('chart-' + yeid + '-scan');
+        if (scanCanvas) {
+          const cfg = makeYcsbTimelineConfig(valSize);
+          if (cfg) new Chart(scanCanvas, cfg);
+        }
+        const reorgEid = valSize.toLowerCase().replace(/-/g,'_') + '-reorg-scaling';
+        const reorgCanvas = document.getElementById('chart-' + reorgEid);
+        if (reorgCanvas) {
+          const cfg = makeReorgScalingConfig(valSize);
+          if (cfg) new Chart(reorgCanvas, cfg);
+        }
+      }
+    }
+
+    initMemos();
+    initCharts();
+  </script>
+</body>
+</html>
