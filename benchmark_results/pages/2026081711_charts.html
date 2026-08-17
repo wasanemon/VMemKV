@@ -52,7 +52,7 @@
           <a href="../2026081711/churn_scaling_ltm_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Churn Scaling, LTM 1KB spot check)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl">この4並列ラウンドは <code class="bg-slate-100 px-1 rounded text-xs">--without-rivals</code> モードで VMemKV の4バリアント(Baseline/+BF/+Inline/+Prefault)のみを実測し、RocksDB/RocksDB-BlobDB/LMDBの数値は直近の<a href="2026081313_charts.html" class="text-indigo-600 hover:underline">08/13</a>フルランから再利用してマージした(rivalコードは無変更のため数値は不変という前提)。本ラウンドの主な検証対象は、<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>/<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>をreflink clone + hole punchで統一した再設計と、実測で発見・修正した3件の独立したライブロック(<code class="bg-slate-100 px-1 rounded text-xs">run_reorganize()</code>の自己競合ループ、<code class="bg-slate-100 px-1 rounded text-xs">acquire_write_handle()</code>のバックオフ無しリトライストーム、<code class="bg-slate-100 px-1 rounded text-xs">Wal::drain_pending()</code>のLSN追いかけっこ)を、32並列スレッドという実際の高並行度の下で正しく機能することを検証すること。既存のIn-Memory/LTM×8B/1KB/64KBマトリクスに加え、新たに2つの実験を追加: (1) Churn-Ratio Scaling — 固定コーパス(8M件, in_memory/1KB)に対する churn 率(直近世代からの変更割合)を振って定常状態の <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> 所要時間を測定したところ、churn_ratio &gt;= 0.05 で60秒のハードキャップに到達(タイムアウト)することが判明——O(diff)設計でも、変更量そのものが大きければコストは避けられないという妥当な結果。(2) Corpus-Size Invariance across Generations — コーパスサイズを振って定常状態の<code class="bg-slate-100 px-1 rounded text-xs">t1t2_steady</code>所要時間をT1-only/T1+T2(フルコピー)と比較(Reorg Scalingタブのチャートに緑の第3系列として表示、Summaryタブにもテーブルで掲載)。また、YCSB-Eの強制トリガースケジュールをt=15秒の単発から t=5秒(reorganize)/t=10秒・t=25秒(defragment)の3段階へ改訂——将棋倒し(スケジュールされた秒に対する実発火の遅延)へのガードを意図的に入れておらず、書き込み負荷次第で実発火が数十秒遅延する挙動も観測された(詳細はYCSB-Eタブのチャート凡例・ツールチップを参照)。</p>
+      <p class="text-slate-500 text-sm max-w-3xl">この4並列ラウンドは <code class="bg-slate-100 px-1 rounded text-xs">--without-rivals</code> モードで VMemKV の4バリアント(Baseline/+BF/+Inline/+Prefault)のみを実測し、RocksDB/RocksDB-BlobDB/LMDBの数値は直近の<a href="2026081313_charts.html" class="text-indigo-600 hover:underline">08/13</a>フルランから再利用してマージした(rivalコードは無変更のため数値は不変という前提)。本ラウンドの主な検証対象は、<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>/<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>をreflink clone + hole punchで統一した再設計と、実測で発見・修正した3件の独立したライブロック(<code class="bg-slate-100 px-1 rounded text-xs">run_reorganize()</code>の自己競合ループ、<code class="bg-slate-100 px-1 rounded text-xs">acquire_write_handle()</code>のバックオフ無しリトライストーム、<code class="bg-slate-100 px-1 rounded text-xs">Wal::drain_pending()</code>のLSN追いかけっこ)を、32並列スレッドという実際の高並行度の下で正しく機能することを検証すること。既存のIn-Memory/LTM×8B/1KB/64KBマトリクスに加え、新たに2つの実験を追加: (1) Churn-Ratio Scaling — 固定コーパス(8M件, in_memory/1KB)に対する churn 率(直近世代からの変更割合)を振って定常状態の <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> 所要時間を測定したところ、churn_ratio &gt;= 0.05(8M件中わずか40万件)で60秒のハードキャップに到達(タイムアウト)することが判明——O(diff)設計でも、変更量そのものが大きければコストは避けられないという妥当な結果。(2) Corpus-Size Invariance across Generations — 既存チェックポイントが存在する状態(2回目以降の呼び出し)でのコーパスサイズを振って定常状態の<code class="bg-slate-100 px-1 rounded text-xs">t1t2_steady</code>所要時間を、T1-only/T1+T2ブートストラップ(直前チェックポイントが無い初回呼び出し。同じ現行reflink+punch実装をコールドで計測しているだけで別実装ではない)と比較(Reorg Scalingタブのチャートに緑の第3系列として表示、Summaryタブにもテーブルで掲載)。また、YCSB-Eの強制トリガースケジュールをt=15秒の単発から t=5秒(reorganize)/t=10秒・t=25秒(defragment)の3段階へ改訂——将棋倒し(スケジュールされた秒に対する実発火の遅延)へのガードを意図的に入れておらず、書き込み負荷次第で実発火が数十秒遅延したり、8B In-Memoryのように挿入スループットが極端に高いケースではreorganize()自体が20秒以上かかり後続のdefragment()トリガーが30秒間に一度も発火しないまま終わる、という挙動も観測された(YCSB-Eタブのチャートはバリアントごとに独立した色・マーカー形状で表示、ホバーで詳細を確認可能)。</p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -122,7 +122,7 @@
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff)) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the older T1-only/T1+T2(full-copy) sweep for comparison.</p>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff), 2nd-or-later call against an existing prior generation) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior generation to reflink from) for comparison.</p>
           </div>
         </div>
         <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
@@ -145,7 +145,7 @@
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Churn-Ratio Scaling (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last generation (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01.</p>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last generation (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; the O(diff) design's cost still scales with how much actually changed, it isn't a fixed cheap constant.</p>
           </div>
         </div>
         <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
@@ -518,7 +518,7 @@
                   <th class="py-2 px-4 font-bold text-slate-700 text-center">64KB</th>
                 </tr>
               </thead>
-              <tbody class="divide-y divide-slate-100"><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">In-Memory</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">1.36s</strong><br><span class="text-slate-400 text-[10px]">Max: 2.29s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">0.66s</strong><br><span class="text-slate-400 text-[10px]">Max: 0.73s</span></td><td class="py-2.5 px-4 text-center text-slate-400">-</td></tr><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">LTM</td><td class="py-2.5 px-4 text-center text-slate-400">-</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">1.29s</strong><br><span class="text-slate-400 text-[10px]">Max: 1.48s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">0.10s</strong><br><span class="text-slate-400 text-[10px]">Max: 0.16s</span></td></tr></tbody>
+              <tbody class="divide-y divide-slate-100"><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">In-Memory</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">2.11s</strong><br><span class="text-slate-400 text-[10px]">Max: 3.75s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">0.95s</strong><br><span class="text-slate-400 text-[10px]">Max: 1.63s</span></td><td class="py-2.5 px-4 text-center text-slate-400">-</td></tr><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">LTM</td><td class="py-2.5 px-4 text-center text-slate-400">-</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">2.11s</strong><br><span class="text-slate-400 text-[10px]">Max: 3.40s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">0.11s</strong><br><span class="text-slate-400 text-[10px]">Max: 0.21s</span></td></tr></tbody>
             </table>
           </div>
         </section>
@@ -529,8 +529,8 @@
               <i data-lucide="shuffle" class="w-5 h-5"></i>
             </div>
             <div>
-              <h4 class="text-sm font-bold text-slate-900">Tier 1+2 Reorganize (Full)</h4>
-              <p class="text-[11px] text-slate-500">Average and worst-case times for a full T1+T2 reorganize / checkpoint.</p>
+              <h4 class="text-sm font-bold text-slate-900">Tier 1+2 Bootstrap (defragment, cold)</h4>
+              <p class="text-[11px] text-slate-500">Average/worst-case for <code class="bg-slate-100 px-1 rounded">defragment()</code>'s very first call on a fresh corpus -- no prior checkpoint exists to reflink from yet, so this is O(N), not the O(diff) steady-state cost. Same code path as everywhere else in this report.</p>
             </div>
           </div>
           <div class="overflow-x-auto">
@@ -543,7 +543,7 @@
                   <th class="py-2 px-4 font-bold text-slate-700 text-center">64KB</th>
                 </tr>
               </thead>
-              <tbody class="divide-y divide-slate-100"><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">In-Memory</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">24.48s</strong><br><span class="text-slate-400 text-[10px]">Max: 40.40s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">13.53s</strong><br><span class="text-slate-400 text-[10px]">Max: 21.74s</span></td><td class="py-2.5 px-4 text-center text-slate-400">-</td></tr><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">LTM</td><td class="py-2.5 px-4 text-center text-slate-400">-</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">39.66s</strong><br><span class="text-slate-400 text-[10px]">Max: 60.00s</span><br><span class="text-[9px] text-amber-500 font-medium">*(1/4 points timed out)</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">32.08s</strong><br><span class="text-slate-400 text-[10px]">Max: 58.06s</span></td></tr></tbody>
+              <tbody class="divide-y divide-slate-100"><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">In-Memory</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">4.51s</strong><br><span class="text-slate-400 text-[10px]">Max: 7.09s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">21.82s</strong><br><span class="text-slate-400 text-[10px]">Max: 33.94s</span></td><td class="py-2.5 px-4 text-center text-slate-400">-</td></tr><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">LTM</td><td class="py-2.5 px-4 text-center text-slate-400">-</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">49.76s</strong><br><span class="text-slate-400 text-[10px]">Max: 60.00s</span><br><span class="text-[9px] text-amber-500 font-medium">*(1/3 timed out, sweep stopped early)</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">37.32s</strong><br><span class="text-slate-400 text-[10px]">Max: 60.00s</span><br><span class="text-[9px] text-amber-500 font-medium">*(1/4 timed out)</span></td></tr></tbody>
             </table>
           </div>
         </section>
@@ -674,10 +674,9 @@
         </div>
         <p class="text-sm text-slate-500">
           YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
-          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
-          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
-          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
+          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー、全バリアント共通)。
+          強制トリガーはバリアントごとに独立集計(全バリアント共通の1本の線には集約しない): t=5秒予定の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(細かい点線)、t=10秒・t=25秒予定の<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>(粗い点線)を、そのバリアント自身の色+マーカー形状(スキャンQPS線をホバーした際の点と同じ形。凡例のポイント形状も対応)で描画。
+          実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。8B In-Memoryのように挿入スループットが極端に高いワークロードでは、t=5秒予定のreorganize()自体が20秒以上かかり、後続のdefragment()トリガー(t=10s/25s)がこの30秒間に一度も発火しないまま終わることもある(この場合、線は1本しか出ない)。カーソルを線に合わせると、その秒に発火したバリアント・種類・予定秒・実発火秒・所要時間を表示。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -699,7 +698,7 @@
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
+          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、ただし<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。reflink元が無いのでO(N)。現行のreflink+punch実装そのものを、コールド状態で計測した数値であって別実装ではない)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既存世代からのreflink clone + hole punch、O(diff)の本来の定常状態。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -839,10 +838,9 @@
         </div>
         <p class="text-sm text-slate-500">
           YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
-          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
-          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
-          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
+          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー、全バリアント共通)。
+          強制トリガーはバリアントごとに独立集計(全バリアント共通の1本の線には集約しない): t=5秒予定の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(細かい点線)、t=10秒・t=25秒予定の<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>(粗い点線)を、そのバリアント自身の色+マーカー形状(スキャンQPS線をホバーした際の点と同じ形。凡例のポイント形状も対応)で描画。
+          実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。8B In-Memoryのように挿入スループットが極端に高いワークロードでは、t=5秒予定のreorganize()自体が20秒以上かかり、後続のdefragment()トリガー(t=10s/25s)がこの30秒間に一度も発火しないまま終わることもある(この場合、線は1本しか出ない)。カーソルを線に合わせると、その秒に発火したバリアント・種類・予定秒・実発火秒・所要時間を表示。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -864,7 +862,7 @@
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
+          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、ただし<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。reflink元が無いのでO(N)。現行のreflink+punch実装そのものを、コールド状態で計測した数値であって別実装ではない)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既存世代からのreflink clone + hole punch、O(diff)の本来の定常状態。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -1004,10 +1002,9 @@
         </div>
         <p class="text-sm text-slate-500">
           YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
-          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
-          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
-          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
+          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー、全バリアント共通)。
+          強制トリガーはバリアントごとに独立集計(全バリアント共通の1本の線には集約しない): t=5秒予定の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(細かい点線)、t=10秒・t=25秒予定の<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>(粗い点線)を、そのバリアント自身の色+マーカー形状(スキャンQPS線をホバーした際の点と同じ形。凡例のポイント形状も対応)で描画。
+          実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。8B In-Memoryのように挿入スループットが極端に高いワークロードでは、t=5秒予定のreorganize()自体が20秒以上かかり、後続のdefragment()トリガー(t=10s/25s)がこの30秒間に一度も発火しないまま終わることもある(この場合、線は1本しか出ない)。カーソルを線に合わせると、その秒に発火したバリアント・種類・予定秒・実発火秒・所要時間を表示。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -1029,7 +1026,7 @@
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
+          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、ただし<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。reflink元が無いのでO(N)。現行のreflink+punch実装そのものを、コールド状態で計測した数値であって別実装ではない)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既存世代からのreflink clone + hole punch、O(diff)の本来の定常状態。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -1169,10 +1166,9 @@
         </div>
         <p class="text-sm text-slate-500">
           YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
-          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
-          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
-          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
+          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー、全バリアント共通)。
+          強制トリガーはバリアントごとに独立集計(全バリアント共通の1本の線には集約しない): t=5秒予定の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(細かい点線)、t=10秒・t=25秒予定の<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>(粗い点線)を、そのバリアント自身の色+マーカー形状(スキャンQPS線をホバーした際の点と同じ形。凡例のポイント形状も対応)で描画。
+          実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。8B In-Memoryのように挿入スループットが極端に高いワークロードでは、t=5秒予定のreorganize()自体が20秒以上かかり、後続のdefragment()トリガー(t=10s/25s)がこの30秒間に一度も発火しないまま終わることもある(この場合、線は1本しか出ない)。カーソルを線に合わせると、その秒に発火したバリアント・種類・予定秒・実発火秒・所要時間を表示。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -1194,7 +1190,7 @@
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
+          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、ただし<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。reflink元が無いのでO(N)。現行のreflink+punch実装そのものを、コールド状態で計測した数値であって別実装ではない)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既存世代からのreflink clone + hole punch、O(diff)の本来の定常状態。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -10539,34 +10535,99 @@
     }
 
     // ── YCSB-E Reorg vertical-line plugin ──────────────────────────────────────
+    const variantMarkers = {
+      'RocksDB':'rect', 'LMDB':'triangle', 'RocksDB-BlobDB':'rectRot',
+      'Baseline':'circle', '+BF':'cross', '+Inline':'crossRot', '+Prefault':'star'
+    };
+
+    function drawMarkerShape(ctx, shape, cx, cy, size, color) {
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.8;
+      switch (shape) {
+        case 'rect':
+          ctx.fillRect(cx - size, cy - size, size * 2, size * 2);
+          break;
+        case 'rectRot':
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - size); ctx.lineTo(cx + size, cy);
+          ctx.lineTo(cx, cy + size); ctx.lineTo(cx - size, cy);
+          ctx.closePath(); ctx.fill();
+          break;
+        case 'triangle':
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - size); ctx.lineTo(cx + size, cy + size); ctx.lineTo(cx - size, cy + size);
+          ctx.closePath(); ctx.fill();
+          break;
+        case 'cross':
+          ctx.beginPath();
+          ctx.moveTo(cx - size, cy); ctx.lineTo(cx + size, cy);
+          ctx.moveTo(cx, cy - size); ctx.lineTo(cx, cy + size);
+          ctx.stroke();
+          break;
+        case 'crossRot':
+          ctx.beginPath();
+          ctx.moveTo(cx - size, cy - size); ctx.lineTo(cx + size, cy + size);
+          ctx.moveTo(cx - size, cy + size); ctx.lineTo(cx + size, cy - size);
+          ctx.stroke();
+          break;
+        case 'star': {
+          const spikes = 5, outerR = size, innerR = size * 0.45;
+          let rot = Math.PI / 2 * 3;
+          const step = Math.PI / spikes;
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - outerR);
+          for (let i = 0; i < spikes; i++) {
+            let x = cx + Math.cos(rot) * outerR, y = cy + Math.sin(rot) * outerR;
+            ctx.lineTo(x, y); rot += step;
+            x = cx + Math.cos(rot) * innerR; y = cy + Math.sin(rot) * innerR;
+            ctx.lineTo(x, y); rot += step;
+          }
+          ctx.lineTo(cx, cy - outerR);
+          ctx.closePath(); ctx.fill();
+          break;
+        }
+        case 'circle':
+        default:
+          ctx.beginPath(); ctx.arc(cx, cy, size, 0, Math.PI * 2); ctx.fill();
+          break;
+      }
+      ctx.restore();
+    }
+
     const reorgLinesPlugin = {
       id: 'reorgLines',
       afterDraw(chart, _args, opts) {
         const naturalSecs = opts.reorgSecs || [];
-        const forcedReorgSecs = opts.forcedReorgSecs || [];
-        const forcedDefragSecs = opts.forcedDefragSecs || [];
-        if (!naturalSecs.length && !forcedReorgSecs.length && !forcedDefragSecs.length) return;
+        const variantEvents = opts.variantEvents || {};
+        const variantList = opts.variantList || [];
+        const hasVariantEvents = variantList.some(v => (variantEvents[v] || []).length);
+        if (!naturalSecs.length && !hasVariantEvents) return;
         const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
         ctx.save();
         ctx.lineWidth = 1.5;
-        ctx.strokeStyle = 'rgba(99,102,241,0.4)';
+        ctx.strokeStyle = 'rgba(99,102,241,0.35)';
         ctx.setLineDash([5,4]);
         for (const s of naturalSecs) {
           const px = x.getPixelForValue(s);
           ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
         }
-        ctx.strokeStyle = 'rgba(217,119,6,0.55)';
-        ctx.setLineDash([2,3]);
-        for (const s of forcedReorgSecs) {
-          const px = x.getPixelForValue(s);
-          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
-        }
-        ctx.strokeStyle = 'rgba(147,51,234,0.6)';
-        ctx.setLineDash([2,3]);
-        for (const s of forcedDefragSecs) {
-          const px = x.getPixelForValue(s);
-          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
-        }
+        variantList.forEach((v, vi) => {
+          const events = variantEvents[v] || [];
+          if (!events.length) return;
+          const col = colors[v] || '#6366f1';
+          const shape = variantMarkers[v] || 'circle';
+          for (const ev of events) {
+            const px = x.getPixelForValue(ev.sec);
+            ctx.strokeStyle = col + '80';
+            ctx.setLineDash(ev.kind === 'reorganize' ? [2,3] : [6,3]);
+            ctx.lineWidth = 1.3;
+            ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, bottom); ctx.stroke();
+            const markerY = top + 8 + (vi % 4) * 13;
+            drawMarkerShape(ctx, shape, px, markerY, 4.5, col);
+          }
+        });
         ctx.restore();
       }
     };
@@ -10586,23 +10647,17 @@
       // Forced triggers are scheduled at t=5s (reorganize()) / t=10s & t=25s (defragment()), but
       // under sustained write contention the actual call can be delayed arbitrarily past its
       // scheduled second -- this is intentionally unguarded (cascading is itself an experiment
-      // result). fired_sec (from forced_events, keyed by kind) is where it actually landed.
-      const forcedReorgSecs = [];
-      const forcedDefragSecs = [];
-      const firedDetail = {};
+      // result), and can even starve later triggers out of the 30s window entirely if an earlier
+      // one runs long enough. fired_sec (from forced_events, per variant, keyed by kind) is where
+      // it actually landed -- kept per-variant (not unioned) so independent variants' events don't
+      // look like one aggregate cluster.
+      const variantEvents = {};
+      const variantList = variantOrder.filter(v => tl[v] && tl[v].length);
       const fe = forcedEventsData[valSizeKey] || {};
-      for (const events of Object.values(fe)) {
-        for (const ev of events) {
-          const s = ev.fired_sec;
-          if (ev.kind === 'reorganize' && !forcedReorgSecs.includes(s)) forcedReorgSecs.push(s);
-          if (ev.kind === 'defragment' && !forcedDefragSecs.includes(s)) forcedDefragSecs.push(s);
-          if (!firedDetail[s]) firedDetail[s] = [];
-          firedDetail[s].push(`${ev.kind}(sched@${ev.scheduled_sec}s, took ${ev.elapsed_sec.toFixed(1)}s)`);
-        }
+      for (const v of variantList) {
+        variantEvents[v] = (fe[v] || []).map(ev => ({ sec: ev.fired_sec, kind: ev.kind, ev }));
       }
-      forcedReorgSecs.sort((a,b) => a-b);
-      forcedDefragSecs.sort((a,b) => a-b);
-      const datasets = variantOrder.filter(v => tl[v] && tl[v].length).map(v => {
+      const datasets = variantList.map(v => {
         const isRocks = rivalStores.includes(v);
         const col = colors[v] || '#6366f1';
         return {
@@ -10613,7 +10668,7 @@
           borderWidth: isRocks ? 2.5 : 1.8,
           borderDash: isRocks ? [6,6] : [],
           tension: 0.25, fill: false,
-          pointStyle: 'circle', pointRadius: 0, pointHoverRadius: 4
+          pointStyle: variantMarkers[v] || 'circle', pointRadius: 0, pointHoverRadius: 4
         };
       });
       if (!datasets.length) return null;
@@ -10624,7 +10679,7 @@
           responsive: true, maintainAspectRatio: false,
           animation: { duration: 900, easing: 'easeInOutQuart' },
           plugins: {
-            reorgLines: { reorgSecs, forcedReorgSecs, forcedDefragSecs },
+            reorgLines: { reorgSecs, variantEvents, variantList },
             legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
             tooltip: {
               mode: 'index', intersect: false,
@@ -10635,10 +10690,14 @@
               callbacks: {
                 title: items => {
                   const s = items[0].raw.x;
-                  let suffix = '';
-                  if (reorgSecs.includes(s)) suffix += '  ⟳ T1 Reorg (natural)';
-                  if (firedDetail[s]) suffix += '  ⚑ ' + firedDetail[s].join(', ');
-                  return `Second ${s}${suffix}`;
+                  const hits = [];
+                  if (reorgSecs.includes(s)) hits.push('⟳ T1 Reorg (natural)');
+                  for (const v of variantList) {
+                    for (const e of (variantEvents[v] || [])) {
+                      if (e.sec === s) hits.push(`⚑ ${v}: ${e.ev.kind}(sched@${e.ev.scheduled_sec}s, took ${e.ev.elapsed_sec.toFixed(1)}s)`);
+                    }
+                  }
+                  return hits.length ? `Second ${s}  ` + hits.join('  ') : `Second ${s}`;
                 },
                 label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
               }

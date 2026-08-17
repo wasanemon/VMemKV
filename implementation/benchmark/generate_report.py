@@ -276,6 +276,61 @@ def render_winners_matrix_html(rows):
     return "\n".join(out)
 
 
+def build_bootstrap_stats(reorg_data):
+    """Avg/max elapsed_sec for the t1only/t1t2 *bootstrap* modes (run_bootstrap() in
+    bench_kv.cpp): a single fresh populate with no prior checkpoint to reflink from, so this
+    is always O(N) regardless of the reflink+punch redesign -- it measures cold-start cost,
+    not a separate/older code path. Excludes t1t2_steady (that's the O(diff) steady-state,
+    covered by render_reorg_steady_table_html instead)."""
+    stats = {}
+    for key in ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"]:
+        modes = reorg_data.get(key, {})
+        entry = {}
+        for mode in ("t1only", "t1t2"):
+            points = modes.get(mode, [])
+            if not points:
+                entry[mode] = None
+                continue
+            times = [p["elapsed_sec"] for p in points]
+            timed_out_count = sum(1 for p in points if p["timed_out"])
+            entry[mode] = {
+                "avg": sum(times) / len(times),
+                "max": max(times),
+                "n": len(points),
+                "timed_out": timed_out_count,
+                # The probe's sweep normally covers 4 ratio points (0.25/0.5/0.75/1.0); fewer
+                # means run_probe_point()'s two-tier timeout handling stopped the sweep early
+                # after a timeout, since larger ratios would only be slower still.
+                "incomplete_sweep": len(points) < 4,
+            }
+        stats[key] = entry
+    return stats
+
+
+def render_bootstrap_table_body_html(stats, mode):
+    row_defs = [("In-Memory", ["8B_In-Memory", "1KB_In-Memory", None]),
+                ("LTM", [None, "1KB_LTM", "64KB_LTM"])]
+    out = ['<tbody class="divide-y divide-slate-100">']
+    for row_label, cols in row_defs:
+        out.append(f'<tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">{row_label}</td>')
+        for key in cols:
+            cell = stats.get(key, {}).get(mode) if key else None
+            if cell is None:
+                out.append('<td class="py-2.5 px-4 text-center text-slate-400">-</td>')
+                continue
+            note = ""
+            if cell["timed_out"] > 0:
+                extra = ", sweep stopped early" if cell["incomplete_sweep"] else ""
+                note = f'<br><span class="text-[9px] text-amber-500 font-medium">*({cell["timed_out"]}/{cell["n"]} timed out{extra})</span>'
+            out.append(
+                f'<td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">{cell["avg"]:.2f}s</strong>'
+                f'<br><span class="text-slate-400 text-[10px]">Max: {cell["max"]:.2f}s</span>{note}</td>'
+            )
+        out.append("</tr>")
+    out.append("</tbody>")
+    return "".join(out)
+
+
 def render_reorg_steady_table_html(reorg_data):
     points = reorg_data.get("1KB_LTM", {}).get("t1t2_steady", [])
     if not points:
@@ -333,6 +388,7 @@ def main():
     reorg_data = build_reorg_scaling_data(args.report_dir)
     churn_rows = build_churn_scaling_rows(args.report_dir)
     winners_rows = compute_winners_matrix(raw_data)
+    bootstrap_stats = build_bootstrap_stats(reorg_data)
 
     html = html.replace(args.template_id, args.report_id)
 
@@ -362,15 +418,28 @@ def main():
         ";\n    const variantOrder = " + json.dumps(VARIANT_ORDER) + ";"
     )
 
+    # "Stacking Variants" legend: same +ScanBaseSequential removal, in the static HTML this time.
+    old_stacking_legend = """          <li><strong>+Prefault</strong>: +Inline + T2 Async Prefaulting</li>
+          <li><strong>+ScanBaseSequential</strong>: +Prefault + base領域専用mmap(MADV_SEQUENTIAL)。本ラウンドから Get もこのmmapの高速パスを使う(全部盛り、= VMemKVStore)</li>
+        </ul>"""
+    new_stacking_legend = """          <li><strong>+Prefault</strong>: +Inline + T2 Async Prefaulting(全部盛り、= VMemKVStore)。旧<code class="bg-slate-100 px-1 rounded text-xs">ScanBaseSequential</code>アブレーションは実測の結果撤去され、その最適化(base領域専用mmap経路)はGet/Scan双方の標準パスへ無条件で統合済み。</li>
+        </ul>"""
+    if old_stacking_legend not in html:
+        raise RuntimeError("Stacking Variants legend template text not found -- template drifted")
+    html = html.replace(old_stacking_legend, new_stacking_legend)
+
     # reorg-scaling chart: add the new t1t2_steady series (corpus-size invariance sweep).
     html = html.replace(
         "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n      };\n      const datasets = ['t1only', 't1t2'].filter(m => rs[m] && rs[m].length).map(m => {",
         "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n        t1t2_steady: { label: 'T1+T2 steady (reflink/punch)', color: '#059669' },\n      };\n      const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {"
     )
 
-    # reorgLinesPlugin: add a 3rd line style for forced defragment() triggers (previously only
-    # natural + forced-reorganize were drawn; forced defragment triggers at t=10s/25s were silently
-    # never rendered).
+    # reorgLinesPlugin: previously drew one shared amber line for ALL variants' forced-reorganize
+    # seconds and one shared purple line for ALL variants' forced-defragment seconds (union across
+    # variants), which (a) silently dropped defragment triggers entirely (bug, now fixed) and
+    # (b) made independent per-variant events look like a single aggregate cluster with no way to
+    # tell which variant fired when. Now draws one line+marker per (variant, event), colored and
+    # shaped by that variant (same shape as its pointStyle on the scan-ops line itself).
     old_plugin = """    const reorgLinesPlugin = {
       id: 'reorgLines',
       afterDraw(chart, _args, opts) {
@@ -396,34 +465,99 @@ def main():
       }
     };
     Chart.register(reorgLinesPlugin);"""
-    new_plugin = """    const reorgLinesPlugin = {
+    new_plugin = """    const variantMarkers = {
+      'RocksDB':'rect', 'LMDB':'triangle', 'RocksDB-BlobDB':'rectRot',
+      'Baseline':'circle', '+BF':'cross', '+Inline':'crossRot', '+Prefault':'star'
+    };
+
+    function drawMarkerShape(ctx, shape, cx, cy, size, color) {
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.8;
+      switch (shape) {
+        case 'rect':
+          ctx.fillRect(cx - size, cy - size, size * 2, size * 2);
+          break;
+        case 'rectRot':
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - size); ctx.lineTo(cx + size, cy);
+          ctx.lineTo(cx, cy + size); ctx.lineTo(cx - size, cy);
+          ctx.closePath(); ctx.fill();
+          break;
+        case 'triangle':
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - size); ctx.lineTo(cx + size, cy + size); ctx.lineTo(cx - size, cy + size);
+          ctx.closePath(); ctx.fill();
+          break;
+        case 'cross':
+          ctx.beginPath();
+          ctx.moveTo(cx - size, cy); ctx.lineTo(cx + size, cy);
+          ctx.moveTo(cx, cy - size); ctx.lineTo(cx, cy + size);
+          ctx.stroke();
+          break;
+        case 'crossRot':
+          ctx.beginPath();
+          ctx.moveTo(cx - size, cy - size); ctx.lineTo(cx + size, cy + size);
+          ctx.moveTo(cx - size, cy + size); ctx.lineTo(cx + size, cy - size);
+          ctx.stroke();
+          break;
+        case 'star': {
+          const spikes = 5, outerR = size, innerR = size * 0.45;
+          let rot = Math.PI / 2 * 3;
+          const step = Math.PI / spikes;
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - outerR);
+          for (let i = 0; i < spikes; i++) {
+            let x = cx + Math.cos(rot) * outerR, y = cy + Math.sin(rot) * outerR;
+            ctx.lineTo(x, y); rot += step;
+            x = cx + Math.cos(rot) * innerR; y = cy + Math.sin(rot) * innerR;
+            ctx.lineTo(x, y); rot += step;
+          }
+          ctx.lineTo(cx, cy - outerR);
+          ctx.closePath(); ctx.fill();
+          break;
+        }
+        case 'circle':
+        default:
+          ctx.beginPath(); ctx.arc(cx, cy, size, 0, Math.PI * 2); ctx.fill();
+          break;
+      }
+      ctx.restore();
+    }
+
+    const reorgLinesPlugin = {
       id: 'reorgLines',
       afterDraw(chart, _args, opts) {
         const naturalSecs = opts.reorgSecs || [];
-        const forcedReorgSecs = opts.forcedReorgSecs || [];
-        const forcedDefragSecs = opts.forcedDefragSecs || [];
-        if (!naturalSecs.length && !forcedReorgSecs.length && !forcedDefragSecs.length) return;
+        const variantEvents = opts.variantEvents || {};
+        const variantList = opts.variantList || [];
+        const hasVariantEvents = variantList.some(v => (variantEvents[v] || []).length);
+        if (!naturalSecs.length && !hasVariantEvents) return;
         const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
         ctx.save();
         ctx.lineWidth = 1.5;
-        ctx.strokeStyle = 'rgba(99,102,241,0.4)';
+        ctx.strokeStyle = 'rgba(99,102,241,0.35)';
         ctx.setLineDash([5,4]);
         for (const s of naturalSecs) {
           const px = x.getPixelForValue(s);
           ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
         }
-        ctx.strokeStyle = 'rgba(217,119,6,0.55)';
-        ctx.setLineDash([2,3]);
-        for (const s of forcedReorgSecs) {
-          const px = x.getPixelForValue(s);
-          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
-        }
-        ctx.strokeStyle = 'rgba(147,51,234,0.6)';
-        ctx.setLineDash([2,3]);
-        for (const s of forcedDefragSecs) {
-          const px = x.getPixelForValue(s);
-          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
-        }
+        variantList.forEach((v, vi) => {
+          const events = variantEvents[v] || [];
+          if (!events.length) return;
+          const col = colors[v] || '#6366f1';
+          const shape = variantMarkers[v] || 'circle';
+          for (const ev of events) {
+            const px = x.getPixelForValue(ev.sec);
+            ctx.strokeStyle = col + '80';
+            ctx.setLineDash(ev.kind === 'reorganize' ? [2,3] : [6,3]);
+            ctx.lineWidth = 1.3;
+            ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, bottom); ctx.stroke();
+            const markerY = top + 8 + (vi % 4) * 13;
+            drawMarkerShape(ctx, shape, px, markerY, 4.5, col);
+          }
+        });
         ctx.restore();
       }
     };
@@ -516,23 +650,17 @@ def main():
       // Forced triggers are scheduled at t=5s (reorganize()) / t=10s & t=25s (defragment()), but
       // under sustained write contention the actual call can be delayed arbitrarily past its
       // scheduled second -- this is intentionally unguarded (cascading is itself an experiment
-      // result). fired_sec (from forced_events, keyed by kind) is where it actually landed.
-      const forcedReorgSecs = [];
-      const forcedDefragSecs = [];
-      const firedDetail = {};
+      // result), and can even starve later triggers out of the 30s window entirely if an earlier
+      // one runs long enough. fired_sec (from forced_events, per variant, keyed by kind) is where
+      // it actually landed -- kept per-variant (not unioned) so independent variants' events don't
+      // look like one aggregate cluster.
+      const variantEvents = {};
+      const variantList = variantOrder.filter(v => tl[v] && tl[v].length);
       const fe = forcedEventsData[valSizeKey] || {};
-      for (const events of Object.values(fe)) {
-        for (const ev of events) {
-          const s = ev.fired_sec;
-          if (ev.kind === 'reorganize' && !forcedReorgSecs.includes(s)) forcedReorgSecs.push(s);
-          if (ev.kind === 'defragment' && !forcedDefragSecs.includes(s)) forcedDefragSecs.push(s);
-          if (!firedDetail[s]) firedDetail[s] = [];
-          firedDetail[s].push(`${ev.kind}(sched@${ev.scheduled_sec}s, took ${ev.elapsed_sec.toFixed(1)}s)`);
-        }
+      for (const v of variantList) {
+        variantEvents[v] = (fe[v] || []).map(ev => ({ sec: ev.fired_sec, kind: ev.kind, ev }));
       }
-      forcedReorgSecs.sort((a,b) => a-b);
-      forcedDefragSecs.sort((a,b) => a-b);
-      const datasets = variantOrder.filter(v => tl[v] && tl[v].length).map(v => {
+      const datasets = variantList.map(v => {
         const isRocks = rivalStores.includes(v);
         const col = colors[v] || '#6366f1';
         return {
@@ -543,7 +671,7 @@ def main():
           borderWidth: isRocks ? 2.5 : 1.8,
           borderDash: isRocks ? [6,6] : [],
           tension: 0.25, fill: false,
-          pointStyle: 'circle', pointRadius: 0, pointHoverRadius: 4
+          pointStyle: variantMarkers[v] || 'circle', pointRadius: 0, pointHoverRadius: 4
         };
       });
       if (!datasets.length) return null;
@@ -554,7 +682,7 @@ def main():
           responsive: true, maintainAspectRatio: false,
           animation: { duration: 900, easing: 'easeInOutQuart' },
           plugins: {
-            reorgLines: { reorgSecs, forcedReorgSecs, forcedDefragSecs },
+            reorgLines: { reorgSecs, variantEvents, variantList },
             legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
             tooltip: {
               mode: 'index', intersect: false,
@@ -565,10 +693,14 @@ def main():
               callbacks: {
                 title: items => {
                   const s = items[0].raw.x;
-                  let suffix = '';
-                  if (reorgSecs.includes(s)) suffix += '  ⟳ T1 Reorg (natural)';
-                  if (firedDetail[s]) suffix += '  ⚑ ' + firedDetail[s].join(', ');
-                  return `Second ${s}${suffix}`;
+                  const hits = [];
+                  if (reorgSecs.includes(s)) hits.push('⟳ T1 Reorg (natural)');
+                  for (const v of variantList) {
+                    for (const e of (variantEvents[v] || [])) {
+                      if (e.sec === s) hits.push(`⚑ ${v}: ${e.ev.kind}(sched@${e.ev.scheduled_sec}s, took ${e.ev.elapsed_sec.toFixed(1)}s)`);
+                    }
+                  }
+                  return hits.length ? `Second ${s}  ` + hits.join('  ') : `Second ${s}`;
                 },
                 label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
               }
@@ -599,10 +731,9 @@ def main():
     old_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
           <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
         </p>"""
-    new_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
-          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
-          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
+    new_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー、全バリアント共通)。
+          強制トリガーはバリアントごとに独立集計(全バリアント共通の1本の線には集約しない): t=5秒予定の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(細かい点線)、t=10秒・t=25秒予定の<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>(粗い点線)を、そのバリアント自身の色+マーカー形状(スキャンQPS線をホバーした際の点と同じ形。凡例のポイント形状も対応)で描画。
+          実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。8B In-Memoryのように挿入スループットが極端に高いワークロードでは、t=5秒予定のreorganize()自体が20秒以上かかり、後続のdefragment()トリガー(t=10s/25s)がこの30秒間に一度も発火しないまま終わることもある(この場合、線は1本しか出ない)。カーソルを線に合わせると、その秒に発火したバリアント・種類・予定秒・実発火秒・所要時間を表示。
         </p>"""
     if old_caption not in html:
         raise RuntimeError("YCSB-E caption template text not found -- template drifted")
@@ -610,11 +741,15 @@ def main():
         raise RuntimeError(f"expected 4 YCSB-E caption occurrences, found {html.count(old_caption)}")
     html = html.replace(old_caption, new_caption)
 
-    # Reorg-scaling caption: mention the new t1t2_steady (reflink/punch) series.
+    # Reorg-scaling caption: mention the new t1t2_steady (reflink/punch) series. Both 藍色/赤色 use
+    # the SAME current checkpoint_and_defragment() code -- 赤色 just measures it invoked cold (no
+    # prior checkpoint to reflink from, i.e. bootstrap cost, always O(N)); 緑色 is the 2nd-or-later
+    # call against an existing prior generation (the real O(diff) steady-state this design exists
+    # for). There is no separate "old design" being measured here.
     old_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>"""
-    new_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
+    new_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、ただし<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。reflink元が無いのでO(N)。現行のreflink+punch実装そのものを、コールド状態で計測した数値であって別実装ではない)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既存世代からのreflink clone + hole punch、O(diff)の本来の定常状態。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>"""
     if old_reorg_caption not in html:
@@ -673,6 +808,30 @@ def main():
     tbody_end = html.index("</tbody>", tbody_content_start)
     html = html[:tbody_content_start] + render_winners_matrix_html(winners_rows) + "\n" + html[tbody_end:]
 
+    # Tier 1 / Tier 1+2 reorganize-duration summary cards: the template's <tbody> content here was
+    # hardcoded numbers from whichever run first wrote the template, and was never regenerated by
+    # this script -- silently stale (still showing the 08/13 run's numbers). Recompute from this
+    # run's own reorg_scaling_*.jsonl. Also rename Tier 1+2's header/caption: "T1+T2 (Full)" read
+    # like a legacy/alternate code path, but it's the exact same checkpoint_and_defragment()
+    # (reflink+punch) used everywhere in this report -- just invoked cold (no prior checkpoint to
+    # reflink from yet), which is why it's O(N) instead of O(diff).
+    def replace_tbody_after(html, anchor_text, new_tbody_inner):
+        anchor = html.index(anchor_text)
+        tbody_open = html.index('<tbody class="divide-y divide-slate-100">', anchor)
+        tbody_close = html.index("</tbody>", tbody_open) + len("</tbody>")
+        return html[:tbody_open] + new_tbody_inner + html[tbody_close:]
+
+    html = replace_tbody_after(html, "Tier 1 Reorganize (T1only)", render_bootstrap_table_body_html(bootstrap_stats, "t1only"))
+    html = replace_tbody_after(html, "Tier 1+2 Reorganize (Full)", render_bootstrap_table_body_html(bootstrap_stats, "t1t2"))
+
+    old_tier12_header = """              <h4 class="text-sm font-bold text-slate-900">Tier 1+2 Reorganize (Full)</h4>
+              <p class="text-[11px] text-slate-500">Average and worst-case times for a full T1+T2 reorganize / checkpoint.</p>"""
+    new_tier12_header = """              <h4 class="text-sm font-bold text-slate-900">Tier 1+2 Bootstrap (defragment, cold)</h4>
+              <p class="text-[11px] text-slate-500">Average/worst-case for <code class="bg-slate-100 px-1 rounded">defragment()</code>'s very first call on a fresh corpus -- no prior checkpoint exists to reflink from yet, so this is O(N), not the O(diff) steady-state cost. Same code path as everywhere else in this report.</p>"""
+    if old_tier12_header not in html:
+        raise RuntimeError("Tier 1+2 header/caption template text not found -- template drifted")
+    html = html.replace(old_tier12_header, new_tier12_header)
+
     # New-experiment summary sections: insert right after the Winners Matrix section closes.
     churn_html = render_churn_table_html(churn_rows)
     reorg_steady_html = render_reorg_steady_table_html(reorg_data)
@@ -686,7 +845,7 @@ def main():
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff)) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the older T1-only/T1+T2(full-copy) sweep for comparison.</p>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff), 2nd-or-later call against an existing prior generation) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior generation to reflink from) for comparison.</p>
           </div>
         </div>
         {reorg_steady_html}
@@ -701,7 +860,7 @@ def main():
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Churn-Ratio Scaling (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last generation (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01.</p>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last generation (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; the O(diff) design's cost still scales with how much actually changed, it isn't a fixed cheap constant.</p>
           </div>
         </div>
         {churn_html}
