@@ -54,14 +54,31 @@ class YCSBTimelineCollector {
     alignas(64) std::array<std::atomic<uint64_t>, kDurationSeconds> insert_counts{};
   };
 
+  // One forced store.reorganize()/store.defragment() call, fired deterministically at a fixed
+  // second-mark instead of waiting for (possibly rare, see kForcedTriggers' own comment) organic
+  // triggering. elapsed_sec is the call's own measured wall-clock duration -- the direct evidence
+  // for whether checkpoint_and_defragment() disrupts a concurrent workload, rather than something
+  // inferred after the fact from a throughput dip in the timeline.
+  struct ForcedEvent {
+    int scheduled_sec;
+    int fired_sec;     // may exceed scheduled_sec if a prior forced call ran long -- see
+                       // kForcedTriggers' comment on why no guard skips a late trigger.
+    std::string kind;  // "reorganize" or "defragment"
+    double elapsed_sec;
+  };
+
   std::vector<ThreadCounter> counters;
   std::array<std::atomic<uint64_t>, kDurationSeconds> t1_reorg_counts{};
   std::array<std::atomic<uint64_t>, kDurationSeconds> t2_reorg_counts{};
-  // Separate from t1_reorg_counts: counts reorgs the benchmark itself forced via
-  // store.reorganize() (see the t=15s hook below), as opposed to ones VMemKV triggered
-  // organically. Kept apart so a future report pass can render these as a differently-colored
-  // vertical line.
+  // Separate from t1_reorg_counts/t2_reorg_counts: counts reorgs/defragments the benchmark itself
+  // forced (see kForcedTriggers below), as opposed to ones VMemKV triggered organically. Kept
+  // apart so a future report pass can render these as differently-colored vertical lines. Exact
+  // per-call timing lives in forced_events instead -- these per-second buckets exist only to keep
+  // the same "reorg activity per second" chart t1_reorg_counts/t2_reorg_counts already draw.
   std::array<std::atomic<uint64_t>, kDurationSeconds> t1_forced_reorg_counts{};
+  std::array<std::atomic<uint64_t>, kDurationSeconds> t2_forced_reorg_counts{};
+  // Only ever touched by thread_idx==0 (see the trigger site below), so no locking needed.
+  std::vector<ForcedEvent> forced_events;
   std::atomic<uint64_t> last_recorded_t1{0};
   std::atomic<uint64_t> last_recorded_t2{0};
   std::atomic<uint64_t> next_key_index;
@@ -73,6 +90,7 @@ class YCSBTimelineCollector {
       t1_reorg_counts[i].store(0, std::memory_order_relaxed);
       t2_reorg_counts[i].store(0, std::memory_order_relaxed);
       t1_forced_reorg_counts[i].store(0, std::memory_order_relaxed);
+      t2_forced_reorg_counts[i].store(0, std::memory_order_relaxed);
     }
   }
 
@@ -103,6 +121,7 @@ class YCSBTimelineCollector {
     std::vector<uint64_t> total_reorg_t1(kDurationSeconds, 0);
     std::vector<uint64_t> total_reorg_t2(kDurationSeconds, 0);
     std::vector<uint64_t> total_forced_reorg_t1(kDurationSeconds, 0);
+    std::vector<uint64_t> total_forced_reorg_t2(kDurationSeconds, 0);
 
     for (const auto &tc : counters) {
       for (int i = 0; i < kDurationSeconds; ++i) {
@@ -114,6 +133,7 @@ class YCSBTimelineCollector {
       total_reorg_t1[i] = t1_reorg_counts[i].load(std::memory_order_relaxed);
       total_reorg_t2[i] = t2_reorg_counts[i].load(std::memory_order_relaxed);
       total_forced_reorg_t1[i] = t1_forced_reorg_counts[i].load(std::memory_order_relaxed);
+      total_forced_reorg_t2[i] = t2_forced_reorg_counts[i].load(std::memory_order_relaxed);
     }
 
     // Sanitize parameters to prevent slash / from breaking folder path
@@ -138,8 +158,17 @@ class YCSBTimelineCollector {
         out << "    {\"sec\": " << (i + 1) << ", \"scan_ops\": " << total_scan[i]
             << ", \"insert_ops\": " << total_insert[i] << ", \"t1_reorg_ops\": " << total_reorg_t1[i]
             << ", \"t2_reorg_ops\": " << total_reorg_t2[i] << ", \"t1_forced_reorg_ops\": " << total_forced_reorg_t1[i]
-            << "}";
+            << ", \"t2_forced_reorg_ops\": " << total_forced_reorg_t2[i] << "}";
         if (i < kDurationSeconds - 1) out << ",";
+        out << "\n";
+      }
+      out << "  ],\n";
+      out << "  \"forced_events\": [\n";
+      for (size_t i = 0; i < forced_events.size(); ++i) {
+        const auto &ev = forced_events[i];
+        out << "    {\"scheduled_sec\": " << ev.scheduled_sec << ", \"fired_sec\": " << ev.fired_sec << ", \"kind\": \""
+            << ev.kind << "\", \"elapsed_sec\": " << ev.elapsed_sec << "}";
+        if (i + 1 < forced_events.size()) out << ",";
         out << "\n";
       }
       out << "  ]\n";
@@ -147,6 +176,41 @@ class YCSBTimelineCollector {
     }
   }
 };
+
+// Fixed schedule for YCSB-E's forced reorganize()/defragment() calls (see the trigger site in
+// register_ycsb_e_benchmark() below): under LTM, natural triggering is rare/unreliable within the
+// 30s window (the append region's soft-limit threshold, and the WAL/space-amp thresholds that
+// drive checkpoint()/defragment(), are often never reached at LTM's much lower throughput), so
+// YCSB-E's timeline would otherwise show little to no reorg activity for those scenarios. Firing
+// these deterministically guarantees comparable data points every run instead of leaving it to
+// chance.
+//
+// t=5s: one reorganize() (T1-only, zero I/O) as a control -- already known cheap from
+// run_reorg_scaling_probe.sh's t1only sweep, included here mainly so the chart has a "known-cheap"
+// reference line next to the defragment() calls below.
+// t=10s and t=25s: two defragment() calls (checkpoint_and_defragment()'s real reflink+punch
+// mechanism), spaced 15s apart -- enough room for each to complete and for the surrounding
+// throughput to resettle before/after, even given real uncertainty over how long a single call
+// takes at YCSB-E's corpus scale. Two calls (not more) is enough to see whether a second cycle
+// looks like the first; repeatability across many more cycles is already covered separately by
+// run_churn_scaling_probe.sh's dense sweep, which isolates the diff-size variable far more
+// cleanly than a live mixed workload can.
+//
+// Deliberately no guard against a late-running call pushing a later trigger's fire time past its
+// own schedule mark, or even past kDurationSeconds entirely: if defragment() at t=10s runs long
+// enough to blow through the t=25s mark, the next check (on this thread's very next loop
+// iteration, see the trigger site) fires it immediately back-to-back -- itself a legitimate,
+// informative result (defragment() takes long enough under this workload/scale that back-to-back
+// cycles pile up), not a bug to engineer around.
+struct ForcedTrigger {
+  int second_mark;
+  bool is_defragment;  // false = reorganize() (T1-only), true = defragment()
+};
+constexpr std::array<ForcedTrigger, 3> kForcedTriggers{{
+    {5, false},
+    {10, true},
+    {25, true},
+}};
 
 constexpr std::size_t kIndexKeyBufferBytes = 32;
 constexpr std::size_t kIndexKeyBytes = 16;
@@ -1249,9 +1313,9 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
           std::string dummy_large(val_size, 'a');
           std::string dummy_8b(8, 'a');
           uint64_t local_ops = 0;
-          // thread_idx==0 only (see below): fires exactly once per run, so a plain local
-          // bool is fine -- no other thread ever touches it.
-          bool forced_reorg_done = false;
+          // thread_idx==0 only (see below): advances monotonically through kForcedTriggers, so a
+          // plain local index is fine -- no other thread ever touches it.
+          std::size_t next_forced_trigger_idx = 0;
 
           ycsb_state->ready_threads.fetch_add(1, std::memory_order_acq_rel);
           // Inside the loop: start the timeline on the very first iteration of this run epoch
@@ -1301,25 +1365,52 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                 col->last_recorded_t2.store(current_t2, std::memory_order_relaxed);
               }
 
-              // Artificially force a T1-only reorganize once, at the t=15s mark: under LTM,
-              // natural reorg triggering is rare/unreliable within the 30s window (the append
-              // region's soft-limit threshold is often never reached at LTM's much lower
-              // throughput), so YCSB-E's timeline otherwise shows no reorg activity at all for
-              // those scenarios. Forcing one deterministically here guarantees at least one
-              // reorg data point per run. Recorded into a separate counter (not
-              // t1_reorg_counts) so it can later be told apart from organically-triggered
-              // reorgs; the report-side (chart coloring) half of this is not yet implemented.
-              if (!forced_reorg_done && elapsed >= 15) {
-                store.reorganize();  // T1-only, zero I/O
-                uint64_t post_t1 = store.get_statistics().t1_reorg_count;
+              // Fire the next scheduled forced reorganize()/defragment() call once elapsed
+              // reaches its mark -- see kForcedTriggers' own comment for the schedule and why a
+              // late-running call is deliberately allowed to push a later trigger's fire time (or
+              // cause it to be skipped entirely, if the window ends first).
+              if (next_forced_trigger_idx < kForcedTriggers.size() &&
+                  elapsed >= kForcedTriggers[next_forced_trigger_idx].second_mark) {
+                const ForcedTrigger &trigger = kForcedTriggers[next_forced_trigger_idx];
+                const auto call_t0 = std::chrono::steady_clock::now();
+                if (trigger.is_defragment) {
+                  store.defragment();
+                } else {
+                  store.reorganize();  // T1-only, zero I/O
+                }
+                const double call_elapsed_sec =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - call_t0).count();
+
+                // Re-derive elapsed/bucket after the call: it may have taken long enough that the
+                // original `elapsed` from the top of this loop iteration is stale. Clamped since a
+                // long enough call can push this past the last valid bucket.
+                const auto fired_elapsed =
+                    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - col->start_time)
+                        .count();
+                const int bucket = static_cast<int>(
+                    std::clamp<int64_t>(fired_elapsed, 0, YCSBTimelineCollector::kDurationSeconds - 1));
+
+                auto post_stats = store.get_statistics();
+                uint64_t post_t1 = post_stats.t1_reorg_count;
                 uint64_t pre_force_t1 = col->last_recorded_t1.load(std::memory_order_relaxed);
                 if (post_t1 > pre_force_t1) {
-                  col->t1_forced_reorg_counts[elapsed].fetch_add(post_t1 - pre_force_t1, std::memory_order_relaxed);
+                  col->t1_forced_reorg_counts[bucket].fetch_add(post_t1 - pre_force_t1, std::memory_order_relaxed);
                   // Absorb the bump into last_recorded_t1 so the *next* poll of this loop
                   // doesn't also attribute this same delta to the natural t1_reorg_counts.
                   col->last_recorded_t1.store(post_t1, std::memory_order_relaxed);
                 }
-                forced_reorg_done = true;
+                uint64_t post_t2 = post_stats.t2_reorg_count;
+                uint64_t pre_force_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
+                if (post_t2 > pre_force_t2) {
+                  col->t2_forced_reorg_counts[bucket].fetch_add(post_t2 - pre_force_t2, std::memory_order_relaxed);
+                  col->last_recorded_t2.store(post_t2, std::memory_order_relaxed);
+                }
+
+                col->forced_events.push_back({trigger.second_mark,
+                                              bucket,
+                                              trigger.is_defragment ? "defragment" : "reorganize",
+                                              call_elapsed_sec});
+                ++next_forced_trigger_idx;
               }
             }
 

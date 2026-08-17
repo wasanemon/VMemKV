@@ -734,22 +734,31 @@ class VMemKVImpl {
 
   // Shared wait/CAS/run/retry loop for the three public methods below. `decide` is invoked fresh
   // on every successful CAS (i.e. strictly after acquiring reorg_running_'s single-flight
-  // guarantee, never before). `force_run` mirrors the old force_t2_gc=true contract: guarantees
-  // at least one reorganize_internal() call
-  // actually completes even if T1's append region is already empty (e.g. bulk_load()'s periodic
-  // internal reorganizes already drained it), rather than skipping because there was "nothing to
-  // do" by the T1-emptiness measure alone.
+  // guarantee, never before). `force_run` mirrors the old force_t2_gc=true contract: guarantees at
+  // least one reorganize_internal() call actually completes even if T1's append region is already
+  // empty (e.g. bulk_load()'s periodic internal reorganizes already drained it), rather than
+  // skipping because there was "nothing to do" by the T1-emptiness measure alone.
+  //
+  // Performs (or waits for a concurrently-running) exactly one reorganize_internal() cycle, then
+  // returns -- never loops back to check whether T1's append region has become fully empty.
+  // Looping on that condition is what the pre-redesign convergence loop inside
+  // reorganize_internal() itself (see TODO.md item 4's resolution) was already found and fixed
+  // for: under sustained concurrent writes, the append region is essentially never momentarily
+  // empty, so a caller re-checking it after every completed cycle can win the CAS against itself
+  // indefinitely, executing cycle after cycle without ever returning. Measured directly (19
+  // concurrent insert threads, 8B values): a single reorganize() call executed 265
+  // reorganize_internal() cycles in 20s and still hadn't returned, with zero CAS losses to any
+  // other caller the whole time -- i.e. it was racing only against its own moving target, not
+  // contending with the background reorg_worker_ or anything else.
   template <typename DecideFn>
   void run_reorganize(DecideFn &&decide, bool force_run) {
-    bool forced_once = false;
     while (true) {
       // 1. Wait for any concurrent background/manual reorganize to complete
       wait_until_reorg_not_running();
 
-      // 2. force_run's contract is that it always ends with a committed cycle, even if T1's
-      // append region was already empty -- so only skip once forced_once too.
-      if (t1_.append_size() == 0 && (!force_run || forced_once)) {
-        break;
+      // 2. Nothing to do, and no cycle was unconditionally requested.
+      if (!force_run && t1_.append_size() == 0) {
+        return;
       }
 
       // 3. Try to acquire the execution lock
@@ -765,8 +774,15 @@ class VMemKVImpl {
         }
         reorg_running_.store(false, std::memory_order_release);
         reorg_running_.notify_all();
-        forced_once = true;
+        return;
       }
+      // Lost the race: someone else (background reorg_worker_, or another concurrent caller) is
+      // already running a cycle. Loop back and wait for it, then try again -- needed for
+      // force_run=true, since the winner's own decide() might not be ours (e.g. we wanted
+      // checkpoint() but a plain reorganize() won the race), so only a cycle *we* ran ourselves
+      // satisfies our caller's request. For force_run=false this can also retry, but is bounded
+      // by how many cycles other callers actually run, not by our own append_size() target
+      // continually moving.
     }
   }
 

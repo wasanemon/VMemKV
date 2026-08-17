@@ -267,12 +267,18 @@ void Wal::write_and_fsync_batch(const std::vector<PendingRecord *> &batch) {
 }
 
 auto Wal::drain_pending() -> uint64_t {
-  while (true) {
-    const uint64_t target = next_lsn_.load(std::memory_order_acquire);
-    if (next_to_flush_ == target) {
-      return target;
-    }
-
+  // Snapshot the target once, not fresh on every iteration: under sustained concurrent writers,
+  // next_lsn_ keeps advancing, so re-reading it each pass chases a moving target and never
+  // returns (measured directly: rotate()'s post-swap drain hung 10+ seconds under 19 concurrent
+  // insert threads, even though it kept making real, useful progress -- see rotate()'s own
+  // comment). Everything reserved as of this call's start (this snapshot) is what durability up
+  // to "now" means; anything reserved after is the next drain_pending() call's job -- via
+  // release_leadership()'s own single-retry handling for its callers, not this function chasing
+  // it internally. The loop below still repeats -- collect_batch() caps each round at
+  // kWalRingCapacity, so more than one round can be needed to reach even a fixed target -- but
+  // that's now bounded by the backlog size at entry, not by how long writers keep arriving.
+  const uint64_t target = next_lsn_.load(std::memory_order_acquire);
+  while (next_to_flush_ != target) {
     try {
       std::vector<PendingRecord *> batch;
       collect_batch(target, batch);
@@ -282,6 +288,7 @@ auto Wal::drain_pending() -> uint64_t {
       throw;
     }
   }
+  return target;
 }
 
 auto Wal::release_leadership(uint64_t observed_target) -> bool {
@@ -444,7 +451,7 @@ void Wal::rotate(uint64_t checkpoint_lsn) {
     flushing_.wait(true, std::memory_order_acquire);
   }
 
-  uint64_t target = drain_pending();  // Catch up on any backlog before touching fd_ at all.
+  (void)drain_pending();  // Catch up on any backlog before touching fd_ at all.
 
   const int old_fd = fd_.load(std::memory_order_acquire);
   struct stat file_stat {};
@@ -516,9 +523,21 @@ void Wal::rotate(uint64_t checkpoint_lsn) {
   // corrupting the "byte-offset order == LSN order" invariant replay/recovery depend on. next_lsn_
   // is self-sufficient; rotation only discards old survivors, it never renumbers anyone.
 
-  while (release_leadership(target)) {
-    target = drain_pending();
-  }
+  // Flush whatever accumulated in the ring while we held leadership for the file swap, then hand
+  // off leadership plainly -- deliberately not release_leadership()'s reclaim-on-straggler retry
+  // (used by the steady-state write path at the top of this file): under sustained concurrent
+  // write load, every backlogged writer is parked waiting on highest_settled_lsn_, not competing
+  // for `flushing_`, until its own LSN settles -- so rotate()'s thread was structurally the only
+  // party ever re-attempting that reclaim, kept "winning" against its own moving target, and never
+  // returned (measured directly: hung 10+ seconds under 19 concurrent insert threads with zero
+  // other reclaim attempts). A writer reserved after this plain release still gets serviced
+  // exactly like any other moment with no rotation in progress: its own reserve+await call makes
+  // its own fresh `!flushing_.exchange(true)` attempt right after reserving, so it either becomes
+  // leader itself or waits for whoever does -- nothing is left permanently stranded, just no
+  // longer rotate()'s personal responsibility to chase.
+  (void)drain_pending();
+  flushing_.store(false, std::memory_order_release);
+  flushing_.notify_all();
 }
 
 auto Wal::next_lsn() const noexcept -> uint64_t { return next_lsn_.load(std::memory_order_relaxed); }

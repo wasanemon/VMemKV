@@ -15,6 +15,7 @@
 
 #include "../api/utils.hpp"
 #include "../core/reference_tracker.hpp"
+#include "../core/spin_backoff.hpp"
 
 // ─── T2 Flat Storage Structs ──────────────────────────────────────────────
 
@@ -238,6 +239,19 @@ class T2FlatFile {
   // firing once right after registering and before the writer_stop_ check -- lets a test pause a
   // writer in exactly that window to reproduce the race deterministically; no-op in production.
   //
+  // The outer while(writer_stop_) loop below deliberately does NOT touch active_readers_ at all:
+  // measured directly (19 concurrent insert threads) that retrying the register-then-check dance
+  // immediately on rejection turns wait_until_retired()'s drain check into a race it can lose
+  // indefinitely -- a rejected writer's slot toggles between the retired value and cleared so
+  // rapidly that the polling side may never observe a gap, so stop_writers_and_wait() (called by
+  // every checkpoint()/defragment() cycle) could hang under sustained write load. Waiting out here
+  // first means a writer only touches active_readers_ once per genuine writer_stop_ transition (a
+  // single, bounded register-and-immediately-release at the edge), not once per retry -- so once
+  // past that transition, the tracked count can only drain, never bounce back up, making the wait
+  // deterministic instead of probabilistic. This still doesn't reopen the gap the ordering above
+  // protects against: the actual register-then-check pair is unchanged, just no longer attempted
+  // in a tight loop while already known to be rejected.
+  //
   // Registers/releases through active_readers_ directly (rather than a named T2MemoryHandle
   // local) on the retry path: T2MemoryHandle's Guard has a deleted copy constructor and no
   // implicit move constructor, so `return handle;` for a named local isn't guaranteed elided
@@ -246,6 +260,10 @@ class T2FlatFile {
   template <typename Hook = NoOpAcquireWriteHandleHook>
   auto acquire_write_handle(Hook &&hook = {}) const noexcept -> T2MemoryHandle {
     while (true) {
+      vmemkv::SpinBackoff backoff;
+      while (writer_stop_.load(std::memory_order_seq_cst)) {
+        backoff.wait();
+      }
       const T2Memory *mem = get_memory();
       active_readers_.acquire(mem);
       hook();
@@ -253,7 +271,6 @@ class T2FlatFile {
         return {active_readers_, mem};  // re-acquire()s the same value; harmless.
       }
       active_readers_.release();
-      std::this_thread::yield();
     }
   }
 
