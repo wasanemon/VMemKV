@@ -28,15 +28,19 @@ for task in "${TASKS[@]}"; do
   
   echo "Launching Instance for: Scenario=$scenario, ValueSize=$val_size (Log: $log_file)"
   
-  # Run the orchestrator script in the background. --reorg-scaling-probe is additive: it runs
-  # after this instance's normal (scenario, value_size) matrix, scoped to that same combo, on the
-  # same already-provisioned instance -- no 5th instance needed, since these 4 tasks already
-  # partition the same 4 combos the probe sweeps (see run_bench_aws_c6id.sh's own comment on this
-  # flag).
+  # Run the orchestrator script in the background. --reorg-scaling-probe and --churn-scaling-probe
+  # are both additive: they run after this instance's normal (scenario, value_size) matrix, on the
+  # same already-provisioned instance -- no 5th instance needed. --reorg-scaling-probe is scoped
+  # to this instance's own combo (these 4 tasks already partition the 4 combos it sweeps).
+  # --churn-scaling-probe only actually does anything on the two value_size=1KB tasks (see its own
+  # comment in run_bench_aws_c6id.sh for why it's fixed to 1KB regardless of this instance's
+  # value_size) -- passing it unconditionally to all 4 is harmless, it just no-ops on the 8B/64KB
+  # tasks.
   "$SCRIPT_DIR/run_bench_aws_c6id.sh" \
     --scenario "$scenario" \
     --value-size "$val_size" \
     --reorg-scaling-probe \
+    --churn-scaling-probe \
     > "$log_file" 2>&1 &
   pids+=($!)
   

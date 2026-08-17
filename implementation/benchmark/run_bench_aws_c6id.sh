@@ -27,12 +27,20 @@ show_help() {
   echo "  --reorg-scaling-probe  After the normal matrix, additionally sweep reorganize()"
   echo "                   duration vs. corpus size (T1-only vs T1+T2) on the same instance via"
   echo "                   run_reorg_scaling_probe.sh and download its JSONL output"
+  echo "  --churn-scaling-probe  After the normal matrix, additionally sweep"
+  echo "                   checkpoint_and_defragment() duration vs. churn ratio at fixed corpus"
+  echo "                   size (in_memory/1KB) plus one ltm/1KB low-churn spot check, on the"
+  echo "                   same instance via run_churn_scaling_probe.sh and download its JSONL"
+  echo "                   output. Only runs on an instance whose --value-size is 1KB (or"
+  echo "                   unset), since the probe's own sweep is fixed to 1KB regardless of"
+  echo "                   this script's --value-size."
   exit 0
 }
 
 SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
 REORG_SCALING_PROBE=false
+CHURN_SCALING_PROBE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -62,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --reorg-scaling-probe)
       REORG_SCALING_PROBE=true
+      shift
+      ;;
+    --churn-scaling-probe)
+      CHURN_SCALING_PROBE=true
       shift
       ;;
     *)
@@ -900,6 +912,78 @@ VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
 
   if [[ "$reorg_probe_failed" -ne 0 ]]; then
     echo "[WARN] reorg-scaling-probe had failures -- main benchmark matrix results above are still valid" >&2
+  fi
+fi
+
+if [[ "$CHURN_SCALING_PROBE" == "true" ]]; then
+  # Additive extra measurement (checkpoint_and_defragment() duration vs. churn ratio at fixed
+  # corpus size), same reasoning as REORG_SCALING_PROBE above for reusing this already-provisioned
+  # instance rather than a dedicated one. Unlike that probe, this one's own sweep is fixed to 1KB
+  # regardless of $VALUE_SIZE_LIMIT (see run_churn_scaling_probe.sh's own comment for why: it
+  # isolates the diff-size variable at one representative value size rather than repeating the
+  # same sweep shape at every size in the matrix) -- so it only runs on an instance whose
+  # --value-size is 1KB or unset, to avoid the in_memory/8B and ltm/64KB instances redundantly
+  # re-running the exact same 1KB sweep a second (or third) time.
+  churn_probe_failed=0
+
+  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]] &&
+     [[ -z "$VALUE_SIZE_LIMIT" || "$VALUE_SIZE_LIMIT" == "1KB" ]]; then
+    churn_inmem_stdout_log="/tmp/vmemkv_churn_probe_inmem_${KEY_NAME}.stdout.log"
+    churn_inmem_stderr_log="/tmp/vmemkv_churn_probe_inmem_${KEY_NAME}.stderr.log"
+    : >"$churn_inmem_stdout_log"
+    : >"$churn_inmem_stderr_log"
+    churn_inmem_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+./benchmark/run_churn_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/churn_scaling_in_memory.jsonl' '/mnt/nvme'
+    "
+    printf -v churn_inmem_remote_cmd_quoted '%q' "$churn_inmem_remote_cmd"
+    echo "[runner] start churn-scaling-probe scenario=in_memory"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${churn_inmem_remote_cmd_quoted}" \
+        2> >(tee -a "$churn_inmem_stderr_log" >&2); } | tee -a "$churn_inmem_stdout_log"
+    churn_inmem_probe_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end churn-scaling-probe scenario=in_memory status=$churn_inmem_probe_status"
+    if [[ "$churn_inmem_probe_status" -ne 0 ]]; then
+      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
+      echo "[WARN] churn-scaling-probe (in_memory) failed with exit code $churn_inmem_probe_status -- logs: $churn_inmem_probe_stdout_log $churn_inmem_probe_stderr_log" >&2
+      churn_probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/churn_scaling_in_memory.jsonl" "${RESULTS_DIR}/churn_scaling_in_memory_1KB.jsonl" || true
+  fi
+
+  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]] &&
+     [[ -z "$VALUE_SIZE_LIMIT" || "$VALUE_SIZE_LIMIT" == "1KB" ]]; then
+    churn_ltm_stdout_log="/tmp/vmemkv_churn_probe_ltm_${KEY_NAME}.stdout.log"
+    churn_ltm_stderr_log="/tmp/vmemkv_churn_probe_ltm_${KEY_NAME}.stderr.log"
+    : >"$churn_ltm_stdout_log"
+    : >"$churn_ltm_stderr_log"
+    # VMEMKV_CONTEXT_memory_budget_bytes explicit here for the same reason as the ltm
+    # reorg-scaling-probe branch above.
+    churn_ltm_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
+./benchmark/run_churn_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/churn_scaling_ltm.jsonl' '/mnt/nvme' '--ltm-spot-check-only'
+    "
+    printf -v churn_ltm_remote_cmd_quoted '%q' "$churn_ltm_remote_cmd"
+    echo "[runner] start churn-scaling-probe scenario=ltm"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${churn_ltm_remote_cmd_quoted}" \
+        2> >(tee -a "$churn_ltm_stderr_log" >&2); } | tee -a "$churn_ltm_stdout_log"
+    churn_ltm_probe_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end churn-scaling-probe scenario=ltm status=$churn_ltm_probe_status"
+    if [[ "$churn_ltm_probe_status" -ne 0 ]]; then
+      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
+      echo "[WARN] churn-scaling-probe (ltm) failed with exit code $churn_ltm_probe_status -- logs: $churn_ltm_probe_stdout_log $churn_ltm_probe_stderr_log" >&2
+      churn_probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/churn_scaling_ltm.jsonl" "${RESULTS_DIR}/churn_scaling_ltm_1KB.jsonl" || true
+  fi
+
+  if [[ "$churn_probe_failed" -ne 0 ]]; then
+    echo "[WARN] churn-scaling-probe had failures -- main benchmark matrix results above are still valid" >&2
   fi
 fi
 
