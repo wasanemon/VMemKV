@@ -115,57 +115,6 @@
     </div>
 
     <div id="tab-summary" class="tab-content active space-y-8">
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-emerald-50 text-emerald-600 rounded-lg">
-            <i data-lucide="git-commit" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff), 2nd-or-later call against an existing prior generation) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior generation to reflink from) for comparison.</p>
-          </div>
-        </div>
-        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
-<thead><tr class="border-b border-slate-200 bg-slate-50/50">
-<th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th>
-<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>
-<th class="py-2 px-3 font-bold text-slate-700">Steady-state defragment() (churn=0.01)</th>
-</tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,064,888</td><td class="py-2 px-3">9.78s</td></tr>
-<tr><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,129,776</td><td class="py-2 px-3">20.85s</td></tr>
-<tr><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,194,664</td><td class="py-2 px-3">27.12s</td></tr>
-<tr><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">46.94s</td></tr>
-</tbody></table></div>
-      </section>
-
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
-            <i data-lucide="activity" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Churn-Ratio Scaling (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last generation (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; the O(diff) design's cost still scales with how much actually changed, it isn't a fixed cheap constant.</p>
-          </div>
-        </div>
-        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
-<thead><tr class="border-b border-slate-200 bg-slate-50/50">
-<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
-<th class="py-2 px-3 font-bold text-slate-700">Churn Ratio</th>
-<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>
-<th class="py-2 px-3 font-bold text-slate-700">defragment() steady-state</th>
-</tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">8.21s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">22.73s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.05</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.25</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.5</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
-<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">41.92s</td></tr>
-</tbody></table></div>
-      </section>
-
       <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-6">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
@@ -496,58 +445,58 @@
           </table>
         </div>
       </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-emerald-50 text-emerald-600 rounded-lg">
+            <i data-lucide="git-commit" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff), 2nd-or-later call against an existing prior generation) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior generation to reflink from) for comparison.</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th>
+<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>
+<th class="py-2 px-3 font-bold text-slate-700">Steady-state defragment() (churn=0.01)</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,064,888</td><td class="py-2 px-3">9.78s</td></tr>
+<tr><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,129,776</td><td class="py-2 px-3">20.85s</td></tr>
+<tr><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,194,664</td><td class="py-2 px-3">27.12s</td></tr>
+<tr><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">46.94s</td></tr>
+</tbody></table></div>
+      </section>
 
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 space-y-4">
-          <div class="flex items-center gap-2.5">
-            <div class="p-1.5 bg-indigo-50 text-indigo-600 rounded-lg">
-              <i data-lucide="zap" class="w-5 h-5"></i>
-            </div>
-            <div>
-              <h4 class="text-sm font-bold text-slate-900">Tier 1 Reorganize (T1only)</h4>
-              <p class="text-[11px] text-slate-500">Average and worst-case times to reorganize the active buffer.</p>
-            </div>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
+            <i data-lucide="activity" class="w-6 h-6"></i>
           </div>
-          <div class="overflow-x-auto">
-            <table class="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr class="border-b border-slate-200 bg-slate-50/50">
-                  <th class="py-2 px-4 font-bold text-slate-700">Scenario</th>
-                  <th class="py-2 px-4 font-bold text-slate-700 text-center">8B</th>
-                  <th class="py-2 px-4 font-bold text-slate-700 text-center">1KB</th>
-                  <th class="py-2 px-4 font-bold text-slate-700 text-center">64KB</th>
-                </tr>
-              </thead>
-              <tbody class="divide-y divide-slate-100"><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">In-Memory</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">2.11s</strong><br><span class="text-slate-400 text-[10px]">Max: 3.75s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">0.95s</strong><br><span class="text-slate-400 text-[10px]">Max: 1.63s</span></td><td class="py-2.5 px-4 text-center text-slate-400">-</td></tr><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">LTM</td><td class="py-2.5 px-4 text-center text-slate-400">-</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">2.11s</strong><br><span class="text-slate-400 text-[10px]">Max: 3.40s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">0.11s</strong><br><span class="text-slate-400 text-[10px]">Max: 0.21s</span></td></tr></tbody>
-            </table>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Churn-Ratio Scaling (new experiment)</h3>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last generation (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; the O(diff) design's cost still scales with how much actually changed, it isn't a fixed cheap constant.</p>
           </div>
-        </section>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Churn Ratio</th>
+<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>
+<th class="py-2 px-3 font-bold text-slate-700">defragment() steady-state</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">8.21s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">22.73s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.05</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.25</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.5</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">41.92s</td></tr>
+</tbody></table></div>
+      </section>
 
-        <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 space-y-4">
-          <div class="flex items-center gap-2.5">
-            <div class="p-1.5 bg-indigo-50 text-indigo-600 rounded-lg">
-              <i data-lucide="shuffle" class="w-5 h-5"></i>
-            </div>
-            <div>
-              <h4 class="text-sm font-bold text-slate-900">Tier 1+2 Bootstrap (defragment, cold)</h4>
-              <p class="text-[11px] text-slate-500">Average/worst-case for <code class="bg-slate-100 px-1 rounded">defragment()</code>'s very first call on a fresh corpus -- no prior checkpoint exists to reflink from yet, so this is O(N), not the O(diff) steady-state cost. Same code path as everywhere else in this report.</p>
-            </div>
-          </div>
-          <div class="overflow-x-auto">
-            <table class="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr class="border-b border-slate-200 bg-slate-50/50">
-                  <th class="py-2 px-4 font-bold text-slate-700">Scenario</th>
-                  <th class="py-2 px-4 font-bold text-slate-700 text-center">8B</th>
-                  <th class="py-2 px-4 font-bold text-slate-700 text-center">1KB</th>
-                  <th class="py-2 px-4 font-bold text-slate-700 text-center">64KB</th>
-                </tr>
-              </thead>
-              <tbody class="divide-y divide-slate-100"><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">In-Memory</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">4.51s</strong><br><span class="text-slate-400 text-[10px]">Max: 7.09s</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">21.82s</strong><br><span class="text-slate-400 text-[10px]">Max: 33.94s</span></td><td class="py-2.5 px-4 text-center text-slate-400">-</td></tr><tr class="hover:bg-slate-50/30 transition-colors"><td class="py-2.5 px-4 font-semibold text-slate-800 bg-slate-50/20">LTM</td><td class="py-2.5 px-4 text-center text-slate-400">-</td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">49.76s</strong><br><span class="text-slate-400 text-[10px]">Max: 60.00s</span><br><span class="text-[9px] text-amber-500 font-medium">*(1/3 timed out, sweep stopped early)</span></td><td class="py-2.5 px-4 text-center text-slate-700">Avg: <strong class="text-slate-900">37.32s</strong><br><span class="text-slate-400 text-[10px]">Max: 60.00s</span><br><span class="text-[9px] text-amber-500 font-medium">*(1/4 timed out)</span></td></tr></tbody>
-            </table>
-          </div>
-        </section>
-      </div>
+
     </div>
 
     <div id="tab-8b-inmem" class="tab-content space-y-12">
