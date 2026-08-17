@@ -103,6 +103,16 @@ def build_raw_data(report_dir):
     return raw_data
 
 
+def _normalize_value_size(file_val_size):
+    # bench_kv writes e.g. "1KB_20__8B_" for the 80/20-mix value-size label -- normalize
+    # to the plain "1KB"/"64KB"/"8B" keys used elsewhere (SCENARIO_LABELS).
+    if file_val_size.startswith("1KB"):
+        return "1KB"
+    if file_val_size.startswith("64KB"):
+        return "64KB"
+    return file_val_size
+
+
 def build_timeline_data(report_dir):
     timeline_data = {}
     for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
@@ -111,8 +121,7 @@ def build_timeline_data(report_dir):
             d = json.loads(f.read_text())
             store = d["store"]
             variant = d["variant"]
-            file_val_size = d["value_size"]
-            if file_val_size != val_size:
+            if _normalize_value_size(d["value_size"]) != val_size:
                 continue
             base_store = store.split("-", 1)[0] if store.startswith("VMemKV") else store
             label = STORE_VARIANT_TO_LABEL.get((base_store, variant))
@@ -121,6 +130,28 @@ def build_timeline_data(report_dir):
             variants[label] = d["timeline"]
         timeline_data[scenario_key] = variants
     return timeline_data
+
+
+def build_forced_events_data(report_dir):
+    """Per (scenario, variant): the actual forced_events list (scheduled_sec, fired_sec, kind,
+    elapsed_sec). Fired second can lag scheduled second arbitrarily under sustained write
+    contention (cascading is intentionally unguarded -- see kForcedTriggers in bench_kv.cpp)."""
+    forced_events_data = {}
+    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
+        variants = {}
+        for f in report_dir.glob(f"ycsb_e_timeline_{scenario}_*.json"):
+            d = json.loads(f.read_text())
+            store = d["store"]
+            variant = d["variant"]
+            if _normalize_value_size(d["value_size"]) != val_size:
+                continue
+            base_store = store.split("-", 1)[0] if store.startswith("VMemKV") else store
+            label = STORE_VARIANT_TO_LABEL.get((base_store, variant))
+            if label is None:
+                continue
+            variants[label] = d.get("forced_events", [])
+        forced_events_data[scenario_key] = variants
+    return forced_events_data
 
 
 def build_reorg_scaling_data(report_dir):
@@ -137,6 +168,7 @@ def build_reorg_scaling_data(report_dir):
             mode = rec["mode"]
             modes.setdefault(mode, []).append({
                 "key_count": rec["key_count"],
+                "ratio": rec.get("ratio"),
                 "elapsed_sec": rec["elapsed_sec"],
                 "timed_out": rec["timed_out"],
             })
@@ -201,6 +233,21 @@ def compute_winners_matrix(raw_data):
     return rows
 
 
+def _badge_for_ratio(ratio):
+    """Matches the 5-tier scheme established by prior reports (e.g. 2026081313): a ±5% band
+    around 1.0x is noise-level ("EVEN", gray); beyond that a weak (pale) or strong (solid,
+    with emoji) WIN/LOSE badge depending on whether the deviation exceeds 15%."""
+    if ratio <= 0.85:
+        return ("❌ LOSE", "bg-rose-600 text-white border-transparent shadow-sm")
+    if ratio < 0.95:
+        return ("LOSE", "bg-rose-50 text-rose-700 border-rose-200")
+    if ratio <= 1.05:
+        return ("≈ EVEN", "bg-slate-100 text-slate-600 border-slate-200")
+    if ratio < 1.15:
+        return ("WIN", "bg-emerald-50 text-emerald-700 border-emerald-200")
+    return ("✅ WIN", "bg-emerald-600 text-white border-transparent shadow-sm")
+
+
 def render_winners_matrix_html(rows):
     workload_display = {
         "Insert": "Insert", "Update": "Update (Zipf)", "Delete": "Delete",
@@ -215,19 +262,36 @@ def render_winners_matrix_html(rows):
                 out.append('<td class="py-3.5 px-4 text-slate-300 text-xs">n/a</td>')
                 continue
             ratio = cell["ratio"]
-            win = ratio >= 1.0
-            badge_class = "bg-emerald-600 text-white border-transparent" if win else "bg-rose-50 text-rose-700 border-rose-100"
-            badge_text = f"✅ WIN ({ratio:.2f}x)" if win else f"⚠️ LOSE ({ratio:.2f}x)"
+            label_text, badge_class = _badge_for_ratio(ratio)
             out.append(f'''<td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border {badge_class} font-bold shadow-sm w-fit">
-      {badge_text}
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border {badge_class} font-bold  w-fit">
+      {label_text} ({ratio:.2f}x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv ({cell["vmemkv_label"]})</span>
     <span class="text-[10px] text-slate-400">vs {cell["rival_label"]}</span>
   </div>
 </td>''')
         out.append("</tr>")
+    return "\n".join(out)
+
+
+def render_reorg_steady_table_html(reorg_data):
+    points = reorg_data.get("1KB_LTM", {}).get("t1t2_steady", [])
+    if not points:
+        return ""
+    out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
+           '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
+           '<th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Steady-state defragment() (churn=0.01)</th>',
+           "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
+    for p in points:
+        status = f'<span class="text-rose-600 font-semibold">≥{p["elapsed_sec"]:.0f}s (timeout)</span>' if p["timed_out"] else f'{p["elapsed_sec"]:.2f}s'
+        ratio_label = f'{p["ratio"]:.0%}' if p["ratio"] is not None else "n/a"
+        out.append(f'<tr><td class="py-2 px-3">{ratio_label}</td><td class="py-2 px-3">{p["key_count"]:,}</td>'
+                    f'<td class="py-2 px-3">{status}</td></tr>')
+    out.append("</tbody></table></div>")
     return "\n".join(out)
 
 
@@ -265,6 +329,7 @@ def main():
 
     raw_data = build_raw_data(args.report_dir)
     timeline_data = build_timeline_data(args.report_dir)
+    forced_events_data = build_forced_events_data(args.report_dir)
     reorg_data = build_reorg_scaling_data(args.report_dir)
     churn_rows = build_churn_scaling_rows(args.report_dir)
     winners_rows = compute_winners_matrix(raw_data)
@@ -282,7 +347,8 @@ def main():
     )
     html = replace_block(
         html, "const timelineData = {", "const reorgScalingData = {",
-        "const timelineData = " + json.dumps(timeline_data, indent=2) + ";\n    "
+        "const timelineData = " + json.dumps(timeline_data, indent=2) + ";\n    " +
+        "const forcedEventsData = " + json.dumps(forced_events_data, indent=2) + ";\n    "
     )
     html = replace_block(
         html, "const reorgScalingData = {", "const workloads =",
@@ -301,6 +367,261 @@ def main():
         "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n      };\n      const datasets = ['t1only', 't1t2'].filter(m => rs[m] && rs[m].length).map(m => {",
         "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n        t1t2_steady: { label: 'T1+T2 steady (reflink/punch)', color: '#059669' },\n      };\n      const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {"
     )
+
+    # reorgLinesPlugin: add a 3rd line style for forced defragment() triggers (previously only
+    # natural + forced-reorganize were drawn; forced defragment triggers at t=10s/25s were silently
+    # never rendered).
+    old_plugin = """    const reorgLinesPlugin = {
+      id: 'reorgLines',
+      afterDraw(chart, _args, opts) {
+        const naturalSecs = opts.reorgSecs || [];
+        const forcedSecs = opts.forcedReorgSecs || [];
+        if (!naturalSecs.length && !forcedSecs.length) return;
+        const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
+        ctx.save();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(99,102,241,0.4)';
+        ctx.setLineDash([5,4]);
+        for (const s of naturalSecs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.strokeStyle = 'rgba(217,119,6,0.55)';
+        ctx.setLineDash([2,3]);
+        for (const s of forcedSecs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.restore();
+      }
+    };
+    Chart.register(reorgLinesPlugin);"""
+    new_plugin = """    const reorgLinesPlugin = {
+      id: 'reorgLines',
+      afterDraw(chart, _args, opts) {
+        const naturalSecs = opts.reorgSecs || [];
+        const forcedReorgSecs = opts.forcedReorgSecs || [];
+        const forcedDefragSecs = opts.forcedDefragSecs || [];
+        if (!naturalSecs.length && !forcedReorgSecs.length && !forcedDefragSecs.length) return;
+        const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
+        ctx.save();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(99,102,241,0.4)';
+        ctx.setLineDash([5,4]);
+        for (const s of naturalSecs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.strokeStyle = 'rgba(217,119,6,0.55)';
+        ctx.setLineDash([2,3]);
+        for (const s of forcedReorgSecs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.strokeStyle = 'rgba(147,51,234,0.6)';
+        ctx.setLineDash([2,3]);
+        for (const s of forcedDefragSecs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.restore();
+      }
+    };
+    Chart.register(reorgLinesPlugin);"""
+    if old_plugin not in html:
+        raise RuntimeError("reorgLinesPlugin template text not found -- template drifted")
+    html = html.replace(old_plugin, new_plugin)
+
+    old_timeline_fn = """    function makeYcsbTimelineConfig(valSizeKey) {
+      const tl = timelineData[valSizeKey];
+      if (!tl || !Object.keys(tl).length) return null;
+      const reorgSecs = [];
+      const forcedReorgSecs = [];
+      for (const data of Object.values(tl)) {
+        data.forEach((d,i) => {
+          if (d.t1_reorg_ops > 0 && !reorgSecs.includes(i+1)) reorgSecs.push(i+1);
+          if (d.t1_forced_reorg_ops > 0 && !forcedReorgSecs.includes(i+1)) forcedReorgSecs.push(i+1);
+        });
+      }
+      reorgSecs.sort((a,b) => a-b);
+      forcedReorgSecs.sort((a,b) => a-b);
+      const datasets = variantOrder.filter(v => tl[v] && tl[v].length).map(v => {
+        const isRocks = rivalStores.includes(v);
+        const col = colors[v] || '#6366f1';
+        return {
+          label: v,
+          data: tl[v].map((d,i) => ({ x: i+1, y: d.scan_ops })),
+          borderColor: col,
+          backgroundColor: 'transparent',
+          borderWidth: isRocks ? 2.5 : 1.8,
+          borderDash: isRocks ? [6,6] : [],
+          tension: 0.25, fill: false,
+          pointStyle: 'circle', pointRadius: 0, pointHoverRadius: 4
+        };
+      });
+      if (!datasets.length) return null;
+      return {
+        type: 'line',
+        data: { datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            reorgLines: { reorgSecs, forcedReorgSecs },
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => {
+                  const s = items[0].raw.x;
+                  let suffix = '';
+                  if (reorgSecs.includes(s)) suffix += '  ⟳ T1 Reorg (natural)';
+                  if (forcedReorgSecs.includes(s)) suffix += '  ⚑ T1 Reorg (forced@15s)';
+                  return `Second ${s}${suffix}`;
+                },
+                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
+              }
+            }
+          },
+          scales: {
+            x: {
+              type: 'linear', min: 1, max: 30,
+              title: { display:true, text:'Elapsed Time (sec)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { stepSize:5, font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            },
+            y: {
+              title: { display:true, text:'Scan Ops / sec', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            }
+          }
+        }
+      };
+    }"""
+    new_timeline_fn = """    function makeYcsbTimelineConfig(valSizeKey) {
+      const tl = timelineData[valSizeKey];
+      if (!tl || !Object.keys(tl).length) return null;
+      const reorgSecs = [];
+      for (const data of Object.values(tl)) {
+        data.forEach((d,i) => {
+          if (d.t1_reorg_ops > 0 && !reorgSecs.includes(i+1)) reorgSecs.push(i+1);
+        });
+      }
+      reorgSecs.sort((a,b) => a-b);
+      // Forced triggers are scheduled at t=5s (reorganize()) / t=10s & t=25s (defragment()), but
+      // under sustained write contention the actual call can be delayed arbitrarily past its
+      // scheduled second -- this is intentionally unguarded (cascading is itself an experiment
+      // result). fired_sec (from forced_events, keyed by kind) is where it actually landed.
+      const forcedReorgSecs = [];
+      const forcedDefragSecs = [];
+      const firedDetail = {};
+      const fe = forcedEventsData[valSizeKey] || {};
+      for (const events of Object.values(fe)) {
+        for (const ev of events) {
+          const s = ev.fired_sec;
+          if (ev.kind === 'reorganize' && !forcedReorgSecs.includes(s)) forcedReorgSecs.push(s);
+          if (ev.kind === 'defragment' && !forcedDefragSecs.includes(s)) forcedDefragSecs.push(s);
+          if (!firedDetail[s]) firedDetail[s] = [];
+          firedDetail[s].push(`${ev.kind}(sched@${ev.scheduled_sec}s, took ${ev.elapsed_sec.toFixed(1)}s)`);
+        }
+      }
+      forcedReorgSecs.sort((a,b) => a-b);
+      forcedDefragSecs.sort((a,b) => a-b);
+      const datasets = variantOrder.filter(v => tl[v] && tl[v].length).map(v => {
+        const isRocks = rivalStores.includes(v);
+        const col = colors[v] || '#6366f1';
+        return {
+          label: v,
+          data: tl[v].map((d,i) => ({ x: i+1, y: d.scan_ops })),
+          borderColor: col,
+          backgroundColor: 'transparent',
+          borderWidth: isRocks ? 2.5 : 1.8,
+          borderDash: isRocks ? [6,6] : [],
+          tension: 0.25, fill: false,
+          pointStyle: 'circle', pointRadius: 0, pointHoverRadius: 4
+        };
+      });
+      if (!datasets.length) return null;
+      return {
+        type: 'line',
+        data: { datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            reorgLines: { reorgSecs, forcedReorgSecs, forcedDefragSecs },
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => {
+                  const s = items[0].raw.x;
+                  let suffix = '';
+                  if (reorgSecs.includes(s)) suffix += '  ⟳ T1 Reorg (natural)';
+                  if (firedDetail[s]) suffix += '  ⚑ ' + firedDetail[s].join(', ');
+                  return `Second ${s}${suffix}`;
+                },
+                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
+              }
+            }
+          },
+          scales: {
+            x: {
+              type: 'linear', min: 1, max: 30,
+              title: { display:true, text:'Elapsed Time (sec)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { stepSize:5, font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            },
+            y: {
+              title: { display:true, text:'Scan Ops / sec', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            }
+          }
+        }
+      };
+    }"""
+    if old_timeline_fn not in html:
+        raise RuntimeError("makeYcsbTimelineConfig template text not found -- template drifted")
+    html = html.replace(old_timeline_fn, new_timeline_fn)
+
+    # Static per-tab captions describing the vertical-line legend (still said "t=15s single
+    # trigger" from the old schedule; now t=5s reorganize() / t=10s+25s defragment(), unguarded).
+    old_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
+          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+        </p>"""
+    new_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
+          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
+          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
+          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
+        </p>"""
+    if old_caption not in html:
+        raise RuntimeError("YCSB-E caption template text not found -- template drifted")
+    if html.count(old_caption) != 4:
+        raise RuntimeError(f"expected 4 YCSB-E caption occurrences, found {html.count(old_caption)}")
+    html = html.replace(old_caption, new_caption)
+
+    # Reorg-scaling caption: mention the new t1t2_steady (reflink/punch) series.
+    old_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
+        </p>"""
+    new_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
+          <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
+        </p>"""
+    if old_reorg_caption not in html:
+        raise RuntimeError("reorg-scaling caption template text not found -- template drifted")
+    if html.count(old_reorg_caption) != 4:
+        raise RuntimeError(f"expected 4 reorg-scaling caption occurrences, found {html.count(old_reorg_caption)}")
+    html = html.replace(old_reorg_caption, new_reorg_caption)
 
     # Header title / links / description.
     old_title = f'<title>VMemKV Performance Charts ({args.template_id})</title>'
@@ -352,10 +673,27 @@ def main():
     tbody_end = html.index("</tbody>", tbody_content_start)
     html = html[:tbody_content_start] + render_winners_matrix_html(winners_rows) + "\n" + html[tbody_end:]
 
-    # Churn-scaling table: insert as a new section right after the Winners Matrix section closes.
+    # New-experiment summary sections: insert right after the Winners Matrix section closes.
     churn_html = render_churn_table_html(churn_rows)
+    reorg_steady_html = render_reorg_steady_table_html(reorg_data)
+    new_sections = ""
+    if reorg_steady_html:
+        new_sections += f'''
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-emerald-50 text-emerald-600 rounded-lg">
+            <i data-lucide="git-commit" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff)) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the older T1-only/T1+T2(full-copy) sweep for comparison.</p>
+          </div>
+        </div>
+        {reorg_steady_html}
+      </section>
+'''
     if churn_html:
-        churn_section = f'''
+        new_sections += f'''
       <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
@@ -369,8 +707,9 @@ def main():
         {churn_html}
       </section>
 '''
+    if new_sections:
         summary_section_marker = html.index('<div id="tab-summary" class="tab-content active space-y-8">') + len('<div id="tab-summary" class="tab-content active space-y-8">')
-        html = html[:summary_section_marker] + churn_section + html[summary_section_marker:]
+        html = html[:summary_section_marker] + new_sections + html[summary_section_marker:]
 
     args.out.write_text(html)
     print(f"Wrote {args.out} ({len(html)} bytes)")

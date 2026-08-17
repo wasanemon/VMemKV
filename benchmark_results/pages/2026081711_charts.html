@@ -52,7 +52,7 @@
           <a href="../2026081711/churn_scaling_ltm_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Churn Scaling, LTM 1KB spot check)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl">この4並列ラウンドは <code class="bg-slate-100 px-1 rounded text-xs">--without-rivals</code> モードで VMemKV の4バリアント(Baseline/+BF/+Inline/+Prefault)のみを実測し、RocksDB/RocksDB-BlobDB/LMDBの数値は直近の<a href="2026081313_charts.html" class="text-indigo-600 hover:underline">08/13</a>フルランから再利用してマージした(rivalコードは無変更のため数値は不変という前提)。本ラウンドの主な検証対象は、<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>/<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>をreflink clone + hole punchで統一した再設計と、実測で発見・修正した3件の独立したライブロック(<code class="bg-slate-100 px-1 rounded text-xs">run_reorganize()</code>の自己競合ループ、<code class="bg-slate-100 px-1 rounded text-xs">acquire_write_handle()</code>のバックオフ無しリトライストーム、<code class="bg-slate-100 px-1 rounded text-xs">Wal::drain_pending()</code>のLSN追いかけっこ)を、32並列スレッドという実際の高並行度の下で正しく機能することを検証すること。既存のIn-Memory/LTM×8B/1KB/64KBマトリクスに加え、新たに2つの実験を追加: (1) Churn-Ratio Scaling — 固定コーパス(8M件, in_memory/1KB)に対する churn 率(直近世代からの変更割合)を振って定常状態の <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> 所要時間を測定したところ、churn_ratio &gt;= 0.05 で60秒のハードキャップに到達(タイムアウト)することが判明——O(diff)設計でも、変更量そのものが大きければコストは避けられないという妥当な結果。(2) Corpus-Size Invariance across Generations — コーパスサイズを振って定常状態の<code class="bg-slate-100 px-1 rounded text-xs">t1t2_steady</code>所要時間をT1-only/T1+T2(フルコピー)と比較(Reorg Scalingタブのチャートに緑の第3系列として表示)。</p>
+      <p class="text-slate-500 text-sm max-w-3xl">この4並列ラウンドは <code class="bg-slate-100 px-1 rounded text-xs">--without-rivals</code> モードで VMemKV の4バリアント(Baseline/+BF/+Inline/+Prefault)のみを実測し、RocksDB/RocksDB-BlobDB/LMDBの数値は直近の<a href="2026081313_charts.html" class="text-indigo-600 hover:underline">08/13</a>フルランから再利用してマージした(rivalコードは無変更のため数値は不変という前提)。本ラウンドの主な検証対象は、<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>/<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>をreflink clone + hole punchで統一した再設計と、実測で発見・修正した3件の独立したライブロック(<code class="bg-slate-100 px-1 rounded text-xs">run_reorganize()</code>の自己競合ループ、<code class="bg-slate-100 px-1 rounded text-xs">acquire_write_handle()</code>のバックオフ無しリトライストーム、<code class="bg-slate-100 px-1 rounded text-xs">Wal::drain_pending()</code>のLSN追いかけっこ)を、32並列スレッドという実際の高並行度の下で正しく機能することを検証すること。既存のIn-Memory/LTM×8B/1KB/64KBマトリクスに加え、新たに2つの実験を追加: (1) Churn-Ratio Scaling — 固定コーパス(8M件, in_memory/1KB)に対する churn 率(直近世代からの変更割合)を振って定常状態の <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> 所要時間を測定したところ、churn_ratio &gt;= 0.05 で60秒のハードキャップに到達(タイムアウト)することが判明——O(diff)設計でも、変更量そのものが大きければコストは避けられないという妥当な結果。(2) Corpus-Size Invariance across Generations — コーパスサイズを振って定常状態の<code class="bg-slate-100 px-1 rounded text-xs">t1t2_steady</code>所要時間をT1-only/T1+T2(フルコピー)と比較(Reorg Scalingタブのチャートに緑の第3系列として表示、Summaryタブにもテーブルで掲載)。また、YCSB-Eの強制トリガースケジュールをt=15秒の単発から t=5秒(reorganize)/t=10秒・t=25秒(defragment)の3段階へ改訂——将棋倒し(スケジュールされた秒に対する実発火の遅延)へのガードを意図的に入れておらず、書き込み負荷次第で実発火が数十秒遅延する挙動も観測された(詳細はYCSB-Eタブのチャート凡例・ツールチップを参照)。</p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -117,6 +117,29 @@
     <div id="tab-summary" class="tab-content active space-y-8">
       <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
+          <div class="p-2 bg-emerald-50 text-emerald-600 rounded-lg">
+            <i data-lucide="git-commit" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff)) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the older T1-only/T1+T2(full-copy) sweep for comparison.</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th>
+<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>
+<th class="py-2 px-3 font-bold text-slate-700">Steady-state defragment() (churn=0.01)</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,064,888</td><td class="py-2 px-3">9.78s</td></tr>
+<tr><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,129,776</td><td class="py-2 px-3">20.85s</td></tr>
+<tr><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,194,664</td><td class="py-2 px-3">27.12s</td></tr>
+<tr><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">46.94s</td></tr>
+</tbody></table></div>
+      </section>
+
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
           <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
             <i data-lucide="activity" class="w-6 h-6"></i>
           </div>
@@ -168,7 +191,7 @@
 <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Insert</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.36x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -177,7 +200,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.46x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -186,7 +209,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.45x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
@@ -195,7 +218,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (2.47x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
@@ -206,7 +229,7 @@
 <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Update (Zipf)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.29x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
@@ -215,7 +238,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.45x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
@@ -224,7 +247,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.97x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -233,7 +256,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (3.19x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
@@ -244,7 +267,7 @@
 <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Delete</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.39x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
@@ -253,7 +276,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.47x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+BF)</span>
@@ -262,7 +285,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.52x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
@@ -271,7 +294,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (3.14x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -282,7 +305,7 @@
 <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Miss)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (2.71x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -291,7 +314,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (3.06x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -300,7 +323,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (2.80x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -309,7 +332,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (2.56x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -320,7 +343,7 @@
 <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Hit, Zipf)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.39x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -329,7 +352,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.19x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
@@ -338,8 +361,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
-      ⚠️ LOSE (0.59x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold  w-fit">
+      ❌ LOSE (0.59x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
     <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
@@ -347,7 +370,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.27x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
@@ -358,8 +381,8 @@
 <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Get (Hit, Uniform)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
-      ✅ WIN (1.11x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold  w-fit">
+      WIN (1.11x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
     <span class="text-[10px] text-slate-400">vs LMDB</span>
@@ -367,8 +390,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
-      ✅ WIN (1.14x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold  w-fit">
+      WIN (1.14x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
     <span class="text-[10px] text-slate-400">vs LMDB</span>
@@ -376,8 +399,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
-      ⚠️ LOSE (0.80x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold  w-fit">
+      ❌ LOSE (0.80x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
     <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
@@ -385,8 +408,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
-      ✅ WIN (1.02x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-slate-100 text-slate-600 border-slate-200 font-bold  w-fit">
+      ≈ EVEN (1.02x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
     <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
@@ -396,8 +419,8 @@
 <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (Zipf)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
-      ⚠️ LOSE (0.83x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold  w-fit">
+      ❌ LOSE (0.83x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
     <span class="text-[10px] text-slate-400">vs LMDB</span>
@@ -405,8 +428,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
-      ✅ WIN (1.04x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-slate-100 text-slate-600 border-slate-200 font-bold  w-fit">
+      ≈ EVEN (1.04x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
     <span class="text-[10px] text-slate-400">vs LMDB</span>
@@ -414,8 +437,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
-      ⚠️ LOSE (0.99x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-slate-100 text-slate-600 border-slate-200 font-bold  w-fit">
+      ≈ EVEN (0.99x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (Baseline)</span>
     <span class="text-[10px] text-slate-400">vs RocksDB</span>
@@ -423,8 +446,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
-      ✅ WIN (1.09x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold  w-fit">
+      WIN (1.09x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
     <span class="text-[10px] text-slate-400">vs LMDB</span>
@@ -434,8 +457,8 @@
 <tr class="hover:bg-indigo-50/10 transition-colors"><td class="py-3.5 px-4 font-bold text-slate-800 bg-slate-50/20">Scan (Uniform)</td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
-      ⚠️ LOSE (0.86x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-200 font-bold  w-fit">
+      LOSE (0.86x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
     <span class="text-[10px] text-slate-400">vs LMDB</span>
@@ -443,8 +466,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
-      ✅ WIN (1.11x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold  w-fit">
+      WIN (1.11x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
     <span class="text-[10px] text-slate-400">vs LMDB</span>
@@ -452,7 +475,7 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent font-bold shadow-sm w-fit">
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-600 text-white border-transparent shadow-sm font-bold  w-fit">
       ✅ WIN (1.38x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Prefault)</span>
@@ -461,8 +484,8 @@
 </td>
 <td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-50 text-rose-700 border-rose-100 font-bold shadow-sm w-fit">
-      ⚠️ LOSE (0.96x)
+    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-slate-100 text-slate-600 border-slate-200 font-bold  w-fit">
+      ≈ EVEN (0.96x)
     </span>
     <span class="text-[11px] text-slate-500 font-medium">vmemkv (+Inline)</span>
     <span class="text-[10px] text-slate-400">vs RocksDB-BlobDB</span>
@@ -652,7 +675,9 @@
         <p class="text-sm text-slate-500">
           YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
           <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
+          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
+          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -674,7 +699,7 @@
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -815,7 +840,9 @@
         <p class="text-sm text-slate-500">
           YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
           <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
+          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
+          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -837,7 +864,7 @@
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -978,7 +1005,9 @@
         <p class="text-sm text-slate-500">
           YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
           <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
+          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
+          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -1000,7 +1029,7 @@
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -1141,7 +1170,9 @@
         <p class="text-sm text-slate-500">
           YCSB-E ワークロード: 95% Scan(100件レンジスキャン)+ 5% Insert を 32スレッドで 30秒間実行。
           <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
+          <strong class="text-amber-600">橙色の点線</strong>: t=5秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>。
+          <strong class="text-purple-600">紫色の点線</strong>: t=10秒・t=25秒時点で強制実行される<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。
+          いずれも実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。カーソルを線に合わせると予定秒/実発火秒/所要時間を表示。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -1163,7 +1194,7 @@
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
+          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2(フルコピー、旧設計)、<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(reflink clone + hole punch、新設計、churn_ratio=0.01でのコーパスサイズ不変性実験。1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -4420,30 +4451,5725 @@
       }
     ]
   },
-  "1KB_In-Memory": {},
-  "1KB_LTM": {},
-  "64KB_LTM": {}
+  "1KB_In-Memory": {
+    "RocksDB": [
+      {
+        "sec": 1,
+        "scan_ops": 132173,
+        "insert_ops": 6962,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 132616,
+        "insert_ops": 7089,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 131680,
+        "insert_ops": 6986,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 133659,
+        "insert_ops": 6926,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 132728,
+        "insert_ops": 7044,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 133892,
+        "insert_ops": 6951,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 133335,
+        "insert_ops": 7009,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 132305,
+        "insert_ops": 6894,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 133176,
+        "insert_ops": 7050,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 132490,
+        "insert_ops": 6929,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 134471,
+        "insert_ops": 7028,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 133535,
+        "insert_ops": 7039,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 133112,
+        "insert_ops": 7004,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 132954,
+        "insert_ops": 7020,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 131346,
+        "insert_ops": 6960,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 132353,
+        "insert_ops": 7022,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 134383,
+        "insert_ops": 6972,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 132795,
+        "insert_ops": 7056,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 133217,
+        "insert_ops": 6966,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 131550,
+        "insert_ops": 6964,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 132566,
+        "insert_ops": 6837,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 132564,
+        "insert_ops": 6978,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 131627,
+        "insert_ops": 7037,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 132551,
+        "insert_ops": 6912,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 132699,
+        "insert_ops": 7079,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 131638,
+        "insert_ops": 7044,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 130643,
+        "insert_ops": 6972,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 132690,
+        "insert_ops": 6942,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 131601,
+        "insert_ops": 6863,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 133179,
+        "insert_ops": 7196,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "+BF": [
+      {
+        "sec": 1,
+        "scan_ops": 231153,
+        "insert_ops": 12213,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 225707,
+        "insert_ops": 11939,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 216389,
+        "insert_ops": 11387,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 232908,
+        "insert_ops": 12168,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 219889,
+        "insert_ops": 11599,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 226225,
+        "insert_ops": 11881,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 230240,
+        "insert_ops": 12013,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 2,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 224966,
+        "insert_ops": 11823,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 124068,
+        "insert_ops": 6614,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 16276,
+        "insert_ops": 904,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 152037,
+        "insert_ops": 8016,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 76039,
+        "insert_ops": 3976,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 104671,
+        "insert_ops": 5514,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 3,
+        "t2_forced_reorg_ops": 2
+      },
+      {
+        "sec": 16,
+        "scan_ops": 197515,
+        "insert_ops": 10293,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 212175,
+        "insert_ops": 11157,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 216586,
+        "insert_ops": 11319,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 226928,
+        "insert_ops": 12086,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 219427,
+        "insert_ops": 11550,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 229942,
+        "insert_ops": 12287,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 223110,
+        "insert_ops": 11684,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 89756,
+        "insert_ops": 4771,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 53585,
+        "insert_ops": 2903,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 176230,
+        "insert_ops": 9467,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 173329,
+        "insert_ops": 9197,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 27526,
+        "insert_ops": 1499,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 170463,
+        "insert_ops": 8972,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 3,
+        "t2_forced_reorg_ops": 2
+      }
+    ],
+    "RocksDB-BlobDB": [
+      {
+        "sec": 1,
+        "scan_ops": 20094,
+        "insert_ops": 1017,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 20253,
+        "insert_ops": 1121,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 20321,
+        "insert_ops": 1136,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 20131,
+        "insert_ops": 964,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 20206,
+        "insert_ops": 1066,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 20095,
+        "insert_ops": 1062,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 20287,
+        "insert_ops": 1035,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 20229,
+        "insert_ops": 1068,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 20311,
+        "insert_ops": 1066,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 20268,
+        "insert_ops": 1103,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 20227,
+        "insert_ops": 1142,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 20208,
+        "insert_ops": 1063,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 20226,
+        "insert_ops": 1096,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 20227,
+        "insert_ops": 1053,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 20176,
+        "insert_ops": 1054,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 20082,
+        "insert_ops": 1088,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 20186,
+        "insert_ops": 1053,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 20143,
+        "insert_ops": 1080,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 20088,
+        "insert_ops": 1088,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 20299,
+        "insert_ops": 1108,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 20242,
+        "insert_ops": 999,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 20365,
+        "insert_ops": 1032,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 20243,
+        "insert_ops": 1098,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 20342,
+        "insert_ops": 1057,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 20162,
+        "insert_ops": 1076,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 20181,
+        "insert_ops": 1008,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 20150,
+        "insert_ops": 1063,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 20242,
+        "insert_ops": 1033,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 20171,
+        "insert_ops": 1086,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 20336,
+        "insert_ops": 1077,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "+Prefault": [
+      {
+        "sec": 1,
+        "scan_ops": 232454,
+        "insert_ops": 12288,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 226720,
+        "insert_ops": 11998,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 221499,
+        "insert_ops": 11643,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 233866,
+        "insert_ops": 12246,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 220067,
+        "insert_ops": 11547,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 225457,
+        "insert_ops": 11797,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 232367,
+        "insert_ops": 12182,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 2,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 221516,
+        "insert_ops": 11661,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 68104,
+        "insert_ops": 3594,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 47876,
+        "insert_ops": 2569,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 223480,
+        "insert_ops": 11877,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 121066,
+        "insert_ops": 6296,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 15564,
+        "insert_ops": 836,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 208363,
+        "insert_ops": 10848,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 3,
+        "t2_forced_reorg_ops": 2
+      },
+      {
+        "sec": 29,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      }
+    ],
+    "+Inline": [
+      {
+        "sec": 1,
+        "scan_ops": 230364,
+        "insert_ops": 12178,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 225825,
+        "insert_ops": 11917,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 220082,
+        "insert_ops": 11599,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 234171,
+        "insert_ops": 12227,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 218704,
+        "insert_ops": 11535,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 226263,
+        "insert_ops": 11851,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 233788,
+        "insert_ops": 12244,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 2,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 223088,
+        "insert_ops": 11701,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 63626,
+        "insert_ops": 3391,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 62658,
+        "insert_ops": 3342,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 181115,
+        "insert_ops": 9618,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 13446,
+        "insert_ops": 648,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 6220,
+        "insert_ops": 354,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 157306,
+        "insert_ops": 8281,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 3,
+        "t2_forced_reorg_ops": 2
+      },
+      {
+        "sec": 16,
+        "scan_ops": 208729,
+        "insert_ops": 10921,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 212535,
+        "insert_ops": 11152,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 224789,
+        "insert_ops": 11817,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 223820,
+        "insert_ops": 11744,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 219585,
+        "insert_ops": 11683,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 229735,
+        "insert_ops": 12252,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 209712,
+        "insert_ops": 10955,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 600,
+        "insert_ops": 27,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 138168,
+        "insert_ops": 7491,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 1,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 197360,
+        "insert_ops": 10566,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 69611,
+        "insert_ops": 3594,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 90837,
+        "insert_ops": 4924,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 2,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 30,
+        "scan_ops": 194889,
+        "insert_ops": 10199,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      }
+    ],
+    "Baseline": [
+      {
+        "sec": 1,
+        "scan_ops": 231643,
+        "insert_ops": 12247,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 225056,
+        "insert_ops": 11901,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 219493,
+        "insert_ops": 11548,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 231227,
+        "insert_ops": 12061,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 216785,
+        "insert_ops": 11454,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 226607,
+        "insert_ops": 11843,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 2,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 232289,
+        "insert_ops": 12174,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 221642,
+        "insert_ops": 11644,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 9747,
+        "insert_ops": 447,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 108158,
+        "insert_ops": 5820,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 112888,
+        "insert_ops": 5977,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 84301,
+        "insert_ops": 4519,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 3,
+        "t2_forced_reorg_ops": 2
+      },
+      {
+        "sec": 15,
+        "scan_ops": 192738,
+        "insert_ops": 10028,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 210015,
+        "insert_ops": 11062,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 218430,
+        "insert_ops": 11472,
+        "t1_reorg_ops": 2,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 226326,
+        "insert_ops": 11949,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 217345,
+        "insert_ops": 11339,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 232596,
+        "insert_ops": 12379,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 218049,
+        "insert_ops": 11653,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 69507,
+        "insert_ops": 3528,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 80077,
+        "insert_ops": 4289,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 1,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 187007,
+        "insert_ops": 9980,
+        "t1_reorg_ops": 1,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 204929,
+        "insert_ops": 10928,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 16831,
+        "insert_ops": 897,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 163202,
+        "insert_ops": 8728,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 30,
+        "scan_ops": 206782,
+        "insert_ops": 10885,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      }
+    ],
+    "LMDB": [
+      {
+        "sec": 1,
+        "scan_ops": 38561,
+        "insert_ops": 2044,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 61798,
+        "insert_ops": 3220,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 66426,
+        "insert_ops": 3459,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 66817,
+        "insert_ops": 3623,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 69745,
+        "insert_ops": 3707,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 70890,
+        "insert_ops": 3753,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 72138,
+        "insert_ops": 3765,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 72650,
+        "insert_ops": 3779,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 72950,
+        "insert_ops": 3815,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 71769,
+        "insert_ops": 3857,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 74167,
+        "insert_ops": 3885,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 75547,
+        "insert_ops": 3872,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 73801,
+        "insert_ops": 3898,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 72346,
+        "insert_ops": 3802,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 75050,
+        "insert_ops": 3897,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 71914,
+        "insert_ops": 3879,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 73789,
+        "insert_ops": 3810,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 73266,
+        "insert_ops": 3885,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 74157,
+        "insert_ops": 3882,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 72372,
+        "insert_ops": 3806,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 73032,
+        "insert_ops": 3782,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 73336,
+        "insert_ops": 3887,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 72890,
+        "insert_ops": 3835,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 72809,
+        "insert_ops": 3824,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 73300,
+        "insert_ops": 3857,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 73351,
+        "insert_ops": 3836,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 72784,
+        "insert_ops": 3867,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 72409,
+        "insert_ops": 3854,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 71926,
+        "insert_ops": 3865,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 72738,
+        "insert_ops": 3808,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ]
+  },
+  "1KB_LTM": {
+    "Baseline": [
+      {
+        "sec": 1,
+        "scan_ops": 71218,
+        "insert_ops": 3765,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 76271,
+        "insert_ops": 3962,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 74946,
+        "insert_ops": 4031,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 75155,
+        "insert_ops": 3987,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 74232,
+        "insert_ops": 3943,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 35475,
+        "insert_ops": 1904,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 55144,
+        "insert_ops": 2838,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 60010,
+        "insert_ops": 3117,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 65216,
+        "insert_ops": 3462,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 56401,
+        "insert_ops": 3030,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 43137,
+        "insert_ops": 2248,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 73682,
+        "insert_ops": 3845,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 80845,
+        "insert_ops": 4235,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 77117,
+        "insert_ops": 4086,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 87430,
+        "insert_ops": 4496,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 77460,
+        "insert_ops": 4161,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 45432,
+        "insert_ops": 2425,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 64509,
+        "insert_ops": 3316,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 57296,
+        "insert_ops": 3029,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 43411,
+        "insert_ops": 2220,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 72569,
+        "insert_ops": 3776,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 79689,
+        "insert_ops": 4236,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 76971,
+        "insert_ops": 4086,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 73354,
+        "insert_ops": 3833,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 71596,
+        "insert_ops": 3679,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 85661,
+        "insert_ops": 4552,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 65765,
+        "insert_ops": 3524,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 51279,
+        "insert_ops": 2701,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 74485,
+        "insert_ops": 3974,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 68323,
+        "insert_ops": 3604,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 4,
+        "t2_forced_reorg_ops": 1
+      }
+    ],
+    "LMDB": [
+      {
+        "sec": 1,
+        "scan_ops": 29948,
+        "insert_ops": 1578,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 32640,
+        "insert_ops": 1760,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 33009,
+        "insert_ops": 1677,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 32958,
+        "insert_ops": 1721,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 33118,
+        "insert_ops": 1737,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 32057,
+        "insert_ops": 1689,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 32378,
+        "insert_ops": 1796,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 32985,
+        "insert_ops": 1769,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 29508,
+        "insert_ops": 1544,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 29541,
+        "insert_ops": 1576,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 28723,
+        "insert_ops": 1532,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 29056,
+        "insert_ops": 1518,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 28431,
+        "insert_ops": 1553,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 28489,
+        "insert_ops": 1420,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 28573,
+        "insert_ops": 1494,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 28518,
+        "insert_ops": 1547,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 28400,
+        "insert_ops": 1437,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 28381,
+        "insert_ops": 1472,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 28761,
+        "insert_ops": 1517,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 28605,
+        "insert_ops": 1531,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 28617,
+        "insert_ops": 1565,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 27727,
+        "insert_ops": 1452,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 28164,
+        "insert_ops": 1480,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 28441,
+        "insert_ops": 1444,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 28179,
+        "insert_ops": 1461,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 28527,
+        "insert_ops": 1517,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 28957,
+        "insert_ops": 1497,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 29156,
+        "insert_ops": 1523,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 28216,
+        "insert_ops": 1477,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 27986,
+        "insert_ops": 1503,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "+Inline": [
+      {
+        "sec": 1,
+        "scan_ops": 77562,
+        "insert_ops": 4061,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 75939,
+        "insert_ops": 3988,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 75535,
+        "insert_ops": 4066,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 75154,
+        "insert_ops": 3983,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 74014,
+        "insert_ops": 3944,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 35569,
+        "insert_ops": 1890,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 51381,
+        "insert_ops": 2686,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 66338,
+        "insert_ops": 3418,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 59343,
+        "insert_ops": 3152,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 46208,
+        "insert_ops": 2512,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 67567,
+        "insert_ops": 3485,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 83022,
+        "insert_ops": 4312,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 79658,
+        "insert_ops": 4231,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 75791,
+        "insert_ops": 3972,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 71650,
+        "insert_ops": 3681,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 65821,
+        "insert_ops": 3544,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 77052,
+        "insert_ops": 4063,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 87610,
+        "insert_ops": 4563,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 87742,
+        "insert_ops": 4603,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 72662,
+        "insert_ops": 3752,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 49838,
+        "insert_ops": 2679,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 77090,
+        "insert_ops": 4051,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 73639,
+        "insert_ops": 3886,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 69823,
+        "insert_ops": 3628,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 65251,
+        "insert_ops": 3433,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 62261,
+        "insert_ops": 3292,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 56530,
+        "insert_ops": 3029,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 47810,
+        "insert_ops": 2519,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 69400,
+        "insert_ops": 3670,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 69265,
+        "insert_ops": 3692,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 3,
+        "t2_forced_reorg_ops": 1
+      }
+    ],
+    "+BF": [
+      {
+        "sec": 1,
+        "scan_ops": 75522,
+        "insert_ops": 3974,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 74557,
+        "insert_ops": 3891,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 73731,
+        "insert_ops": 3963,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 73880,
+        "insert_ops": 3936,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 72733,
+        "insert_ops": 3839,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 36373,
+        "insert_ops": 1964,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 50559,
+        "insert_ops": 2607,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 67376,
+        "insert_ops": 3508,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 61987,
+        "insert_ops": 3279,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 52199,
+        "insert_ops": 2860,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 52439,
+        "insert_ops": 2692,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 78703,
+        "insert_ops": 4125,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 76048,
+        "insert_ops": 3944,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 72141,
+        "insert_ops": 3823,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 88785,
+        "insert_ops": 4583,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 48262,
+        "insert_ops": 2610,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 68916,
+        "insert_ops": 3663,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 69895,
+        "insert_ops": 3634,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 65957,
+        "insert_ops": 3455,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 59423,
+        "insert_ops": 3159,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 52672,
+        "insert_ops": 2647,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 55337,
+        "insert_ops": 2921,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 71412,
+        "insert_ops": 3819,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 66007,
+        "insert_ops": 3433,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 61554,
+        "insert_ops": 3245,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 54732,
+        "insert_ops": 2806,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 42103,
+        "insert_ops": 2222,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 71663,
+        "insert_ops": 3801,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 85853,
+        "insert_ops": 4545,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 83315,
+        "insert_ops": 4455,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 3,
+        "t2_forced_reorg_ops": 1
+      }
+    ],
+    "RocksDB-BlobDB": [
+      {
+        "sec": 1,
+        "scan_ops": 20911,
+        "insert_ops": 1061,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 23123,
+        "insert_ops": 1246,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 22949,
+        "insert_ops": 1254,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 22598,
+        "insert_ops": 1113,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 22829,
+        "insert_ops": 1207,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 22722,
+        "insert_ops": 1234,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 22753,
+        "insert_ops": 1164,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 22771,
+        "insert_ops": 1179,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 22964,
+        "insert_ops": 1255,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 22764,
+        "insert_ops": 1270,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 22509,
+        "insert_ops": 1210,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 22743,
+        "insert_ops": 1198,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 22556,
+        "insert_ops": 1208,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 22342,
+        "insert_ops": 1148,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 22607,
+        "insert_ops": 1217,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 22527,
+        "insert_ops": 1191,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 22280,
+        "insert_ops": 1201,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 22623,
+        "insert_ops": 1196,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 22675,
+        "insert_ops": 1123,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 22661,
+        "insert_ops": 1211,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 22608,
+        "insert_ops": 1233,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 22517,
+        "insert_ops": 1173,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 22432,
+        "insert_ops": 1125,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 21994,
+        "insert_ops": 1129,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 22518,
+        "insert_ops": 1156,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 22301,
+        "insert_ops": 1195,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 22633,
+        "insert_ops": 1226,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 22640,
+        "insert_ops": 1258,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 22471,
+        "insert_ops": 1169,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 22653,
+        "insert_ops": 1201,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "RocksDB": [
+      {
+        "sec": 1,
+        "scan_ops": 61410,
+        "insert_ops": 3271,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 69013,
+        "insert_ops": 3581,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 69598,
+        "insert_ops": 3661,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 69810,
+        "insert_ops": 3776,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 70828,
+        "insert_ops": 3746,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 71178,
+        "insert_ops": 3791,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 70451,
+        "insert_ops": 3698,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 71320,
+        "insert_ops": 3677,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 71082,
+        "insert_ops": 3773,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 70804,
+        "insert_ops": 3755,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 71724,
+        "insert_ops": 3706,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 72262,
+        "insert_ops": 3792,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 72031,
+        "insert_ops": 3816,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 72226,
+        "insert_ops": 3718,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 72182,
+        "insert_ops": 3743,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 65074,
+        "insert_ops": 3523,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 73903,
+        "insert_ops": 3870,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 74663,
+        "insert_ops": 3883,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 74542,
+        "insert_ops": 3957,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 73982,
+        "insert_ops": 3815,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 74854,
+        "insert_ops": 3972,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 74549,
+        "insert_ops": 3901,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 74911,
+        "insert_ops": 3999,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 75360,
+        "insert_ops": 3870,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 74487,
+        "insert_ops": 3916,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 75067,
+        "insert_ops": 3991,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 74857,
+        "insert_ops": 3985,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 74711,
+        "insert_ops": 3987,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 75216,
+        "insert_ops": 3966,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 75318,
+        "insert_ops": 3928,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "+Prefault": [
+      {
+        "sec": 1,
+        "scan_ops": 75052,
+        "insert_ops": 3949,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 70313,
+        "insert_ops": 3653,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 66162,
+        "insert_ops": 3531,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 73279,
+        "insert_ops": 3951,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 78536,
+        "insert_ops": 4154,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 49302,
+        "insert_ops": 2639,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 68839,
+        "insert_ops": 3627,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 42394,
+        "insert_ops": 2139,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 76732,
+        "insert_ops": 4076,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 74531,
+        "insert_ops": 3962,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 72133,
+        "insert_ops": 3738,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 67958,
+        "insert_ops": 3541,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 62803,
+        "insert_ops": 3343,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 56997,
+        "insert_ops": 3000,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 58255,
+        "insert_ops": 2970,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 66365,
+        "insert_ops": 3554,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 60429,
+        "insert_ops": 3223,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 46766,
+        "insert_ops": 2442,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 86625,
+        "insert_ops": 4472,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 79719,
+        "insert_ops": 4181,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 42962,
+        "insert_ops": 2231,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 69776,
+        "insert_ops": 3670,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 63525,
+        "insert_ops": 3400,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 53533,
+        "insert_ops": 2826,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 72096,
+        "insert_ops": 3697,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 68062,
+        "insert_ops": 3560,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 64007,
+        "insert_ops": 3374,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 56107,
+        "insert_ops": 3003,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 44844,
+        "insert_ops": 2432,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 72534,
+        "insert_ops": 3806,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 4,
+        "t2_forced_reorg_ops": 1
+      }
+    ]
+  },
+  "64KB_LTM": {
+    "+BF": [
+      {
+        "sec": 1,
+        "scan_ops": 2475,
+        "insert_ops": 114,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 2570,
+        "insert_ops": 146,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 2711,
+        "insert_ops": 137,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 2573,
+        "insert_ops": 129,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 2765,
+        "insert_ops": 142,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 2535,
+        "insert_ops": 123,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 2624,
+        "insert_ops": 122,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 2584,
+        "insert_ops": 140,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 2555,
+        "insert_ops": 145,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 2646,
+        "insert_ops": 158,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 2490,
+        "insert_ops": 141,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1769,
+        "insert_ops": 92,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 1303,
+        "insert_ops": 95,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 14,
+        "scan_ops": 2574,
+        "insert_ops": 124,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 2673,
+        "insert_ops": 135,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 2615,
+        "insert_ops": 134,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 2565,
+        "insert_ops": 127,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 2587,
+        "insert_ops": 137,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 2625,
+        "insert_ops": 153,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 2374,
+        "insert_ops": 144,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 2506,
+        "insert_ops": 124,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 2293,
+        "insert_ops": 125,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 2370,
+        "insert_ops": 150,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 2234,
+        "insert_ops": 117,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 2321,
+        "insert_ops": 112,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 2410,
+        "insert_ops": 142,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 2379,
+        "insert_ops": 108,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 1202,
+        "insert_ops": 67,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 29,
+        "scan_ops": 2561,
+        "insert_ops": 136,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 2680,
+        "insert_ops": 123,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      }
+    ],
+    "RocksDB": [
+      {
+        "sec": 1,
+        "scan_ops": 2130,
+        "insert_ops": 99,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 2060,
+        "insert_ops": 108,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 2376,
+        "insert_ops": 122,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 2341,
+        "insert_ops": 117,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 2362,
+        "insert_ops": 131,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 2497,
+        "insert_ops": 120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 2254,
+        "insert_ops": 110,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 2392,
+        "insert_ops": 123,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 2344,
+        "insert_ops": 121,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 2344,
+        "insert_ops": 136,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 2368,
+        "insert_ops": 126,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 2283,
+        "insert_ops": 136,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 2375,
+        "insert_ops": 155,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 2398,
+        "insert_ops": 119,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 2330,
+        "insert_ops": 130,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 2321,
+        "insert_ops": 114,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 2388,
+        "insert_ops": 126,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 2320,
+        "insert_ops": 106,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 2376,
+        "insert_ops": 118,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 2279,
+        "insert_ops": 127,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 2346,
+        "insert_ops": 142,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 2380,
+        "insert_ops": 129,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 2311,
+        "insert_ops": 129,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 2258,
+        "insert_ops": 148,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 2345,
+        "insert_ops": 125,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 2237,
+        "insert_ops": 103,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 2296,
+        "insert_ops": 116,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 2353,
+        "insert_ops": 140,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 2368,
+        "insert_ops": 103,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 2316,
+        "insert_ops": 126,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "+Prefault": [
+      {
+        "sec": 1,
+        "scan_ops": 2368,
+        "insert_ops": 109,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 2518,
+        "insert_ops": 141,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 2743,
+        "insert_ops": 142,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 2634,
+        "insert_ops": 128,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 2725,
+        "insert_ops": 141,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 2571,
+        "insert_ops": 124,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 2548,
+        "insert_ops": 127,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 2632,
+        "insert_ops": 131,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 2564,
+        "insert_ops": 160,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 2588,
+        "insert_ops": 137,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 2511,
+        "insert_ops": 155,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1917,
+        "insert_ops": 92,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 57,
+        "insert_ops": 1,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 1240,
+        "insert_ops": 68,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 29,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 0,
+        "insert_ops": 0,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      }
+    ],
+    "Baseline": [
+      {
+        "sec": 1,
+        "scan_ops": 2466,
+        "insert_ops": 114,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 2554,
+        "insert_ops": 141,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 2707,
+        "insert_ops": 136,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 2632,
+        "insert_ops": 136,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 2727,
+        "insert_ops": 138,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 2563,
+        "insert_ops": 125,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 2607,
+        "insert_ops": 126,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 2616,
+        "insert_ops": 141,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 2565,
+        "insert_ops": 146,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 2563,
+        "insert_ops": 146,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 2481,
+        "insert_ops": 154,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1573,
+        "insert_ops": 69,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 2138,
+        "insert_ops": 140,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 14,
+        "scan_ops": 2537,
+        "insert_ops": 129,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 2628,
+        "insert_ops": 120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 2663,
+        "insert_ops": 141,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 2570,
+        "insert_ops": 125,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 2317,
+        "insert_ops": 134,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 2439,
+        "insert_ops": 143,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 2333,
+        "insert_ops": 130,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 2459,
+        "insert_ops": 130,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 2257,
+        "insert_ops": 120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 2374,
+        "insert_ops": 147,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 2271,
+        "insert_ops": 113,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 2258,
+        "insert_ops": 117,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 2333,
+        "insert_ops": 140,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 2334,
+        "insert_ops": 112,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 1304,
+        "insert_ops": 28,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 1635,
+        "insert_ops": 129,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 30,
+        "scan_ops": 2651,
+        "insert_ops": 122,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      }
+    ],
+    "+Inline": [
+      {
+        "sec": 1,
+        "scan_ops": 2471,
+        "insert_ops": 114,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 2523,
+        "insert_ops": 143,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 2747,
+        "insert_ops": 138,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 2626,
+        "insert_ops": 132,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 2748,
+        "insert_ops": 139,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 2570,
+        "insert_ops": 125,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 2635,
+        "insert_ops": 133,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 2617,
+        "insert_ops": 134,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 2609,
+        "insert_ops": 160,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 2623,
+        "insert_ops": 141,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 2524,
+        "insert_ops": 150,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 2012,
+        "insert_ops": 105,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 1225,
+        "insert_ops": 88,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 14,
+        "scan_ops": 2474,
+        "insert_ops": 120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 2566,
+        "insert_ops": 127,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 2655,
+        "insert_ops": 128,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 2687,
+        "insert_ops": 132,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 2523,
+        "insert_ops": 143,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 2470,
+        "insert_ops": 140,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 2361,
+        "insert_ops": 144,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 2493,
+        "insert_ops": 133,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 2113,
+        "insert_ops": 119,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 2389,
+        "insert_ops": 146,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 2251,
+        "insert_ops": 115,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 2356,
+        "insert_ops": 108,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 2345,
+        "insert_ops": 138,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 2332,
+        "insert_ops": 116,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 859,
+        "insert_ops": 47,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 2429,
+        "insert_ops": 120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 1,
+        "t2_forced_reorg_ops": 1
+      },
+      {
+        "sec": 30,
+        "scan_ops": 2578,
+        "insert_ops": 132,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0,
+        "t2_forced_reorg_ops": 0
+      }
+    ],
+    "RocksDB-BlobDB": [
+      {
+        "sec": 1,
+        "scan_ops": 1704,
+        "insert_ops": 78,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 1533,
+        "insert_ops": 83,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 1873,
+        "insert_ops": 101,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 1947,
+        "insert_ops": 97,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 1887,
+        "insert_ops": 92,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 1879,
+        "insert_ops": 101,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 1943,
+        "insert_ops": 97,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 1877,
+        "insert_ops": 95,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 1838,
+        "insert_ops": 90,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 1922,
+        "insert_ops": 92,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 1894,
+        "insert_ops": 101,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 1863,
+        "insert_ops": 96,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 1905,
+        "insert_ops": 116,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 1890,
+        "insert_ops": 104,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 1875,
+        "insert_ops": 114,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 1884,
+        "insert_ops": 122,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 1876,
+        "insert_ops": 95,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 1908,
+        "insert_ops": 101,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 1891,
+        "insert_ops": 117,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 1906,
+        "insert_ops": 76,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 1877,
+        "insert_ops": 106,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 1904,
+        "insert_ops": 86,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 1893,
+        "insert_ops": 87,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 1859,
+        "insert_ops": 101,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 1893,
+        "insert_ops": 111,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 1871,
+        "insert_ops": 104,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 1958,
+        "insert_ops": 117,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 1881,
+        "insert_ops": 107,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 1854,
+        "insert_ops": 107,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 1860,
+        "insert_ops": 118,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ],
+    "LMDB": [
+      {
+        "sec": 1,
+        "scan_ops": 2334,
+        "insert_ops": 106,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 2,
+        "scan_ops": 2380,
+        "insert_ops": 137,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 3,
+        "scan_ops": 2538,
+        "insert_ops": 128,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 4,
+        "scan_ops": 2403,
+        "insert_ops": 113,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 5,
+        "scan_ops": 2429,
+        "insert_ops": 142,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 6,
+        "scan_ops": 2487,
+        "insert_ops": 116,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 7,
+        "scan_ops": 2339,
+        "insert_ops": 116,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 8,
+        "scan_ops": 2519,
+        "insert_ops": 118,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 9,
+        "scan_ops": 2174,
+        "insert_ops": 112,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 10,
+        "scan_ops": 2171,
+        "insert_ops": 137,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 11,
+        "scan_ops": 2068,
+        "insert_ops": 111,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 12,
+        "scan_ops": 2116,
+        "insert_ops": 131,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 13,
+        "scan_ops": 2236,
+        "insert_ops": 137,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 14,
+        "scan_ops": 2151,
+        "insert_ops": 114,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 2011,
+        "insert_ops": 111,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 2113,
+        "insert_ops": 102,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 17,
+        "scan_ops": 2114,
+        "insert_ops": 108,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 18,
+        "scan_ops": 2252,
+        "insert_ops": 110,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 19,
+        "scan_ops": 2116,
+        "insert_ops": 110,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 20,
+        "scan_ops": 2134,
+        "insert_ops": 109,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 21,
+        "scan_ops": 2040,
+        "insert_ops": 118,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 2260,
+        "insert_ops": 135,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 2252,
+        "insert_ops": 122,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 2132,
+        "insert_ops": 125,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 2096,
+        "insert_ops": 127,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 2131,
+        "insert_ops": 111,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 27,
+        "scan_ops": 2018,
+        "insert_ops": 90,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 28,
+        "scan_ops": 2125,
+        "insert_ops": 124,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 29,
+        "scan_ops": 2199,
+        "insert_ops": 120,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      },
+      {
+        "sec": 30,
+        "scan_ops": 2189,
+        "insert_ops": 111,
+        "t1_reorg_ops": 0,
+        "t2_reorg_ops": 0,
+        "t1_forced_reorg_ops": 0
+      }
+    ]
+  }
+};
+    const forcedEventsData = {
+  "8B_In-Memory": {
+    "+Inline": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 29,
+        "kind": "reorganize",
+        "elapsed_sec": 27.5615
+      }
+    ],
+    "LMDB": [],
+    "Baseline": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 29,
+        "kind": "reorganize",
+        "elapsed_sec": 27.7381
+      }
+    ],
+    "+BF": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 29,
+        "kind": "reorganize",
+        "elapsed_sec": 30.1437
+      }
+    ],
+    "RocksDB-BlobDB": [],
+    "RocksDB": [],
+    "+Prefault": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 29,
+        "kind": "reorganize",
+        "elapsed_sec": 28.0343
+      }
+    ]
+  },
+  "1KB_In-Memory": {
+    "RocksDB": [],
+    "+BF": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 6,
+        "kind": "reorganize",
+        "elapsed_sec": 1.27232
+      },
+      {
+        "scheduled_sec": 10,
+        "fired_sec": 14,
+        "kind": "defragment",
+        "elapsed_sec": 3.7551
+      },
+      {
+        "scheduled_sec": 25,
+        "fired_sec": 29,
+        "kind": "defragment",
+        "elapsed_sec": 4.0948
+      }
+    ],
+    "RocksDB-BlobDB": [],
+    "+Prefault": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 6,
+        "kind": "reorganize",
+        "elapsed_sec": 1.21359
+      },
+      {
+        "scheduled_sec": 10,
+        "fired_sec": 27,
+        "kind": "defragment",
+        "elapsed_sec": 10.2333
+      },
+      {
+        "scheduled_sec": 25,
+        "fired_sec": 29,
+        "kind": "defragment",
+        "elapsed_sec": 9.32967
+      }
+    ],
+    "+Inline": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 6,
+        "kind": "reorganize",
+        "elapsed_sec": 1.21636
+      },
+      {
+        "scheduled_sec": 10,
+        "fired_sec": 14,
+        "kind": "defragment",
+        "elapsed_sec": 3.76157
+      },
+      {
+        "scheduled_sec": 25,
+        "fired_sec": 28,
+        "kind": "defragment",
+        "elapsed_sec": 3.65334
+      }
+    ],
+    "Baseline": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 5,
+        "kind": "reorganize",
+        "elapsed_sec": 0.654361
+      },
+      {
+        "scheduled_sec": 10,
+        "fired_sec": 13,
+        "kind": "defragment",
+        "elapsed_sec": 3.43175
+      },
+      {
+        "scheduled_sec": 25,
+        "fired_sec": 28,
+        "kind": "defragment",
+        "elapsed_sec": 3.2331
+      }
+    ],
+    "LMDB": []
+  },
+  "1KB_LTM": {
+    "Baseline": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 29,
+        "kind": "reorganize",
+        "elapsed_sec": 39.8802
+      }
+    ],
+    "LMDB": [],
+    "+Inline": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 29,
+        "kind": "reorganize",
+        "elapsed_sec": 36.4679
+      }
+    ],
+    "+BF": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 29,
+        "kind": "reorganize",
+        "elapsed_sec": 38.5383
+      }
+    ],
+    "RocksDB-BlobDB": [],
+    "RocksDB": [],
+    "+Prefault": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 29,
+        "kind": "reorganize",
+        "elapsed_sec": 54.4917
+      }
+    ]
+  },
+  "64KB_LTM": {
+    "+BF": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 5,
+        "kind": "reorganize",
+        "elapsed_sec": 0.210122
+      },
+      {
+        "scheduled_sec": 10,
+        "fired_sec": 12,
+        "kind": "defragment",
+        "elapsed_sec": 2.64606
+      },
+      {
+        "scheduled_sec": 25,
+        "fired_sec": 27,
+        "kind": "defragment",
+        "elapsed_sec": 2.98814
+      }
+    ],
+    "RocksDB": [],
+    "+Prefault": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 5,
+        "kind": "reorganize",
+        "elapsed_sec": 0.223006
+      },
+      {
+        "scheduled_sec": 10,
+        "fired_sec": 27,
+        "kind": "defragment",
+        "elapsed_sec": 17.0288
+      },
+      {
+        "scheduled_sec": 25,
+        "fired_sec": 29,
+        "kind": "defragment",
+        "elapsed_sec": 15.5987
+      }
+    ],
+    "Baseline": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 5,
+        "kind": "reorganize",
+        "elapsed_sec": 0.204947
+      },
+      {
+        "scheduled_sec": 10,
+        "fired_sec": 12,
+        "kind": "defragment",
+        "elapsed_sec": 2.27038
+      },
+      {
+        "scheduled_sec": 25,
+        "fired_sec": 28,
+        "kind": "defragment",
+        "elapsed_sec": 3.39601
+      }
+    ],
+    "+Inline": [
+      {
+        "scheduled_sec": 5,
+        "fired_sec": 5,
+        "kind": "reorganize",
+        "elapsed_sec": 0.204847
+      },
+      {
+        "scheduled_sec": 10,
+        "fired_sec": 12,
+        "kind": "defragment",
+        "elapsed_sec": 2.71817
+      },
+      {
+        "scheduled_sec": 25,
+        "fired_sec": 28,
+        "kind": "defragment",
+        "elapsed_sec": 3.0951
+      }
+    ],
+    "RocksDB-BlobDB": [],
+    "LMDB": []
+  }
 };
     const reorgScalingData = {
   "8B_In-Memory": {
     "t1only": [
       {
         "key_count": 5000000,
+        "ratio": 0.25,
         "elapsed_sec": 1.42887,
         "timed_out": false
       },
       {
         "key_count": 10000000,
+        "ratio": 0.5,
         "elapsed_sec": 2.11304,
         "timed_out": false
       },
       {
         "key_count": 15000000,
+        "ratio": 0.75,
         "elapsed_sec": 1.12562,
         "timed_out": false
       },
       {
         "key_count": 20000000,
+        "ratio": 1,
         "elapsed_sec": 3.7529,
         "timed_out": false
       }
@@ -4451,21 +10177,25 @@
     "t1t2": [
       {
         "key_count": 5000000,
+        "ratio": 0.25,
         "elapsed_sec": 2.12346,
         "timed_out": false
       },
       {
         "key_count": 10000000,
+        "ratio": 0.5,
         "elapsed_sec": 3.63748,
         "timed_out": false
       },
       {
         "key_count": 15000000,
+        "ratio": 0.75,
         "elapsed_sec": 5.20235,
         "timed_out": false
       },
       {
         "key_count": 20000000,
+        "ratio": 1,
         "elapsed_sec": 7.08824,
         "timed_out": false
       }
@@ -4475,21 +10205,25 @@
     "t1only": [
       {
         "key_count": 2000000,
+        "ratio": 0.25,
         "elapsed_sec": 0.742532,
         "timed_out": false
       },
       {
         "key_count": 4000000,
+        "ratio": 0.5,
         "elapsed_sec": 0.676002,
         "timed_out": false
       },
       {
         "key_count": 6000000,
+        "ratio": 0.75,
         "elapsed_sec": 0.73807,
         "timed_out": false
       },
       {
         "key_count": 8000000,
+        "ratio": 1,
         "elapsed_sec": 1.62996,
         "timed_out": false
       }
@@ -4497,21 +10231,25 @@
     "t1t2": [
       {
         "key_count": 2000000,
+        "ratio": 0.25,
         "elapsed_sec": 10.1043,
         "timed_out": false
       },
       {
         "key_count": 4000000,
+        "ratio": 0.5,
         "elapsed_sec": 17.7343,
         "timed_out": false
       },
       {
         "key_count": 6000000,
+        "ratio": 0.75,
         "elapsed_sec": 25.4872,
         "timed_out": false
       },
       {
         "key_count": 8000000,
+        "ratio": 1,
         "elapsed_sec": 33.9388,
         "timed_out": false
       }
@@ -4521,21 +10259,25 @@
     "t1only": [
       {
         "key_count": 2064888,
+        "ratio": 0.25,
         "elapsed_sec": 1.02606,
         "timed_out": false
       },
       {
         "key_count": 4129776,
+        "ratio": 0.5,
         "elapsed_sec": 1.70698,
         "timed_out": false
       },
       {
         "key_count": 6194664,
+        "ratio": 0.75,
         "elapsed_sec": 2.2974,
         "timed_out": false
       },
       {
         "key_count": 8259552,
+        "ratio": 1,
         "elapsed_sec": 3.40336,
         "timed_out": false
       }
@@ -4543,16 +10285,19 @@
     "t1t2": [
       {
         "key_count": 2064888,
+        "ratio": 0.25,
         "elapsed_sec": 32.648,
         "timed_out": false
       },
       {
         "key_count": 4129776,
+        "ratio": 0.5,
         "elapsed_sec": 56.6177,
         "timed_out": false
       },
       {
         "key_count": 6194664,
+        "ratio": 0.75,
         "elapsed_sec": 60,
         "timed_out": true
       }
@@ -4560,21 +10305,25 @@
     "t1t2_steady": [
       {
         "key_count": 2064888,
+        "ratio": 0.25,
         "elapsed_sec": 9.78364,
         "timed_out": false
       },
       {
         "key_count": 4129776,
+        "ratio": 0.5,
         "elapsed_sec": 20.8498,
         "timed_out": false
       },
       {
         "key_count": 6194664,
+        "ratio": 0.75,
         "elapsed_sec": 27.1214,
         "timed_out": false
       },
       {
         "key_count": 8259552,
+        "ratio": 1,
         "elapsed_sec": 46.9381,
         "timed_out": false
       }
@@ -4584,21 +10333,25 @@
     "t1only": [
       {
         "key_count": 32760,
+        "ratio": 0.25,
         "elapsed_sec": 0.0378443,
         "timed_out": false
       },
       {
         "key_count": 65520,
+        "ratio": 0.5,
         "elapsed_sec": 0.0799202,
         "timed_out": false
       },
       {
         "key_count": 98280,
+        "ratio": 0.75,
         "elapsed_sec": 0.12471,
         "timed_out": false
       },
       {
         "key_count": 131040,
+        "ratio": 1,
         "elapsed_sec": 0.209428,
         "timed_out": false
       }
@@ -4606,21 +10359,25 @@
     "t1t2": [
       {
         "key_count": 32760,
+        "ratio": 0.25,
         "elapsed_sec": 10.9738,
         "timed_out": false
       },
       {
         "key_count": 65520,
+        "ratio": 0.5,
         "elapsed_sec": 33.1726,
         "timed_out": false
       },
       {
         "key_count": 98280,
+        "ratio": 0.75,
         "elapsed_sec": 45.1305,
         "timed_out": false
       },
       {
         "key_count": 131040,
+        "ratio": 1,
         "elapsed_sec": 60,
         "timed_out": true
       }
@@ -4786,8 +10543,9 @@
       id: 'reorgLines',
       afterDraw(chart, _args, opts) {
         const naturalSecs = opts.reorgSecs || [];
-        const forcedSecs = opts.forcedReorgSecs || [];
-        if (!naturalSecs.length && !forcedSecs.length) return;
+        const forcedReorgSecs = opts.forcedReorgSecs || [];
+        const forcedDefragSecs = opts.forcedDefragSecs || [];
+        if (!naturalSecs.length && !forcedReorgSecs.length && !forcedDefragSecs.length) return;
         const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
         ctx.save();
         ctx.lineWidth = 1.5;
@@ -4799,7 +10557,13 @@
         }
         ctx.strokeStyle = 'rgba(217,119,6,0.55)';
         ctx.setLineDash([2,3]);
-        for (const s of forcedSecs) {
+        for (const s of forcedReorgSecs) {
+          const px = x.getPixelForValue(s);
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
+        }
+        ctx.strokeStyle = 'rgba(147,51,234,0.6)';
+        ctx.setLineDash([2,3]);
+        for (const s of forcedDefragSecs) {
           const px = x.getPixelForValue(s);
           ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
         }
@@ -4813,15 +10577,31 @@
       const tl = timelineData[valSizeKey];
       if (!tl || !Object.keys(tl).length) return null;
       const reorgSecs = [];
-      const forcedReorgSecs = [];
       for (const data of Object.values(tl)) {
         data.forEach((d,i) => {
           if (d.t1_reorg_ops > 0 && !reorgSecs.includes(i+1)) reorgSecs.push(i+1);
-          if (d.t1_forced_reorg_ops > 0 && !forcedReorgSecs.includes(i+1)) forcedReorgSecs.push(i+1);
         });
       }
       reorgSecs.sort((a,b) => a-b);
+      // Forced triggers are scheduled at t=5s (reorganize()) / t=10s & t=25s (defragment()), but
+      // under sustained write contention the actual call can be delayed arbitrarily past its
+      // scheduled second -- this is intentionally unguarded (cascading is itself an experiment
+      // result). fired_sec (from forced_events, keyed by kind) is where it actually landed.
+      const forcedReorgSecs = [];
+      const forcedDefragSecs = [];
+      const firedDetail = {};
+      const fe = forcedEventsData[valSizeKey] || {};
+      for (const events of Object.values(fe)) {
+        for (const ev of events) {
+          const s = ev.fired_sec;
+          if (ev.kind === 'reorganize' && !forcedReorgSecs.includes(s)) forcedReorgSecs.push(s);
+          if (ev.kind === 'defragment' && !forcedDefragSecs.includes(s)) forcedDefragSecs.push(s);
+          if (!firedDetail[s]) firedDetail[s] = [];
+          firedDetail[s].push(`${ev.kind}(sched@${ev.scheduled_sec}s, took ${ev.elapsed_sec.toFixed(1)}s)`);
+        }
+      }
       forcedReorgSecs.sort((a,b) => a-b);
+      forcedDefragSecs.sort((a,b) => a-b);
       const datasets = variantOrder.filter(v => tl[v] && tl[v].length).map(v => {
         const isRocks = rivalStores.includes(v);
         const col = colors[v] || '#6366f1';
@@ -4844,7 +10624,7 @@
           responsive: true, maintainAspectRatio: false,
           animation: { duration: 900, easing: 'easeInOutQuart' },
           plugins: {
-            reorgLines: { reorgSecs, forcedReorgSecs },
+            reorgLines: { reorgSecs, forcedReorgSecs, forcedDefragSecs },
             legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
             tooltip: {
               mode: 'index', intersect: false,
@@ -4857,7 +10637,7 @@
                   const s = items[0].raw.x;
                   let suffix = '';
                   if (reorgSecs.includes(s)) suffix += '  ⟳ T1 Reorg (natural)';
-                  if (forcedReorgSecs.includes(s)) suffix += '  ⚑ T1 Reorg (forced@15s)';
+                  if (firedDetail[s]) suffix += '  ⚑ ' + firedDetail[s].join(', ');
                   return `Second ${s}${suffix}`;
                 },
                 label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
