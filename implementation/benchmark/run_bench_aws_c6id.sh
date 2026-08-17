@@ -121,12 +121,14 @@ AWS_REGION="ap-northeast-1"
 # either holds, they shift over time.
 INSTANCE_TYPE="i4i.8xlarge"
 # Pin the spot request to whichever AZ currently has the best odds, rather than leaving subnet
-# selection to run-instances' own (uncontrollable, for a single non-Fleet request) default. At
-# switch time, `aws ec2 get-spot-placement-scores --instance-types i4i.8xlarge --target-capacity 1
-# --region-names ap-northeast-1 --single-availability-zone` scored all 3 AZs equally (3/10), so
-# ap-northeast-1a was kept for continuity with the prior c6id-era choice rather than for any actual
-# advantage. Re-run that command before assuming this still holds; it can shift over time.
-PREFERRED_AZ="ap-northeast-1a"
+# selection to run-instances' own (uncontrollable, for a single non-Fleet request) default.
+# `aws ec2 get-spot-placement-scores --instance-types i4i.8xlarge --target-capacity 1
+# --region-names ap-northeast-1 --single-availability-zone` scores all 3 AZs equally (3/10) as of
+# 2026-08-17, so among AZs with equal interruption odds, pick by `describe-spot-price-history`
+# instead: ap-northeast-1d ran ~5-15% cheaper than -1a and ~16% cheaper than -1c over the trailing
+# 7 days (~$0.55-0.56/hr vs ~$0.58-0.65/hr vs ~$0.64-0.68/hr). Re-run both commands before assuming
+# either still holds; they shift over time.
+PREFERRED_AZ="ap-northeast-1d"
 MIN_TIME="5.0s"
 LTM_MEMORY_BUDGET_BYTES="$(vmemkv_matrix::ltm_memory_budget_bytes)"
 LTM_SWAP_BUDGET_BYTES="$(vmemkv_matrix::ltm_swap_budget_bytes)"
