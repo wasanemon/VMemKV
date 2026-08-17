@@ -106,7 +106,7 @@ vmemkv_matrix::benchmark_filter_for_case() {
   local scenario_regex
   local value_regex
 
-  scenario_regex="$(vmemkv_matrix::scenario_filter "$scenario_key" "$vmemkv_only")"
+  scenario_regex="$(vmemkv_matrix::scenario_filter "$vmemkv_only")"
   value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
   printf '%s\n' "(${scenario_regex}).*${value_regex}"
 }
@@ -166,7 +166,7 @@ vmemkv_matrix::ltm_priming_filter() {
   # measured at 200-1200s, vs. ~20-30s unconstrained.
   local vmemkv_only="${1:-}"
   local scenario_regex
-  scenario_regex="$(vmemkv_matrix::scenario_filter "" "$vmemkv_only")"
+  scenario_regex="$(vmemkv_matrix::scenario_filter "$vmemkv_only")"
   printf '(%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$\n' "$scenario_regex"
 }
 
