@@ -34,6 +34,11 @@ show_help() {
   echo "                   output. Only runs on an instance whose --value-size is 1KB (or"
   echo "                   unset), since the probe's own sweep is fixed to 1KB regardless of"
   echo "                   this script's --value-size."
+  echo "  --without-rivals  Drop RocksDB/RocksDB-BlobDB/LMDB from the benchmark filter, running"
+  echo "                   VMemKV variants only. Use for regression-check runs after a"
+  echo "                   VMemKV-internal-only code change, where the rivals' numbers are"
+  echo "                   unaffected and re-measuring them is pure wasted AWS time/cost -- merge"
+  echo "                   the prior full run's rival-only results back in afterward."
   exit 0
 }
 
@@ -41,6 +46,7 @@ SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
 REORG_SCALING_PROBE=false
 CHURN_SCALING_PROBE=false
+WITHOUT_RIVALS=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,6 +80,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --churn-scaling-probe)
       CHURN_SCALING_PROBE=true
+      shift
+      ;;
+    --without-rivals)
+      WITHOUT_RIVALS=true
       shift
       ;;
     *)
@@ -517,9 +527,9 @@ run_scenario() {
     fi
     scenario_run_filter="$scenario_ycsb_only_filter"
   elif [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    scenario_run_filter="$(vmemkv_matrix::benchmark_filter_for_case "$scenario_key" "${VALUE_SIZE_LIMIT,,}")"
+    scenario_run_filter="$(vmemkv_matrix::benchmark_filter_for_case "$scenario_key" "${VALUE_SIZE_LIMIT,,}" "$WITHOUT_RIVALS")"
   else
-    scenario_run_filter="$(vmemkv_matrix::scenario_effective_filter "$scenario_key" "$LARGE_VALUE_FIRST" "$QUICK")"
+    scenario_run_filter="$(vmemkv_matrix::scenario_effective_filter "$scenario_key" "$LARGE_VALUE_FIRST" "$QUICK" "$WITHOUT_RIVALS")"
   fi
   scenario_env_prefix="$(vmemkv_matrix::scenario_env_prefix "$scenario_key")"
   scenario_context_prefix="$(scenario_context_env_prefix "$scenario_key")"
@@ -565,7 +575,7 @@ run_scenario() {
     # (store, value size) is enough, since Scan now clones from that same shared master too (no
     # separate Scan-only master to prime).
     local priming_filter priming_cmd priming_cmd_quoted
-    priming_filter="$(vmemkv_matrix::ltm_priming_filter)"
+    priming_filter="$(vmemkv_matrix::ltm_priming_filter "$WITHOUT_RIVALS")"
     # VMEMKV_CONTEXT_memory_budget_bytes must be set here too, not just on the measurement pass
     # below (scenario_context_prefix) -- bench_kv's detect_machine_memory_bytes() falls back to
     # the host's raw /proc/meminfo MemTotal whenever this is unset, and priming runs unconstrained
@@ -739,11 +749,11 @@ if [[ "${YCSB_ONLY:-0}" == "1" ]]; then
   ltm_filter="${ltm_filter:-Store=(VMemKV|RocksDB)/Variant=(Baseline|Bloom-T1InlineValue-Prefaulting|RocksDB)/Op=YCSB-E/Dist=Zipf}"
   MIN_TIME="${MIN_TIME:-30s}"
 elif [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-  inmem_filter="${inmem_filter:-$(vmemkv_matrix::benchmark_filter_for_case in_memory "${VALUE_SIZE_LIMIT,,}")}"
-  ltm_filter="${ltm_filter:-$(vmemkv_matrix::benchmark_filter_for_case ltm "${VALUE_SIZE_LIMIT,,}")}"
+  inmem_filter="${inmem_filter:-$(vmemkv_matrix::benchmark_filter_for_case in_memory "${VALUE_SIZE_LIMIT,,}" "$WITHOUT_RIVALS")}"
+  ltm_filter="${ltm_filter:-$(vmemkv_matrix::benchmark_filter_for_case ltm "${VALUE_SIZE_LIMIT,,}" "$WITHOUT_RIVALS")}"
 else
-  inmem_filter="${inmem_filter:-$(vmemkv_matrix::scenario_effective_filter in_memory "$LARGE_VALUE_FIRST" "$QUICK")}"
-  ltm_filter="${ltm_filter:-$(vmemkv_matrix::scenario_effective_filter ltm "$LARGE_VALUE_FIRST" "$QUICK")}"
+  inmem_filter="${inmem_filter:-$(vmemkv_matrix::scenario_effective_filter in_memory "$LARGE_VALUE_FIRST" "$QUICK" "$WITHOUT_RIVALS")}"
+  ltm_filter="${ltm_filter:-$(vmemkv_matrix::scenario_effective_filter ltm "$LARGE_VALUE_FIRST" "$QUICK" "$WITHOUT_RIVALS")}"
 fi
 
 echo "Counting remote benchmarks concurrently..."
@@ -798,18 +808,27 @@ echo "Downloading results..."
 RESULTS_DIR="${REPO_ROOT}/implementation/benchmark/logs"
 mkdir -p "$RESULTS_DIR"
 
+# With --without-rivals, the downloaded JSON only covers VMemKV variants; tag the filename so it
+# is never mistaken for (or silently overwritten by/onto) a full-matrix result, and so a later
+# merge step (see vmemkv_matrix::scenario_filter()'s comment re: merge_vmemkv_only_results.py) can
+# find both halves unambiguously.
+without_rivals_suffix=""
+if [[ "$WITHOUT_RIVALS" == "true" ]]; then
+  without_rivals_suffix="_vmemkv_only"
+fi
+
 if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
-  dst_name="results_in_memory.json"
+  dst_name="results_in_memory${without_rivals_suffix}.json"
   if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    dst_name="results_in_memory_${VALUE_SIZE_LIMIT}.json"
+    dst_name="results_in_memory_${VALUE_SIZE_LIMIT}${without_rivals_suffix}.json"
   fi
   scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path in_memory)" "${RESULTS_DIR}/${dst_name}"
 fi
 
 if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
-  dst_name="results_ltm.json"
+  dst_name="results_ltm${without_rivals_suffix}.json"
   if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    dst_name="results_ltm_${VALUE_SIZE_LIMIT}.json"
+    dst_name="results_ltm_${VALUE_SIZE_LIMIT}${without_rivals_suffix}.json"
   fi
   scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path ltm)" "${RESULTS_DIR}/${dst_name}"
 fi

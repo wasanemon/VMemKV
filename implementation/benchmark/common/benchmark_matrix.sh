@@ -5,7 +5,17 @@
 # duplicating filter strings.
 
 vmemkv_matrix::scenario_filter() {
-  printf '%s\n' '(^Store=VMemKV/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/)'
+  # vmemkv_only ("true"/"1"): drops the three rival backends (RocksDB/RocksDB-BlobDB/LMDB) from
+  # the filter -- their numbers are unaffected by a VMemKV-internal-only code change, so
+  # re-measuring them is pure wasted AWS time/cost for a regression-check run. Their most recent
+  # full-matrix numbers (from a run with this left off) are meant to be merged back in afterward
+  # rather than re-measured every time; see merge_vmemkv_only_results.py.
+  local vmemkv_only="${1:-}"
+  if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
+    printf '%s\n' '(^Store=VMemKV/)'
+  else
+    printf '%s\n' '(^Store=VMemKV/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/)'
+  fi
 }
 
 # LTM scenario memory parameters: a small *declared* budget (fed to bench_kv as
@@ -92,10 +102,11 @@ vmemkv_matrix::value_filter_fragment() {
 vmemkv_matrix::benchmark_filter_for_case() {
   local scenario_key="$1"
   local value_key="$2"
+  local vmemkv_only="${3:-}"
   local scenario_regex
   local value_regex
 
-  scenario_regex="$(vmemkv_matrix::scenario_filter "$scenario_key")"
+  scenario_regex="$(vmemkv_matrix::scenario_filter "$scenario_key" "$vmemkv_only")"
   value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
   printf '%s\n' "(${scenario_regex}).*${value_regex}"
 }
@@ -103,6 +114,7 @@ vmemkv_matrix::benchmark_filter_for_case() {
 vmemkv_matrix::scenario_run_filter() {
   local scenario_key="$1"
   local value_order="$2"
+  local vmemkv_only="${3:-}"
   local -a values=()
   local -a case_filters=()
   local value_key
@@ -110,7 +122,7 @@ vmemkv_matrix::scenario_run_filter() {
 
   read -r -a values <<<"$value_order"
   for value_key in "${values[@]}"; do
-    case_filters+=("$(vmemkv_matrix::benchmark_filter_for_case "$scenario_key" "$value_key")")
+    case_filters+=("$(vmemkv_matrix::benchmark_filter_for_case "$scenario_key" "$value_key" "$vmemkv_only")")
   done
 
   for value_key in "${case_filters[@]}"; do
@@ -127,15 +139,19 @@ vmemkv_matrix::scenario_effective_filter() {
   local scenario_key="$1"
   local large_value_first="${2:-0}"
   local quick="${3:-0}"
+  local vmemkv_only="${4:-}"
 
   if [[ "$quick" == "true" || "$quick" == "1" ]]; then
+    # Already VMemKV-only by construction (see scenario_quick_filter()'s own hardcoded
+    # Store=VMemKV patterns) -- vmemkv_only is a no-op here either way.
     vmemkv_matrix::scenario_quick_filter "$scenario_key"
     return
   fi
 
   vmemkv_matrix::scenario_run_filter \
     "$scenario_key" \
-    "$(vmemkv_matrix::scenario_value_order_keys_from_flag "$scenario_key" "$large_value_first")"
+    "$(vmemkv_matrix::scenario_value_order_keys_from_flag "$scenario_key" "$large_value_first")" \
+    "$vmemkv_only"
 }
 
 vmemkv_matrix::ltm_priming_filter() {
@@ -148,8 +164,9 @@ vmemkv_matrix::ltm_priming_filter() {
   # Used to "prime" this master at full, unconstrained disk speed before a cgroup-wrapped LTM run
   # (see run_bench.sh's --cgroup path): a real per-master populate under that same cgroup was
   # measured at 200-1200s, vs. ~20-30s unconstrained.
+  local vmemkv_only="${1:-}"
   local scenario_regex
-  scenario_regex="$(vmemkv_matrix::scenario_filter)"
+  scenario_regex="$(vmemkv_matrix::scenario_filter "" "$vmemkv_only")"
   printf '(%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$\n' "$scenario_regex"
 }
 

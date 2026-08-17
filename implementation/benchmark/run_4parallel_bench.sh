@@ -5,6 +5,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --without-rivals: pass straight through to each of the 4 instances (see
+# run_bench_aws_c6id.sh --help). Use this for a regression-check run after a VMemKV-internal-only
+# change, where RocksDB/RocksDB-BlobDB/LMDB's numbers are unaffected and re-measuring them is pure
+# wasted AWS time/cost -- reuse the most recent full-bench run's rival-only numbers instead (see
+# merge_vmemkv_only_results.py, referenced from vmemkv_matrix::scenario_filter()'s comment).
+# Downloaded results are tagged with a _vmemkv_only suffix so they never collide with a full run's.
+WITHOUT_RIVALS_FLAG=""
+if [[ "${1:-}" == "--without-rivals" ]]; then
+  WITHOUT_RIVALS_FLAG="--without-rivals"
+  echo "[without-rivals] Running VMemKV variants only -- reuse the last full-bench run's rival numbers."
+fi
+
 echo "========================================================"
 echo " Starting 4-Parallel AWS Spot Benchmarks for VMemKV     "
 echo "========================================================"
@@ -36,11 +48,14 @@ for task in "${TASKS[@]}"; do
   # comment in run_bench_aws_c6id.sh for why it's fixed to 1KB regardless of this instance's
   # value_size) -- passing it unconditionally to all 4 is harmless, it just no-ops on the 8B/64KB
   # tasks.
+  extra_flags=(--reorg-scaling-probe --churn-scaling-probe)
+  if [[ -n "$WITHOUT_RIVALS_FLAG" ]]; then
+    extra_flags+=("$WITHOUT_RIVALS_FLAG")
+  fi
   "$SCRIPT_DIR/run_bench_aws_c6id.sh" \
     --scenario "$scenario" \
     --value-size "$val_size" \
-    --reorg-scaling-probe \
-    --churn-scaling-probe \
+    "${extra_flags[@]}" \
     > "$log_file" 2>&1 &
   pids+=($!)
   
