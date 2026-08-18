@@ -147,9 +147,8 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 // ─── Store type lists ───────────────────────────────────────────────────────
 
 // VMemKV 自体のバリエーション（Baseline, Cumulative Steps, Ablations, Inlining）
-#define VMemKVStores                                                                                                 \
-  vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Inline, \
-      vmemkv::variants::VMemKV_Var3_Prefault
+#define VMemKVStores \
+  vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Inline
 
 // 競合バックエンドのバリエーション（RocksDBStore, LMDBStoreなど）
 #ifdef ENABLE_ROCKSDB

@@ -47,11 +47,8 @@ namespace vmemkv {
 struct T2Memory {
   std::byte *base = nullptr;
   uint64_t capacity = 0;
-  // Unique across every T2Memory this process ever constructs, so append_prefault()'s
-  // thread-local chunk cache (t2_flat_file.cpp) can detect a stale mapping even when a freed
-  // T2Memory's heap address is reused by a new one -- comparing raw T2Memory* is an ABA hazard.
-  //
-  // Also the pairing tag between a T2Memory and the T1Index::SortedSnapshot built against it:
+  // Unique across every T2Memory this process ever constructs -- the pairing tag between a
+  // T2Memory and the T1Index::SortedSnapshot built against it:
   // VMemKVImpl::reorganize_internal() stamps the same generation onto both, so a reader can tell
   // whether the pair it holds is self-consistent.
   uint64_t generation;
@@ -166,11 +163,8 @@ struct T2Memory {
   auto operator=(const T2Memory &) -> T2Memory & = delete;
 
   // Every T2Memory this process ever constructs must draw from this one process-global counter,
-  // never a fixed/arbitrary value: process-global uniqueness is what append_prefault()'s
-  // thread-local chunk cache depends on to detect a freed T2Memory's heap address being reused by
-  // an unrelated instance (see `generation`'s declaration above). A fixed value here would let
-  // two unrelated stores share a tag, letting a stale thread-local cache write through a freed
-  // T2Memory into the wrong store's mapping.
+  // never a fixed/arbitrary value -- see `generation`'s declaration above for why uniqueness
+  // matters (the T1Index::SortedSnapshot pairing check).
   static auto allocate_generation() noexcept -> uint64_t {
     static std::atomic<uint64_t> counter{1};
     return counter.fetch_add(1, std::memory_order_relaxed);
@@ -301,10 +295,6 @@ class T2FlatFile {
   static auto append_default(const T2Memory *mem,
                              std::span<const std::byte> key,
                              std::span<const std::byte> value) -> uint64_t;
-  // Appends a new key-value record using thread-local chunk allocation and pre-faulting optimization.
-  static auto append_prefault(const T2Memory *mem,
-                              std::span<const std::byte> key,
-                              std::span<const std::byte> value) -> uint64_t;
   // Updates the value of an existing record in-place if the new value fits within alloc_len.
   // - Thread-safety: Thread-safe for distinct keys (callers hold per-key stripe lock).
   // - Guarantees: Returns true on success; false if new value exceeds alloc_len.

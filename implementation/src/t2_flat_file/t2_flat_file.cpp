@@ -18,9 +18,7 @@ namespace vmemkv {
 namespace {
 
 // Writes a ValueRecordHeader followed by key, value, and zero padding out to the next 8-byte
-// boundary at `record_base`. Shared by append_default() and append_prefault(), which otherwise
-// duplicated this exact sequence and differed only in how they obtained record_base (a plain
-// atomic offset fetch vs. a thread-local pre-faulted chunk).
+// boundary at `record_base`.
 void write_record(std::byte *record_base, std::span<const std::byte> key, std::span<const std::byte> value) noexcept {
   const uint64_t raw_len = sizeof(ValueRecordHeader) + key.size() + value.size();
   const uint64_t aligned_len = vmemkv::align_up(raw_len);
@@ -89,58 +87,6 @@ auto T2FlatFile::append_default(const T2Memory *mem,
   }
 
   std::byte *record_base = mem->base + offset;
-  write_record(record_base, key, value);
-
-  return offset;
-}
-
-struct ThreadChunk {
-  std::byte *base = nullptr;
-  uint64_t offset = 0;
-  uint64_t capacity = 0;
-  // Identifies which T2Memory this chunk was carved from via T2Memory::generation rather than a
-  // raw T2Memory* -- a freed T2Memory's heap address can be reused, which would otherwise make
-  // this staleness check false-negative against an already-unmapped region.
-  uint64_t mem_generation = 0;
-  bool has_mem_generation = false;
-};
-static thread_local ThreadChunk tl_chunk;
-static constexpr uint64_t OSPageSize = 4096;
-
-auto T2FlatFile::append_prefault(const T2Memory *mem,
-                                 std::span<const std::byte> key,
-                                 std::span<const std::byte> value) -> uint64_t {
-  const uint64_t raw_required = sizeof(ValueRecordHeader) + key.size() + value.size();
-  const uint64_t required = vmemkv::align_up(raw_required);
-
-  if (tl_chunk.capacity < required || !tl_chunk.has_mem_generation || tl_chunk.mem_generation != mem->generation) {
-    const uint64_t chunk_alloc_size = 2ULL * 1024 * 1024;  // 2MB
-    // Same `mem`-derived counter as append_default() -- see T2Memory::bytes_used's declaration.
-    const uint64_t global_offset = mem->bytes_used.fetch_add(chunk_alloc_size, std::memory_order_relaxed);
-
-    if (global_offset + chunk_alloc_size > mem->capacity) {
-      throw std::runtime_error("T2 storage capacity exceeded during chunk allocation");
-    }
-
-    tl_chunk.base = const_cast<std::byte *>(mem->base) + global_offset;
-    tl_chunk.offset = 0;
-    tl_chunk.capacity = chunk_alloc_size;
-    tl_chunk.mem_generation = mem->generation;
-    tl_chunk.has_mem_generation = true;
-
-    // Pre-fault the allocated 2MB chunk by writing to each page (4KB steps)
-    for (uint64_t page = 0; page < chunk_alloc_size; page += OSPageSize) {
-      volatile std::byte *ptr = tl_chunk.base + page;
-      *ptr = std::byte{0};
-    }
-  }
-
-  std::byte *record_base = tl_chunk.base + tl_chunk.offset;
-  uint64_t offset = record_base - mem->base;
-
-  tl_chunk.offset += required;
-  tl_chunk.capacity -= required;
-
   write_record(record_base, key, value);
 
   return offset;

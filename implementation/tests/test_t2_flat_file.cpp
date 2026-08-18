@@ -1,9 +1,8 @@
 // test_t2_flat_file.cpp — Isolated correctness tests for the standalone T2FlatFile type.
 //
 // These tests exercise vmemkv::T2FlatFile directly (no VMemKVImpl/T1Index/WAL involvement):
-// append_default/append_prefault record equivalence, in-place update_value_at, swap_memory, and
-// a T2Memory::generation regression test for the ABA fix in append_prefault()'s thread-local
-// chunk cache (t2_flat_file.cpp).
+// append_default record round-tripping, in-place update_value_at, swap_memory, and
+// T2Memory::generation uniqueness.
 
 #include <doctest/doctest.h>
 #include <fcntl.h>
@@ -31,8 +30,6 @@ using vmemkv_test::as_span;
 using vmemkv_test::bytes_of;
 using vmemkv_test::span_to_string;
 
-// append_prefault() carves 2MB thread-local chunks (t2_flat_file.cpp), so capacity must clear
-// that regardless of how little data a given test actually writes.
 constexpr uint64_t kTestCapacityBytes = 4ULL * 1024 * 1024;
 
 struct TempT2File {
@@ -63,36 +60,6 @@ TEST_CASE("T2FlatFile: append_default then at() round-trips key/value") {
   const auto record = t2.file.at(offset, mem);
   CHECK(span_to_string(record.key) == "hello");
   CHECK(span_to_string(record.value) == "world");
-}
-
-TEST_CASE("T2FlatFile: append_prefault then at() round-trips key/value") {
-  TempT2File t2;
-  auto mem = t2.file.get_memory_handle();
-  const uint64_t offset = t2.file.append_prefault(mem, as_span(bytes_of("hello")), as_span(bytes_of("world")));
-
-  const auto record = t2.file.at(offset, mem);
-  CHECK(span_to_string(record.key) == "hello");
-  CHECK(span_to_string(record.value) == "world");
-}
-
-TEST_CASE("T2FlatFile: append_default and append_prefault produce identical record layouts") {
-  // Regression guard for the write_record() extraction shared by both append paths: they must
-  // keep producing the exact same on-disk layout (header fields, key/value bytes) for the same
-  // input, now that the previously-duplicated write logic lives in one place.
-  TempT2File t2;
-  auto mem = t2.file.get_memory_handle();
-  const uint64_t default_offset = t2.file.append_default(mem, as_span(bytes_of("shared-key")), as_span(bytes_of("v1")));
-  const uint64_t prefault_offset =
-      t2.file.append_prefault(mem, as_span(bytes_of("shared-key")), as_span(bytes_of("v1")));
-
-  const auto default_record = t2.file.at(default_offset, mem);
-  const auto prefault_record = t2.file.at(prefault_offset, mem);
-
-  CHECK(default_record.header->key_len == prefault_record.header->key_len);
-  CHECK(default_record.header->value_len == prefault_record.header->value_len);
-  CHECK(default_record.header->alloc_len == prefault_record.header->alloc_len);
-  CHECK(span_to_string(default_record.key) == span_to_string(prefault_record.key));
-  CHECK(span_to_string(default_record.value) == span_to_string(prefault_record.value));
 }
 
 TEST_CASE("T2FlatFile: update_value_at overwrites in place when the new value fits alloc_len") {
@@ -130,9 +97,10 @@ TEST_CASE("T2FlatFile: swap_memory publishes the new capacity/bytes_used/base") 
 }
 
 TEST_CASE("T2FlatFile: T2Memory::generation is unique and never repeats, even across a freed address") {
-  // Direct test of the ABA-guard contract append_prefault()'s thread-local chunk cache relies
-  // on: generation must never repeat, independent of whether a later T2Memory's heap allocation
-  // happens to reuse an earlier, already-freed one's address.
+  // generation is the pairing tag between a T2Memory and the T1Index::SortedSnapshot built
+  // against it (see T2Memory::generation's declaration), so it must never repeat, independent of
+  // whether a later T2Memory's heap allocation happens to reuse an earlier, already-freed one's
+  // address.
   auto mem_a = make_anon_t2_memory(4096);
   auto mem_b = make_anon_t2_memory(4096);
   CHECK(mem_a->generation != mem_b->generation);
@@ -143,31 +111,6 @@ TEST_CASE("T2FlatFile: T2Memory::generation is unique and never repeats, even ac
 
   CHECK(mem_c->generation != generation_a);
   CHECK(mem_c->generation != mem_b->generation);
-}
-
-// Regression test for the T2Memory::generation ABA fix: append_prefault's thread-local chunk
-// cache is keyed by which T2Memory it was carved from. A freed T2Memory's heap address could be
-// reused by a new one on the same thread, making a raw-pointer "same mapping" comparison a false
-// positive against an unmapped region (a real use-after-free/SEGV). Destroy+reconstruct in a loop
-// reliably exercises that address-reuse pattern.
-TEST_CASE("T2FlatFile: append_prefault survives repeated destroy+reconstruct from the same thread") {
-  constexpr int iterations = 100;
-  for (int i = 0; i < iterations; ++i) {
-    const std::filesystem::path path = reserve_t2_path();
-    {
-      vmemkv::T2FlatFile t2(path, kTestCapacityBytes, vmemkv::T2Memory::allocate_generation());
-      const std::string key = "k" + std::to_string(i);
-      const std::string value = "v" + std::to_string(i);
-      auto mem = t2.get_memory_handle();
-      const uint64_t offset = t2.append_prefault(mem, as_span(bytes_of(key)), as_span(bytes_of(value)));
-
-      const auto record = t2.at(offset, mem);
-      CHECK(span_to_string(record.key) == key);
-      CHECK(span_to_string(record.value) == value);
-    }
-    std::error_code ignored;
-    std::filesystem::remove(path, ignored);
-  }
 }
 
 // Regression test: read_t2_record_seqlock() used to take an already-built T2RecordView and only

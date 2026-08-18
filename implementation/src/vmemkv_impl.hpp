@@ -165,9 +165,6 @@ class VMemKVImpl {
     if constexpr (ConfigT::UseT1InlineValue) {
       parts.emplace_back("T1InlineValue");
     }
-    if constexpr (ConfigT::UsePrefaulting) {
-      parts.emplace_back("Prefaulting");
-    }
     if constexpr (ConfigT::UseGetPopulateRead) {
       parts.emplace_back("GetPopulateRead");
     }
@@ -847,12 +844,7 @@ class VMemKVImpl {
       typename T1IndexT::PutResult put_result;
       {
         T2FlatFile::T2MemoryHandle mem = t2_.acquire_write_handle();
-        uint64_t offset;
-        if constexpr (ConfigT::UsePrefaulting) {
-          offset = vmemkv::T2FlatFile::append_prefault(mem, full_key, value);
-        } else {
-          offset = vmemkv::T2FlatFile::append_default(mem, full_key, value);
-        }
+        uint64_t offset = vmemkv::T2FlatFile::append_default(mem, full_key, value);
         uint64_t write_generation = mem->generation;
 
         uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + full_key.size() + value.size());
@@ -1600,21 +1592,22 @@ class VMemKVImpl {
         }
       }
 
-      // Under Prefaulting, eagerly install page table entries for just the currently-valid
-      // prefix [0, bytes_used) in one bulk call per mapping, not via MAP_POPULATE on the mmap
-      // calls themselves (which would eagerly fault in the entire capacity). This matters even
-      // for already page-cache-resident data: mmap() doesn't share page *table* entries across
-      // separate VMAs of the same file, so each fresh mapping still needs its own per-page minor
-      // fault to install a PTE the first time it's touched, cache-resident or not. get_impl()
-      // reads single-page records straight through base_mmap_scan_seq, and a Uniform-distributed
-      // workload touching most of a large corpus pays for *every one* of those first-touch minor
-      // faults during the timed benchmark itself if a mapping it reads isn't pre-warmed --
-      // measured to regress 1KB In-Memory Get/Hit/Uniform by ~250x without this. Both mappings
-      // are warmed (not just whichever one this generation's corpus happens to use), since which
-      // one is actually hit is now decided per record, not once here.
+      // Unconditional (not gated by any config tag): eagerly install page table entries for just
+      // the currently-valid prefix [0, bytes_used) in one bulk call per mapping, not via
+      // MAP_POPULATE on the mmap calls themselves (which would eagerly fault in the entire
+      // capacity). This
+      // matters even for already page-cache-resident data: mmap() doesn't share page *table*
+      // entries across separate VMAs of the same file, so each fresh mapping still needs its own
+      // per-page minor fault to install a PTE the first time it's touched, cache-resident or not.
+      // get_impl() reads single-page records straight through base_mmap_scan_seq, and a
+      // Uniform-distributed workload touching most of a large corpus pays for *every one* of
+      // those first-touch minor faults during the timed benchmark itself if a mapping it reads
+      // isn't pre-warmed -- measured to regress 1KB In-Memory Get/Hit/Uniform by ~250x without
+      // this. Both mappings are warmed (not just whichever one this generation's corpus happens
+      // to use), since which one is actually hit is now decided per record, not once here.
       // Best-effort: a failure here just means the first touch of each page pays an ordinary (if
       // still page-cache-resident-cheap) minor fault instead of finding it pre-installed.
-      if (ConfigT::UsePrefaulting && bytes_used > 0) {
+      if (bytes_used > 0) {
         if (base_mmap_scan_ptr != nullptr) {
           ::madvise(base_mmap_scan_ptr, bytes_used, MADV_POPULATE_READ);
         }

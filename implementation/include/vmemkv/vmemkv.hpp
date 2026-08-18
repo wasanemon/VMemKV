@@ -59,8 +59,11 @@ using VMemKVLMDB = StoreAdapter<::LMDBStore>;
 using VMemKV_GetPopulateRead = StoreAdapter<VMemKVImpl<Config<GetPopulateRead>>>;
 using VMemKV_Var0_Baseline = VMemKV_Baseline;
 using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
-using VMemKV_Var2_Inline = StoreAdapter<VMemKVImpl<Config<BloomFilter, T1InlineValue>>>;
-using VMemKV_Var3_Prefault = VMemKVStore;  // Fully optimized production configuration
+// Fully optimized production configuration. System_AllOn equals Config<BloomFilter,
+// T1InlineValue> (see config.hpp), i.e. exactly this variant's config, so this is the same type
+// as VMemKVStore rather than a distinct one -- see config.hpp's Prefaulting comment for why no
+// further stacking level exists above this one.
+using VMemKV_Var2_Inline = VMemKVStore;
 using VMemKVStore = VMemKVStore;
 
 using VMemKV_RocksDB = VMemKVRocksDB;
@@ -75,7 +78,6 @@ using VMemKV_LMDB = VMemKVLMDB;
 using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
                                     VMemKV_Var1_Bloom,
                                     VMemKV_Var2_Inline,
-                                    VMemKV_Var3_Prefault,
                                     VMemKV_RocksDB,
                                     VMemKV_RocksDBBlobDB,
                                     VMemKV_LMDB>;

@@ -111,9 +111,8 @@ constexpr uint64_t kStoreCapacityBytes = 64ULL * 1024 * 1024;
 
 }  // namespace
 
-#define CRASH_RECOVERY_STORE_TYPES                                                                                   \
-  vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Inline, \
-      vmemkv::variants::VMemKV_Var3_Prefault
+#define CRASH_RECOVERY_STORE_TYPES \
+  vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Inline
 
 TEST_CASE_TEMPLATE("crash recovery: clean restart, empty store stays empty", Store, CRASH_RECOVERY_STORE_TYPES) {
   const auto path = reserve_crash_temp_path();

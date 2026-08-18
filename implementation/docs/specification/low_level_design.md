@@ -562,17 +562,11 @@ T1のインデックススロットに十分な空きビット領域がないた
 - **値が 1〜8 バイトの場合**:
   - `payload_bits` に対するビットシフトやビットの埋め込みは行わず、64ビットのビットパターンをそのまま無加工で格納し、デコード時は `inline_size` に従いバイトコピーを行う。これにより、`double`、`time`、連番のサロゲートキー（偶数・奇数を問わず）など、あらゆる64ビット以内のデータ型を完全にインライン化できる。
 
-### 7.4 Chunk Allocation / Pre-faulting (T2 Lock Mitigation)
+### 7.4 T2 書き込み時の Chunk Allocation / Pre-faulting は不採用
 
-マルチコア高並列書き込み環境における Linux カーネルの仮想メモリページフォールトおよび `mmap_lock`（VMAロック）の競合によるオーバーヘッド（Cache Line Bouncing）を緩和するための最適化である。
+各書き込みスレッドがT2領域へ`append`する際にスレッドごと大きなブロック(2MB)を一括予約し、直後に4KBページ単位でダミーライトして物理メモリページを一括割り当てさせる手法は、ページタッチ処理を`acquire_write_handle()`で取得したT2書き込みハンドル保持中に行うことになる。これは`checkpoint_and_defragment()`の`stop_writers_and_wait()`(進行中のwriterが全員ハンドルを手放すまで待つdrain処理)を直接長引かせ、持続的な同時書き込み負荷下では`checkpoint_and_defragment()`自体を2.7〜5.7倍遅くする。scanとinsertが混在するYCSB-Eワークロードでは、これによりscanスループットが最大16秒連続でゼロになる(詳細は`benchmark_results/pages/2026081711_charts.html`のYCSB-Eタブを参照)。唯一の恩恵(Zipf分布のホットな読み取りにおける初回page fault遅延の回避)は低スレッド数に偏っており、32スレッドの現実的な並行度ではほぼ消失する。
 
-* **スレッドローカル Chunk アロケーション**: 
-  各書き込みスレッドが T2 領域へ `append` する際、アトミックカウンタから個別に領域をアロケートするのではなく、スレッドごとに大きなブロック（例: 2MB）を一括予約する。
-* **一括 Pre-faulting**:
-  Chunk 確保直後に、その 2MB 領域を 4KB ページ単位（標準ページサイズ）でダミーライトし、カーネルに物理メモリページを一括で割り当てさせる。
-  これにより、その後の個々の `insert`（`memcpy`）においてはページフォールトの発生が **1/500** に激減し、OS カーネルの `mmap_lock` に入ることなく完全に並行して超高速にメモリコピーを実行できるようになる。
-* **コンパイル時解決の徹底**:
-  最適化のオーバーヘッドをゼロにするため、`vmemkv::Config` のテンプレート引数タグ（`Prefaulting`）を介して `constexpr if` によってコンパイル時に分岐とコード生成が制御される。
+読み込み側の`base_mmap_scan`/`base_mmap_scan_seq`ウォームアップ(7.9節)は、書き込みハンドルとは無関係なタイミング・機構で実行されるため、この問題を持たず、常時有効である。
 
 #### 7.4.1 T2 の Huge Page 化 (`MADV_HUGEPAGE`) は不採用
 
@@ -604,7 +598,7 @@ T2 の「base」領域(2.2節)は書き込み後二度と変更されないた�
   - `base_mmap_scan_seq`(read-only mmap、`MADV_SEQUENTIAL`): 埋め込みサイズヒントが1ページ以下のレコード用。広い先読み窓で多数の小さいレコードのフォルトを少数の major fault にまとめられる。`scan_impl()`・`get_impl()`双方の小レコード読み取りで使う。
   - `base_mmap_scan`(read-only mmap、カーネルのデフォルト(適応的)readahead方針): それより大きいレコード用。`scan_impl()`の大レコード読み取りと、`get_impl()`の大レコード読み取りのうちページキャッシュ常駐が確認できた場合(`mincore()`)に使う。無条件に`MADV_SEQUENTIAL`を付けると、大きいレコードのコーパスをZipfのような偏ったアクセスで読む場合に読み取りバイト数が余分に増えることが測定で判明したため、こちらは意図的に控えめな方針にしてある。
   - `read_fd`(`dup()`したファイルディスクリプタ経由の`pread()`): `get_impl()`の大レコード読み取りで、上記のページキャッシュ常駐確認が取れなかった場合に、そのレコード1つぶんにサイズを絞って読む。
-- **Prefaulting との連携**: `Prefaulting`(7.4節、値のinsert時プリフォルト最適化)が同時に有効な場合、`base_mmap_scan`・`base_mmap_scan_seq`の両方が `MAP_POPULATE` 相当で作成時に即座にウォームアップされる(reorganize直後の初回アクセスがコールドフォルトの嵐で不安定になるのを防ぐ)。
+- **マッピング作成時のウォームアップ**: `base_mmap_scan`・`base_mmap_scan_seq`の両方を、作成時に `MAP_POPULATE` 相当で即座にウォームアップする(reorganize直後の初回アクセスがコールドフォルトの嵐で不安定になるのを防ぐ)。1KB In-Memory Get/Hit/Uniformで約250倍の退行を防ぐ効果があり、常時有効。
 - **測定方法・結果**: `implementation/docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md`(base/tail split と実データ読み取りの元設計)、`implementation/docs/benchmark/20260810_t2_no_madvise_random.md`を参照。`Scan` は他の Op と共通のマスターコーパスを使用する。
 
 ### 7.10 `checkpoint_and_defragment()` の reflink + hole punch 機構
