@@ -392,6 +392,11 @@ class VMemKVImpl {
     };
     std::unordered_map<std::pair<StoreKey, uint64_t>, uint64_t, RelocationKeyHash> relocated;
 
+    // Every (prefix, hash) the post-stop pass's destructive drain_and_clear() call has removed
+    // from tail_entries_ so far this cycle -- see copy_live_entries()'s own comment and the catch
+    // block below for why this must be restored if the cycle aborts before committing.
+    std::vector<std::pair<StoreKey, uint64_t>> drained_this_cycle;
+
     // Reused across copy_live_entries() calls to avoid a per-record heap allocation.
     std::vector<std::byte> key_copy;
     std::vector<std::byte> value_copy;
@@ -410,6 +415,15 @@ class VMemKVImpl {
     // `destructive` must be false for the pre-stop call (writers are still live -- see
     // TailEntryTracker::drain_and_clear()'s contract) and true for the post-stop call (the only
     // point anything actually gets consumed/reset).
+    //
+    // Every (prefix, hash) the destructive call visits is recorded into `drained_this_cycle`,
+    // regardless of what visit() below does with it (skip as deleted/inline/old-base, or become a
+    // candidate) -- see the catch block far below for why: if this cycle throws before
+    // t1_.reorganize() ever runs, T1 is never touched, so these keys are still exactly as
+    // tail-resident/unrelocated as they were before this call ran, but drain_and_clear() has
+    // already permanently removed them from tail_entries_. Re-recording a stale one (already
+    // deleted/inlined by the time of a later retry) is harmless -- the next drain just finds that
+    // again and skips it, same as this one did.
     auto copy_live_entries = [&](bool destructive) {
       struct Candidate {
         StoreKey prefix;
@@ -418,6 +432,9 @@ class VMemKVImpl {
       };
       std::vector<Candidate> candidates;
       auto visit = [&](const StoreKey &prefix, uint64_t hash) {
+        if (destructive) {
+          drained_this_cycle.emplace_back(prefix, hash);
+        }
         if (relocated.contains({prefix, hash})) {
           return;  // Already copied by an earlier call to copy_live_entries().
         }
@@ -637,6 +654,18 @@ class VMemKVImpl {
       }
       std::error_code remove_ec;
       std::filesystem::remove(temp_path_t2, remove_ec);
+      // Restores every entry the post-stop pass's drain_and_clear() permanently removed from
+      // tail_entries_ this cycle. T1 was never touched (this function's own top comment: every
+      // real failure runs strictly before T1 is ever published), so these keys are still exactly
+      // as tail-resident/unrelocated as they were before this cycle started -- the next cycle
+      // must see them again, or a live entry's generation stamp silently goes stale forever the
+      // next time it's actually relocated (reproduced directly: a store->defragment() following
+      // an aborted cycle hung retrying try_in_place_update()'s generation-pairing loop on exactly
+      // such an entry, because it had vanished from tail_entries_ with nothing left to ever flip
+      // its retry condition true again).
+      for (const auto &[prefix, hash] : drained_this_cycle) {
+        tail_entries_.record(prefix, hash);
+      }
       throw;
     }
 
