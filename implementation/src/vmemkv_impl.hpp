@@ -393,8 +393,8 @@ class VMemKVImpl {
     std::unordered_map<std::pair<StoreKey, uint64_t>, uint64_t, RelocationKeyHash> relocated;
 
     // Every (prefix, hash) the post-stop pass's destructive drain_and_clear() call has removed
-    // from tail_entries_ so far this cycle -- see copy_live_entries()'s own comment and the catch
-    // block below for why this must be restored if the cycle aborts before committing.
+    // from tail_entries_ so far this cycle -- see the catch block below for why this must be
+    // restored if the cycle aborts before committing.
     std::vector<std::pair<StoreKey, uint64_t>> drained_this_cycle;
 
     // Reused across copy_live_entries() calls to avoid a per-record heap allocation.
@@ -414,16 +414,8 @@ class VMemKVImpl {
     // perspective -- does not publish anything, does not touch T1 at all.
     // `destructive` must be false for the pre-stop call (writers are still live -- see
     // TailEntryTracker::drain_and_clear()'s contract) and true for the post-stop call (the only
-    // point anything actually gets consumed/reset).
-    //
-    // Every (prefix, hash) the destructive call visits is recorded into `drained_this_cycle`,
-    // regardless of what visit() below does with it (skip as deleted/inline/old-base, or become a
-    // candidate) -- see the catch block far below for why: if this cycle throws before
-    // t1_.reorganize() ever runs, T1 is never touched, so these keys are still exactly as
-    // tail-resident/unrelocated as they were before this call ran, but drain_and_clear() has
-    // already permanently removed them from tail_entries_. Re-recording a stale one (already
-    // deleted/inlined by the time of a later retry) is harmless -- the next drain just finds that
-    // again and skips it, same as this one did.
+    // point anything actually gets consumed/reset). Every (prefix, hash) a destructive call
+    // visits is also recorded into `drained_this_cycle` -- see the catch block far below for why.
     auto copy_live_entries = [&](bool destructive) {
       struct Candidate {
         StoreKey prefix;
@@ -658,11 +650,9 @@ class VMemKVImpl {
       // tail_entries_ this cycle. T1 was never touched (this function's own top comment: every
       // real failure runs strictly before T1 is ever published), so these keys are still exactly
       // as tail-resident/unrelocated as they were before this cycle started -- the next cycle
-      // must see them again, or a live entry's generation stamp silently goes stale forever the
-      // next time it's actually relocated (reproduced directly: a store->defragment() following
-      // an aborted cycle hung retrying try_in_place_update()'s generation-pairing loop on exactly
-      // such an entry, because it had vanished from tail_entries_ with nothing left to ever flip
-      // its retry condition true again).
+      // must see them again, or an entry's generation stamp silently goes stale the next time
+      // it's actually relocated, sending try_in_place_update()'s generation-pairing check into an
+      // unwinnable retry loop (reproduced directly via a defragment() following an aborted cycle).
       for (const auto &[prefix, hash] : drained_this_cycle) {
         tail_entries_.record(prefix, hash);
       }
@@ -2224,20 +2214,16 @@ class VMemKVImpl {
     }
 
     // Read-only pass for copy_live_entries()'s pre-stop call: calls fn(prefix, hash) for every
-    // currently-published entry without resetting anything. Never call this once writers might be
-    // stopped (see drain_and_clear() below for why) -- this exists specifically for the *other*
-    // case, where writers are still live and any reset would race them.
-    //
-    // Not resetting means a live writer can freely reuse a low index via record()'s CAS at any
-    // point during this call -- entries_[i]/ready_[i] can change under us mid-read. That's fine
-    // here only because this pass never mutates ready_/tail_: at worst a torn read skips an entry
-    // (silently missing an in-progress publish, same as any other best-effort peek) or observes a
-    // *different* live entry than the one that incremented tail_ to include this index -- either
-    // way, harmless, because copy_live_entries()'s post-stop drain_and_clear() call re-derives
-    // every candidate fresh from T1 (get_by_prefix_hash()) rather than trusting what's cached here,
-    // and is guaranteed to see the complete, final set once writers are actually stopped. This call
-    // is purely a head start, matching its "safe to run any number of times, including zero"
-    // contract.
+    // currently-published entry without resetting anything. Safe to call while writers are still
+    // live -- unlike drain_and_clear() below, never touches ready_/tail_, so a concurrent
+    // record() reusing a low index mid-read can only cause a torn read to skip an entry (silently
+    // missing an in-progress publish) or see a *different* live entry than the one that grew
+    // tail_ to include this index. Either way, harmless: copy_live_entries()'s post-stop
+    // drain_and_clear() call re-derives every candidate fresh from T1 (get_by_prefix_hash())
+    // rather than trusting what's cached here, and is guaranteed to see the complete, final set
+    // once writers are actually stopped. This call is purely a head start, matching its "safe to
+    // run any number of times, including zero" contract -- it is never, on its own, sufficient
+    // for correctness.
     template <typename Fn>
     void peek_live(Fn &&fn) const {
       const size_t count = std::min<size_t>(tail_.load(std::memory_order_acquire), kCapacity);
@@ -2251,35 +2237,26 @@ class VMemKVImpl {
     // Calls fn(prefix, hash) for every published entry, then resets for the next cycle. Destructive
     // (resets tail_ and every visited ready_[i]) -- only call this when no writer can be
     // concurrently calling record(), i.e. from copy_live_entries()'s post-stop pass, strictly after
-    // stop_writers_and_wait() has returned. Calling this while writers are still live reopens the
-    // exact race peek_live() above exists to avoid: a writer's record() can reuse an index this call
-    // just reset tail_ to make available, publish into it, and then have this call's own trailing
-    // cleanup loop (which blindly resets ready_[i] for every i < count) clobber that brand-new
-    // entry's ready_[i] back to false -- entries_[i] keeps the writer's real data, but nothing will
-    // ever set ready_[i] true again, so the *next* drain_and_clear() call waits on it forever
-    // (reproduced directly: entries_[0] held real, live key/hash data while ready_[0] read false
-    // with no thread anywhere in record() to ever flip it).
+    // stop_writers_and_wait() has returned; see peek_live()'s comment above for why an earlier
+    // version calling this pre-stop instead corrupted a live entry (entries_[0] held real key/hash
+    // data while ready_[0] read false forever, with no thread left in record() to ever flip it).
     //
-    // Two distinct races the current design does still need to close for its actual (post-stop-
-    // only) caller:
+    // Two races this implementation closes even though its only current caller can't trigger
+    // either (kept as defense in depth, not an unchecked assumption, so this stays safe to reuse
+    // elsewhere without re-deriving the reasoning):
     //  1. A separately snapshotted "count = tail_.load()" followed by "tail_.store(0)" leaves a
     //     window where a writer's reserve (the tail_ CAS in record()) can land in between: it's
     //     invisible to this call's `count` (taken before the CAS) yet erased by the store(0) (which
     //     lands after), so no drain_and_clear() call, this one or any future one, ever observes it.
     //     Fixed by folding the read and the reset into one atomic exchange() -- a writer's CAS
     //     against the live value of `tail_` can only observe this exchange's result or its own
-    //     success, never a torn mix, so it's deterministically on one side of the cut. (This
-    //     specific race is now moot for this call's only caller -- no writer can reach record() at
-    //     all post-stop -- but exchange() is no more expensive than load()+store() and keeps this
-    //     function safe to reuse elsewhere without re-deriving the same reasoning.)
+    //     success, never a torn mix, so it's deterministically on one side of the cut.
     //  2. record()'s reserve (the CAS) and publish (entries_[i]/ready_[i] store) are two separate
     //     steps, so an index included in `count` (because its CAS already landed) may not have
     //     published yet. Skipping such an index instead of waiting for it would lose it the same
     //     way: publish would land after this call has already moved on and reset ready_[i] to
     //     false. Waiting is always bounded -- record() has no blocking call between reserving and
-    //     publishing, and post-stop, that writer's mem release (which record() must precede) has
-    //     already been waited for by stop_writers_and_wait(), so the wait below is never live here
-    //     in practice -- kept as defense in depth rather than an unchecked assumption.
+    //     publishing.
     template <typename Fn>
     void drain_and_clear(Fn &&fn) {
       const size_t count = std::min<size_t>(tail_.exchange(0, std::memory_order_acq_rel), kCapacity);
