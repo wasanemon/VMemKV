@@ -1413,6 +1413,11 @@ TEST_CASE(
               uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
               REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0, mem->generation) ==
                       ImplT::T1IndexT::PutResult::Applied);
+              // write_entry_lockfree() would also record this into tail_entries_ -- do the same
+              // here since this injection bypasses that function to construct the scenario
+              // directly. Must land before `mem` releases below, same as write_entry_lockfree()'s
+              // own ordering requirement.
+              store->impl().record_tail_entry_for_test(key_bytes);
             });
           });
           // mem released here -- only now can stop_writers_and_wait() (blocked on this exact
@@ -1497,6 +1502,11 @@ TEST_CASE(
               uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
               REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0, mem->generation) ==
                       ImplT::T1IndexT::PutResult::Applied);
+              // write_entry_lockfree() would also record this into tail_entries_ -- do the same
+              // here since this injection bypasses that function to construct the scenario
+              // directly. Must land before `mem` releases below, same as write_entry_lockfree()'s
+              // own ordering requirement.
+              store->impl().record_tail_entry_for_test(key_bytes);
             });
           });
         });
@@ -1621,6 +1631,9 @@ TEST_CASE("VMemKV: checkpoint() heals a straggler entry stamped with a stale T2 
       const uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
       REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0, /*generation=*/g1) ==
               ImplT::T1IndexT::PutResult::Applied);
+      // write_entry_lockfree() would also record this into tail_entries_ -- do the same here
+      // since this injection bypasses that function to construct the scenario directly.
+      store->impl().record_tail_entry_for_test(key_bytes);
     });
   });
 

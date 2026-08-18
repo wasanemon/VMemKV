@@ -186,42 +186,52 @@ class T1Index {
   // callers pairing this against T2Memory must validate the result themselves.
   auto get_with_hash(std::span<const std::byte> key) const -> LookupResult {
     const auto [prefix, hash] = prepare_key_and_hash(key);
-
-    return with_epoch_guard([&]() -> LookupResult {
-      const auto snapshot = sorted_snapshot_.load(std::memory_order_acquire);
-      const SortedRegion *sorted = snapshot->region;
-      const AppendGeneration *active_gen = append_active_.load(std::memory_order_acquire);
-      const AppendRegion *active = active_gen->region;
-
-      // load_slot_consistent() reads (hash, payload, generation) as a consistent triple via the
-      // slot's seqlock -- independent loads here could feed update_impl() a torn pair and corrupt
-      // a live T2 write (see SortedSlot::version's declaration).
-
-      // 1. check active append region
-      if (const AppendSlot *slot = active->find_with_index(*active_gen->index, prefix, hash)) {
-        const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
-        return LookupResult{slot_payload, slot_hash, slot_generation};
-      }
-
-      // 2. check immutable append region if exists
-      if (const AppendGeneration *imm_gen = append_immutable_.load(std::memory_order_acquire)) {
-        const AppendRegion *imm = imm_gen->region;
-        if (const AppendSlot *slot = imm->find_with_index(*imm_gen->index, prefix, hash)) {
-          const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
-          return LookupResult{slot_payload, slot_hash, slot_generation};
-        }
-      }
-
-      // 3. check sorted region
-      if (const SortedSlot *slot = find_sorted(*sorted, prefix, hash)) {
-        const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
-        return LookupResult{slot_payload, slot_hash, slot_generation};
-      }
-
-      return LookupResult{STORE_NOT_FOUND, 0};
-    });
+    return with_epoch_guard([&]() -> LookupResult { return lookup_by_prefix_hash(prefix, hash); });
   }
 
+  // Same lookup as get_with_hash(), for a caller that already has (prefix, hash) from elsewhere
+  // (e.g. a write-time tracker keyed on the same pair T1 itself uses internally) rather than the
+  // original raw key bytes.
+  auto get_by_prefix_hash(const StoreKey &prefix, uint64_t hash) const -> LookupResult {
+    return with_epoch_guard([&]() -> LookupResult { return lookup_by_prefix_hash(prefix, hash); });
+  }
+
+ private:
+  // Shared 3-tier lookup body for get_with_hash()/get_by_prefix_hash() -- must be called from
+  // inside with_epoch_guard(). load_slot_consistent() reads (hash, payload, generation) as a
+  // consistent triple via the slot's seqlock -- independent loads here could feed update_impl() a
+  // torn pair and corrupt a live T2 write (see SortedSlot::version's declaration).
+  auto lookup_by_prefix_hash(const StoreKey &prefix, uint64_t hash) const -> LookupResult {
+    const auto snapshot = sorted_snapshot_.load(std::memory_order_acquire);
+    const SortedRegion *sorted = snapshot->region;
+    const AppendGeneration *active_gen = append_active_.load(std::memory_order_acquire);
+    const AppendRegion *active = active_gen->region;
+
+    // 1. check active append region
+    if (const AppendSlot *slot = active->find_with_index(*active_gen->index, prefix, hash)) {
+      const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
+      return LookupResult{slot_payload, slot_hash, slot_generation};
+    }
+
+    // 2. check immutable append region if exists
+    if (const AppendGeneration *imm_gen = append_immutable_.load(std::memory_order_acquire)) {
+      const AppendRegion *imm = imm_gen->region;
+      if (const AppendSlot *slot = imm->find_with_index(*imm_gen->index, prefix, hash)) {
+        const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
+        return LookupResult{slot_payload, slot_hash, slot_generation};
+      }
+    }
+
+    // 3. check sorted region
+    if (const SortedSlot *slot = find_sorted(*sorted, prefix, hash)) {
+      const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
+      return LookupResult{slot_payload, slot_hash, slot_generation};
+    }
+
+    return LookupResult{STORE_NOT_FOUND, 0};
+  }
+
+ public:
   // Retrieves the 64-bit payload associated with a key prefix.
   // - Thread-safety: Lock-free and concurrently readable while reorganization is in progress.
   // - Guarantees: Returns the latest visible value or STORE_NOT_FOUND if not found.

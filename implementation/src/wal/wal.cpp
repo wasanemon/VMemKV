@@ -524,20 +524,30 @@ void Wal::rotate(uint64_t checkpoint_lsn) {
   // is self-sufficient; rotation only discards old survivors, it never renumbers anyone.
 
   // Flush whatever accumulated in the ring while we held leadership for the file swap, then hand
-  // off leadership plainly -- deliberately not release_leadership()'s reclaim-on-straggler retry
+  // off leadership -- deliberately not release_leadership()'s caller-loops-forever reclaim retry
   // (used by the steady-state write path at the top of this file): under sustained concurrent
   // write load, every backlogged writer is parked waiting on highest_settled_lsn_, not competing
   // for `flushing_`, until its own LSN settles -- so rotate()'s thread was structurally the only
   // party ever re-attempting that reclaim, kept "winning" against its own moving target, and never
   // returned (measured directly: hung 10+ seconds under 19 concurrent insert threads with zero
-  // other reclaim attempts). A writer reserved after this plain release still gets serviced
-  // exactly like any other moment with no rotation in progress: its own reserve+await call makes
-  // its own fresh `!flushing_.exchange(true)` attempt right after reserving, so it either becomes
-  // leader itself or waits for whoever does -- nothing is left permanently stranded, just no
-  // longer rotate()'s personal responsibility to chase.
-  (void)drain_pending();
-  flushing_.store(false, std::memory_order_release);
-  flushing_.notify_all();
+  // other reclaim attempts).
+  //
+  // A single bounded reclaim (not a loop) still closes a real gap a plain release leaves open: a
+  // writer that reserves an LSN and reaches its own `await_durable()` leadership check in the
+  // exact window between this drain's snapshot and the release below observes `flushing_` still
+  // true, so it parks on highest_settled_lsn_ as a follower -- but that LSN was never covered by
+  // any drain, and a plain release only wakes flushing_'s own waiters, not this follower. One more
+  // bounded drain (still snapshot-once, so it can't itself chase a moving target) covers exactly
+  // that writer before the final release. A writer reserving strictly after this final release
+  // makes its own fresh `!flushing_.exchange(true)` attempt and becomes leader or follower for a
+  // now-current leader, same as any other moment with no rotation in progress -- so this never
+  // needs a third round.
+  const uint64_t drained_to = drain_pending();
+  if (release_leadership(drained_to)) {
+    (void)drain_pending();
+    flushing_.store(false, std::memory_order_release);
+    flushing_.notify_all();
+  }
 }
 
 auto Wal::next_lsn() const noexcept -> uint64_t { return next_lsn_.load(std::memory_order_relaxed); }

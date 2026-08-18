@@ -97,6 +97,18 @@ struct Config {
   static constexpr size_t DeadRangeCapacityLog2 = 20;
   static constexpr size_t DeadRangeCapacityEntries = size_t{1} << DeadRangeCapacityLog2;
 
+  // Capacity of the tail-entry tracker that feeds checkpoint_and_defragment()'s copy_live_entries()
+  // -- one entry per key written into T2's tail region since the last cycle, so that pass can
+  // enumerate exactly what needs copying into the new generation instead of scanning the entire
+  // live keyspace. Unlike DeadRangeCapacityEntries above, an entry lost here is a correctness bug,
+  // not a benign leak (its bytes only exist in the old generation's tail, which the cycle
+  // discards) -- TailEntryHardThresholdPercent leaves generous headroom below 100% so writers
+  // block (see maybe_reorganize_if_needed()) well before this tracker could ever actually fill.
+  static constexpr size_t TailEntryCapacityLog2 = 20;
+  static constexpr size_t TailEntryCapacityEntries = size_t{1} << TailEntryCapacityLog2;
+  static constexpr size_t TailEntrySoftThresholdPercent = 50;
+  static constexpr size_t TailEntryHardThresholdPercent = 90;
+
   // Default Tier 2 (T2) file storage capacity: 1 TiB.
   static constexpr size_t DefaultT2CapacityBytes = 1ULL << 40;
 

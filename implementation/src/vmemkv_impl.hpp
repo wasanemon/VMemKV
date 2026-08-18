@@ -396,49 +396,51 @@ class VMemKVImpl {
     std::vector<std::byte> key_copy;
     std::vector<std::byte> value_copy;
 
-    // Reads every currently-live, non-inline, tail-resident entry (offset >= old_base_boundary)
-    // via the public, lock-free t1_.scan() API and copies any not already in `relocated` into the
-    // temp file -- in old-physical-offset order, not `merged`'s key order, for the same reason
-    // the old per-entry code sorted: T2 physical offset is unrelated to key order, so reading in
-    // key order is an effectively-random access pattern under an LTM-scale mmap; old-offset order
-    // is monotonically increasing and kernel/madvise-readahead-friendly. Old-base-resident entries
-    // (offset < old_base_boundary) are skipped entirely: their bytes already sit at the correct
-    // offset in the clone, untouched. Purely read-only from T1's perspective -- does not publish
-    // anything, does not touch T1 at all.
-    static constexpr std::array<std::byte, kStoreKeyBytes> kMaxKeyBytes = [] {
-      std::array<std::byte, kStoreKeyBytes> bytes{};
-      bytes.fill(std::byte{0xFF});
-      return bytes;
-    }();
-    auto copy_live_entries = [&] {
+    // Drains tail_entries_ (every key written into T2's tail since the last cycle -- see that
+    // tracker's own comment) and copies any still-live, non-inline, tail-resident entry not
+    // already in `relocated` into the temp file -- in old-physical-offset order, not `merged`'s
+    // key order, for the same reason the old per-entry code sorted: T2 physical offset is
+    // unrelated to key order, so reading in key order is an effectively-random access pattern
+    // under an LTM-scale mmap; old-offset order is monotonically increasing and kernel/madvise-
+    // readahead-friendly. get_by_prefix_hash() re-resolves each drained (prefix, hash) against
+    // T1's current state rather than trusting a value cached at record() time, since the same key
+    // can be recorded multiple times (each write re-records it) or deleted before this drains --
+    // whichever state T1 shows right now is authoritative. Purely read-only from T1's
+    // perspective -- does not publish anything, does not touch T1 at all.
+    // `destructive` must be false for the pre-stop call (writers are still live -- see
+    // TailEntryTracker::drain_and_clear()'s contract) and true for the post-stop call (the only
+    // point anything actually gets consumed/reset).
+    auto copy_live_entries = [&](bool destructive) {
       struct Candidate {
         StoreKey prefix;
         uint64_t hash;
         uint64_t old_offset;
       };
       std::vector<Candidate> candidates;
-      t1_.scan(std::span<const std::byte>{},
-               std::span<const std::byte>(kMaxKeyBytes),
-               [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash, uint64_t /*t2_generation*/) {
-                 if (payload == vmemkv::STORE_NOT_FOUND) {
-                   return;
-                 }
-                 if constexpr (ConfigT::UseT1InlineValue) {
-                   if (t1_detail::is_inline(hash)) {
-                     return;
-                   }
-                 }
-                 const uint64_t offset = payload & kOffsetMask;
-                 if (offset < old_base_boundary) {
-                   return;  // Old-base-resident: bytes already correct in the clone, untouched.
-                 }
-                 StoreKey prefix;
-                 std::copy(index_key.begin(), index_key.end(), prefix.begin());
-                 if (relocated.contains({prefix, hash})) {
-                   return;  // Already copied by an earlier call to copy_live_entries().
-                 }
-                 candidates.push_back({prefix, hash, offset});
-               });
+      auto visit = [&](const StoreKey &prefix, uint64_t hash) {
+        if (relocated.contains({prefix, hash})) {
+          return;  // Already copied by an earlier call to copy_live_entries().
+        }
+        const auto res = t1_.get_by_prefix_hash(prefix, hash);
+        if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
+          return;  // Deleted since this was recorded.
+        }
+        if constexpr (ConfigT::UseT1InlineValue) {
+          if (t1_detail::is_inline(res.raw_hash)) {
+            return;  // A later write shrank this key's value below the inline threshold.
+          }
+        }
+        const uint64_t offset = res.payload_bits & kOffsetMask;
+        if (offset < old_base_boundary) {
+          return;  // Old-base-resident: bytes already correct in the clone, untouched.
+        }
+        candidates.push_back({prefix, res.raw_hash, offset});
+      };
+      if (destructive) {
+        tail_entries_.drain_and_clear(visit);
+      } else {
+        tail_entries_.peek_live(visit);
+      }
 
       if (candidates.empty()) {
         return;
@@ -501,8 +503,11 @@ class VMemKVImpl {
 
       // Pre-stop pass: a pure performance optimization, not a correctness requirement -- see
       // stop_writers_and_wait() below for why the amount of work left for the post-stop pass
-      // matters. Safe to run any number of times (including zero); T1 is not touched.
-      copy_live_entries();
+      // matters. Safe to run any number of times (including zero); T1 is not touched. Must use the
+      // non-destructive peek_live() (destructive=false), not drain_and_clear() -- writers are still
+      // live here, and drain_and_clear()'s reset races them (see TailEntryTracker::drain_and_clear()'s
+      // contract comment).
+      copy_live_entries(/*destructive=*/false);
 
       // Closes the residual window between here and T1's publish at the very end: while
       // writer_stop_ is set, acquire_write_handle() defers new writers instead of handing out a
@@ -529,8 +534,9 @@ class VMemKVImpl {
       } resume_guard{&t2_};
 
       // Post-stop pass: guaranteed complete -- nothing more can appear until resume_writers()
-      // runs, below.
-      copy_live_entries();
+      // runs, below. The only call site where destructive=true (drain_and_clear()) is safe -- no
+      // writer can reach record() until resume_writers() runs, above.
+      copy_live_entries(/*destructive=*/true);
 
       uint64_t new_capacity = t2_.bytes_capacity();
       if (next_bytes_used > new_capacity) {
@@ -811,6 +817,13 @@ class VMemKVImpl {
   auto t2() noexcept -> vmemkv::T2FlatFile & { return t2_; }
   auto t2() const noexcept -> const vmemkv::T2FlatFile & { return t2_; }
 
+  // TEST-ONLY: records `full_key` into tail_entries_ as write_entry_lockfree() would, for a test
+  // that injects a T2 tail write via the low-level acquire_write_handle()/append_default()
+  // primitives directly (bypassing write_entry_lockfree()) to simulate a specific outcome.
+  void record_tail_entry_for_test(std::span<const std::byte> full_key) {
+    tail_entries_.record(t1_detail::prefix_from_bytes(full_key), t1_detail::hash_full_key(full_key));
+  }
+
   auto get_statistics() const noexcept -> vmemkv::VMemKVStatistics {
     return vmemkv::VMemKVStatistics{.t1_reorg_count = reorg_t1_count_.load(std::memory_order_relaxed),
                                     .t2_reorg_count = reorg_t2_count_.load(std::memory_order_relaxed),
@@ -852,6 +865,15 @@ class VMemKVImpl {
         assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
         uint64_t encoded_payload = offset | (block_count << kSizeEmbeddingShift);
         put_result = t1_.put(full_key, encoded_payload, false, 0, write_generation);
+        if (put_result == T1IndexT::PutResult::Applied) {
+          // Recorded while `mem` is still held, not after this block closes: mem's release is
+          // exactly the signal stop_writers_and_wait() uses to conclude this writer is done (see
+          // this handle's own contract, referenced in the comment below). copy_live_entries()'s
+          // post-stop pass only runs after that signal fires, so this must land first or that
+          // pass could miss this entry entirely -- its bytes only exist in this (about to retire)
+          // generation's tail.
+          tail_entries_.record(t1_detail::prefix_from_bytes(full_key), t1_detail::hash_full_key(full_key));
+        }
       }
       // `mem` is released here, strictly before maybe_reorganize_if_needed() below: that call can
       // block this thread waiting for a concurrent reorganize() to finish (hard-threshold
@@ -1884,7 +1906,7 @@ class VMemKVImpl {
         // ever fires on append-region/delete pressure (see maybe_reorganize_if_needed()) --
         // space_amp/dead-range/WAL-size changes never themselves cause a wakeup, so this only
         // checks them "while already awake anyway."
-        if (space_amp_over_threshold() || dead_ranges_.near_capacity()) {
+        if (space_amp_over_threshold() || dead_ranges_.near_capacity() || tail_entries_.near_capacity()) {
           reorganize_internal(/*do_t2_rebuild=*/true, /*do_checkpoint=*/true);
         } else if (wal_over_threshold()) {
           reorganize_internal(/*do_t2_rebuild=*/false, /*do_checkpoint=*/true);
@@ -1924,6 +1946,28 @@ class VMemKVImpl {
     }
 
     if (append_size >= hard_limit || append_size >= append_capacity) {
+      if (reorg_running_.load(std::memory_order_acquire)) {
+        hard_stall_count_.fetch_add(1, std::memory_order_relaxed);
+      }
+      wait_until_reorg_not_running();
+    }
+
+    // Same soft/hard split as above, for tail_entries_ instead of the T1 append region. Unlike
+    // the append region (drained by *any* reorganize_internal() call), only a T2-touching cycle
+    // drains tail_entries_ -- see reorg_worker_loop()'s priority check, which folds
+    // tail_entries_.near_capacity() into the same condition as dead_ranges_.near_capacity() so
+    // the wakeup this triggers actually picks that kind of cycle.
+    const size_t tail_size = tail_entries_.size();
+    const size_t tail_capacity = ConfigT::TailEntryCapacityEntries;
+    const size_t tail_soft_limit = (tail_capacity * ConfigT::TailEntrySoftThresholdPercent) / 100;
+    const size_t tail_hard_limit = (tail_capacity * ConfigT::TailEntryHardThresholdPercent) / 100;
+
+    if (tail_size >= tail_soft_limit) {
+      reorg_requested_.store(true, std::memory_order_release);
+      reorg_requested_.notify_all();
+    }
+
+    if (tail_size >= tail_hard_limit) {
       if (reorg_running_.load(std::memory_order_acquire)) {
         hard_stall_count_.fetch_add(1, std::memory_order_relaxed);
       }
@@ -2079,6 +2123,159 @@ class VMemKVImpl {
     std::atomic<size_t> tail_{0};
   };
   mutable DeadRangeTracker dead_ranges_;
+
+  // Records (StoreKey prefix, hash) for every entry written into T2's tail region (offset >=
+  // old_base_boundary) since the last checkpoint_and_defragment() cycle, so copy_live_entries()
+  // can enumerate exactly what needs copying into the new generation instead of scanning the
+  // entire live keyspace. Same fixed-capacity, atomic-index-allocated, lock-free append pattern
+  // as DeadRangeTracker, except each slot is a compound record: an index's data (entries_[i]) is
+  // written as plain (non-atomic) memory, then published via a separate atomic ready flag --
+  // record() writes entries_[i] before ready_[i].store(true, release), drain_and_clear() only
+  // reads entries_[i] after observing ready_[i].load(acquire) == true, so the release/acquire
+  // pairing on ready_[i] makes the plain write to entries_[i] safely visible.
+  //
+  // Unlike DeadRangeTracker, dropping an entry here is a correctness bug, not a benign leak (its
+  // bytes only exist in the old generation's tail, which the cycle discards) -- capacity is never
+  // actually allowed to run out: maybe_reorganize_if_needed()'s hard threshold blocks writers,
+  // and the background worker forces a T2-touching cycle (which drains this), well before size()
+  // could reach kCapacity. record() unconditionally reserving-then-dropping past kCapacity is
+  // defense in depth only, unreachable if those thresholds hold.
+  class TailEntryTracker {
+   public:
+    TailEntryTracker()
+        : entries_(static_cast<Entry *>(::mmap(nullptr,
+                                               kCapacity * sizeof(Entry),
+                                               PROT_READ | PROT_WRITE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                               -1,
+                                               0))),
+          ready_(static_cast<std::atomic<bool> *>(::mmap(nullptr,
+                                                         kCapacity * sizeof(std::atomic<bool>),
+                                                         PROT_READ | PROT_WRITE,
+                                                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                                         -1,
+                                                         0))) {
+      if (entries_ == MAP_FAILED || ready_ == MAP_FAILED) {
+        throw std::system_error(errno, std::generic_category(), "mmap TailEntryTracker");
+      }
+      for (size_t i = 0; i < kCapacity; ++i) {
+        new (&ready_[i]) std::atomic<bool>(false);
+      }
+    }
+    ~TailEntryTracker() {
+      ::munmap(entries_, kCapacity * sizeof(Entry));
+      ::munmap(ready_, kCapacity * sizeof(std::atomic<bool>));
+    }
+    TailEntryTracker(const TailEntryTracker &) = delete;
+    auto operator=(const TailEntryTracker &) -> TailEntryTracker & = delete;
+
+    void record(const StoreKey &prefix, uint64_t hash) noexcept {
+      size_t index = tail_.load(std::memory_order_relaxed);
+      while (true) {
+        if (index >= kCapacity) {
+          return;  // Defense in depth only -- see this tracker's own comment.
+        }
+        if (tail_.compare_exchange_weak(index, index + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+          entries_[index] = Entry{prefix, hash};
+          ready_[index].store(true, std::memory_order_release);
+          return;
+        }
+      }
+    }
+
+    [[nodiscard]] auto size() const noexcept -> size_t {
+      return std::min<size_t>(tail_.load(std::memory_order_relaxed), kCapacity);
+    }
+
+    // Mirrors DeadRangeTracker::near_capacity()'s role: forces a T2-touching cycle (which drains
+    // this tracker) before it could otherwise fill purely from soft-threshold-triggered T1-only
+    // cycles, which don't touch this at all.
+    [[nodiscard]] auto near_capacity() const noexcept -> bool {
+      return size() >= (kCapacity * ConfigT::TailEntrySoftThresholdPercent) / 100;
+    }
+
+    // Read-only pass for copy_live_entries()'s pre-stop call: calls fn(prefix, hash) for every
+    // currently-published entry without resetting anything. Never call this once writers might be
+    // stopped (see drain_and_clear() below for why) -- this exists specifically for the *other*
+    // case, where writers are still live and any reset would race them.
+    //
+    // Not resetting means a live writer can freely reuse a low index via record()'s CAS at any
+    // point during this call -- entries_[i]/ready_[i] can change under us mid-read. That's fine
+    // here only because this pass never mutates ready_/tail_: at worst a torn read skips an entry
+    // (silently missing an in-progress publish, same as any other best-effort peek) or observes a
+    // *different* live entry than the one that incremented tail_ to include this index -- either
+    // way, harmless, because copy_live_entries()'s post-stop drain_and_clear() call re-derives
+    // every candidate fresh from T1 (get_by_prefix_hash()) rather than trusting what's cached here,
+    // and is guaranteed to see the complete, final set once writers are actually stopped. This call
+    // is purely a head start, matching its "safe to run any number of times, including zero"
+    // contract.
+    template <typename Fn>
+    void peek_live(Fn &&fn) const {
+      const size_t count = std::min<size_t>(tail_.load(std::memory_order_acquire), kCapacity);
+      for (size_t i = 0; i < count; ++i) {
+        if (ready_[i].load(std::memory_order_acquire)) {
+          fn(entries_[i].prefix, entries_[i].hash);
+        }
+      }
+    }
+
+    // Calls fn(prefix, hash) for every published entry, then resets for the next cycle. Destructive
+    // (resets tail_ and every visited ready_[i]) -- only call this when no writer can be
+    // concurrently calling record(), i.e. from copy_live_entries()'s post-stop pass, strictly after
+    // stop_writers_and_wait() has returned. Calling this while writers are still live reopens the
+    // exact race peek_live() above exists to avoid: a writer's record() can reuse an index this call
+    // just reset tail_ to make available, publish into it, and then have this call's own trailing
+    // cleanup loop (which blindly resets ready_[i] for every i < count) clobber that brand-new
+    // entry's ready_[i] back to false -- entries_[i] keeps the writer's real data, but nothing will
+    // ever set ready_[i] true again, so the *next* drain_and_clear() call waits on it forever
+    // (reproduced directly: entries_[0] held real, live key/hash data while ready_[0] read false
+    // with no thread anywhere in record() to ever flip it).
+    //
+    // Two distinct races the current design does still need to close for its actual (post-stop-
+    // only) caller:
+    //  1. A separately snapshotted "count = tail_.load()" followed by "tail_.store(0)" leaves a
+    //     window where a writer's reserve (the tail_ CAS in record()) can land in between: it's
+    //     invisible to this call's `count` (taken before the CAS) yet erased by the store(0) (which
+    //     lands after), so no drain_and_clear() call, this one or any future one, ever observes it.
+    //     Fixed by folding the read and the reset into one atomic exchange() -- a writer's CAS
+    //     against the live value of `tail_` can only observe this exchange's result or its own
+    //     success, never a torn mix, so it's deterministically on one side of the cut. (This
+    //     specific race is now moot for this call's only caller -- no writer can reach record() at
+    //     all post-stop -- but exchange() is no more expensive than load()+store() and keeps this
+    //     function safe to reuse elsewhere without re-deriving the same reasoning.)
+    //  2. record()'s reserve (the CAS) and publish (entries_[i]/ready_[i] store) are two separate
+    //     steps, so an index included in `count` (because its CAS already landed) may not have
+    //     published yet. Skipping such an index instead of waiting for it would lose it the same
+    //     way: publish would land after this call has already moved on and reset ready_[i] to
+    //     false. Waiting is always bounded -- record() has no blocking call between reserving and
+    //     publishing, and post-stop, that writer's mem release (which record() must precede) has
+    //     already been waited for by stop_writers_and_wait(), so the wait below is never live here
+    //     in practice -- kept as defense in depth rather than an unchecked assumption.
+    template <typename Fn>
+    void drain_and_clear(Fn &&fn) {
+      const size_t count = std::min<size_t>(tail_.exchange(0, std::memory_order_acq_rel), kCapacity);
+      for (size_t i = 0; i < count; ++i) {
+        while (!ready_[i].load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        fn(entries_[i].prefix, entries_[i].hash);
+      }
+      for (size_t i = 0; i < count; ++i) {
+        ready_[i].store(false, std::memory_order_relaxed);
+      }
+    }
+
+   private:
+    struct Entry {
+      StoreKey prefix{};
+      uint64_t hash = 0;
+    };
+    static constexpr size_t kCapacity = ConfigT::TailEntryCapacityEntries;
+    Entry *entries_;
+    std::atomic<bool> *ready_;
+    std::atomic<size_t> tail_{0};
+  };
+  mutable TailEntryTracker tail_entries_;
 };
 
 using VMemKV = VMemKVImpl<vmemkv::Config<>>;
