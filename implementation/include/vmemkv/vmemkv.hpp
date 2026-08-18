@@ -61,8 +61,7 @@ using VMemKV_Var0_Baseline = VMemKV_Baseline;
 using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
 // Fully optimized production configuration. System_AllOn equals Config<BloomFilter,
 // T1InlineValue> (see config.hpp), i.e. exactly this variant's config, so this is the same type
-// as VMemKVStore rather than a distinct one -- see config.hpp's Prefaulting comment for why no
-// further stacking level exists above this one.
+// as VMemKVStore rather than a distinct one.
 using VMemKV_Var2_Inline = VMemKVStore;
 using VMemKVStore = VMemKVStore;
 

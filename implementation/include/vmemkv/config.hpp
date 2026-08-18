@@ -35,27 +35,6 @@
 //           bits of the hash field for inline metadata, skipping T2.
 //   - [JP]: ハッシュフィールドの空きビット（上位4ビット）を利用して、1〜8バイトの値を
 //           T1スロット内に直接インライン格納する最適化。T2への書き込みをバイパスする。
-//
-// * Prefaulting (not a tag in this file -- see below):
-//   - [EN]: Eagerly touching every page of a freshly-grabbed 2MB T2 append chunk
-//           (t2_flat_file.cpp) to avoid later per-record page faults requires holding the T2
-//           write handle (acquire_write_handle()) for the whole page-touch loop, which extends
-//           checkpoint_and_defragment()'s stop_writers_and_wait() drain wait. Under sustained
-//           concurrent write load this makes checkpoint_and_defragment() itself 2.7-5.7x slower,
-//           and under a mixed scan+insert workload (YCSB-E) collapses scan throughput to zero for
-//           up to 16 consecutive seconds. The upside (avoiding first-touch minor-fault latency for
-//           hot Zipf-distributed reads) is concentrated at low thread counts and negligible by 32
-//           threads. See benchmark_results/pages/2026081711_charts.html's YCSB-E tab for the
-//           timeline data.
-//   - [JP]: T2の新しい2MBチャンクを掴むたびに全ページへ即座に書き込み、append時の個々の
-//           page faultを事前に回避する手法は、そのページタッチループ全体でT2書き込みハンドル
-//           (acquire_write_handle())を保持し続けることになり、checkpoint_and_defragment()の
-//           stop_writers_and_wait()のdrain待ちを延ばす。持続的な同時書き込み負荷下では
-//           checkpoint_and_defragment()自体が2.7〜5.7倍遅くなり、scanとinsertが混在する
-//           YCSB-E負荷ではscanスループットが最大16秒連続でゼロになる。恩恵(Zipf分布のホットな
-//           読み取りにおける初回page fault遅延の回避)は低スレッド数に偏り、32スレッドでは
-//           ほぼ無視できる。詳細はbenchmark_results/pages/2026081711_charts.htmlのYCSB-Eタブを
-//           参照。
 
 #pragma once
 
