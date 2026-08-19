@@ -287,6 +287,7 @@ class VMemKVImpl {
     // The offset below which every byte is already durable from an earlier cycle -- constant for
     // the entire lifetime of the T2Memory being read here (see T2Memory::base_boundary's comment).
     const uint64_t old_base_boundary = t2_.get_memory()->base_boundary;
+    capture_watermark_.store(old_base_boundary, std::memory_order_relaxed);
 
     // The store's one persistent T2 data file: created once (first-ever cycle, via O_CREAT) and
     // appended to in place on every subsequent cycle -- never cloned, replaced, or renamed. Bytes
@@ -313,14 +314,12 @@ class VMemKVImpl {
     // that growth would otherwise compete with the live T2 mmap's resident pages for the same RAM.
     uint64_t bytes_synced = old_base_boundary;
 
-    // Every (prefix, hash) this cycle has already durabilized -- copy_live_entries()'s dedup
-    // between its pre-stop and post-stop passes (both may observe the same tail entry).
-    struct KeyHash {
-      auto operator()(const std::pair<StoreKey, uint64_t> &k) const noexcept -> size_t {
-        return std::hash<uint64_t>{}(k.second);
-      }
-    };
-    std::unordered_set<std::pair<StoreKey, uint64_t>, KeyHash> durabilized;
+    // Every T2 offset this cycle has already durabilized -- copy_live_entries()'s dedup between
+    // its pre-stop and post-stop passes (both may observe the same tail entry). Keyed by offset,
+    // not by (prefix, hash): a key redirected out-of-place between the two passes (its old offset
+    // blocked by capture_watermark_, see that member's comment) gets a genuinely new offset that
+    // must still be captured, even though the *key* was already durabilized once at its old one.
+    std::unordered_set<uint64_t> durabilized;
 
     // Every (prefix, hash) the post-stop pass's destructive drain_and_clear() call has removed
     // from tail_entries_ so far this cycle -- see the catch block below for why this must be
@@ -355,9 +354,6 @@ class VMemKVImpl {
         if (destructive) {
           drained_this_cycle.emplace_back(prefix, hash);
         }
-        if (durabilized.contains({prefix, hash})) {
-          return;  // Already durabilized by an earlier call to copy_live_entries() this cycle.
-        }
         const auto res = t1_.get_by_prefix_hash(prefix, hash);
         if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
           return;  // Deleted since this was recorded.
@@ -370,6 +366,9 @@ class VMemKVImpl {
         const uint64_t offset = res.payload_bits & kOffsetMask;
         if (offset < old_base_boundary) {
           return;  // Already durable from an earlier cycle.
+        }
+        if (durabilized.contains(offset)) {
+          return;  // Already durabilized by an earlier call to copy_live_entries() this cycle.
         }
         candidates.push_back({prefix, res.raw_hash, offset});
       };
@@ -404,6 +403,15 @@ class VMemKVImpl {
         // value_len/alloc_len are unsynchronized and a stale read once wouldn't be caught by the
         // version recheck -- see that function's comment. key_copy/value_copy are reused across
         // calls purely to avoid a per-record heap allocation.
+        //
+        // Claimed via capture_watermark_ *before* this read (see that member's comment): once
+        // this store() is visible, any in-place update racing this exact offset is guaranteed to
+        // see allow_in_place==false and redirect out-of-place instead, so the seqlock read below
+        // observes the last possible in-place write to this offset, never one that lands after.
+        // candidates are processed in ascending-offset order (see the sort above), so this is
+        // always a forward-only advance.
+        capture_watermark_.store(candidate.offset + 1, std::memory_order_release);
+
         uint32_t alloc_len = 0;
         uint64_t version = 0;
         read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(candidate.offset, mem); },
@@ -418,7 +426,7 @@ class VMemKVImpl {
         const uint64_t written_through =
             pwrite_record_at_offset(fd_guard.fd, candidate.offset, key_copy, value_copy, alloc_len, version);
         maybe_sync_and_drop_checkpoint_cache(fd_guard.fd, written_through, bytes_synced);
-        durabilized.insert({candidate.prefix, candidate.hash});
+        durabilized.insert(candidate.offset);
       }
     };
 
@@ -559,6 +567,10 @@ class VMemKVImpl {
       for (const auto &[prefix, hash] : drained_this_cycle) {
         tail_entries_.record(prefix, hash);
       }
+      // Un-claim whatever this aborted attempt had blocked: nothing durable actually happened
+      // (see above), so there is no reason for in-place updates to keep redirecting out-of-place
+      // for offsets this cycle never actually captured.
+      capture_watermark_.store(old_base_boundary, std::memory_order_relaxed);
       throw;
     }
 
@@ -623,7 +635,16 @@ class VMemKVImpl {
       // (falls through to write_entry_lockfree()) instead. base_boundary is constant for this
       // T2Memory's entire lifetime (see its own declaration), so this check needs no additional
       // synchronization beyond the plain read `mem` already required.
-      const bool allow_in_place = offset >= mem->base_boundary;
+      //
+      // capture_watermark_ extends the same redirect to a record checkpoint_internal() has
+      // already claimed *this cycle*, before base_boundary itself has advanced to cover it (see
+      // that member's own comment) -- without this, an in-place update landing between
+      // checkpoint_internal()'s claim and its actual durabilizing read/write of this offset could
+      // mutate bytes it's about to (or already did) capture, silently reverting a live read back
+      // to the pre-update value the moment the new generation publishes (proven via a direct
+      // repro, not just reasoned about -- see the crash-recovery regression test for this).
+      const bool allow_in_place =
+          offset >= mem->base_boundary && offset >= capture_watermark_.load(std::memory_order_acquire);
       if (key_matches && value.size() <= alloc_len && allow_in_place) {
         if (!t2_.update_value_at(offset, value, mem)) {
           return {InPlaceOutcome::Aborted};
@@ -1874,6 +1895,18 @@ class VMemKVImpl {
   std::atomic<uint64_t> hard_stall_count_{0};
 
   bool recovering_ = false;  // True only during the constructor's initial WAL replay.
+
+  // Write-side barrier for checkpoint_internal()'s tail durabilization (see its own comment and
+  // try_in_place_update()'s allow_in_place check). Reset to old_base_boundary at the start of
+  // each cycle; checkpoint_internal() advances it strictly forward, past a record's offset,
+  // *before* reading that record -- so any in-place update whose allow_in_place check observes
+  // offset < capture_watermark_ is guaranteed to be redirected out-of-place instead of mutating a
+  // record checkpoint_internal() is about to (or already did) durabilize. Conservative by
+  // construction: it only ever needs to be *at least* as far along as what's genuinely durable
+  // this cycle, never exactly so, so races with the claim step never need to be resolved -- an
+  // update that's blocked slightly earlier than strictly necessary just takes the always-safe
+  // out-of-place path instead.
+  mutable std::atomic<uint64_t> capture_watermark_{0};
 
   // Records (StoreKey prefix, hash) for every entry written into T2's tail region (offset >=
   // old_base_boundary) since the last checkpoint_internal() cycle, so copy_live_entries() can

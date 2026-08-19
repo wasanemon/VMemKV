@@ -748,3 +748,59 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
 
   cleanup_store_files(path);
 }
+
+// Regression test for a real race, confirmed via direct reproduction (not just reasoned about):
+// checkpoint_internal()'s pre-stop pass (copy_live_entries(/*destructive=*/false)) used to capture
+// a tail-resident record's current bytes and mark it durabilized with no barrier stopping an
+// in-place update from landing on that exact offset immediately afterward; the post-stop pass
+// then skipped it (already durabilized), so the checkpoint file kept the stale, pre-update bytes.
+// Once the cycle published a fresh T2Memory generation with base_boundary advanced past this
+// offset, the record became base-resident -- read through the seqlock-free base-region mmaps
+// (7.9), which reflect the *file's* stale bytes, not the in-place update's private COW page. Live
+// reads reverted to the pre-update value immediately, with no crash or restart involved; only a
+// subsequent restart (WAL replay of the update, whose LSN is always > checkpoint_lsn) corrected
+// it.
+//
+// Fixed on the write side (capture_watermark_, see its own declaration and
+// try_in_place_update()'s allow_in_place check): checkpoint_internal() claims a record's offset
+// -- advancing capture_watermark_ past it -- *before* reading it, so any in-place update racing
+// that exact offset is guaranteed to see allow_in_place==false and redirect out-of-place instead
+// of mutating a record the checkpoint has already (or is about to) durabilize. This makes the
+// race impossible rather than detecting and correcting it after the fact.
+TEST_CASE(
+    "checkpoint: an in-place update racing the pre-stop/writer-stop window stays visible live and survives a restart") {
+  const auto path = reserve_crash_temp_path();
+  const std::string v1(200, 'a');
+  const std::string v2(200, 'b');
+  {
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+    REQUIRE(store->insert("racer", v1));  // Tail-resident: no checkpoint has run yet.
+
+    std::thread racer;
+    store->impl().reorganize_internal(
+        /*do_checkpoint=*/true,
+        /*pre_stop_hook=*/[&] {
+          // Fires after the pre-stop copy_live_entries() pass has already captured "racer"=v1
+          // and before stop_writers_and_wait() blocks new writers -- the exact window under
+          // suspicion. update() itself waits for WAL durability, so joining here is sufficient
+          // to guarantee the racing write is fully applied (T2 and WAL) before this hook returns.
+          racer = std::thread([&] { REQUIRE(store->update("racer", v2)); });
+          racer.join();
+        });
+
+    // Live reads must already reflect v2 regardless of what the checkpoint file captured -- T2's
+    // live mapping was updated in place independently of checkpoint_internal()'s file I/O.
+    const auto live = get_bytes(store, "racer");
+    REQUIRE(live.has_value());
+    CHECK(*live == v2);
+  }
+  // Restart without another checkpoint: if the checkpoint file's "racer" slot captured a stale
+  // v1 and the store trusted it without correction, this would read back v1.
+  {
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
+    const auto val = get_bytes(store, "racer");
+    REQUIRE(val.has_value());
+    CHECK(*val == v2);
+  }
+  cleanup_store_files(path);
+}
