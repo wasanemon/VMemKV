@@ -15,3 +15,9 @@
     - If the removal's rationale is genuinely worth preserving beyond the commit message, do not
       write it into source/docs unprompted — propose a separate, dedicated decision-record
       document and get the user's go-ahead before creating it.
+- Never diagnose a performance bottleneck, or propose/discuss a design change to fix one, from
+  code-reading or reasoning alone. Measure first (add timers, profile, break down the call into
+  its component phases) and let the numbers name the actual bottleneck before proposing a fix —
+  a plausible-sounding hypothesis about where time goes can be confidently wrong in exactly the
+  part that matters, and the real cost can sit somewhere structurally unrelated to what looked
+  suspicious from the code alone.
