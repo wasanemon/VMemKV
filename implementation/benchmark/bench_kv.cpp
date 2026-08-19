@@ -54,10 +54,10 @@ class YCSBTimelineCollector {
     alignas(64) std::array<std::atomic<uint64_t>, kDurationSeconds> insert_counts{};
   };
 
-  // One forced store.reorganize()/store.defragment() call, fired deterministically at a fixed
+  // One forced store.reorganize()/store.checkpoint() call, fired deterministically at a fixed
   // second-mark instead of waiting for (possibly rare, see kForcedTriggers' own comment) organic
   // triggering. elapsed_sec is the call's own measured wall-clock duration -- the direct evidence
-  // for whether checkpoint_and_defragment() disrupts a concurrent workload, rather than something
+  // for whether checkpoint_internal() disrupts a concurrent workload, rather than something
   // inferred after the fact from a throughput dip in the timeline.
   struct ForcedEvent {
     int scheduled_sec;
@@ -177,18 +177,17 @@ class YCSBTimelineCollector {
   }
 };
 
-// Fixed schedule for YCSB-E's forced reorganize()/defragment() calls (see the trigger site in
+// Fixed schedule for YCSB-E's forced reorganize()/checkpoint() calls (see the trigger site in
 // register_ycsb_e_benchmark() below): under LTM, natural triggering is rare/unreliable within the
-// 30s window (the append region's soft-limit threshold, and the WAL/space-amp thresholds that
-// drive checkpoint()/defragment(), are often never reached at LTM's much lower throughput), so
-// YCSB-E's timeline would otherwise show little to no reorg activity for those scenarios. Firing
-// these deterministically guarantees comparable data points every run instead of leaving it to
-// chance.
+// 30s window (the append region's soft-limit threshold, and the WAL-size threshold that drives
+// checkpoint(), are often never reached at LTM's much lower throughput), so YCSB-E's timeline
+// would otherwise show little to no reorg activity for those scenarios. Firing these
+// deterministically guarantees comparable data points every run instead of leaving it to chance.
 //
 // t=5s: one reorganize() (T1-only, zero I/O) as a control -- already known cheap from
 // run_reorg_scaling_probe.sh's t1only sweep, included here mainly so the chart has a "known-cheap"
-// reference line next to the defragment() calls below.
-// t=10s and t=25s: two defragment() calls (checkpoint_and_defragment()'s real reflink+punch
+// reference line next to the checkpoint() calls below.
+// t=10s and t=25s: two checkpoint() calls (checkpoint_internal()'s in-place tail-durabilization
 // mechanism), spaced 15s apart -- enough room for each to complete and for the surrounding
 // throughput to resettle before/after, even given real uncertainty over how long a single call
 // takes at YCSB-E's corpus scale. Two calls (not more) is enough to see whether a second cycle
@@ -197,14 +196,14 @@ class YCSBTimelineCollector {
 // cleanly than a live mixed workload can.
 //
 // Deliberately no guard against a late-running call pushing a later trigger's fire time past its
-// own schedule mark, or even past kDurationSeconds entirely: if defragment() at t=10s runs long
+// own schedule mark, or even past kDurationSeconds entirely: if checkpoint() at t=10s runs long
 // enough to blow through the t=25s mark, the next check (on this thread's very next loop
 // iteration, see the trigger site) fires it immediately back-to-back -- itself a legitimate,
-// informative result (defragment() takes long enough under this workload/scale that back-to-back
+// informative result (checkpoint() takes long enough under this workload/scale that back-to-back
 // cycles pile up), not a bug to engineer around.
 struct ForcedTrigger {
   int second_mark;
-  bool is_defragment;  // false = reorganize() (T1-only), true = defragment()
+  bool is_checkpoint;  // false = reorganize() (T1-only), true = checkpoint()
 };
 constexpr std::array<ForcedTrigger, 3> kForcedTriggers{{
     {5, false},
@@ -517,8 +516,6 @@ static void register_benchmark_context() {
                               std::to_string(vmemkv::Config<>::T1ReorganizeSoftThresholdPercent));
   benchmark::AddCustomContext("t1_reorganize_hard_threshold_percent",
                               std::to_string(vmemkv::Config<>::T1ReorganizeHardThresholdPercent));
-  benchmark::AddCustomContext("t2_storage_fragmentation_threshold_percent",
-                              std::to_string(vmemkv::Config<>::T2StorageFragmentationThresholdPercent));
 }
 
 class BenchmarkContextRegistrar {
@@ -714,7 +711,7 @@ struct PopulateOptions {
 // which every backend implements: rivals via their own batched WriteBatch/txn machinery,
 // VMemKV by writing straight into T1/T2 and skipping the WAL entirely. Callers that need the
 // result to be durable (survive a crash, or be reusable by a later construction) must trigger
-// that separately -- see bulk_load()'s own doc comment -- typically via store.defragment()
+// that separately -- see bulk_load()'s own doc comment -- typically via store.checkpoint()
 // immediately after this returns.
 template <typename Store>
 static void populate(Store &store, PopulateOptions options) {
@@ -726,7 +723,7 @@ static void populate(Store &store, PopulateOptions options) {
 
 // Same logical key set {0..key_count) as populate(), but inserted in a fixed-seed-shuffled
 // order instead of ascending key order. Used by reorg_probe (below) so its reorganize()/
-// defragment() timing measurements exercise a T2 layout that's genuinely scattered relative to
+// checkpoint() timing measurements exercise a T2 layout that's genuinely scattered relative to
 // key order, instead of the already-key-ordered layout ascending-order populate() would leave
 // (bulk_load_impl() appends in call order). Deterministic (fixed kBenchmarkSeed) so repeated
 // builds of the same master are byte-identical.
@@ -784,15 +781,15 @@ class ZipfDistribution {
   }
 };
 
-// Always starts from a genuinely wiped, empty store: the T2 file, WAL, manifest, and every
-// generation-numbered checkpoint file (path + ".chkN.t1" / ".chkN.t2" -- N is unpredictable,
-// hence the directory sweep). Used for rival backends (their own on-disk format has no
-// relationship to VMemKV's checkpoint reuse below) and for scenarios that genuinely need a
-// fresh/empty corpus every time -- Insert (measures inserting into an empty store). Leaving the
-// manifest/.chkN.* files behind would let a "fresh" store silently fast-boot from an unrelated
-// scenario's leftover checkpoint whenever it happened to share this same unscoped path and had
-// called defragment() -- corrupting later scenarios sharing that path (a fresh-looking Insert
-// silently rejecting every key as already-present, since it isn't actually empty).
+// Always starts from a genuinely wiped, empty store: the T2 file, WAL, manifest, and the T1/T2
+// checkpoint files (path + ".t1chk" / ".t2chk"). Used for rival backends (their own on-disk
+// format has no relationship to VMemKV's checkpoint reuse below) and for scenarios that genuinely
+// need a fresh/empty corpus every time -- Insert (measures inserting into an empty store).
+// Leaving the manifest/checkpoint files behind would let a "fresh" store silently fast-boot from
+// an unrelated scenario's leftover checkpoint whenever it happened to share this same unscoped
+// path and had called checkpoint() -- corrupting later scenarios sharing that path (a
+// fresh-looking Insert silently rejecting every key as already-present, since it isn't actually
+// empty).
 //
 // `extra_spared_prefixes`/`sweep_other_stale_paths` default to "spare nothing extra, always
 // sweep" for the ordinary (Insert non-LTM) caller, whose own files are genuinely
@@ -820,35 +817,33 @@ static auto make_vmemkv_fresh(const std::string &path,
   std::filesystem::remove(path, error_code);
   std::filesystem::remove(vmemkv::derive_wal_path(path), error_code);
   std::filesystem::remove(vmemkv::derive_manifest_path(path), error_code);
-
-  const std::filesystem::path path_obj(path);
-  const std::string chk_prefix = path_obj.filename().string() + ".chk";
-  std::error_code iter_error_code;
-  for (const auto &entry : std::filesystem::directory_iterator(path_obj.parent_path(), iter_error_code)) {
-    if (entry.path().filename().string().starts_with(chk_prefix)) {
-      std::filesystem::remove(entry.path(), error_code);
-    }
-  }
+  std::filesystem::remove(vmemkv::derive_t1_chk_path(path), error_code);
+  std::filesystem::remove(vmemkv::derive_t2_chk_path(path), error_code);
 
   return constructor();
 }
 
-// Builds (once) a VMemKV checkpoint at `master_path` -- a real populate() + defragment() --
-// if one isn't already there, then clones it into a fresh instance path by hardlinking the
-// checkpoint's generation-numbered .chkN.t1/.chkN.t2 files (see checkpoint.hpp's
-// derive_t1_chk_path()/derive_t2_chk_path(): never modified in place once committed, exactly
-// like RocksDB's SST files -- see RocksDBStore::clone_from()'s comment for the same reasoning)
-// and writing a matching manifest, with *no* WAL at the new path -- so constructing a
-// VMemKVImpl there fast-boots straight from the checkpoint with nothing to replay.
+// Builds (once) a VMemKV checkpoint at `master_path` -- a real populate() + checkpoint() -- if
+// one isn't already there, then clones it into a fresh instance path and writing a matching
+// manifest, with *no* WAL at the new path -- so constructing a VMemKVImpl there fast-boots
+// straight from the checkpoint with nothing to replay.
+//
+// The T1 checkpoint file is hardlinked (checkpoint.hpp's write_t1_checkpoint(): always written to
+// a temp path and rename()'d onto the final one, so a later cycle on the clone replaces the
+// clone's directory entry with a fresh inode rather than mutating the one still shared with the
+// master -- exactly like RocksDB's SST files, see RocksDBStore::clone_from()'s comment for the
+// same reasoning). The T2 checkpoint file cannot use the same trick: checkpoint_internal()
+// durabilizes T2's tail via pwrite() directly into the persistent file, in place, so a hardlinked
+// T2 file would let the clone's own later checkpoint cycles corrupt the master (and any other
+// clone sharing that inode) -- it's copied instead.
 //
 // This is what lets Get/Update/Delete/YCSB-E/Scan (see their registrations below) all get a
 // fresh, fully-populated, fully-reorganized instance on every construction without paying
 // bulk_load's cost more than once per (variant, val_size) -- and, since they all pass the same
 // (val_size, key_count), they transparently share that one on-disk master rather than each
-// building their own. Every clone here is independent: it hardlinks a snapshot of the
-// checkpoint's data and starts with no WAL of its own, so a later mutation (e.g. Delete removing
-// keys, or YCSB-E's insert mix growing the corpus) on one clone never touches the master or any
-// sibling clone taken from it.
+// building their own. Every clone here is independent and starts with no WAL of its own, so a
+// later mutation (e.g. Delete removing keys, or YCSB-E's insert mix growing the corpus) on one
+// clone never touches the master or any sibling clone taken from it.
 template <typename Store>
 static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
                                               std::size_t val_size,
@@ -869,7 +864,7 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
         register_primed_master_prefix(master_path),
         !should_skip_cleanup());
     populate(*master_store, {key_count, val_size});
-    master_store->defragment();
+    master_store->impl().checkpoint();
     master_store.reset();
     manifest = vmemkv::read_manifest(master_manifest_path);
     if (!manifest.has_value()) {
@@ -885,10 +880,10 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
   std::filesystem::remove(vmemkv::derive_wal_path(instance_path), ignored);
   std::filesystem::remove(vmemkv::derive_manifest_path(instance_path), ignored);
 
-  const auto master_t1 = vmemkv::derive_t1_chk_path(master_path, manifest->generation);
-  const auto master_t2 = vmemkv::derive_t2_chk_path(master_path, manifest->generation);
-  const auto instance_t1 = vmemkv::derive_t1_chk_path(instance_path, manifest->generation);
-  const auto instance_t2 = vmemkv::derive_t2_chk_path(instance_path, manifest->generation);
+  const auto master_t1 = vmemkv::derive_t1_chk_path(master_path);
+  const auto master_t2 = vmemkv::derive_t2_chk_path(master_path);
+  const auto instance_t1 = vmemkv::derive_t1_chk_path(instance_path);
+  const auto instance_t2 = vmemkv::derive_t2_chk_path(instance_path);
   std::filesystem::remove(instance_t1, ignored);
   std::filesystem::remove(instance_t2, ignored);
   std::error_code link_error;
@@ -896,9 +891,10 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
   if (link_error) {
     throw std::runtime_error("Failed to hardlink T1 checkpoint for clone: " + link_error.message());
   }
-  std::filesystem::create_hard_link(master_t2, instance_t2, link_error);
-  if (link_error) {
-    throw std::runtime_error("Failed to hardlink T2 checkpoint for clone: " + link_error.message());
+  std::error_code copy_error;
+  std::filesystem::copy_file(master_t2, instance_t2, copy_error);
+  if (copy_error) {
+    throw std::runtime_error("Failed to copy T2 checkpoint for clone: " + copy_error.message());
   }
   vmemkv::write_manifest(vmemkv::derive_manifest_path(instance_path), manifest->generation, manifest->t2_bytes_used);
 
@@ -1259,11 +1255,10 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
         // own run phase grows the corpus past ycsb_populate_size afterward: nothing ever
         // mutates the master/checkpoint itself, only this clone, so a later YCSB-E
         // construction cloning the same still-pristine source is unaffected. Deliberately
-        // *not* calling store.defragment() here as a "defensive" no-op: defragment()
-        // unconditionally forces at least one real T2 rebuild pass (see
-        // VMemKVImpl::run_reorganize()'s forced_once handling), even when the append region
-        // is already empty, so on an already-pristine clone it would only add a real,
-        // non-trivial rebuild cost for zero benefit.
+        // *not* calling store.checkpoint() here as a "defensive" no-op: checkpoint()
+        // unconditionally forces at least one real cycle (see VMemKVImpl::run_reorganize()'s
+        // force_run handling), even when the append region is already empty, so on an
+        // already-pristine clone it would only add a real, non-trivial cost for zero benefit.
 
         // NOTE: collector setup and background reorg thread are launched per-run inside the
         // benchmark body (via epoch synchronization) to handle multiple trial/warmup runs correctly.
@@ -1365,7 +1360,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                 col->last_recorded_t2.store(current_t2, std::memory_order_relaxed);
               }
 
-              // Fire the next scheduled forced reorganize()/defragment() call once elapsed
+              // Fire the next scheduled forced reorganize()/checkpoint() call once elapsed
               // reaches its mark -- see kForcedTriggers' own comment for the schedule and why a
               // late-running call is deliberately allowed to push a later trigger's fire time (or
               // cause it to be skipped entirely, if the window ends first).
@@ -1373,8 +1368,8 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                   elapsed >= kForcedTriggers[next_forced_trigger_idx].second_mark) {
                 const ForcedTrigger &trigger = kForcedTriggers[next_forced_trigger_idx];
                 const auto call_t0 = std::chrono::steady_clock::now();
-                if (trigger.is_defragment) {
-                  store.defragment();
+                if (trigger.is_checkpoint) {
+                  store.checkpoint();
                 } else {
                   store.reorganize();  // T1-only, zero I/O
                 }
@@ -1408,7 +1403,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
 
                 col->forced_events.push_back({trigger.second_mark,
                                               bucket,
-                                              trigger.is_defragment ? "defragment" : "reorganize",
+                                              trigger.is_checkpoint ? "checkpoint" : "reorganize",
                                               call_elapsed_sec});
                 ++next_forced_trigger_idx;
               }
@@ -1479,7 +1474,7 @@ static void register_insert_benchmark(Holder insert_holder,
       // LTM mode's pre-populated starting corpus is exactly the same (val_size, corpus_size)
       // fully-populated/committed state every other scenario's shared master represents (see
       // make_fresh_corpus_checkpoint()'s comment) -- clone from it instead of independently
-      // bulk_load()ing + defragment()ing once per thread-count registration. Directly
+      // bulk_load()ing + checkpoint()ing once per thread-count registration. Directly
       // fixes a measured regression: under an LTM-sized corpus inside a memory-constrained
       // cgroup, VMemKV's independent per-thread-count populate blew out to 200-1200s (vs.
       // ~20-30s unconstrained) -- paying that once via the shared master instead of up to
@@ -1774,40 +1769,34 @@ void register_all_benchmarks() {
 
 // ─── Reorg-scaling probe (standalone CLI mode, bypasses Google Benchmark) ───────────────────
 //
-// Measures how long a single reorganize()/defragment() call takes as a function of corpus size,
+// Measures how long a single reorganize()/checkpoint() call takes as a function of corpus size,
 // for T1-only vs T1+T2 modes. Google Benchmark's own registration model assumes the same
 // operation repeats many times to build a statistic; here we want to time exactly one, possibly
 // very slow, blocking call and be able to tell a driver script "this is taking too long" without
 // waiting indefinitely -- hence a standalone CLI mode instead of a registered benchmark case.
 //
-// Results from an i4i.8xlarge run (2026-08-04, see run_reorg_scaling_probe.sh's output):
-// isolated T1-only reorganize stays fast even at full LTM scale (<=2.7s up to 8.26M entries at
-// 1KB, <0.2s up to 131K entries at 64KB) -- markedly better than in-memory T1+T2, which already
-// takes 20-35s at its own full scale (8-20M entries). T1+T2 under the LTM cgroup is dramatically
-// worse still: it timed out (>60s) at just 25% of the 1KB target (2.06M entries) and at 100% of
-// the 64KB target (131K entries, but ~8.6GB of live T2 bytes) -- rewriting that much T2 data
-// through a 1GiB-constrained page cache is where reorganize() actually becomes impractical, not
-// the T1-only merge itself.
+// checkpoint_internal() durabilizes T2's live tail in place (5.2), touching only
+// [old_base_boundary, current bytes_used) regardless of how large the rest of the corpus is.
+// t1t2 (run_bootstrap()) and t1t2_steady (run_steady()) both measure this same mechanism; they
+// differ only in whether the corpus already has a prior checkpoint to diff against.
 //
 // Population/checkpoint/churn are deliberately NOT time-limited here -- only the outer shell
 // driver's own generous backstop timeout (wrapping this whole process) covers them. Only the
-// reorganize()/defragment() call itself is capped (timed_run(), below), via a background thread
+// reorganize()/checkpoint() call itself is capped (timed_run(), below), via a background thread
 // plus future::wait_for(), so a runaway call is reported on its own without also charging setup
 // time against the same budget (conflating the two would make a timeout ambiguous: slow setup, or
-// slow reorganize/defragment?).
+// slow reorganize/checkpoint?).
 //
 // Three modes, selected via --mode:
-//   t1only / t1t2 (run_bootstrap(), below): the original design -- a single fresh populate
-//     followed by exactly one timed reorganize()/defragment() call. Always O(N): there's no prior
-//     generation to reflink from, so this measures checkpoint_and_defragment()'s bootstrap cost.
-//   t1t2_steady (run_steady(), below): measures a *second* (or later) defragment() call against a
-//     corpus that already has one checkpointed generation -- this is what exercises the
-//     reflink+punch O(diff) path. Used by two experiments that share this same mechanism, only
-//     differing in which axis (--ratio or --churn-ratio) they sweep: "Churn-Ratio Scaling" (fixed
-//     --ratio, varies --churn-ratio) and "Corpus-Size Invariance across Generations" (fixed
-//     --churn-ratio, varies --ratio, relying on run_steady()'s incremental corpus growth to avoid
-//     re-populating from scratch at each point). See run_churn_scaling_probe.sh and
-//     run_reorg_scaling_probe.sh's t1t2_steady sweep, respectively.
+//   t1only / t1t2 (run_bootstrap(), below): a single fresh populate followed by exactly one timed
+//     reorganize()/checkpoint() call.
+//   t1t2_steady (run_steady(), below): measures a *second* (or later) checkpoint() call against a
+//     corpus that already has one checkpointed generation. Used by two experiments that share
+//     this same mechanism, only differing in which axis (--ratio or --churn-ratio) they sweep:
+//     "Churn-Ratio Scaling" (fixed --ratio, varies --churn-ratio) and "Corpus-Size Invariance
+//     across Generations" (fixed --churn-ratio, varies --ratio, relying on run_steady()'s
+//     incremental corpus growth to avoid re-populating from scratch at each point). See
+//     run_churn_scaling_probe.sh and run_reorg_scaling_probe.sh's t1t2_steady sweep, respectively.
 namespace reorg_probe {
 
 constexpr int kReorgTimeoutSeconds = 60;
@@ -1898,7 +1887,7 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
   return args;
 }
 
-// Times a single call to `fn` (reorganize()/defragment()) in a detached background thread capped
+// Times a single call to `fn` (reorganize()/checkpoint()) in a detached background thread capped
 // at kReorgTimeoutSeconds -- see the file-level comment above this namespace for why
 // google-benchmark's iteration model doesn't fit timing exactly one, possibly very slow, blocking
 // call.
@@ -1921,7 +1910,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 }
 
 // _Exit(), not return: on timeout, timed_run()'s worker thread is still inside reorganize()/
-// defragment() touching `store` -- abandoning it via detach() and terminating without running
+// checkpoint() touching `store` -- abandoning it via detach() and terminating without running
 // destructors (skipping `store`'s ~VMemKVImpl(), which would otherwise join reorg_worker_ and
 // could itself block forever) is what makes this process's exit actually bounded. On success,
 // _Exit() is just the simplest way to avoid the same destructor path racing the
@@ -1938,28 +1927,26 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 }
 
 // T1-only / T1+T2 bootstrap modes: a single fresh populate (scattered insert order, see
-// populate_random_order()'s comment) followed by exactly one timed reorganize()/defragment()
-// call. Always O(N) regardless of the checkpoint_and_defragment() reflink+punch redesign --
-// there is no prior generation to reflink from -- so this remains the bootstrap-cost baseline
-// (see run_reorg_scaling_probe.sh's own comment).
+// populate_random_order()'s comment) followed by exactly one timed reorganize()/checkpoint()
+// call, against a corpus with no prior checkpoint.
 [[noreturn]] void run_bootstrap(const ProbeArgs &args) {
   using Store = vmemkv::variants::VMemKVStore;
 
   const std::size_t full_key_count = corpus_size_for_value(args.val_size);
   const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-  const bool force_t2_gc = args.mode == ProbeMode::kT1T2;
+  const bool force_checkpoint = args.mode == ProbeMode::kT1T2;
 
   const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_" + (force_t2_gc ? "t1t2" : "t1only") + "_" +
+                           std::to_string(args.val_size) + "_" + (force_checkpoint ? "t1t2" : "t1only") + "_" +
                            std::to_string(static_cast<int>(args.ratio * 100));
 
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
   populate_random_order(*store, {key_count, args.val_size});
 
-  auto [elapsed_sec, timed_out] = timed_run([&store, force_t2_gc]() {
-    if (force_t2_gc) {
-      store->defragment();
+  auto [elapsed_sec, timed_out] = timed_run([&store, force_checkpoint]() {
+    if (force_checkpoint) {
+      store->checkpoint();
     } else {
       store->reorganize();
     }
@@ -1967,10 +1954,10 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   report_and_exit(args, key_count, elapsed_sec, timed_out);
 }
 
-// Steady-state mode: measures a *second* (or later) defragment() call, after the corpus already
-// has one checkpointed generation to reflink from -- this is what actually exercises
-// checkpoint_and_defragment()'s O(diff) path, unlike run_bootstrap() above which always measures
-// the O(N) first-ever-checkpoint case.
+// Steady-state mode: measures a *second* (or later) checkpoint() call, after the corpus already
+// has one checkpointed generation -- unlike run_bootstrap() above, this exercises
+// checkpoint_internal() against a tail that only reflects the churn applied since that first
+// checkpoint, not a from-scratch corpus.
 //
 // Persists across invocations at a fixed, ratio/churn-independent path (keyed only by
 // --sweep-tag/scenario/value-size) so a driver script can call this repeatedly -- with an
@@ -2023,7 +2010,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   // per call, see update_impl()'s comment), so a single sequential thread issuing hundreds of
   // thousands of them serializes on fsync latency alone -- observed locally taking >300s for
   // 400K updates regardless of corpus size or churn ratio, i.e. a property of this churn-
-  // application loop, not of the defragment() call being measured. Splitting across threads lets
+  // application loop, not of the checkpoint() call being measured. Splitting across threads lets
   // concurrent WAL appends benefit from group commit (see wal.cpp) the same way a real concurrent
   // write workload would.
   const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * args.churn_ratio));
@@ -2052,7 +2039,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     }
   }
 
-  auto [elapsed_sec, timed_out] = timed_run([&store]() { store->defragment(); });
+  auto [elapsed_sec, timed_out] = timed_run([&store]() { store->checkpoint(); });
 
   if (!timed_out) {
     std::ofstream marker(count_marker_path, std::ios::trunc);

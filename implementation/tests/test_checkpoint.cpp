@@ -199,17 +199,15 @@ TEST_CASE("Manifest: truncated file reads as nullopt") {
   std::filesystem::remove(path);
 }
 
-TEST_CASE("Path derivation: manifest/t1chk/t2chk paths are distinct and generation-scoped") {
+TEST_CASE("Path derivation: manifest/t1chk/t2chk paths are distinct and stable") {
   const std::filesystem::path t2_path = "/tmp/some_store";
 
   const auto manifest_path = vmemkv::derive_manifest_path(t2_path);
-  const auto t1chk_gen5 = vmemkv::derive_t1_chk_path(t2_path, 5);
-  const auto t1chk_gen5_again = vmemkv::derive_t1_chk_path(t2_path, 5);
-  const auto t1chk_gen6 = vmemkv::derive_t1_chk_path(t2_path, 6);
-  const auto t2chk_gen5 = vmemkv::derive_t2_chk_path(t2_path, 5);
+  const auto t1chk_path = vmemkv::derive_t1_chk_path(t2_path);
+  const auto t1chk_path_again = vmemkv::derive_t1_chk_path(t2_path);
+  const auto t2chk_path = vmemkv::derive_t2_chk_path(t2_path);
 
-  CHECK(manifest_path != t1chk_gen5);
-  CHECK(t1chk_gen5 == t1chk_gen5_again);  // deterministic for the same (t2_path, generation)
-  CHECK(t1chk_gen5 != t1chk_gen6);        // different generations must not collide
-  CHECK(t1chk_gen5 != t2chk_gen5);        // T1 chk and T2 data files for the same generation differ
+  CHECK(manifest_path != t1chk_path);
+  CHECK(t1chk_path == t1chk_path_again);  // deterministic for the same t2_path
+  CHECK(t1chk_path != t2chk_path);        // T1 chk and T2 data files are separate paths
 }

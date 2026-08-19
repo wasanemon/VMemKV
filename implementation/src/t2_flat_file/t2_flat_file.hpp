@@ -68,11 +68,11 @@ struct T2Memory {
   // base-region mappings below (`base_mmap_scan`/`base_mmap_scan_seq`/`read_fd`). update_impl()
   // checks this directly to decide whether an in-place update must redirect out-of-place instead
   // (see kOffsetMask's use there). Constant for this T2Memory's entire lifetime, set once at
-  // construction from `initial_bytes_used` -- checkpoint_and_defragment() (TODO.md item 5) only
-  // ever grows it by publishing a whole new generation (a fresh T2Memory) via swap_memory(), never
-  // by mutating an existing one in place, so no atomic/synchronization is needed here: publication
-  // of the new T2Memory itself (via T2FlatFile's atomic pointer swap) already establishes the
-  // necessary happens-before relationship for every plain field in it, this one included.
+  // construction from `initial_bytes_used` -- checkpoint_internal() only ever grows it by
+  // publishing a whole new generation (a fresh T2Memory) via swap_memory(), never by mutating an
+  // existing one in place, so no atomic/synchronization is needed here: publication of the new
+  // T2Memory itself (via T2FlatFile's atomic pointer swap) already establishes the necessary
+  // happens-before relationship for every plain field in it, this one included.
   uint64_t base_boundary = 0;
 
   // A second, read-only mmap covering [0, capacity) of this exact generation's file -- distinct
@@ -81,14 +81,12 @@ struct T2Memory {
   // large-record path, via try_read_resident_base_record()) for records whose embedded size
   // hint is larger than one page -- see `base_mmap_scan_seq` below for the small-record
   // counterpart and the "T2 base-region reads" comment in vmemkv_impl.hpp for why there are two.
-  // Mapped full-capacity (not just bytes_used-at-creation-time) specifically so that
-  // base_boundary can grow via a T1-only checkpoint's incremental promotion without ever needing
-  // to remap: since this mapping is PROT_READ-only, it never triggers copy-on-write, so it
-  // always transparently reflects whatever the backing file's current page-cache content is,
-  // including bytes written by a later pwrite() through a different fd -- reads are only ever
-  // gated by the `offset < base_boundary` check (scan_impl()), never by whether this specific
-  // mapping has "seen" a write, so nothing beyond that gate needs to change when base_boundary
-  // grows. Its lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based
+  // Mapped full-capacity (not just bytes_used-at-creation-time): since this mapping is
+  // PROT_READ-only, it never triggers copy-on-write, so it always transparently reflects whatever
+  // the backing file's current page-cache content is, including bytes written by
+  // checkpoint_internal()'s pwrite() through a different fd -- reads are only ever gated by the
+  // `offset < base_boundary` check (scan_impl()), never by whether this specific mapping has
+  // "seen" a write. Its lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based
   // retirement scheme that already protects `base`/`capacity`. nullptr unless explicitly set by
   // the caller (mmap_t2_memory() in vmemkv_impl.hpp -- best-effort -- a failure to create it just
   // means the reader falls back to the
@@ -147,8 +145,7 @@ struct T2Memory {
       ::munmap(base, static_cast<size_t>(capacity));
     }
     if (base_mmap_scan != nullptr) {
-      // Mapped to `capacity` (see base_mmap_scan's own comment above), not base_boundary -- the
-      // mapping's length never changes after creation even though base_boundary grows in place.
+      // Mapped to `capacity` (see base_mmap_scan's own comment above), not base_boundary.
       ::munmap(base_mmap_scan, static_cast<size_t>(capacity));
     }
     if (base_mmap_scan_seq != nullptr) {

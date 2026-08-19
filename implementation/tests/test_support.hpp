@@ -16,11 +16,8 @@
 
 namespace vmemkv_test {
 
-// Base directory for test-created T2/WAL/checkpoint files. VMemKV's checkpoint_and_defragment()
-// requires a reflink-capable filesystem (ioctl(FICLONE) -- see TODO.md item 5), which the system
-// temp directory is not guaranteed to be (e.g. ext4 on a typical dev machine). Sourced from
-// VMEMKV_TEST_TMPDIR if set (see scripts/ensure_xfs_dev_volume.sh), falling back to the system
-// temp directory otherwise -- that fallback is only correct on a reflink-capable machine.
+// Base directory for test-created T2/WAL/checkpoint files. Sourced from VMEMKV_TEST_TMPDIR if set
+// (see scripts/ensure_xfs_dev_volume.sh), falling back to the system temp directory otherwise.
 inline auto test_temp_root() -> const std::filesystem::path & {
   static const std::filesystem::path root = [] {
     if (const char *env = std::getenv("VMEMKV_TEST_TMPDIR"); env != nullptr && *env != '\0') {

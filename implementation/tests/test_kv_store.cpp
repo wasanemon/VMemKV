@@ -391,108 +391,6 @@ TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
   CHECK(entry_count == 3U);
 }
 
-TEST_CASE("VMemKV: manual reorganize forces physical storage garbage collection") {
-  auto store = StoreFactory<vmemkv::variants::VMemKV_Baseline>::make();
-
-  const int key_count = 100;
-  for (int i = 0; i < key_count; ++i) {
-    store->insert(std::to_string(i), static_cast<uint64_t>(i + 1000));
-  }
-
-  uint64_t initial_t2_used = store->t2().bytes_used();
-  REQUIRE(initial_t2_used > 0);
-
-  const int remove_count = 15;
-  for (int i = 0; i < remove_count; ++i) {
-    store->remove(std::to_string(i));
-  }
-
-  CHECK(store->t2().bytes_used() == initial_t2_used);
-
-  store->defragment();
-
-  uint64_t post_reorg_t2_used = store->t2().bytes_used();
-  CHECK(post_reorg_t2_used < initial_t2_used);
-
-  for (int i = remove_count; i < key_count; ++i) {
-    CHECK(test_util::get_sync(store, std::to_string(i)) == static_cast<uint64_t>(i + 1000));
-  }
-}
-
-// Regression test for the no-sort compaction redesign: a full T1+T2 reorganize used to lay T2
-// out in *key* order (a byproduct of offset_mapper being invoked in T1's key-merge order); it
-// now relocates entries in *old physical offset* order instead (see offset_mapper_fn's batch
-// implementation in vmemkv_impl.hpp), producing a T2 file that's compacted (dead space dropped)
-// but not key-sorted. This directly proves both halves of that claim: the new physical offsets
-// preserve the *old* offsets' relative order, and that order does not coincide with key order.
-TEST_CASE("VMemKV: reorganize compacts T2 in old-physical-offset order, not key order") {
-  auto store = StoreFactory<vmemkv::variants::VMemKV_Baseline>::make();
-  using ImplType = std::remove_reference_t<decltype(store->impl())>;
-
-  auto to_span = [](const std::string &key_string) {
-    return std::span<const std::byte>(reinterpret_cast<const std::byte *>(key_string.data()), key_string.size());
-  };
-  auto offset_of = [&](const std::string &key) -> uint64_t {
-    return store->impl().t1().get_with_hash(to_span(key)).payload_bits & ImplType::kOffsetMask;
-  };
-
-  // Keys inserted in an order decorrelated from lexicographic order, so their T1-key order and
-  // T1-insertion(~old T2 physical offset) order disagree for at least one pair.
-  const std::vector<std::string> keys = {"m5", "a9", "z1", "c3", "k7", "b2", "y8", "d4"};
-  for (const auto &key : keys) {
-    store->insert(key, 1);
-  }
-  // Delete a couple of keys so the post-reorg T2 file is genuinely compacted (dead entries
-  // dropped), not just relocated 1:1.
-  store->remove("a9");
-  store->remove("y8");
-
-  std::vector<std::string> surviving = {"m5", "z1", "c3", "k7", "b2", "d4"};
-  std::vector<std::pair<std::string, uint64_t>> pre_reorg;
-  pre_reorg.reserve(surviving.size());
-  for (const auto &key : surviving) {
-    pre_reorg.emplace_back(key, offset_of(key));
-  }
-  // Old-offset order and key order genuinely disagree pre-reorg (sanity check on the fixture
-  // itself, not the thing under test): insertion order was m5,a9(removed),z1,c3,k7,b2,y8(removed),d4.
-  std::vector<std::pair<std::string, uint64_t>> by_old_offset = pre_reorg;
-  std::ranges::sort(by_old_offset, {}, &std::pair<std::string, uint64_t>::second);
-  std::vector<std::string> old_offset_order;
-  for (const auto &[key, offset] : by_old_offset) {
-    old_offset_order.push_back(key);
-  }
-  std::vector<std::string> key_order = surviving;
-  std::ranges::sort(key_order);
-  REQUIRE(old_offset_order != key_order);
-
-  store->defragment();
-
-  std::vector<std::pair<std::string, uint64_t>> post_reorg;
-  post_reorg.reserve(surviving.size());
-  for (const auto &key : surviving) {
-    post_reorg.emplace_back(key, offset_of(key));
-  }
-
-  // (a) Old-offset order is preserved: sorting post-reorg offsets ascending must reproduce the
-  // exact same key order as sorting pre-reorg offsets ascending -- proving relocation walked
-  // entries in old-physical-offset order, not key order.
-  std::vector<std::pair<std::string, uint64_t>> by_new_offset = post_reorg;
-  std::ranges::sort(by_new_offset, {}, &std::pair<std::string, uint64_t>::second);
-  std::vector<std::string> new_offset_order;
-  for (const auto &[key, offset] : by_new_offset) {
-    new_offset_order.push_back(key);
-  }
-  CHECK(new_offset_order == old_offset_order);
-
-  // (b) The new layout is NOT key-sorted: it still disagrees with lexicographic key order.
-  CHECK(new_offset_order != key_order);
-
-  // (c) Still a real compaction: dead space from the two removed keys is gone.
-  for (const auto &key : surviving) {
-    CHECK(test_util::get_sync(store, key) == 1U);
-  }
-}
-
 // Regression test: a same-size update targeting a record in T2's "base" region (written by the
 // last full reorganize) must be redirected out-of-place instead of taking the in-place fast path
 // -- see update_impl()'s base_boundary check and T2Memory::base_boundary's declaration for why an
@@ -508,7 +406,7 @@ TEST_CASE("VMemKV: update after reorganize redirects out-of-place, Scan sees fre
   REQUIRE(store->insert("key_a", value_a));
   REQUIRE(store->insert("key_b", value_b));
 
-  store->defragment();  // Forces a full T1+T2 rebuild: both records now sit in the base region.
+  store->checkpoint();  // Advances base_boundary: both records now sit in the base region.
 
   // Same-size update: would take the in-place fast path if key_a's offset weren't in the base.
   const std::string value_a_updated(kValue200Bytes, 'A');
@@ -530,9 +428,9 @@ TEST_CASE("VMemKV: update after reorganize redirects out-of-place, Scan sees fre
   REQUIRE(get_result.has_value());
   CHECK(std::string(reinterpret_cast<const char *>(get_result->data()), get_result->size()) == value_a_updated);
 
-  // A second reorganize should absorb the out-of-place update into a new base region, and a
+  // A second checkpoint should absorb the out-of-place update into a new base region, and a
   // further same-size update should again be redirected rather than corrupting the new base.
-  store->defragment();
+  store->checkpoint();
   const std::string value_a_updated2(kValue200Bytes, 'Z');
   REQUIRE(store->update("key_a", value_a_updated2));
   std::map<std::string, std::string> seen2;
@@ -545,7 +443,7 @@ TEST_CASE("VMemKV: update after reorganize redirects out-of-place, Scan sees fre
 }
 
 // Stress/regression test: update() (base-region redirect decision) races scan() (base_mmap_scan
-// read path) races repeated defragment() (moves base_boundary, swaps T2Memory generations, remaps
+// read path) races repeated checkpoint() (moves base_boundary, swaps T2Memory generations, remaps
 // base_mmap_scan) -- the three-way race the base/tail split's correctness depends on. Run under
 // ThreadSanitizer for direct race detection; also self-checks independent of TSan, since every
 // value written here is `kStressValueBytes` copies of one repeated character, so a torn read shows
@@ -558,7 +456,7 @@ TEST_CASE("VMemKV: update after reorganize redirects out-of-place, Scan sees fre
 // tripping it; raising this constant is likely to make this test flaky on that unrelated, unfixed
 // issue rather than exercise more of the code this test actually targets.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("VMemKV: concurrent update+scan survive repeated reorganize (stress)") {
+TEST_CASE("VMemKV: concurrent update+scan survive repeated checkpoint (stress)") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   constexpr int kKeyCount = 50;
@@ -605,7 +503,7 @@ TEST_CASE("VMemKV: concurrent update+scan survive repeated reorganize (stress)")
   });
 
   for (int i = 0; i < kReorgCycles; ++i) {
-    store->defragment();
+    store->checkpoint();
   }
   stop.store(true, std::memory_order_relaxed);
   updater.join();
@@ -620,14 +518,12 @@ TEST_CASE("VMemKV: concurrent update+scan survive repeated reorganize (stress)")
   }
 }
 
-// Regression test for base_boundary coverage across repeated checkpoint() cycles: checkpoint()
-// and defragment() now share the same reflink+punch mechanism (TODO.md item 5) -- each cycle
-// produces a whole new generation (via checkpoint_and_defragment()) whose base_boundary covers
-// everything live at that point, not just an in-place extension of the previous generation's.
-// Without this, a long-running insert-only process (space_amp stays ~1.0 forever with no
-// deletes, so defragment() never fires organically) would have base_mmap/read_fd coverage frozen
-// forever at whatever the first forced checkpoint() established, even as the live corpus kept
-// growing past it.
+// Regression test for base_boundary coverage across repeated checkpoint() cycles: each cycle
+// (via checkpoint_internal()) publishes a whole new T2Memory generation whose base_boundary
+// covers everything durabilized so far, not just an in-place extension of the previous
+// generation's. Without this, a long-running insert-only process would have base_mmap/read_fd
+// coverage frozen forever at whatever the first forced checkpoint() established, even as the
+// live corpus kept growing past it.
 TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated cycles") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
@@ -638,7 +534,7 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
   for (int i = 0; i < 10; ++i) {
     REQUIRE(store->insert(padded_key(i), value));
   }
-  store->checkpoint();  // First checkpoint: no prior generation to clone from, starts fresh.
+  store->checkpoint();  // First checkpoint: creates the T2 checkpoint file.
 
   const uint64_t boundary_after_first = store->impl().t2().get_memory()->base_boundary;
   CHECK(boundary_after_first > 0);
@@ -646,8 +542,7 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
   CHECK(store->impl().t2().get_memory()->base_mmap_scan_seq != nullptr);
   CHECK(store->impl().t2().get_memory()->read_fd >= 0);
 
-  // Insert more, then checkpoint again -- a fresh reflink+swap cycle regardless of fragmentation,
-  // since checkpoint() and defragment() are the same mechanism now (TODO.md item 5).
+  // Insert more, then checkpoint again -- a fresh T2Memory generation every cycle.
   for (int i = 10; i < 20; ++i) {
     REQUIRE(store->insert(padded_key(i), value));
   }
@@ -672,9 +567,8 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
 
 // Stress/regression test: update()'s in-place path racing repeated checkpoint() cycles, entered
 // via the checkpoint() API specifically (as opposed to the "...repeated reorganize (stress)"
-// test above, which uses defragment()) -- checkpoint() and defragment() now share the same
-// underlying checkpoint_and_defragment() mechanism (TODO.md item 5), so this exercises the same
-// generation-swap/writer-stop machinery through a second public entry point.
+// test above, which uses defragment()) -- this exercises the same generation-swap/writer-stop
+// machinery checkpoint_internal() drives through a second public entry point.
 //
 // Deliberately bounded (kOpsPerCycle updates/scans per cycle, spawned and joined once per
 // checkpoint() call) rather than free-spinning update/scan threads for the whole test duration:
@@ -949,7 +843,7 @@ TEST_CASE_TEMPLATE("[mt] concurrent reads are consistent", Store, STORE_TYPES) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("VMemKV reorganize resolves storage fragmentation") {
+TEST_CASE("VMemKV: checkpoint preserves correctness across garbage from update/remove") {
   auto store = StoreFactory<vmemkv::variants::VMemKV_Baseline>::make();
 
   std::string val1(kValue100Bytes, 'x');
@@ -967,10 +861,7 @@ TEST_CASE("VMemKV reorganize resolves storage fragmentation") {
 
   CHECK(store->remove("k1"));
 
-  store->defragment();
-
-  uint64_t bytes_used_after_reorg = store->t2().bytes_used();
-  CHECK(bytes_used_after_reorg < bytes_used_after_update);
+  store->checkpoint();
 
   CHECK_FALSE(test_util::get_bytes_sync(store, "k1").has_value());
   auto got = test_util::get_bytes_sync(store, "k2");
@@ -1093,13 +984,13 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
 // reorganize_internal()'s stress-harness verification.
 
 // Regression test: scan_impl() used to acquire one T2MemoryHandle up front and hold it for the
-// whole scan, but a concurrent defragment() rebuilds T2 (fresh mmap, fresh layout) partway
+// whole scan, but a concurrent checkpoint() publishes a fresh T2Memory generation partway
 // through -- later T1 offsets could belong to a newer generation than that handle protects,
 // causing out-of-bounds reads or an infinite seqlock retry loop. Fixed by stamping every T1
 // sorted_snapshot_ with the T2Memory generation it was built against and validating the pair on
 // every read. Reaching the final CHECK without hanging is this test's primary assertion.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("VMemKV: scan survives a T2-rebuilding reorganize running concurrently (regression)") {
+TEST_CASE("VMemKV: scan survives a T2-generation-swapping checkpoint running concurrently (regression)") {
   using TestStore = vmemkv::variants::VMemKVStore;
   auto store = StoreFactory<TestStore>::make();
 
@@ -1119,7 +1010,7 @@ TEST_CASE("VMemKV: scan survives a T2-rebuilding reorganize running concurrently
   std::atomic<bool> stop{false};
   std::thread reorganizer([&] {
     while (!stop.load(std::memory_order_relaxed)) {
-      store->defragment();  // Forces a full T2 rebuild (new mmap, new generation) every call.
+      store->checkpoint();  // Forces a fresh T2Memory (new mmap, new generation) every call.
     }
   });
 
@@ -1133,8 +1024,8 @@ TEST_CASE("VMemKV: scan survives a T2-rebuilding reorganize running concurrently
       for (int i = 0; i < kScansPerThread; ++i) {
         const size_t count =
             store->scan("k0000", "k9999", [](std::span<const std::byte>, std::span<const std::byte>) {});
-        // Reorganize is pure GC (no key is ever added or removed by it), so every scan should
-        // see exactly kKeyCount entries throughout, regardless of how many reorganizes raced it.
+        // checkpoint() never adds or removes a key, so every scan should see exactly kKeyCount
+        // entries throughout, regardless of how many checkpoints raced it.
         if (count != static_cast<size_t>(kKeyCount)) {
           count_mismatch.store(true, std::memory_order_relaxed);
         }
@@ -1176,7 +1067,7 @@ TEST_CASE("VMemKV: reorganize's T2 record read survives a concurrent in-place up
 
   constexpr int kReorgCycles = 300;
   for (int i = 0; i < kReorgCycles; ++i) {
-    store->defragment();  // Forces a full T2 rebuild every call, maximizing race opportunities.
+    store->checkpoint();  // Forces a fresh T2Memory generation every call, maximizing race opportunities.
   }
   stop.store(true, std::memory_order_relaxed);
   updater.join();
@@ -1394,7 +1285,6 @@ TEST_CASE(
   // (about-to-be-retired) generation, registering it with the reference tracker before
   // stop_writers_and_wait() ever scans it.
   store->impl().reorganize_internal(
-      /*do_t2_rebuild=*/true,
       /*do_checkpoint=*/true,
       /*pre_stop_hook=*/
       [&] {
@@ -1434,7 +1324,7 @@ TEST_CASE(
 }
 
 // Regression test for the formerly-open "residual window" race described in
-// checkpoint_and_defragment()'s comment: T2FlatFile::acquire_write_handle() used to check
+// checkpoint_internal()'s comment: T2FlatFile::acquire_write_handle() used to check
 // writer_stop_ *before* registering with the reference tracker, which
 // ThreadReferenceTracker::wait_until_retired()'s single index-ordered scan (it never re-examines
 // a slot once past it) could race -- a writer whose check saw the flag false, but who hadn't
@@ -1467,7 +1357,6 @@ TEST_CASE(
   std::atomic<bool> writer_registered{false};
 
   store->impl().reorganize_internal(
-      /*do_t2_rebuild=*/true,
       /*do_checkpoint=*/true,
       /*pre_stop_hook=*/
       [&] {
@@ -1526,13 +1415,13 @@ TEST_CASE(
 }
 
 // Regression test for a design this codebase used to have: an earlier version of
-// checkpoint_and_defragment() published T1's new generation incrementally, mid-rebuild,
+// checkpoint_internal() published T1's new generation incrementally, mid-rebuild,
 // before T2 was ready. An exception there (e.g. from truncate()/mmap() under real
 // ENOSPC/EMFILE/ENOMEM pressure) could leave a T1 entry permanently naming a T2 generation that
 // would never be published, hanging get()/update() on that key forever inside
 // try_in_place_update()'s/get_impl()'s `mem->generation < res.generation` retry loop --
 // reproduced via fault injection during that redesign, which is what motivated moving T1's
-// publish to a single, I/O-free call at the very end (see checkpoint_and_defragment()'s own
+// publish to a single, I/O-free call at the very end (see checkpoint_internal()'s own
 // comment). This test proves the current design instead: injecting a fault at the last possible
 // moment before T1 could ever be touched (NoOpPreFinishHook's seam) still leaves the store fully
 // functional afterward -- no hang, correct data, and a subsequent defragment() succeeds normally.
@@ -1551,7 +1440,6 @@ TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the st
   bool threw = false;
   try {
     store->impl().reorganize_internal(
-        /*do_t2_rebuild=*/true,
         /*do_checkpoint=*/true,
         /*pre_stop_hook=*/vmemkv::NoOpPreStopHook{},
         /*pre_finish_hook=*/[] { throw InjectedFault{}; });
@@ -1567,8 +1455,8 @@ TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the st
 
   REQUIRE(store->update("key", std::string(200, 'w')));
 
-  // A subsequent, unfaulted rebuild must still succeed normally.
-  store->defragment();
+  // A subsequent, unfaulted checkpoint cycle must still succeed normally.
+  store->checkpoint();
   const auto final_readback = test_util::get_bytes_sync(store, "key");
   REQUIRE(final_readback.has_value());
   CHECK(final_readback->size() == 200);
@@ -1581,16 +1469,12 @@ struct TinyWalCheckpointConfig : vmemkv::Config<> {
 using VMemKV_TinyWalCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyWalCheckpointConfig>>;
 }  // namespace
 
-// Regression test for how checkpoint_and_defragment() (TODO.md item 5) handles a straggler entry
-// left stamped with an already-retired T2 generation by the still-open, separately-tracked
-// residual-window race (see T2FlatFile::acquire_write_handle()'s contract). Unlike the old
-// T1-only checkpoint path (removed -- its offset_mapper was a pure passthrough that never
-// validated generations, unlike the full-rebuild path's), checkpoint() now always goes through
-// the same relocation/validation offset_mapper_fn defragment() uses. So a straggler like this is
-// silently healed by the very next checkpoint() cycle: T1's scan finds it by its live key/hash
-// regardless of what generation it was stamped with, its bytes (really, physically written
-// against the current generation -- only its T1 stamp lies about that) get copied forward
-// normally, and its generation stamp gets corrected to match.
+// Regression test for how checkpoint_internal() handles a straggler entry left stamped with an
+// already-retired T2 generation by the still-open, separately-tracked residual-window race (see
+// T2FlatFile::acquire_write_handle()'s contract). checkpoint_internal()'s offset_mapper_fn visits
+// every live entry T1's merge produces and restamps its generation unconditionally, so a
+// straggler like this is silently healed by the very next checkpoint() cycle regardless of what
+// generation it was stamped with.
 TEST_CASE("VMemKV: checkpoint() heals a straggler entry stamped with a stale T2 generation") {
   using TestStore = VMemKV_TinyWalCheckpoint;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
@@ -1600,18 +1484,18 @@ TEST_CASE("VMemKV: checkpoint() heals a straggler entry stamped with a stale T2 
   const std::string baseline_value(200, 'v');
   REQUIRE(store->insert("baseline", baseline_value));
 
-  // Uses the gated public defragment() (reorg_running_ CAS), not reorganize_internal() directly:
+  // Uses the gated public checkpoint() (reorg_running_ CAS), not reorganize_internal() directly:
   // TinyWalCheckpointConfig's tiny threshold means the background reorg_worker_ thread is a real,
   // active competitor here (unlike the writer-stop-barrier regression test above, whose default 64MiB
   // threshold never lets the worker fire during a short test) -- bypassing the gate would let this
   // test's direct calls race the worker's own reorganize_internal() calls.
 
-  // Cycle 1: force a full T2 rebuild -- generation G1.
-  store->impl().defragment();
+  // Cycle 1: force a checkpoint -- generation G1.
+  store->impl().checkpoint();
   const uint64_t g1 = store->impl().t2().get_memory()->generation;
 
-  // Cycle 2: force another full T2 rebuild -- generation G2, retiring G1's T2Memory.
-  store->impl().defragment();
+  // Cycle 2: force another checkpoint -- generation G2, retiring G1's T2Memory.
+  store->impl().checkpoint();
   const uint64_t g2 = store->impl().t2().get_memory()->generation;
   REQUIRE(g2 != g1);
 
@@ -1637,8 +1521,7 @@ TEST_CASE("VMemKV: checkpoint() heals a straggler entry stamped with a stale T2 
     });
   });
 
-  // Cycle 3: an ordinary checkpoint() -- the same mechanism as defragment() now (TODO.md item 5)
-  // -- must both succeed and correctly heal the straggler.
+  // Cycle 3: an ordinary checkpoint() must both succeed and correctly heal the straggler.
   const auto stats_before = store->impl().get_statistics();
   store->impl().checkpoint();
   const auto stats_after = store->impl().get_statistics();

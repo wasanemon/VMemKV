@@ -461,7 +461,7 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
 // entry sees it paired with its original, now possibly-stale generation, not whatever generation
 // that second call itself was invoked with.
 //
-// Not reachable from vmemkv_impl.hpp's checkpoint_and_defragment(), which calls
+// Not reachable from vmemkv_impl.hpp's checkpoint_internal(), which calls
 // t1_.reorganize() exactly once per rebuild cycle, only after T2FlatFile::stop_writers_and_wait()
 // has already guaranteed no new T2-append-backed entry can appear. The property remains true and
 // worth guarding here purely as T1Index's own contract, verified in isolation via reorganize()'s

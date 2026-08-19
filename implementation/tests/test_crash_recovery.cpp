@@ -38,16 +38,8 @@ void cleanup_store_files(const std::filesystem::path &t2_path) {
   std::filesystem::remove(t2_path, ignored);
   std::filesystem::remove(vmemkv::derive_wal_path(t2_path), ignored);
   std::filesystem::remove(vmemkv::derive_manifest_path(t2_path), ignored);
-
-  // Generation-numbered checkpoint files (t2_path + ".chkN.t1" / ".chkN.t2") have an
-  // unpredictable N, so sweep the parent directory for anything sharing the base filename.
-  const std::string prefix = t2_path.filename().string() + ".chk";
-  std::error_code iter_ec;
-  for (const auto &entry : std::filesystem::directory_iterator(t2_path.parent_path(), iter_ec)) {
-    if (entry.path().filename().string().starts_with(prefix)) {
-      std::filesystem::remove(entry.path(), ignored);
-    }
-  }
+  std::filesystem::remove(vmemkv::derive_t1_chk_path(t2_path), ignored);
+  std::filesystem::remove(vmemkv::derive_t2_chk_path(t2_path), ignored);
 }
 
 // Values are always >= 9 bytes so T1InlineValue's <=8B inlining never applies,
@@ -394,7 +386,7 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
     CHECK(live_count == kInsertCount - kRemoveCount);
 
     store->reorganize();  // T1-only fast path.
-    store->defragment();  // Forced T2 GC.
+    store->defragment();  // T1-only placeholder (5.2) -- exercised here for survival, not GC.
 
     for (int i = kRemoveCount; i < kInsertCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
@@ -516,10 +508,10 @@ TEST_CASE("crash recovery: update failing on T2 capacity exceeded leaves no phan
 
 // ─── Checkpoint / Reload integration tests ──────────────────────────────────────────────────
 // See docs/specification/low_level_design.md 5.2-5.5. These exercise the checkpoint mechanism
-// entirely through the public Store interface plus filesystem inspection of the manifest and
-// generation-numbered files it produces -- never through VMemKVImpl internals directly.
+// entirely through the public Store interface plus filesystem inspection of the manifest and the
+// checkpoint files it produces -- never through VMemKVImpl internals directly.
 
-TEST_CASE_TEMPLATE("checkpoint: explicit defragment() persists a manifest and survives restart",
+TEST_CASE_TEMPLATE("checkpoint: explicit checkpoint() persists a manifest and survives restart",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
   const auto path = reserve_crash_temp_path();
@@ -529,7 +521,7 @@ TEST_CASE_TEMPLATE("checkpoint: explicit defragment() persists a manifest and su
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
-    store->defragment();  // Forces the T2-GC path -- now also a checkpoint.
+    store->impl().checkpoint();
     CHECK(std::filesystem::exists(vmemkv::derive_manifest_path(path)));
   }
   {
@@ -552,7 +544,7 @@ TEST_CASE("checkpoint: rotates the WAL down to just the post-checkpoint tail") {
   }
   const uint64_t wal_size_before = std::filesystem::file_size(vmemkv::derive_wal_path(path));
 
-  store->defragment();
+  store->impl().checkpoint();
 
   const uint64_t wal_size_after = std::filesystem::file_size(vmemkv::derive_wal_path(path));
   CHECK(wal_size_after < wal_size_before);  // Rotation dropped everything up to checkpoint_lsn.
@@ -560,32 +552,32 @@ TEST_CASE("checkpoint: rotates the WAL down to just the post-checkpoint tail") {
   cleanup_store_files(path);
 }
 
-TEST_CASE("checkpoint: a second checkpoint deletes the previous generation's files") {
+TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 checkpoint files") {
   const auto path = reserve_crash_temp_path();
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < 20; ++i) {
     REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
   }
-  store->defragment();
+  store->impl().checkpoint();
   const auto manifest1 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest1.has_value());
-  const auto gen1_t1 = vmemkv::derive_t1_chk_path(path, manifest1->generation);
-  const auto gen1_t2 = vmemkv::derive_t2_chk_path(path, manifest1->generation);
-  REQUIRE(std::filesystem::exists(gen1_t1));
-  REQUIRE(std::filesystem::exists(gen1_t2));
+  const auto t1_chk_path = vmemkv::derive_t1_chk_path(path);
+  const auto t2_chk_path = vmemkv::derive_t2_chk_path(path);
+  REQUIRE(std::filesystem::exists(t1_chk_path));
+  REQUIRE(std::filesystem::exists(t2_chk_path));
 
   for (int i = 0; i < 20; ++i) {
     REQUIRE(store->insert("b" + std::to_string(i), make_value(1000 + i)));
   }
-  store->defragment();
+  store->impl().checkpoint();
   const auto manifest2 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest2.has_value());
-  CHECK(manifest2->generation != manifest1->generation);
+  CHECK(manifest2->generation != manifest1->generation);  // checkpoint_lsn still advances...
 
-  CHECK_FALSE(std::filesystem::exists(gen1_t1));  // Previous generation cleaned up.
-  CHECK_FALSE(std::filesystem::exists(gen1_t2));
-  CHECK(std::filesystem::exists(vmemkv::derive_t1_chk_path(path, manifest2->generation)));
-  CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path, manifest2->generation)));
+  // ...but the checkpoint files themselves are the same paths every cycle -- checkpoint_internal()
+  // durabilizes in place rather than building a new file per generation.
+  CHECK(std::filesystem::exists(t1_chk_path));
+  CHECK(std::filesystem::exists(t2_chk_path));
 
   cleanup_store_files(path);
 }
@@ -598,7 +590,7 @@ TEST_CASE("checkpoint: deletes and updates after a checkpoint are correctly refl
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
-    store->defragment();  // Checkpoint captures all 30 keys.
+    store->impl().checkpoint();  // Checkpoint captures all 30 keys.
 
     // Tail activity after the checkpoint: delete half, update the rest.
     for (int i = 0; i < kKeyCount / 2; ++i) {
@@ -631,7 +623,7 @@ TEST_CASE("checkpoint: insert/checkpoint/insert-more/restart preserves both pre-
     for (int i = 0; i < kFirstBatch; ++i) {
       REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
     }
-    store->defragment();
+    store->impl().checkpoint();
     for (int i = 0; i < kSecondBatch; ++i) {
       REQUIRE(store->insert("b" + std::to_string(i), make_value(1000 + i)));
     }
@@ -657,14 +649,14 @@ TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     REQUIRE(store->insert("k", make_value(0)));
-    store->defragment();
+    store->impl().checkpoint();
   }
   const auto manifest = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest.has_value());
-  // Simulate loss/corruption of the checkpointed generation's T1 chk file. Since the WAL has
-  // already been rotated down to the tail, falling back to full replay would silently lose the
-  // pre-checkpoint key -- construction must fail loudly instead (see load_checkpoint_if_present).
-  std::filesystem::remove(vmemkv::derive_t1_chk_path(path, manifest->generation));
+  // Simulate loss/corruption of the T1 checkpoint file. Since the WAL has already been rotated
+  // down to the tail, falling back to full replay would silently lose the pre-checkpoint key --
+  // construction must fail loudly instead (see load_checkpoint_if_present).
+  std::filesystem::remove(vmemkv::derive_t1_chk_path(path));
 
   CHECK_THROWS(std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes));
 
@@ -679,10 +671,10 @@ using VMemKV_TinyWalCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyWal
 }  // namespace
 
 // Regression test for checkpoint()'s first-ever call: this store has never committed a checkpoint
-// before, so there's no existing T2 checkpoint file to reflink-clone from -- checkpoint_and_
-// defragment() (TODO.md item 5) must fall back to starting a genuinely fresh file instead, even
-// for an insert-only workload that never generates fragmentation on its own.
-TEST_CASE("checkpoint(): first call on a fresh store starts a fresh T2 generation (no clone source)") {
+// before, so checkpoint_internal() must create the T2 checkpoint file (O_CREAT) rather than
+// assume one already exists, even for an insert-only workload that never generates fragmentation
+// on its own.
+TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint file") {
   const auto path = reserve_crash_temp_path();
   auto store = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
   for (int i = 0; i < 200; ++i) {
@@ -694,9 +686,7 @@ TEST_CASE("checkpoint(): first call on a fresh store starts a fresh T2 generatio
 
   CHECK(std::filesystem::exists(vmemkv::derive_manifest_path(path)));
   CHECK(stats_after.t2_reorg_count == stats_before.t2_reorg_count + 1);
-  const auto manifest = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
-  REQUIRE(manifest.has_value());
-  CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path, manifest->generation)));
+  CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path)));
 
   for (int i = 0; i < 200; ++i) {
     const auto val = get_bytes(store, "k" + std::to_string(i));
@@ -707,11 +697,10 @@ TEST_CASE("checkpoint(): first call on a fresh store starts a fresh T2 generatio
   cleanup_store_files(path);
 }
 
-// Regression test proving checkpoint() and defragment() are the same mechanism now (TODO.md item
-// 5): repeated checkpoint() calls each produce a genuinely new T2 generation via reflink clone +
-// swap, with the previous cycle's T2 checkpoint file cleaned up every time -- not reused the way
-// the old, now-removed T1-only checkpoint path used to.
-TEST_CASE("checkpoint: repeated checkpoint() calls each rebuild T2 via a fresh generation") {
+// Regression test: repeated checkpoint() calls each durabilize the tail written since the last
+// cycle in place (same T1/T2 checkpoint file paths throughout, checkpoint_lsn still advancing
+// every cycle), and a restart after several cycles correctly adopts the final state.
+TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survive restart") {
   const auto path = reserve_crash_temp_path();
   auto store = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
 
@@ -719,8 +708,8 @@ TEST_CASE("checkpoint: repeated checkpoint() calls each rebuild T2 via a fresh g
   store->impl().checkpoint();
   const auto manifest1 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest1.has_value());
-  auto last_t2_chk_path = vmemkv::derive_t2_chk_path(path, manifest1->generation);
-  REQUIRE(std::filesystem::exists(last_t2_chk_path));
+  const auto t2_chk_path = vmemkv::derive_t2_chk_path(path);
+  REQUIRE(std::filesystem::exists(t2_chk_path));
 
   const auto stats_after_seed = store->impl().get_statistics();
 
@@ -736,16 +725,14 @@ TEST_CASE("checkpoint: repeated checkpoint() calls each rebuild T2 via a fresh g
 
     const auto manifest_now = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
     REQUIRE(manifest_now.has_value());
-    CHECK(manifest_now->generation != last_generation);      // A fresh generation every cycle.
-    CHECK_FALSE(std::filesystem::exists(last_t2_chk_path));  // Old T2 file cleaned up.
+    CHECK(manifest_now->generation != last_generation);  // checkpoint_lsn advances every cycle.
     last_generation = manifest_now->generation;
-    last_t2_chk_path = vmemkv::derive_t2_chk_path(path, manifest_now->generation);
-    REQUIRE(std::filesystem::exists(last_t2_chk_path));
+    REQUIRE(std::filesystem::exists(t2_chk_path));  // Same file, every cycle.
   }
 
   const auto stats_after_cycles = store->impl().get_statistics();
   CHECK(stats_after_cycles.t2_reorg_count ==
-        stats_after_seed.t2_reorg_count + kCycles);  // Every checkpoint() rebuilt T2.
+        stats_after_seed.t2_reorg_count + kCycles);  // Every checkpoint() ran a cycle.
 
   // A genuine restart adopts the final checkpoint correctly.
   store.reset();

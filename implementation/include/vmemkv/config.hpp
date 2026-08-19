@@ -82,22 +82,13 @@ struct Config {
   static constexpr size_t kBitsPerByte = 8;
   static constexpr size_t T1ReorganizeSoftThresholdPercent = 50;
   static constexpr size_t T1ReorganizeHardThresholdPercent = 95;
-  static constexpr size_t T2StorageFragmentationThresholdPercent = 30;
 
   // T1 append region capacity (ablation knob).
   // Keep this as a power of two to preserve cache-friendly masking behavior.
   static constexpr size_t T1AppendCapacityLog2 = 22;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
-  // Capacity of the dead old-base offset-range tracker that feeds checkpoint_and_defragment()'s
-  // hole-punch targets (TODO.md item 5) -- one entry per out-of-place-redirected update or delete
-  // whose superseded offset was in the old-base region. Nearing capacity forces an earlier cycle
-  // (see space_amp_over_threshold()'s sibling check), same role T1ReorganizeHardThresholdPercent
-  // plays for T1AppendCapacityEntries.
-  static constexpr size_t DeadRangeCapacityLog2 = 20;
-  static constexpr size_t DeadRangeCapacityEntries = size_t{1} << DeadRangeCapacityLog2;
-
-  // Capacity of the tail-entry tracker that feeds checkpoint_and_defragment()'s copy_live_entries()
+  // Capacity of the tail-entry tracker that feeds checkpoint_internal()'s copy_live_entries()
   // -- one entry per key written into T2's tail region since the last cycle, so that pass can
   // enumerate exactly what needs copying into the new generation instead of scanning the entire
   // live keyspace. Unlike DeadRangeCapacityEntries above, an entry lost here is a correctness bug,

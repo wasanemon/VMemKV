@@ -111,33 +111,29 @@ class T1CheckpointFile {
 
 // ─── Manifest (<t2_path>.manifest) ─────────────────────────────────────────
 //
-// The single source of truth for "which checkpoint generation is current". `generation` doubles
-// as the checkpoint LSN (5.3): the T1 and T2 checkpoint files for a generation live at paths
-// derived from it, and neither is trusted by a reader until the manifest naming that generation
+// The single source of truth for "how much of the T1/T2 checkpoint files is durable and safe to
+// trust". `generation` is the checkpoint LSN (5.3): the WAL replay boundary, and the point up to
+// which T1's checkpoint file and T2's live data file are guaranteed consistent with each other.
+// Neither file is trusted by a reader beyond what the manifest promises until the manifest itself
 // is committed (write to temp, fsync, rename atomically). This is what makes the pair crash-safe
 // (5.2/5.3).
 
 inline constexpr uint32_t kManifestMagic = 0x314B4D56;  // ASCII "VMK1"
-// v3: collapsed back to a single `generation` field. v2 had split it into separate
-// `t1_generation`/`t2_generation` fields specifically to support a checkpoint that advanced T1's
-// checkpoint file without touching T2 (VMemKVImpl::checkpoint_t1_only_with_delta_flush()) --
-// checkpoint_and_defragment() (TODO.md item 5) always rebuilds both together now, so the two
-// values are never distinct and the split field serves no purpose. A v1 or v2 manifest fails both
-// the format_version check and the file-size check in read_manifest(), so it's treated identically
-// to "no checkpoint exists yet" (same contract as any other corrupt/missing manifest); no on-disk
-// migration path exists or is needed.
-inline constexpr uint8_t kManifestFormatVersion = 3;
+// A v1/v2/v3 manifest fails the format_version check in read_manifest(), so it's treated
+// identically to "no checkpoint exists yet" (same contract as any other corrupt/missing
+// manifest); no on-disk migration path exists or is needed.
+inline constexpr uint8_t kManifestFormatVersion = 4;
 
 struct ManifestHeader {
   uint32_t magic = kManifestMagic;
   uint8_t format_version = kManifestFormatVersion;
   // NOLINTNEXTLINE(modernize-avoid-c-arrays)
   uint8_t reserved[3] = {};
-  // == checkpoint_lsn of the cycle that committed this manifest. Names both the T1 checkpoint
-  // file (derive_t1_chk_path) and the T2 checkpoint file (derive_t2_chk_path) -- every committed
-  // checkpoint rebuilds both together.
+  // == checkpoint_lsn of the cycle that committed this manifest -- the WAL replay boundary, not
+  // a filename component (derive_t1_chk_path/derive_t2_chk_path name fixed, generation-independent
+  // paths; see their own comments).
   uint64_t generation = 0;
-  uint64_t t2_bytes_used = 0;  // Logical bytes used in `generation`'s T2 checkpoint file -- not
+  uint64_t t2_bytes_used = 0;  // Logical bytes durably written to the T2 checkpoint file -- not
                                // recoverable from that file's size alone (it may be truncated to
                                // a larger capacity than its live data occupies).
   uint64_t checksum = 0;       // FNV-1a64 over the header with checksum zeroed.
@@ -156,14 +152,16 @@ inline auto derive_manifest_path(const std::filesystem::path &t2_path) -> std::f
   return {t2_path.string() + ".manifest"};
 }
 
-// Derives the generation-specific T1 checkpoint / T2 checkpoint file paths. Never reused
-// across generations, so an orphaned file from an incomplete checkpoint (crash before the
-// manifest rename) is simply never referenced by anything and is safe to leave or delete.
-inline auto derive_t1_chk_path(const std::filesystem::path &t2_path, uint64_t generation) -> std::filesystem::path {
-  return {t2_path.string() + ".chk" + std::to_string(generation) + ".t1"};
+// Derives the T1 checkpoint / T2 checkpoint file paths. Each is a single path reused across
+// every checkpoint this store ever commits: the T1 file is fully rewritten each cycle via
+// write_t1_checkpoint()'s temp+rename, and the T2 file is the store's one persistent data file,
+// appended to in place. Neither is trusted by a reader until the manifest names the generation
+// that last wrote them (5.3).
+inline auto derive_t1_chk_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
+  return {t2_path.string() + ".t1chk"};
 }
-inline auto derive_t2_chk_path(const std::filesystem::path &t2_path, uint64_t generation) -> std::filesystem::path {
-  return {t2_path.string() + ".chk" + std::to_string(generation) + ".t2"};
+inline auto derive_t2_chk_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
+  return {t2_path.string() + ".t2chk"};
 }
 
 // Writes the manifest to a temp file beside `manifest_path` and renames it atomically onto
