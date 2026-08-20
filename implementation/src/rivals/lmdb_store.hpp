@@ -108,8 +108,9 @@ class LMDBStore {
             KeyFn &&make_key,
             ValueFn &&make_value) {
     ensure_master_built(master_path, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
-    static std::atomic<uint64_t> clone_counter{0};
-    path_ = master_path + "_clone_" + std::to_string(clone_counter.fetch_add(1, std::memory_order_relaxed)) + ".lmdb";
+    // Fixed path, not an ever-incrementing counter -- see rocksdb_store.hpp's identical
+    // constructor / bench_kv.cpp's make_vmemkv_clone_from_checkpoint() for why.
+    path_ = master_path + "_clone.lmdb";
     clone_from(master_path, path_);
 
     if (mdb_env_create(&env_) != 0) {

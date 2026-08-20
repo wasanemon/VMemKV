@@ -72,8 +72,9 @@ class RocksDBBlobDBStore {
                                 std::forward<KeyFn>(make_key),
                                 std::forward<ValueFn>(make_value),
                                 "RocksDB(BlobDB)");
-    static std::atomic<uint64_t> clone_counter{0};
-    path_ = master_path + "_clone_" + std::to_string(clone_counter.fetch_add(1, std::memory_order_relaxed));
+    // Fixed path, not an ever-incrementing counter -- see rocksdb_store.hpp's identical
+    // constructor / bench_kv.cpp's make_vmemkv_clone_from_checkpoint() for why.
+    path_ = master_path + "_clone";
     common::clone_from(make_benchmark_db_options(), master_path, path_, "RocksDB(BlobDB)");
     db_.reset(common::open_db(make_benchmark_db_options(), path_, "RocksDB(BlobDB) (clone)"));
   }

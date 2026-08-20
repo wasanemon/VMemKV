@@ -67,8 +67,12 @@ class RocksDBStore {
                                 std::forward<KeyFn>(make_key),
                                 std::forward<ValueFn>(make_value),
                                 "RocksDB");
-    static std::atomic<uint64_t> clone_counter{0};
-    path_ = master_path + "_clone_" + std::to_string(clone_counter.fetch_add(1, std::memory_order_relaxed));
+    // Fixed path, not an ever-incrementing counter -- see bench_kv.cpp's make_vmemkv_clone_from_
+    // checkpoint() for why this is safe (at most one clone of a given master is ever live
+    // process-wide) and necessary (an unbounded counter accumulates a fresh multi-GB clone per
+    // benchmark case instead of reusing one). clone_from() below already destroys any stale
+    // directory at this path before rebuilding it.
+    path_ = master_path + "_clone";
     common::clone_from(make_benchmark_db_options(), master_path, path_, "RocksDB");
     db_.reset(common::open_db(make_benchmark_db_options(), path_, "RocksDB (clone)"));
   }

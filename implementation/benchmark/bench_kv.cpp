@@ -863,9 +863,15 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
     }
   }
 
-  static std::atomic<uint64_t> clone_counter{0};
-  const std::string instance_path =
-      master_path + "_clone_" + std::to_string(clone_counter.fetch_add(1, std::memory_order_relaxed));
+  // Fixed path, not an ever-incrementing counter: g_active_store_holder (see StoreHolder below)
+  // is a single global slot, so at most one clone of any given master is ever live process-wide
+  // -- switching holders always resets the previous one before this runs again. Reusing one path
+  // means every subsequent clone's own remove-then-rebuild below (already required, to discard
+  // whatever the *previous* master-build or clone left there) also bounds this master's cumulative
+  // on-disk clone footprint to one clone's worth instead of accumulating a fresh multi-GB copy per
+  // benchmark case for the rest of the process's run -- this alone was enough to exhaust a
+  // multi-TB NVMe partway through a run that never got past ~50 of ~200 benchmark cases.
+  const std::string instance_path = master_path + "_clone";
   std::error_code ignored;
   std::filesystem::remove(instance_path, ignored);
   std::filesystem::remove(vmemkv::derive_wal_path(instance_path), ignored);
