@@ -1284,11 +1284,12 @@ TEST_CASE(
   // acquire_write_handle() call is guaranteed to land against the still-current
   // (about-to-be-retired) generation, registering it with the reference tracker before
   // stop_writers_and_wait() ever scans it.
+  using ImplT_1287 = std::decay_t<decltype(store->impl())>;
   store->impl().reorganize_internal(
-      /*do_checkpoint=*/true,
+      ImplT_1287::ReorgMode::Checkpoint,
       /*pre_stop_hook=*/
       [&] {
-        using ImplT = std::decay_t<decltype(store->impl())>;
+        using ImplT = ImplT_1287;
         straggler_writer = std::thread([&] {
           vmemkv::T2FlatFile::T2MemoryHandle mem = store->impl().t2().acquire_write_handle();
           // Simulates being "mid-write": long enough that, absent the stop-and-wait, the rebuild
@@ -1357,7 +1358,7 @@ TEST_CASE(
   std::atomic<bool> writer_registered{false};
 
   store->impl().reorganize_internal(
-      /*do_checkpoint=*/true,
+      std::decay_t<decltype(store->impl())>::ReorgMode::Checkpoint,
       /*pre_stop_hook=*/
       [&] {
         using ImplT = std::decay_t<decltype(store->impl())>;
@@ -1439,10 +1440,9 @@ TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the st
 
   bool threw = false;
   try {
-    store->impl().reorganize_internal(
-        /*do_checkpoint=*/true,
-        /*pre_stop_hook=*/vmemkv::NoOpPreStopHook{},
-        /*pre_finish_hook=*/[] { throw InjectedFault{}; });
+    store->impl().reorganize_internal(std::decay_t<decltype(store->impl())>::ReorgMode::Checkpoint,
+                                      /*pre_stop_hook=*/vmemkv::NoOpPreStopHook{},
+                                      /*pre_finish_hook=*/[] { throw InjectedFault{}; });
   } catch (const InjectedFault &) {
     threw = true;  // Mirrors reorg_worker_loop()'s catch (...) {} -- swallow and move on.
   }
@@ -1537,4 +1537,122 @@ TEST_CASE("VMemKV: checkpoint() heals a straggler entry stamped with a stale T2 
 
   // Unrelated keys remain readable throughout.
   CHECK(test_util::get_sync(store, "baseline") != vmemkv::STORE_NOT_FOUND);
+}
+
+TEST_CASE("VMemKV: defragment() relocates live data, reclaims dead space, and preserves correctness") {
+  auto store = StoreFactory<vmemkv::variants::VMemKV_Baseline>::make();
+
+  constexpr int kKeyCount = 500;
+  const std::string big_value(200, 'v');
+  auto key_for = [](int index) {
+    const std::string digits = std::to_string(index);
+    return "k" + std::string(4 - digits.size(), '0') + digits;
+  };
+  for (int i = 0; i < kKeyCount; ++i) {
+    REQUIRE(store->insert(key_for(i), big_value));
+  }
+  store->checkpoint();  // Make everything base-resident, like the scenario defragment() targets.
+
+  // Churn every key with grow-updates (never in-place: base-resident records can never update in
+  // place) to accumulate dead space, then delete a slice outright.
+  const std::string grown_value(240, 'w');
+  for (int i = 0; i < kKeyCount; ++i) {
+    REQUIRE(store->update(key_for(i), grown_value));
+  }
+  for (int i = 0; i < 50; ++i) {
+    REQUIRE(store->remove(key_for(i)));
+  }
+  store->checkpoint();
+
+  const uint64_t bytes_used_before_defrag = store->t2().bytes_used();
+
+  store->defragment();
+
+  const uint64_t bytes_used_after_defrag = store->t2().bytes_used();
+  // Every live record is now packed tight (alloc_len == value size, no slack) with zero dead
+  // bytes between them -- strictly less than before, where each of the 500 grow-updates left its
+  // pre-update copy as garbage.
+  CHECK(bytes_used_after_defrag < bytes_used_before_defrag);
+
+  // Deleted keys stay gone; every surviving key reads back its latest value.
+  for (int i = 0; i < 50; ++i) {
+    CHECK_FALSE(test_util::get_bytes_sync(store, key_for(i)).has_value());
+  }
+  for (int i = 50; i < kKeyCount; ++i) {
+    const auto got = test_util::get_bytes_sync(store, key_for(i));
+    REQUIRE(got.has_value());
+    CHECK(as_string(*got) == grown_value);
+  }
+
+  // Scan still sees exactly the surviving set, in order.
+  size_t scan_count = 0;
+  std::string last_key;
+  const size_t total =
+      store->scan("k0000", "k9999", [&](std::span<const std::byte> key_bytes, std::span<const std::byte>) {
+        const std::string key(reinterpret_cast<const char *>(key_bytes.data()), key_bytes.size());
+        CHECK(key > last_key);
+        last_key = key;
+        ++scan_count;
+      });
+  CHECK(total == static_cast<size_t>(kKeyCount - 50));
+  CHECK(scan_count == total);
+}
+
+TEST_CASE("VMemKV: sustained concurrent writers survive repeated defragment() cycles (regression)") {
+  using TestStore = vmemkv::variants::VMemKVStore;
+  auto store = StoreFactory<TestStore>::make();
+
+  constexpr int kKeyCount = 2000;
+  const std::string big_value(200, 'v');
+  auto key_for = [](int index) {
+    const std::string digits = std::to_string(index);
+    return "k" + std::string(4 - digits.size(), '0') + digits;
+  };
+  for (int i = 0; i < kKeyCount; ++i) {
+    REQUIRE(store->insert(key_for(i), big_value));
+  }
+  store->checkpoint();  // Every key starts base-resident, so every writer update below is forced
+                        // out-of-place -- the exact "checkpoint aggressively, then keep writing"
+                        // scenario defragment_internal()'s design targets.
+
+  std::atomic<bool> stop{false};
+  std::thread defragmenter([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      store->defragment();  // Relocates every live record to a fresh file every cycle.
+    }
+  });
+
+  constexpr int kWriterThreadCount = 8;
+  constexpr int kUpdatesPerThread = 500;
+  std::atomic<bool> any_write_failed{false};
+  std::vector<std::thread> writers;
+  writers.reserve(kWriterThreadCount);
+  for (int t = 0; t < kWriterThreadCount; ++t) {
+    writers.emplace_back([&, t] {
+      std::mt19937_64 rng(4000 + t);
+      std::uniform_int_distribution<int> key_dist(0, kKeyCount - 1);
+      for (int i = 0; i < kUpdatesPerThread; ++i) {
+        const int idx = key_dist(rng);
+        if (!store->update(key_for(idx), big_value)) {
+          any_write_failed.store(true, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  for (auto &writer : writers) {
+    writer.join();
+  }
+  stop.store(true, std::memory_order_relaxed);
+  defragmenter.join();
+
+  CHECK_FALSE(any_write_failed.load());
+
+  // Every key survives, still readable, after the dust settles -- run one final defragment() so
+  // this also exercises the case where nothing raced it.
+  store->defragment();
+  for (int i = 0; i < kKeyCount; ++i) {
+    const auto got = test_util::get_bytes_sync(store, key_for(i));
+    REQUIRE(got.has_value());
+    CHECK(got->size() == big_value.size());
+  }
 }

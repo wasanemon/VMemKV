@@ -777,16 +777,17 @@ TEST_CASE(
     REQUIRE(store->insert("racer", v1));  // Tail-resident: no checkpoint has run yet.
 
     std::thread racer;
-    store->impl().reorganize_internal(
-        /*do_checkpoint=*/true,
-        /*pre_stop_hook=*/[&] {
-          // Fires after the pre-stop copy_live_entries() pass has already captured "racer"=v1
-          // and before stop_writers_and_wait() blocks new writers -- the exact window under
-          // suspicion. update() itself waits for WAL durability, so joining here is sufficient
-          // to guarantee the racing write is fully applied (T2 and WAL) before this hook returns.
-          racer = std::thread([&] { REQUIRE(store->update("racer", v2)); });
-          racer.join();
-        });
+    using ImplT = std::decay_t<decltype(store->impl())>;
+    store->impl().reorganize_internal(ImplT::ReorgMode::Checkpoint,
+                                      /*pre_stop_hook=*/[&] {
+                                        // Fires after the pre-stop copy_live_entries() pass has already captured
+                                        // "racer"=v1 and before stop_writers_and_wait() blocks new writers -- the exact
+                                        // window under suspicion. update() itself waits for WAL durability, so joining
+                                        // here is sufficient to guarantee the racing write is fully applied (T2 and
+                                        // WAL) before this hook returns.
+                                        racer = std::thread([&] { REQUIRE(store->update("racer", v2)); });
+                                        racer.join();
+                                      });
 
     // Live reads must already reflect v2 regardless of what the checkpoint file captured -- T2's
     // live mapping was updated in place independently of checkpoint_internal()'s file I/O.

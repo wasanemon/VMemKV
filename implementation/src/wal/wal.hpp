@@ -208,8 +208,8 @@ class Wal {
   // One shared notify_all() per round instead of a per-record done-flag; see class contract above.
   // Guarded by settled_mutex_ (not a plain atomic): a follower's wait in await_durable() needs a
   // genuinely bounded wait_for(), which condition_variable provides and atomic<uint64_t>::wait()
-  // does not (no timed overload) -- see await_durable()'s own comment for why an unbounded wait
-  // here was found to strand followers permanently under heavy concurrent load.
+  // does not (no timed overload) -- see await_durable()'s own comment for the leadership-handoff
+  // gap this closes.
   mutable std::mutex settled_mutex_;
   mutable std::condition_variable settled_cv_;
   uint64_t highest_settled_lsn_ = 0;

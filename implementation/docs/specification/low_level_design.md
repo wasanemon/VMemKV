@@ -215,7 +215,7 @@ struct VMemKV {
 
 `reorganize` は Ordering Fragmentation を解消する: Tier 1 `append_region` の肥大化により候補探索・確認コストが増え、Get / Scan が遅くなる問題である。
 
-Tier 2 側にも delete や append-update の結果として生じる Storage Fragmentation(Tier 1 から参照されない古い Tier 2 record の蓄積)が存在するが、現在この蓄積を物理的に回収する機構はない(4.3 節)。
+Tier 2 側にも delete や append-update の結果として生じる Storage Fragmentation(Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ)が存在する。`checkpoint_internal()`(4.3 節)はこれを解消しない。`defragment_internal()`(4.6 節)が Tier 2 全体を再配置してこれを解消する。
 
 ### 4.2 T1 Reorganize
 
@@ -285,13 +285,14 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WA
 * **`WAL_MAX_BYTES_SINCE_CHECKPOINT`**: 直前 checkpoint の checkpoint LSN 以降に WAL へ append されたバイト数の上限。Checkpoint はこのサイズベースのトリガーのみで判定し、書き込みレートに関わらず起動時の WAL replay 時間を有界に保つ。
 * **`tail_entries_near_capacity`**: tail 領域の生存 entry を追跡する固定容量バッファ(`checkpoint_internal()`の `copy_live_entries()`が消費する)が閾値に近づいた場合、容量枯渇を避けるため早期に checkpoint する。
 * **`Force`**: `checkpoint()` の明示呼び出し。
-* 公開 API は **`reorganize()`**(T1-only インメモリマージ、T2 に触れず checkpoint もしない)・**`defragment()`**・**`checkpoint()`** の3つ。`checkpoint()` は `checkpoint_internal()` を呼ぶ。`defragment()` は現状 `reorganize()` と同じ効果(T1-only マージ)のプレースホルダであり、将来 Storage Fragmentation を解消する実装のための入口として API 上残してある。
+* `defragment()` に自動トリガーはない。`Force`(明示呼び出し)のみで起動する。O(生存コーパス全体) のコストがかかるため、`checkpoint()` と異なり書き込み量に応じたバックグラウンド自動発火の仕組みはまだ配線されていない。
+* 公開 API は **`reorganize()`**(T1-only インメモリマージ、T2 に触れず checkpoint もしない)・**`defragment()`**・**`checkpoint()`** の3つ。`checkpoint()` は `checkpoint_internal()` を、`defragment()` は `defragment_internal()`(4.6 節)を呼ぶ。
 
 | API | 効果 |
 |---|---|
 | `reorganize()` | T1 の Append→Sorted マージのみ。T2/ディスク非関与 |
 | `checkpoint()` | Tier 2 の tail を in-place で永続化し、manifest を commit して WAL を rotate する |
-| `defragment()` | `reorganize()` と同一のプレースホルダ。Storage Fragmentation は解消しない |
+| `defragment()` | Tier 2 の生存データ全件を新しい offset へ再配置し、manifest を commit して WAL を rotate する(4.6 節) |
 
 ### 4.5 T1 Reorganize Auto-Trigger (ワークロード適応型 L2 キャッシュサイズ制限と Soft/Hard しきい値)
 
@@ -320,6 +321,37 @@ T1 `reorganize` は、`append_region` のサイズに応じて自動的にバッ
 マルチスレッド並行スキャンにおいてフラグ書き込みによるキャッシュラインの奪い合い（Cache Bouncing）を回避するため、**Read-Check-Write (TEST and SET) パターン**による軽量なアトミックフラグ `scan_active_` を用いる。
 1. `scan()` の開始時に `scan_active_` が `false` の場合のみ `true` を書き込む。すでに `true` の場合は読み取り（Read-only）でバイパスし、無駄なキャッシュ無効化を防ぐ。
 2. `reorganize()` のマージ完了時に、`scan_active_` を `false` にリセットする。
+
+### 4.6 T2 Defragment (`defragment_internal()`)
+
+`checkpoint_internal()`(4.3 節)が解消しない Storage Fragmentation ―― Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ ―― を、`defragment_internal()` が解消する。生存中の Tier 2 record 全件を、T1 の key 順のまま新規ファイルへ連続した offset で再配置し、旧ファイルを丸ごと置き換える。
+
+`checkpoint_internal()` との違いは「record を動かすかどうか」の一点であり、それ以外の同期機構(`capture_watermark_`、`tail_entries_`、`T2FlatFile::stop_writers_and_wait()`、`t1_.reorganize()` の単一 publish ポイント、`T2Memory` 世代スワップ)は共有する。
+
+**Input**
+
+- T1 の現在の生存 entry 全件(`sorted_region` + `append_region`)
+- Tier 2 の生存中の record 全件(base 領域・tail 領域の両方)
+
+**Output**
+
+- 新しい世代の `T2Memory`(新規ファイルへの `mmap`。offset は生存 record ごとに新規採番され、`base_boundary` はファイル全体を覆う)
+- `payload_bits`(offset + block_count)と世代タグを更新した Tier 1
+
+**Procedure**
+
+1. 現在の tail 領域の生存 record 全件を対象に `capture_watermark_` を一括で前進させる(この時点の `bytes_used` へ)。以降このサイクルが完了するまで、それらの record への in-place 更新はすべて out-of-place へリダイレクトされる。base 領域の record はもとから in-place 更新の対象外のため、この barrier は不要。
+2. T1 を key 順に走査し、各生存 key の現在値を新規ファイルへ順番に `pwrite()` する。alloc_len は現在値のサイズちょうどに詰める(スラックを残さない)。この走査は writer をブロックしない。
+3. 走査中に生じた書き込みを `tail_entries_` から回収し、新規ファイルへ追記する形で再配置する(`checkpoint_internal()` の pre-stop パスと同じ反復収束)。
+4. `T2FlatFile::stop_writers_and_wait()` で新規書き込みを短時間だけ止め、直前まで残っていた差分を最後にもう一度回収・再配置する。
+5. `t1_.reorganize()` を1回呼び、生存 entry 全件の `payload_bits` を新しい offset/block_count へ、世代タグを新しい `T2Memory` の世代へ書き換える。
+6. 新しい `T2Memory` を publish し、writer を再開する。新規ファイルを正式なパスへ `rename()` する(Linux の unlink-while-open の性質により、旧ファイルの実データは既存の読者がいなくなるまで保持される ―― 明示的な `unlink()` は不要)。
+
+**Effect**
+
+- Storage Fragmentation を完全に解消する(生存データのみが、隙間なく、key 順で新規ファイルに存在する)。
+- Ordering Fragmentation も副次的に解消する: Scan が読む物理 offset 順が再び T1 の key 順と一致する。
+- コストは生存コーパスサイズに比例する(`checkpoint_internal()` の「前回サイクル以降の tail のみ」より高コスト)。頻繁な呼び出しには向かない。
 
 ## 5. Checkpoint Reload
 
@@ -452,9 +484,9 @@ checkpoint reload は T1 `reorganize()` がトリガーする atomic pointer swa
 - `Serialized`: 同一 key に対しては直列化が必要
 - `Single-flight`: 並行呼び出し時、実行者（leader）を 1 スレッドだけ選出する。follower の挙動は経路で異なり、soft 経路では待機せず継続、hard 経路では leader 完了まで待機する（アトミックフラグで制御）。
 
-`Checkpoint reload` は `T1 reorganize` (4.4 節のトリガー成立時)の中でトリガーされ、同一の `reorg_running_` single-flight ロックを共有する。すなわち両者は同じ実行スロットを取り合う、実質的に同一操作のバリエーションである。
+`Checkpoint reload` と `Defragment`(4.6 節)は共に `T1 reorganize` (4.4 節のトリガー成立時、または `defragment()` の明示呼び出し)の中でトリガーされ、同一の `reorg_running_` single-flight ロックを共有する。すなわち三者は同じ実行スロットを取り合う、実質的に同一操作のバリエーションである。record を動かすかどうか(4.6 節冒頭)以外、並行性の扱いに差はない。
 
-| Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize | Checkpoint reload |
+| Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize | Checkpoint reload / Defragment |
 | --- | --- | --- | --- | --- | --- | --- |
 | `Get` | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed with retry/snapshot |
 | `Scan` | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed with retry/snapshot |
@@ -463,7 +495,7 @@ checkpoint reload は T1 `reorganize()` がトリガーする atomic pointer swa
 | `Update/Delete` (distinct key) | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed with retry/snapshot |
 | `Update/Delete` (same key) | Allowed | Allowed | Serialized | Serialized | Allowed with retry/snapshot | Allowed with retry/snapshot |
 | `T1 reorganize` | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Single-flight | Single-flight (同一実行スロット) |
-| `Checkpoint reload` | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Single-flight (同一実行スロット) | Single-flight |
+| `Checkpoint reload / Defragment` | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Single-flight (同一実行スロット) | Single-flight |
 
 ### 6.4 Conflict Resolution Rules
 
@@ -486,10 +518,10 @@ checkpoint reload は T1 `reorganize()` がトリガーする atomic pointer swa
 - Insert / Update / Delete は T1 `reorganize` と並行してよい。
 - ただし、writer が旧世代バッファに対して行う書き込み（reserve & publish）は、再編成スレッド側のマージ開始前に実行される一段目のエポック同期バリア（`wait_until_epoch`）によって完全にドレインされる。これにより、書き込みスレッド側でのリトライや明示的なロック同期を一切不要としつつ、進行中のすべての更新がデータロストなく新旧いずれかの世代に安全に振り分けられる。
 
-#### Checkpoint Reload vs All Operations
+#### Checkpoint Reload / Defragment vs All Operations
 
-- Checkpoint reload は T1 `reorganize()` の中でトリガーされ、`reorganize` と同一の atomic pointer swap 機構を用いる。したがって「T1 Reorganize vs Readers」「T1 Reorganize vs Writers」で述べた整合性規則がそのまま適用される。
-- T1 checkpoint ファイル・T2 ファイルの構築中も、Get / Scan / Insert / Update / Delete は通常通り継続してよい。これらは新世代の `append_region` へ書き込まれるか、旧世代のスナップショットを読むかのいずれかであり、進行中の checkpoint file 構築とは一切干渉しない。
+- Checkpoint reload と Defragment はいずれも T1 `reorganize()` の中でトリガーされ、`reorganize` と同一の atomic pointer swap 機構を用いる。したがって「T1 Reorganize vs Readers」「T1 Reorganize vs Writers」で述べた整合性規則がそのまま適用される。
+- T1 checkpoint ファイル・T2 ファイルの構築中も、Get / Scan / Insert / Update / Delete は通常通り継続してよい。これらは新世代の `append_region` へ書き込まれるか、旧世代のスナップショットを読むかのいずれかであり、進行中のファイル構築とは一切干渉しない。
 - 新世代への切り替え(manifest の `rename`、および in-memory の pointer swap)が完了するまでは、クライアントへ新世代を公開してはならない。
 
 ### 6.5 Implementation Candidates

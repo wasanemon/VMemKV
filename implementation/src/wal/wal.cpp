@@ -375,20 +375,19 @@ auto Wal::await_durable(PendingRecord *rec) -> uint64_t {
   bool is_leader = !flushing_.exchange(true, std::memory_order_acq_rel);
 
   if (!is_leader) {
-    // Bounded wait_for(), not a plain wait(): a PAUSE-spin-then-yield() hybrid (mirroring
-    // RocksDB's WriteThread::AwaitState()) was tried here to let the leader's notify skip its
-    // FUTEX_WAKE syscall. It helped in an isolated WAL-only benchmark but made the full system
+    // Bounded wait_for(), not a plain condition-variable wait(): a PAUSE-spin-then-yield() hybrid
+    // (mirroring RocksDB's WriteThread::AwaitState()) was tried here to let the leader's notify
+    // skip its wake syscall. It helped in an isolated WAL-only benchmark but made the full system
     // worse -- spinning steals cycles from other concurrent work that isn't free outside
-    // isolation. A plain unbounded wait() replaced it, but that has no timed overload and no
-    // stronger real-world guarantee than "eventually observed" (the same concern
-    // wait_until_reorg_not_running() already works around for reorg_running_, by polling instead
-    // of waiting unconditionally) -- and unlike that call, this one is on the hot path, so it
-    // can't just borrow that function's 10ms interval. Measured directly: 32 concurrent writer
-    // threads against an 8M-key, fully-checkpointed store (every update() forced out-of-place,
-    // so every await_durable() call is a real WAL round) hung permanently here, every follower
-    // parked waiting on an LSN nothing was ever going to settle. If a wait times out and this
-    // follower's LSN is still unsettled with no leader currently active, it elects itself rather
-    // than trusting another notify_all() to arrive.
+    // isolation.
+    //
+    // A short timeout closes a gap a plain (unbounded) wait cannot: this follower's own leader
+    // may hand off leadership to a third thread in the gap between `flushing_`'s release and this
+    // follower re-checking it (see release_leadership()'s contract), and nothing then guarantees
+    // that new leader's own drain covers this follower's specific LSN. Bounding the wait means a
+    // follower left stranded this way notices within kFollowerWaitTimeout, at which point --
+    // finding no leader active for its still-unsettled LSN -- it elects itself rather than
+    // continuing to trust a notify_all() that may never name it.
     constexpr auto kFollowerWaitTimeout = std::chrono::milliseconds(5);
     std::unique_lock<std::mutex> lock(settled_mutex_);
     while (highest_settled_lsn_ < lsn) {
