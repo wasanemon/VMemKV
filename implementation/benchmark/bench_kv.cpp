@@ -814,6 +814,63 @@ static auto make_vmemkv_fresh(const std::string &path,
   return constructor();
 }
 
+// Copies only `[0, live_bytes)` of `source` into `dest` (creating/truncating `dest` first),
+// preserving `source`'s full logical size as a sparse hole beyond that point instead of
+// materializing it. Needed because a T2 checkpoint file's logical size is its *capacity*
+// (DefaultT2CapacityBytes, currently 1 TiB -- see load_checkpoint_if_present()'s fstat()-based
+// capacity detection, which relies on the file's apparent size matching what the store was
+// originally constructed with), almost all of which is an untouched sparse hole beyond
+// `live_bytes` for any real corpus. std::filesystem::copy_file() has no notion of holes and
+// copies the full logical extent byte-for-byte, turning a multi-GB-real/1-TiB-logical sparse
+// master into a 1-TiB-real, fully-allocated clone -- confirmed directly: this exhausted a
+// multi-TB NVMe partway through a single AWS benchmark run.
+static void copy_t2_checkpoint_sparse(const std::filesystem::path &source,
+                                      const std::filesystem::path &dest,
+                                      uint64_t live_bytes) {
+  const int src_fd = ::open(source.c_str(), O_RDONLY);
+  if (src_fd < 0) {
+    throw std::runtime_error("Failed to open T2 checkpoint source for clone: " + source.string());
+  }
+  struct FDGuard {
+    int fd;
+    ~FDGuard() {
+      if (fd >= 0) ::close(fd);
+    }
+  } src_guard{src_fd};
+
+  struct stat source_stat {};
+  if (::fstat(src_fd, &source_stat) != 0) {
+    throw std::runtime_error("Failed to stat T2 checkpoint source for clone: " + source.string());
+  }
+  const auto logical_size = static_cast<uint64_t>(source_stat.st_size);
+
+  const int dst_fd = ::open(dest.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (dst_fd < 0) {
+    throw std::runtime_error("Failed to create T2 checkpoint clone: " + dest.string());
+  }
+  FDGuard dst_guard{dst_fd};
+  if (::ftruncate(dst_fd, static_cast<off_t>(logical_size)) != 0) {
+    throw std::runtime_error("Failed to size T2 checkpoint clone: " + dest.string());
+  }
+
+  std::vector<std::byte> buffer(4ULL * 1024 * 1024);
+  uint64_t offset = 0;
+  while (offset < live_bytes) {
+    const size_t chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), live_bytes - offset));
+    const ssize_t bytes_read = ::pread(src_fd, buffer.data(), chunk, static_cast<off_t>(offset));
+    if (bytes_read < 0) {
+      throw std::runtime_error("Failed to read T2 checkpoint for clone: " + source.string());
+    }
+    if (bytes_read == 0) {
+      break;  // Live region ends before live_bytes (e.g. a still-sparse tail) -- nothing more to copy.
+    }
+    if (::pwrite(dst_fd, buffer.data(), static_cast<size_t>(bytes_read), static_cast<off_t>(offset)) != bytes_read) {
+      throw std::runtime_error("Failed to write T2 checkpoint clone: " + dest.string());
+    }
+    offset += static_cast<uint64_t>(bytes_read);
+  }
+}
+
 // Builds (once) a VMemKV checkpoint at `master_path` -- a real populate() + checkpoint() -- if
 // one isn't already there, then clones it into a fresh instance path and writing a matching
 // manifest, with *no* WAL at the new path -- so constructing a VMemKVImpl there fast-boots
@@ -826,7 +883,7 @@ static auto make_vmemkv_fresh(const std::string &path,
 // same reasoning). The T2 checkpoint file cannot use the same trick: checkpoint_internal()
 // durabilizes T2's tail via pwrite() directly into the persistent file, in place, so a hardlinked
 // T2 file would let the clone's own later checkpoint cycles corrupt the master (and any other
-// clone sharing that inode) -- it's copied instead.
+// clone sharing that inode) -- it's copied instead (see copy_t2_checkpoint_sparse() above).
 //
 // This is what lets Get/Update/Delete/YCSB-E/Scan (see their registrations below) all get a
 // fresh, fully-populated, fully-reorganized instance on every construction without paying
@@ -888,11 +945,7 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
   if (link_error) {
     throw std::runtime_error("Failed to hardlink T1 checkpoint for clone: " + link_error.message());
   }
-  std::error_code copy_error;
-  std::filesystem::copy_file(master_t2, instance_t2, copy_error);
-  if (copy_error) {
-    throw std::runtime_error("Failed to copy T2 checkpoint for clone: " + copy_error.message());
-  }
+  copy_t2_checkpoint_sparse(master_t2, instance_t2, manifest->t2_bytes_used);
   vmemkv::write_manifest(vmemkv::derive_manifest_path(instance_path), manifest->generation, manifest->t2_bytes_used);
 
   return std::make_unique<Store>(instance_path, Store::ConfigType::DefaultT2CapacityBytes);
