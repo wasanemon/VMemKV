@@ -1684,12 +1684,6 @@ static void register_scan_benchmarks(const std::string &sname,
 // =============================================================================
 void register_all_benchmarks() {
   int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
-  // TEMP PROBE: allow oversubscribing past hardware_concurrency() to check whether the AWS
-  // (32-thread, real cores) write-path gap vs RocksDB is a pure lock/contention effect that also
-  // shows up when the thread count exceeds locally-available cores. MUST REVERT after use.
-  if (const char *env = std::getenv("VMEMKV_BENCH_MAX_THREADS")) {
-    hw_threads = std::max(hw_threads, std::atoi(env));
-  }
 
   // Uniform 4-point thread counts for plotting scalability: {1, 4, 16, hw_threads}
   std::vector<int> thread_counts = {1, 4};

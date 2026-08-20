@@ -321,7 +321,7 @@ install_remote_dependencies() {
       fi
       sleep 4
     done
-    sudo apt-get update -y >/tmp/setup.log 2>&1 && sudo apt-get install -y build-essential cmake ninja-build libgoogle-perftools-dev librocksdb-dev liblmdb-dev jq rsync xfsprogs >>/tmp/setup.log 2>&1
+    sudo apt-get update -y >/tmp/setup.log 2>&1 && sudo apt-get install -y build-essential cmake ninja-build libgoogle-perftools-dev librocksdb-dev liblmdb-dev jq rsync >>/tmp/setup.log 2>&1
   "
 }
 
@@ -348,8 +348,8 @@ prepare_remote_storage() {
       fi
     else
       if ! sudo blkid \"\$DEV\" >/dev/null 2>&1; then
-        echo \"Formatting NVMe SSD \$DEV as XFS...\"
-        sudo mkfs.xfs -m reflink=1 -f \"\$DEV\" >/dev/null 2>&1
+        echo \"Formatting NVMe SSD \$DEV as ext4...\"
+        sudo mkfs.ext4 -F \"\$DEV\" >/dev/null 2>&1
       else
         echo \"NVMe SSD \$DEV already has a filesystem; mounting without reformatting...\"
       fi

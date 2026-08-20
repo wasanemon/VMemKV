@@ -16,8 +16,8 @@
 
 namespace vmemkv_test {
 
-// Base directory for test-created T2/WAL/checkpoint files. Sourced from VMEMKV_TEST_TMPDIR if set
-// (see scripts/ensure_xfs_dev_volume.sh), falling back to the system temp directory otherwise.
+// Base directory for test-created T2/WAL/checkpoint files. Sourced from VMEMKV_TEST_TMPDIR if
+// set, falling back to the system temp directory otherwise.
 inline auto test_temp_root() -> const std::filesystem::path & {
   static const std::filesystem::path root = [] {
     if (const char *env = std::getenv("VMEMKV_TEST_TMPDIR"); env != nullptr && *env != '\0') {
