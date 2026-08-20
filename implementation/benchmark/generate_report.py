@@ -355,348 +355,23 @@ def main():
         "const reorgScalingData = " + json.dumps(reorg_data, indent=2) + ";\n    "
     )
 
-    # variantOrder/colors: this run has no +ScanBaseSequential ablation (removed upstream).
+    # checkpoint()/defragment() mislabeling: churn-scaling, reorg-scaling and YCSB-E's forced
+    # triggers only ever call checkpoint(), never defragment() -- but older report rounds
+    # (predating that split) still describe them as defragment()/reflink+punch/O(N)/O(diff). Best
+    # effort (not asserted) since exact wording has drifted across rounds; a no-op once fixed.
     html = html.replace(
-        "const colors = {\n      'RocksDB':'#64748b', 'LMDB':'#10b981', 'RocksDB-BlobDB':'#a855f7',\n      'Baseline':'#94a3b8',\n      '+BF':'#f59e0b', '+Inline':'#6366f1', '+Prefault':'#ec4899', '+ScanBaseSequential':'#0ea5e9'\n    };\n    const rivalStores = ['RocksDB','LMDB','RocksDB-BlobDB'];\n    const variantOrder = ['RocksDB','LMDB','RocksDB-BlobDB','Baseline','+BF','+Inline','+Prefault','+ScanBaseSequential'];",
-        "const colors = " + json.dumps(COLORS) + ";\n    const rivalStores = " + json.dumps(RIVAL_STORES) +
-        ";\n    const variantOrder = " + json.dumps(VARIANT_ORDER) + ";"
+        "t=10秒・t=25秒予定の<code class=\"bg-slate-100 px-1 rounded text-xs\">defragment()</code>(粗い点線)",
+        "t=10秒・t=25秒予定の<code class=\"bg-slate-100 px-1 rounded text-xs\">checkpoint()</code>(粗い点線)",
     )
-
-    # "Stacking Variants" legend: same +ScanBaseSequential removal, in the static HTML this time.
-    old_stacking_legend = """          <li><strong>+Prefault</strong>: +Inline + T2 Async Prefaulting</li>
-          <li><strong>+ScanBaseSequential</strong>: +Prefault + base領域専用mmap(MADV_SEQUENTIAL)。本ラウンドから Get もこのmmapの高速パスを使う(全部盛り、= VMemKVStore)</li>
-        </ul>"""
-    new_stacking_legend = """          <li><strong>+Prefault</strong>: +Inline + T2 Async Prefaulting(全部盛り、= VMemKVStore)。旧<code class="bg-slate-100 px-1 rounded text-xs">ScanBaseSequential</code>アブレーションは実測の結果撤去され、その最適化(base領域専用mmap経路)はGet/Scan双方の標準パスへ無条件で統合済み。</li>
-        </ul>"""
-    if old_stacking_legend not in html:
-        raise RuntimeError("Stacking Variants legend template text not found -- template drifted")
-    html = html.replace(old_stacking_legend, new_stacking_legend)
-
-    # reorg-scaling chart: add the new t1t2_steady series (corpus-size invariance sweep).
-    html = html.replace(
-        "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n      };\n      const datasets = ['t1only', 't1t2'].filter(m => rs[m] && rs[m].length).map(m => {",
-        "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n        t1t2_steady: { label: 'T1+T2 steady', color: '#059669' },\n      };\n      const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {"
-    )
-
-    # reorgLinesPlugin: previously drew one shared amber line for ALL variants' forced-reorganize
-    # seconds and one shared purple line for ALL variants' forced-checkpoint seconds (union across
-    # variants), which (a) silently dropped checkpoint triggers entirely (bug, now fixed) and
-    # (b) made independent per-variant events look like a single aggregate cluster with no way to
-    # tell which variant fired when. Now draws one line+marker per (variant, event), colored and
-    # shaped by that variant (same shape as its pointStyle on the scan-ops line itself).
-    old_plugin = """    const reorgLinesPlugin = {
-      id: 'reorgLines',
-      afterDraw(chart, _args, opts) {
-        const naturalSecs = opts.reorgSecs || [];
-        const forcedSecs = opts.forcedReorgSecs || [];
-        if (!naturalSecs.length && !forcedSecs.length) return;
-        const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
-        ctx.save();
-        ctx.lineWidth = 1.5;
-        ctx.strokeStyle = 'rgba(99,102,241,0.4)';
-        ctx.setLineDash([5,4]);
-        for (const s of naturalSecs) {
-          const px = x.getPixelForValue(s);
-          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
-        }
-        ctx.strokeStyle = 'rgba(217,119,6,0.55)';
-        ctx.setLineDash([2,3]);
-        for (const s of forcedSecs) {
-          const px = x.getPixelForValue(s);
-          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
-        }
-        ctx.restore();
-      }
-    };
-    Chart.register(reorgLinesPlugin);"""
-    new_plugin = """    const variantMarkers = {
-      'RocksDB':'rect', 'LMDB':'triangle', 'RocksDB-BlobDB':'rectRot',
-      'Baseline':'circle', '+BF':'cross', '+Inline':'crossRot', '+Prefault':'star'
-    };
-
-    function drawMarkerShape(ctx, shape, cx, cy, size, color) {
-      ctx.save();
-      ctx.fillStyle = color;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.8;
-      switch (shape) {
-        case 'rect':
-          ctx.fillRect(cx - size, cy - size, size * 2, size * 2);
-          break;
-        case 'rectRot':
-          ctx.beginPath();
-          ctx.moveTo(cx, cy - size); ctx.lineTo(cx + size, cy);
-          ctx.lineTo(cx, cy + size); ctx.lineTo(cx - size, cy);
-          ctx.closePath(); ctx.fill();
-          break;
-        case 'triangle':
-          ctx.beginPath();
-          ctx.moveTo(cx, cy - size); ctx.lineTo(cx + size, cy + size); ctx.lineTo(cx - size, cy + size);
-          ctx.closePath(); ctx.fill();
-          break;
-        case 'cross':
-          ctx.beginPath();
-          ctx.moveTo(cx - size, cy); ctx.lineTo(cx + size, cy);
-          ctx.moveTo(cx, cy - size); ctx.lineTo(cx, cy + size);
-          ctx.stroke();
-          break;
-        case 'crossRot':
-          ctx.beginPath();
-          ctx.moveTo(cx - size, cy - size); ctx.lineTo(cx + size, cy + size);
-          ctx.moveTo(cx - size, cy + size); ctx.lineTo(cx + size, cy - size);
-          ctx.stroke();
-          break;
-        case 'star': {
-          const spikes = 5, outerR = size, innerR = size * 0.45;
-          let rot = Math.PI / 2 * 3;
-          const step = Math.PI / spikes;
-          ctx.beginPath();
-          ctx.moveTo(cx, cy - outerR);
-          for (let i = 0; i < spikes; i++) {
-            let x = cx + Math.cos(rot) * outerR, y = cy + Math.sin(rot) * outerR;
-            ctx.lineTo(x, y); rot += step;
-            x = cx + Math.cos(rot) * innerR; y = cy + Math.sin(rot) * innerR;
-            ctx.lineTo(x, y); rot += step;
-          }
-          ctx.lineTo(cx, cy - outerR);
-          ctx.closePath(); ctx.fill();
-          break;
-        }
-        case 'circle':
-        default:
-          ctx.beginPath(); ctx.arc(cx, cy, size, 0, Math.PI * 2); ctx.fill();
-          break;
-      }
-      ctx.restore();
-    }
-
-    const reorgLinesPlugin = {
-      id: 'reorgLines',
-      afterDraw(chart, _args, opts) {
-        const naturalSecs = opts.reorgSecs || [];
-        const variantEvents = opts.variantEvents || {};
-        const variantList = opts.variantList || [];
-        const hasVariantEvents = variantList.some(v => (variantEvents[v] || []).length);
-        if (!naturalSecs.length && !hasVariantEvents) return;
-        const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
-        ctx.save();
-        ctx.lineWidth = 1.5;
-        ctx.strokeStyle = 'rgba(99,102,241,0.35)';
-        ctx.setLineDash([5,4]);
-        for (const s of naturalSecs) {
-          const px = x.getPixelForValue(s);
-          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke();
-        }
-        variantList.forEach((v, vi) => {
-          const events = variantEvents[v] || [];
-          if (!events.length) return;
-          const col = colors[v] || '#6366f1';
-          const shape = variantMarkers[v] || 'circle';
-          for (const ev of events) {
-            const px = x.getPixelForValue(ev.sec);
-            ctx.strokeStyle = col + '80';
-            ctx.setLineDash(ev.kind === 'reorganize' ? [2,3] : [6,3]);
-            ctx.lineWidth = 1.3;
-            ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, bottom); ctx.stroke();
-            const markerY = top + 8 + (vi % 4) * 13;
-            drawMarkerShape(ctx, shape, px, markerY, 4.5, col);
-          }
-        });
-        ctx.restore();
-      }
-    };
-    Chart.register(reorgLinesPlugin);"""
-    if old_plugin not in html:
-        raise RuntimeError("reorgLinesPlugin template text not found -- template drifted")
-    html = html.replace(old_plugin, new_plugin)
-
-    old_timeline_fn = """    function makeYcsbTimelineConfig(valSizeKey) {
-      const tl = timelineData[valSizeKey];
-      if (!tl || !Object.keys(tl).length) return null;
-      const reorgSecs = [];
-      const forcedReorgSecs = [];
-      for (const data of Object.values(tl)) {
-        data.forEach((d,i) => {
-          if (d.t1_reorg_ops > 0 && !reorgSecs.includes(i+1)) reorgSecs.push(i+1);
-          if (d.t1_forced_reorg_ops > 0 && !forcedReorgSecs.includes(i+1)) forcedReorgSecs.push(i+1);
-        });
-      }
-      reorgSecs.sort((a,b) => a-b);
-      forcedReorgSecs.sort((a,b) => a-b);
-      const datasets = variantOrder.filter(v => tl[v] && tl[v].length).map(v => {
-        const isRocks = rivalStores.includes(v);
-        const col = colors[v] || '#6366f1';
-        return {
-          label: v,
-          data: tl[v].map((d,i) => ({ x: i+1, y: d.scan_ops })),
-          borderColor: col,
-          backgroundColor: 'transparent',
-          borderWidth: isRocks ? 2.5 : 1.8,
-          borderDash: isRocks ? [6,6] : [],
-          tension: 0.25, fill: false,
-          pointStyle: 'circle', pointRadius: 0, pointHoverRadius: 4
-        };
-      });
-      if (!datasets.length) return null;
-      return {
-        type: 'line',
-        data: { datasets },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          animation: { duration: 900, easing: 'easeInOutQuart' },
-          plugins: {
-            reorgLines: { reorgSecs, forcedReorgSecs },
-            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
-            tooltip: {
-              mode: 'index', intersect: false,
-              backgroundColor: 'rgba(15,23,42,0.95)',
-              titleFont: {size:12,family:'Inter',weight:'bold'},
-              bodyFont: {size:11,family:'Inter'},
-              padding:10, cornerRadius:8,
-              callbacks: {
-                title: items => {
-                  const s = items[0].raw.x;
-                  let suffix = '';
-                  if (reorgSecs.includes(s)) suffix += '  ⟳ T1 Reorg (natural)';
-                  if (forcedReorgSecs.includes(s)) suffix += '  ⚑ T1 Reorg (forced@15s)';
-                  return `Second ${s}${suffix}`;
-                },
-                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
-              }
-            }
-          },
-          scales: {
-            x: {
-              type: 'linear', min: 1, max: 30,
-              title: { display:true, text:'Elapsed Time (sec)', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { stepSize:5, font:{size:10,family:'Inter'}, color:'#94a3b8' }
-            },
-            y: {
-              title: { display:true, text:'Scan Ops / sec', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
-            }
-          }
-        }
-      };
-    }"""
-    new_timeline_fn = """    function makeYcsbTimelineConfig(valSizeKey) {
-      const tl = timelineData[valSizeKey];
-      if (!tl || !Object.keys(tl).length) return null;
-      const reorgSecs = [];
-      for (const data of Object.values(tl)) {
-        data.forEach((d,i) => {
-          if (d.t1_reorg_ops > 0 && !reorgSecs.includes(i+1)) reorgSecs.push(i+1);
-        });
-      }
-      reorgSecs.sort((a,b) => a-b);
-      // Forced triggers are scheduled at t=5s (reorganize()) / t=10s & t=25s (checkpoint()), but
-      // under sustained write contention the actual call can be delayed arbitrarily past its
-      // scheduled second -- this is intentionally unguarded (cascading is itself an experiment
-      // result), and can even starve later triggers out of the 30s window entirely if an earlier
-      // one runs long enough. fired_sec (from forced_events, per variant, keyed by kind) is where
-      // it actually landed -- kept per-variant (not unioned) so independent variants' events don't
-      // look like one aggregate cluster.
-      const variantEvents = {};
-      const variantList = variantOrder.filter(v => tl[v] && tl[v].length);
-      const fe = forcedEventsData[valSizeKey] || {};
-      for (const v of variantList) {
-        variantEvents[v] = (fe[v] || []).map(ev => ({ sec: ev.fired_sec, kind: ev.kind, ev }));
-      }
-      const datasets = variantList.map(v => {
-        const isRocks = rivalStores.includes(v);
-        const col = colors[v] || '#6366f1';
-        return {
-          label: v,
-          data: tl[v].map((d,i) => ({ x: i+1, y: d.scan_ops })),
-          borderColor: col,
-          backgroundColor: 'transparent',
-          borderWidth: isRocks ? 2.5 : 1.8,
-          borderDash: isRocks ? [6,6] : [],
-          tension: 0.25, fill: false,
-          pointStyle: variantMarkers[v] || 'circle', pointRadius: 0, pointHoverRadius: 4
-        };
-      });
-      if (!datasets.length) return null;
-      return {
-        type: 'line',
-        data: { datasets },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          animation: { duration: 900, easing: 'easeInOutQuart' },
-          plugins: {
-            reorgLines: { reorgSecs, variantEvents, variantList },
-            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
-            tooltip: {
-              mode: 'index', intersect: false,
-              backgroundColor: 'rgba(15,23,42,0.95)',
-              titleFont: {size:12,family:'Inter',weight:'bold'},
-              bodyFont: {size:11,family:'Inter'},
-              padding:10, cornerRadius:8,
-              callbacks: {
-                title: items => {
-                  const s = items[0].raw.x;
-                  const hits = [];
-                  if (reorgSecs.includes(s)) hits.push('⟳ T1 Reorg (natural)');
-                  for (const v of variantList) {
-                    for (const e of (variantEvents[v] || [])) {
-                      if (e.sec === s) hits.push(`⚑ ${v}: ${e.ev.kind}(sched@${e.ev.scheduled_sec}s, took ${e.ev.elapsed_sec.toFixed(1)}s)`);
-                    }
-                  }
-                  return hits.length ? `Second ${s}  ` + hits.join('  ') : `Second ${s}`;
-                },
-                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw.y)} scan/s`
-              }
-            }
-          },
-          scales: {
-            x: {
-              type: 'linear', min: 1, max: 30,
-              title: { display:true, text:'Elapsed Time (sec)', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { stepSize:5, font:{size:10,family:'Inter'}, color:'#94a3b8' }
-            },
-            y: {
-              title: { display:true, text:'Scan Ops / sec', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
-            }
-          }
-        }
-      };
-    }"""
-    if old_timeline_fn not in html:
-        raise RuntimeError("makeYcsbTimelineConfig template text not found -- template drifted")
-    html = html.replace(old_timeline_fn, new_timeline_fn)
-
-    # Static per-tab captions describing the vertical-line legend (still said "t=15s single
-    # trigger" from the old schedule; now t=5s reorganize() / t=10s+25s checkpoint(), unguarded).
-    old_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
-          <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
-        </p>"""
-    new_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー、全バリアント共通)。
-          強制トリガーはバリアントごとに独立集計(全バリアント共通の1本の線には集約しない): t=5秒予定の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(細かい点線)、t=10秒・t=25秒予定の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>(粗い点線)を、そのバリアント自身の色+マーカー形状(スキャンQPS線をホバーした際の点と同じ形。凡例のポイント形状も対応)で描画。
-          実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。8B In-Memoryのように挿入スループットが極端に高いワークロードでは、t=5秒予定のreorganize()自体が20秒以上かかり、後続のcheckpoint()トリガー(t=10s/25s)がこの30秒間に一度も発火しないまま終わることもある(この場合、線は1本しか出ない)。カーソルを線に合わせると、その秒に発火したバリアント・種類・予定秒・実発火秒・所要時間を表示。
-        </p>"""
-    if old_caption not in html:
-        raise RuntimeError("YCSB-E caption template text not found -- template drifted")
-    if html.count(old_caption) != 4:
-        raise RuntimeError(f"expected 4 YCSB-E caption occurrences, found {html.count(old_caption)}")
-    html = html.replace(old_caption, new_caption)
-
-    # Reorg-scaling caption: mention the new t1t2_steady series.
-    old_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
-          <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
-        </p>"""
-    new_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
-          <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
-        </p>"""
-    if old_reorg_caption not in html:
-        raise RuntimeError("reorg-scaling caption template text not found -- template drifted")
-    if html.count(old_reorg_caption) != 4:
-        raise RuntimeError(f"expected 4 reorg-scaling caption occurrences, found {html.count(old_reorg_caption)}")
-    html = html.replace(old_reorg_caption, new_reorg_caption)
+    html = html.replace("後続のdefragment()トリガー", "後続のcheckpoint()トリガー")
+    html = html.replace("t=10s & t=25s (defragment())", "t=10s & t=25s (checkpoint())")
+    old_reorg_caption_variants = [
+        """<strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、ただし<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。reflink元が無いのでO(N)。現行のreflink+punch実装そのものを、コールド状態で計測した数値であって別実装ではない)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既存世代からのreflink clone + hole punch、O(diff)の本来の定常状態。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。""",
+        """<strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。""",
+    ]
+    new_reorg_caption = """<strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。"""
+    for old_variant in old_reorg_caption_variants:
+        html = html.replace(old_variant, new_reorg_caption)
 
     # Header title / links / description.
     old_title = f'<title>VMemKV Performance Charts ({args.template_id})</title>'
@@ -748,65 +423,66 @@ def main():
     tbody_end = html.index("</tbody>", tbody_content_start)
     html = html[:tbody_content_start] + render_winners_matrix_html(winners_rows) + "\n" + html[tbody_end:]
 
-    # Drop the Tier 1 / Tier 1+2 reorganize-duration summary cards entirely. They were found to be
-    # 100% redundant with the per-tab "Reorganize Duration vs. Corpus Size" chart (same
-    # reorg_scaling_*.jsonl data, avg/max-collapsed instead of shown against corpus size, which
-    # is the actually interesting axis) -- and this exact card was also where a real staleness bug
-    # was found (it silently carried over the *previous* report's hardcoded numbers verbatim for a
-    # full cycle, since nothing in this script ever touched it). Removing the whole thing is
-    # simpler and more honest than fixing numbers nobody was cross-checking against the chart
-    # anyway.
+    # Tier 1 / Tier 1+2 reorganize-duration summary grid: dropped as 100% redundant with the
+    # per-tab "Reorganize Duration vs. Corpus Size" chart (removed once, so a no-op if the
+    # template already lacks it).
     grid_open_marker = '      <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">'
     grid_close_marker = '</section>\n      </div>\n    </div>\n'
-    grid_start = html.index(grid_open_marker)
-    grid_close_start = html.index(grid_close_marker, grid_start)
-    # Keep the trailing "    </div>\n" (tab-summary's own closing tag); only the grid + its two
-    # <section> children are being removed.
-    grid_end = grid_close_start + len('</section>\n      </div>\n')
-    html = html[:grid_start] + html[grid_end:]
+    if grid_open_marker in html:
+        grid_start = html.index(grid_open_marker)
+        grid_close_start = html.index(grid_close_marker, grid_start)
+        # Keep the trailing "    </div>\n" (tab-summary's own closing tag); only the grid + its
+        # two <section> children are being removed.
+        grid_end = grid_close_start + len('</section>\n      </div>\n')
+        html = html[:grid_start] + html[grid_end:]
 
-    # New-experiment summary sections: insert right after the Winners Matrix section closes (so
-    # final tab-summary order is Workload Winners -> Corpus-Size Invariance -> Churn-Ratio Scaling;
-    # Workload Winners is already first in the template, and reorganize-duration no longer has its
-    # own section per above).
-    churn_html = render_churn_table_html(churn_rows)
-    reorg_steady_html = render_reorg_steady_table_html(reorg_data)
-    new_sections = ""
-    if reorg_steady_html:
-        new_sections += f'''
+    # Corpus-Size Invariance / Churn-Ratio Scaling summary sections: replace the existing
+    # section's table in place if the template already has it (added by a prior report round),
+    # otherwise insert a fresh section right after the Workload Winners section closes.
+    section_open_marker = '<section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">'
+
+    def upsert_section(html, heading, icon_bg, icon_text, icon_name, title, description_html, table_html):
+        if not table_html:
+            return html
+        section_html = f'''
       <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
-          <div class="p-2 bg-emerald-50 text-emerald-600 rounded-lg">
-            <i data-lucide="git-commit" class="w-6 h-6"></i>
+          <div class="p-2 {icon_bg} {icon_text} rounded-lg">
+            <i data-lucide="{icon_name}" class="w-6 h-6"></i>
           </div>
           <div>
-            <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration (2nd-or-later call against an already-checkpointed corpus) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior checkpoint) for comparison.</p>
+            <h3 class="text-base font-bold text-slate-900">{title}</h3>
+            <p class="text-xs text-slate-500">{description_html}</p>
           </div>
         </div>
-        {reorg_steady_html}
+        {table_html}
       </section>
 '''
-    if churn_html:
-        new_sections += f'''
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
-            <i data-lucide="activity" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Churn-Ratio Scaling (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last checkpoint (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; cost still scales with how much actually changed, it isn't a fixed cheap constant.</p>
-          </div>
-        </div>
-        {churn_html}
-      </section>
-'''
-    if new_sections:
-        # Right after the Workload Winners <section>'s own closing tag (the first </section>
-        # following its tbody, before the grid block that used to sit here).
-        winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
-        html = html[:winners_section_close] + new_sections + html[winners_section_close:]
+        heading_idx = html.find(heading)
+        if heading_idx == -1:
+            # Not present yet: insert right after the Workload Winners section closes.
+            winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
+            return html[:winners_section_close] + section_html + html[winners_section_close:]
+        section_start = html.rindex(section_open_marker, 0, heading_idx)
+        section_end = html.index("</section>", heading_idx) + len("</section>")
+        return html[:section_start] + section_html.strip("\n") + html[section_end:]
+
+    html = upsert_section(
+        html,
+        heading="Corpus-Size Invariance across Generations (new experiment)",
+        icon_bg="bg-emerald-50", icon_text="text-emerald-600", icon_name="git-commit",
+        title="Corpus-Size Invariance across Generations (new experiment)",
+        description_html='Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration (2nd-or-later call against an already-checkpointed corpus) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior checkpoint) for comparison.',
+        table_html=render_reorg_steady_table_html(reorg_data),
+    )
+    html = upsert_section(
+        html,
+        heading="Churn-Ratio Scaling (new experiment)",
+        icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="activity",
+        title="Churn-Ratio Scaling (new experiment)",
+        description_html='Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last checkpoint (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; cost still scales with how much actually changed, it isn\'t a fixed cheap constant.',
+        table_html=render_churn_table_html(churn_rows),
+    )
 
     args.out.write_text(html)
     print(f"Wrote {args.out} ({len(html)} bytes)")
