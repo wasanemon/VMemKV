@@ -3,10 +3,12 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -204,7 +206,13 @@ class Wal {
   std::atomic<bool> flushing_{false};  // CAS/exchange-elected leader flag (mirrors reorg_running_).
   // Highest LSN whose PendingRecord::error is safe to read ("settled", not necessarily durable).
   // One shared notify_all() per round instead of a per-record done-flag; see class contract above.
-  std::atomic<uint64_t> highest_settled_lsn_{0};
+  // Guarded by settled_mutex_ (not a plain atomic): a follower's wait in await_durable() needs a
+  // genuinely bounded wait_for(), which condition_variable provides and atomic<uint64_t>::wait()
+  // does not (no timed overload) -- see await_durable()'s own comment for why an unbounded wait
+  // here was found to strand followers permanently under heavy concurrent load.
+  mutable std::mutex settled_mutex_;
+  mutable std::condition_variable settled_cv_;
+  uint64_t highest_settled_lsn_ = 0;
   // Sticky once a write()/fsync() round fails: later append_record() calls fail fast. Treat as
   // fatal to the process, not just to WAL calls.
   std::atomic<bool> poisoned_{false};

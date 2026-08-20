@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -162,8 +164,11 @@ void Wal::fail_all_pending_and_release_leadership(const std::exception_ptr &err)
   // never reserved by anyone -- it's next_lsn_'s value at the point we stopped); harmless to
   // re-store/re-notify even if this particular sweep had nothing new to fail (next_to_flush_
   // starts at >= 1, so this never underflows).
-  highest_settled_lsn_.store(next_to_flush_ - 1, std::memory_order_release);
-  highest_settled_lsn_.notify_all();
+  {
+    const std::lock_guard<std::mutex> lock(settled_mutex_);
+    highest_settled_lsn_ = next_to_flush_ - 1;
+  }
+  settled_cv_.notify_all();
   flushing_.store(false, std::memory_order_release);
   flushing_.notify_all();
 }
@@ -257,8 +262,11 @@ void Wal::write_and_fsync_batch(const std::vector<PendingRecord *> &batch) {
 
   // One shared wake-up for the whole round instead of a per-record notify_one() loop -- see class
   // contract in wal.hpp.
-  highest_settled_lsn_.store(round_last_lsn, std::memory_order_release);
-  highest_settled_lsn_.notify_all();
+  {
+    const std::lock_guard<std::mutex> lock(settled_mutex_);
+    highest_settled_lsn_ = round_last_lsn;
+  }
+  settled_cv_.notify_all();
 
   for (auto *rec : batch) {
     ring_[rec->lsn % kWalRingCapacity].store(nullptr, std::memory_order_release);
@@ -364,19 +372,39 @@ auto Wal::reserve_record(WalRecordType type,
 
 auto Wal::await_durable(PendingRecord *rec) -> uint64_t {
   const uint64_t lsn = rec->lsn;
-  const bool is_leader = !flushing_.exchange(true, std::memory_order_acq_rel);
+  bool is_leader = !flushing_.exchange(true, std::memory_order_acq_rel);
 
   if (!is_leader) {
-    uint64_t settled = highest_settled_lsn_.load(std::memory_order_acquire);
-    while (settled < lsn) {
-      // Plain wait(), not a spin-then-wait hybrid: a PAUSE-spin-then-yield() hybrid (mirroring
-      // RocksDB's WriteThread::AwaitState()) was tried here to let the leader's notify skip its
-      // FUTEX_WAKE syscall. It helped in an isolated WAL-only benchmark but made the full system
-      // worse -- spinning steals cycles from other concurrent work that isn't free outside
-      // isolation. Reverted to a plain wait().
-      highest_settled_lsn_.wait(settled, std::memory_order_acquire);
-      settled = highest_settled_lsn_.load(std::memory_order_acquire);
+    // Bounded wait_for(), not a plain wait(): a PAUSE-spin-then-yield() hybrid (mirroring
+    // RocksDB's WriteThread::AwaitState()) was tried here to let the leader's notify skip its
+    // FUTEX_WAKE syscall. It helped in an isolated WAL-only benchmark but made the full system
+    // worse -- spinning steals cycles from other concurrent work that isn't free outside
+    // isolation. A plain unbounded wait() replaced it, but that has no timed overload and no
+    // stronger real-world guarantee than "eventually observed" (the same concern
+    // wait_until_reorg_not_running() already works around for reorg_running_, by polling instead
+    // of waiting unconditionally) -- and unlike that call, this one is on the hot path, so it
+    // can't just borrow that function's 10ms interval. Measured directly: 32 concurrent writer
+    // threads against an 8M-key, fully-checkpointed store (every update() forced out-of-place,
+    // so every await_durable() call is a real WAL round) hung permanently here, every follower
+    // parked waiting on an LSN nothing was ever going to settle. If a wait times out and this
+    // follower's LSN is still unsettled with no leader currently active, it elects itself rather
+    // than trusting another notify_all() to arrive.
+    constexpr auto kFollowerWaitTimeout = std::chrono::milliseconds(5);
+    std::unique_lock<std::mutex> lock(settled_mutex_);
+    while (highest_settled_lsn_ < lsn) {
+      const bool timed_out = settled_cv_.wait_for(lock, kFollowerWaitTimeout) == std::cv_status::timeout;
+      if (timed_out && highest_settled_lsn_ < lsn) {
+        lock.unlock();
+        if (!flushing_.exchange(true, std::memory_order_acq_rel)) {
+          is_leader = true;
+          break;
+        }
+        lock.lock();
+      }
     }
+  }
+
+  if (!is_leader) {
     const std::exception_ptr err = rec->error;
     rec->release();
     if (err) {
