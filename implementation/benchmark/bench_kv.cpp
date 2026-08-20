@@ -56,21 +56,20 @@ class YCSBTimelineCollector {
 
   // One forced store.reorganize()/store.checkpoint() call, fired deterministically at a fixed
   // second-mark instead of waiting for (possibly rare, see kForcedTriggers' own comment) organic
-  // triggering. elapsed_sec is the call's own measured wall-clock duration -- the direct evidence
-  // for whether checkpoint_internal() disrupts a concurrent workload, rather than something
-  // inferred after the fact from a throughput dip in the timeline.
+  // triggering. elapsed_sec is the call's own measured wall-clock duration, so a throughput dip
+  // in the timeline can be attributed directly instead of inferred after the fact.
   struct ForcedEvent {
     int scheduled_sec;
     int fired_sec;     // may exceed scheduled_sec if a prior forced call ran long -- see
                        // kForcedTriggers' comment on why no guard skips a late trigger.
-    std::string kind;  // "reorganize" or "defragment"
+    std::string kind;  // "reorganize" or "checkpoint"
     double elapsed_sec;
   };
 
   std::vector<ThreadCounter> counters;
   std::array<std::atomic<uint64_t>, kDurationSeconds> t1_reorg_counts{};
   std::array<std::atomic<uint64_t>, kDurationSeconds> t2_reorg_counts{};
-  // Separate from t1_reorg_counts/t2_reorg_counts: counts reorgs/defragments the benchmark itself
+  // Separate from t1_reorg_counts/t2_reorg_counts: counts reorgs the benchmark itself
   // forced (see kForcedTriggers below), as opposed to ones VMemKV triggered organically. Kept
   // apart so a future report pass can render these as differently-colored vertical lines. Exact
   // per-call timing lives in forced_events instead -- these per-second buckets exist only to keep
@@ -178,29 +177,21 @@ class YCSBTimelineCollector {
 };
 
 // Fixed schedule for YCSB-E's forced reorganize()/checkpoint() calls (see the trigger site in
-// register_ycsb_e_benchmark() below): under LTM, natural triggering is rare/unreliable within the
-// 30s window (the append region's soft-limit threshold, and the WAL-size threshold that drives
-// checkpoint(), are often never reached at LTM's much lower throughput), so YCSB-E's timeline
-// would otherwise show little to no reorg activity for those scenarios. Firing these
-// deterministically guarantees comparable data points every run instead of leaving it to chance.
+// register_ycsb_e_benchmark() below): natural triggering is unreliable within the 30s window
+// (especially under LTM's lower throughput), so YCSB-E's timeline would otherwise show little to
+// no reorg activity for some scenarios. Firing these deterministically guarantees comparable data
+// points every run instead of leaving it to chance.
 //
-// t=5s: one reorganize() (T1-only, zero I/O) as a control -- already known cheap from
-// run_reorg_scaling_probe.sh's t1only sweep, included here mainly so the chart has a "known-cheap"
-// reference line next to the checkpoint() calls below.
-// t=10s and t=25s: two checkpoint() calls (checkpoint_internal()'s in-place tail-durabilization
-// mechanism), spaced 15s apart -- enough room for each to complete and for the surrounding
-// throughput to resettle before/after, even given real uncertainty over how long a single call
-// takes at YCSB-E's corpus scale. Two calls (not more) is enough to see whether a second cycle
-// looks like the first; repeatability across many more cycles is already covered separately by
-// run_churn_scaling_probe.sh's dense sweep, which isolates the diff-size variable far more
-// cleanly than a live mixed workload can.
+// t=5s: one reorganize() as a known-cheap control, giving the chart a reference line next to the
+// checkpoint() calls below. t=10s and t=25s: two checkpoint() calls, spaced 15s apart -- enough
+// room for each to complete and for surrounding throughput to resettle before/after. Two calls is
+// enough to see whether a second cycle looks like the first.
 //
 // Deliberately no guard against a late-running call pushing a later trigger's fire time past its
 // own schedule mark, or even past kDurationSeconds entirely: if checkpoint() at t=10s runs long
 // enough to blow through the t=25s mark, the next check (on this thread's very next loop
 // iteration, see the trigger site) fires it immediately back-to-back -- itself a legitimate,
-// informative result (checkpoint() takes long enough under this workload/scale that back-to-back
-// cycles pile up), not a bug to engineer around.
+// informative result, not a bug to engineer around.
 struct ForcedTrigger {
   int second_mark;
   bool is_checkpoint;  // false = reorganize() (T1-only), true = checkpoint()
@@ -1255,10 +1246,9 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
         // own run phase grows the corpus past ycsb_populate_size afterward: nothing ever
         // mutates the master/checkpoint itself, only this clone, so a later YCSB-E
         // construction cloning the same still-pristine source is unaffected. Deliberately
-        // *not* calling store.checkpoint() here as a "defensive" no-op: checkpoint()
-        // unconditionally forces at least one real cycle (see VMemKVImpl::run_reorganize()'s
-        // force_run handling), even when the append region is already empty, so on an
-        // already-pristine clone it would only add a real, non-trivial cost for zero benefit.
+        // *not* calling store.checkpoint() here as a "defensive" no-op: checkpoint() always
+        // forces a real, non-trivial-cost cycle, even on an already-pristine clone, for zero
+        // benefit here.
 
         // NOTE: collector setup and background reorg thread are launched per-run inside the
         // benchmark body (via epoch synchronization) to handle multiple trial/warmup runs correctly.
@@ -1775,11 +1765,6 @@ void register_all_benchmarks() {
 // very slow, blocking call and be able to tell a driver script "this is taking too long" without
 // waiting indefinitely -- hence a standalone CLI mode instead of a registered benchmark case.
 //
-// checkpoint_internal() durabilizes T2's live tail in place (5.2), touching only
-// [old_base_boundary, current bytes_used) regardless of how large the rest of the corpus is.
-// t1t2 (run_bootstrap()) and t1t2_steady (run_steady()) both measure this same mechanism; they
-// differ only in whether the corpus already has a prior checkpoint to diff against.
-//
 // Population/checkpoint/churn are deliberately NOT time-limited here -- only the outer shell
 // driver's own generous backstop timeout (wrapping this whole process) covers them. Only the
 // reorganize()/checkpoint() call itself is capped (timed_run(), below), via a background thread
@@ -1791,17 +1776,14 @@ void register_all_benchmarks() {
 //   t1only / t1t2 (run_bootstrap(), below): a single fresh populate followed by exactly one timed
 //     reorganize()/checkpoint() call.
 //   t1t2_steady (run_steady(), below): measures a *second* (or later) checkpoint() call against a
-//     corpus that already has one checkpointed generation. Used by two experiments that share
-//     this same mechanism, only differing in which axis (--ratio or --churn-ratio) they sweep:
-//     "Churn-Ratio Scaling" (fixed --ratio, varies --churn-ratio) and "Corpus-Size Invariance
-//     across Generations" (fixed --churn-ratio, varies --ratio, relying on run_steady()'s
-//     incremental corpus growth to avoid re-populating from scratch at each point). See
-//     run_churn_scaling_probe.sh and run_reorg_scaling_probe.sh's t1t2_steady sweep, respectively.
+//     corpus that already has one checkpointed generation. Used by two experiments that only
+//     differ in which axis (--ratio or --churn-ratio) they sweep -- see run_churn_scaling_probe.sh
+//     and run_reorg_scaling_probe.sh's t1t2_steady sweep, respectively.
 namespace reorg_probe {
 
 constexpr int kReorgTimeoutSeconds = 60;
 
-enum class ProbeMode { kT1Only, kT1T2, kT1T2Steady };
+enum class ProbeMode { kT1Only, kT1T2, kT1T2Steady, kDefrag, kDefragContention };
 
 struct ProbeArgs {
   bool is_ltm = false;
@@ -1860,6 +1842,10 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
         args.mode = ProbeMode::kT1T2;
       } else if (value == "t1t2_steady") {
         args.mode = ProbeMode::kT1T2Steady;
+      } else if (value == "defrag") {
+        args.mode = ProbeMode::kDefrag;
+      } else if (value == "defrag_contention") {
+        args.mode = ProbeMode::kDefragContention;
       } else {
         fail("unknown --mode: " + std::string(value));
       }
@@ -1875,8 +1861,8 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
-        "--mode=<t1only|t1t2|t1t2_steady> --ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] "
-        "[--sweep-tag=<name>]");
+        "--mode=<t1only|t1t2|t1t2_steady|defrag|defrag_contention> --ratio=<0.0-1.0> "
+        "[--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>]");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
     fail("--ratio must be in (0.0, 1.0]");
@@ -1916,8 +1902,24 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 // _Exit() is just the simplest way to avoid the same destructor path racing the
 // now-finished-but-still-detached worker thread.
 [[noreturn]] void report_and_exit(const ProbeArgs &args, std::size_t key_count, double elapsed_sec, bool timed_out) {
-  const char *mode_name =
-      args.mode == ProbeMode::kT1Only ? "t1only" : (args.mode == ProbeMode::kT1T2 ? "t1t2" : "t1t2_steady");
+  const char *mode_name = "t1t2_steady";
+  switch (args.mode) {
+    case ProbeMode::kT1Only:
+      mode_name = "t1only";
+      break;
+    case ProbeMode::kT1T2:
+      mode_name = "t1t2";
+      break;
+    case ProbeMode::kT1T2Steady:
+      mode_name = "t1t2_steady";
+      break;
+    case ProbeMode::kDefrag:
+      mode_name = "defrag";
+      break;
+    case ProbeMode::kDefragContention:
+      mode_name = "defrag_contention";  // Unreachable: this mode reports via its own print, below.
+      break;
+  }
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
             << "," << "\"mode\":\"" << mode_name << "\"," << "\"ratio\":" << args.ratio << ","
             << "\"churn_ratio\":" << args.churn_ratio << "," << "\"key_count\":" << key_count << ","
@@ -1955,9 +1957,8 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 }
 
 // Steady-state mode: measures a *second* (or later) checkpoint() call, after the corpus already
-// has one checkpointed generation -- unlike run_bootstrap() above, this exercises
-// checkpoint_internal() against a tail that only reflects the churn applied since that first
-// checkpoint, not a from-scratch corpus.
+// has one checkpointed generation -- unlike run_bootstrap() above, which always measures a
+// from-scratch corpus's first checkpoint.
 //
 // Persists across invocations at a fixed, ratio/churn-independent path (keyed only by
 // --sweep-tag/scenario/value-size) so a driver script can call this repeatedly -- with an
@@ -2049,6 +2050,151 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   report_and_exit(args, key_count, elapsed_sec, timed_out);
 }
 
+// Defrag mode: a single fresh populate, one checkpoint() to establish a realistic pre-defragment
+// state, optional churn (--churn-ratio, same multi-threaded application as run_steady() above),
+// then exactly one timed defragment() call. Two sweeps share this same mode: fixed churn_ratio=0,
+// varying --ratio ("corpus-size scaling") and fixed --ratio=1.0, varying --churn-ratio
+// ("churn-ratio invariance") -- see run_defrag_scaling_probe.sh.
+[[noreturn]] void run_defrag(const ProbeArgs &args) {
+  using Store = vmemkv::variants::VMemKVStore;
+
+  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
+  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
+
+  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
+                           std::to_string(args.val_size) + "_defrag_" +
+                           std::to_string(static_cast<int>(args.ratio * 100)) + "_" +
+                           std::to_string(static_cast<int>(args.churn_ratio * 100));
+
+  auto store = make_vmemkv_fresh(
+      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+  populate_random_order(*store, {key_count, args.val_size});
+  store->checkpoint();
+
+  if (args.churn_ratio > 0.0) {
+    const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * args.churn_ratio));
+    std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000) +
+                              static_cast<uint64_t>(args.churn_ratio * 1000000));
+    std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
+    std::vector<std::size_t> churn_indices(churn_count);
+    for (auto &idx : churn_indices) {
+      idx = churn_index_dist(churn_rng);
+    }
+    const std::size_t churn_threads =
+        std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
+    std::vector<std::thread> workers;
+    workers.reserve(churn_threads);
+    for (std::size_t t = 0; t < churn_threads; ++t) {
+      workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
+        for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
+          const std::size_t idx = churn_indices[i];
+          store->update(make_key(idx), make_value_for_key(idx, val_size));
+        }
+      });
+    }
+    for (auto &worker : workers) {
+      worker.join();
+    }
+  }
+
+  auto [elapsed_sec, timed_out] = timed_run([&store]() { store->defragment(); });
+  report_and_exit(args, key_count, elapsed_sec, timed_out);
+}
+
+// Defrag-contention mode: measures how much concurrent write throughput degrades while
+// defragment() is running, and defragment()'s own duration under that contention. Same
+// populate+checkpoint setup as run_defrag(), then two phases: an isolated write-TPS baseline
+// (fixed op count per thread, no concurrent defragment()), and a concurrent phase where writer
+// threads run continuously for defragment()'s entire duration (stop-flag controlled, joined right
+// after the timed call returns). --ratio scales corpus size; --churn-ratio is unused here.
+[[noreturn]] void run_defrag_contention(const ProbeArgs &args) {
+  using Store = vmemkv::variants::VMemKVStore;
+
+  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
+  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
+
+  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
+                           std::to_string(args.val_size) + "_defragcontention_" +
+                           std::to_string(static_cast<int>(args.ratio * 100));
+
+  auto store = make_vmemkv_fresh(
+      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+  populate_random_order(*store, {key_count, args.val_size});
+  store->checkpoint();
+
+  const std::size_t writer_threads = std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+
+  // stop == nullptr: run exactly fixed_ops then return. stop != nullptr: run until *stop is set,
+  // ignoring fixed_ops, returning however many ops actually completed.
+  auto run_writer = [&store, key_count, val_size = args.val_size](
+                        std::size_t seed_offset, const std::atomic<bool> *stop, std::size_t fixed_ops) -> std::size_t {
+    std::mt19937_64 rng(kBenchmarkSeed + seed_offset);
+    std::uniform_int_distribution<std::size_t> key_dist(0, key_count - 1);
+    std::size_t done = 0;
+    if (stop == nullptr) {
+      for (; done < fixed_ops; ++done) {
+        const std::size_t idx = key_dist(rng);
+        store->update(make_key(idx), make_value_for_key(idx, val_size));
+      }
+    } else {
+      while (!stop->load(std::memory_order_relaxed)) {
+        const std::size_t idx = key_dist(rng);
+        store->update(make_key(idx), make_value_for_key(idx, val_size));
+        ++done;
+      }
+    }
+    return done;
+  };
+
+  // Phase A: isolated baseline -- fixed op count per thread, no concurrent defragment().
+  constexpr std::size_t kOpsPerThreadBaseline = 20'000;
+  double isolated_write_tps = 0.0;
+  {
+    std::vector<std::thread> workers;
+    workers.reserve(writer_threads);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::size_t t = 0; t < writer_threads; ++t) {
+      workers.emplace_back([&run_writer, t] { run_writer(t, nullptr, kOpsPerThreadBaseline); });
+    }
+    for (auto &w : workers) {
+      w.join();
+    }
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    isolated_write_tps = static_cast<double>(writer_threads * kOpsPerThreadBaseline) / elapsed;
+  }
+
+  // Phase B: concurrent -- writer threads run continuously for defragment()'s entire duration.
+  std::atomic<bool> stop{false};
+  std::vector<std::size_t> counts(writer_threads, 0);
+  std::vector<std::thread> workers;
+  workers.reserve(writer_threads);
+  for (std::size_t t = 0; t < writer_threads; ++t) {
+    workers.emplace_back([&run_writer, &counts, t, &stop] { counts[t] = run_writer(t + 1000, &stop, 0); });
+  }
+  const auto b0 = std::chrono::steady_clock::now();
+  auto [defrag_elapsed_sec, timed_out] = timed_run([&store]() { store->defragment(); });
+  const auto b1 = std::chrono::steady_clock::now();
+  stop.store(true, std::memory_order_relaxed);
+  for (auto &w : workers) {
+    w.join();
+  }
+  const double wall = std::chrono::duration<double>(b1 - b0).count();
+  std::size_t total_ops = 0;
+  for (auto c : counts) {
+    total_ops += c;
+  }
+  const double concurrent_write_tps = wall > 0.0 ? static_cast<double>(total_ops) / wall : 0.0;
+
+  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
+            << "," << "\"mode\":\"defrag_contention\"," << "\"ratio\":" << args.ratio << ","
+            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << writer_threads << ","
+            << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
+            << "\"defrag_elapsed_sec\":" << defrag_elapsed_sec << ","
+            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
+  std::_Exit(timed_out ? 124 : 0);
+}
+
 [[noreturn]] void run(const ProbeArgs &args) {
   if (args.is_ltm) {
     // Matches benchmark_matrix.sh's real scenario_env_prefix() for "ltm" -- corpus_size_for_value()
@@ -2059,6 +2205,10 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   }
   if (args.mode == ProbeMode::kT1T2Steady) {
     run_steady(args);
+  } else if (args.mode == ProbeMode::kDefrag) {
+    run_defrag(args);
+  } else if (args.mode == ProbeMode::kDefragContention) {
+    run_defrag_contention(args);
   } else {
     run_bootstrap(args);
   }

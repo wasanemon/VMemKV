@@ -6,7 +6,7 @@
 
 # Runs one --reorg-probe data point, applies two-tier timeout handling, and appends its JSONL
 # result line to $OUTPUT_PATH:
-#   - bench_kv's own internal kReorgTimeoutSeconds cap on the reorganize()/defragment() call
+#   - bench_kv's own internal kReorgTimeoutSeconds cap on the reorganize()/checkpoint() call
 #     itself -- this is what actually bounds the interesting measurement.
 #   - this function's outer OUTER_TIMEOUT_SECONDS, a generous backstop covering setup too (which
 #     the internal cap deliberately excludes), in case populate/checkpoint/churn itself hangs.
@@ -34,7 +34,7 @@ run_probe_point() {
   fi
 
   if [[ -n "$line" ]] && echo "$line" | python3 -c "import json,sys; json.load(sys.stdin)" >/dev/null 2>&1; then
-    # The probe's own internal reorganize()/defragment()-timeout fired: it still printed a JSON
+    # The probe's own internal reorganize()/checkpoint()-timeout fired: it still printed a JSON
     # line (timed_out:true) before exiting 124. Trust that over synthesizing our own record.
     log "${label}: internal timeout -- $line"
     echo "$line" >> "$OUTPUT_PATH"

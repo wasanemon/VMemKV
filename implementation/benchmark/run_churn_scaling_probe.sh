@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
-# run_churn_scaling_probe.sh - "Churn-Ratio Scaling" experiment: sweeps
-# checkpoint_and_defragment()'s wall-clock duration as a function of *churn ratio* (the fraction
-# of keys updated since the previous checkpoint), at a *fixed* corpus size -- the direct evidence
-# for the reflink+punch redesign's core claim that cost is O(diff since last cycle), not O(N).
-# Companion to run_reorg_scaling_probe.sh's "Corpus-Size Invariance across Generations" experiment
-# (fixed churn, varying corpus size instead); both share bench_kv.cpp's --mode=t1t2_steady and
-# this file's run_probe_point() helper.
+# run_churn_scaling_probe.sh - "Churn-Ratio Scaling" experiment: sweeps checkpoint()'s wall-clock
+# duration as a function of *churn ratio* (the fraction of keys updated since the previous
+# checkpoint), at a *fixed* corpus size. Companion to run_reorg_scaling_probe.sh's "Corpus-Size
+# Invariance" sweep (fixed churn, varying corpus size instead); both share bench_kv.cpp's
+# --mode=t1t2_steady and this file's run_probe_point() helper.
 #
-# Scope, chosen to keep AWS time down (see chat/design notes, 2026-08-16): the dense churn-ratio
-# sweep runs at in_memory scale only -- the O(N)-vs-O(diff) distinction is a disk-I/O-*volume*
-# argument, not a memory-pressure one, so its shape doesn't need real swap thrashing to show up,
-# and in_memory iteration is fast/cheap (no cgroup wait). A single additional low-churn point is
-# run at ltm scale (via --ltm-spot-check-only, meant to be invoked separately from run_bench_aws_
-# c6id.sh's cgroup-wrapped LTM pass): this is the direct replacement for the old ">27 minutes,
-# didn't finish" pathological result (TODO.md item 4) -- a concrete completion time instead.
+# Scope, chosen to keep AWS time down: the dense churn-ratio sweep runs at in_memory scale only
+# (fast/cheap, no cgroup wait). A single additional low-churn point is run at ltm scale (via
+# --ltm-spot-check-only, meant to be invoked separately from run_bench_aws_c6id.sh's
+# cgroup-wrapped LTM pass).
 #
 # Each data point reuses run_reorg_scaling_probe.sh's two-tier timeout handling (see
 # common/reorg_probe_common.sh's run_probe_point()). Churn ratios are swept ascending; unlike the
@@ -55,11 +50,9 @@ if [[ "$MODE_FILTER" != "--ltm-spot-check-only" ]]; then
 fi
 
 if [[ "$MODE_FILTER" == "--ltm-spot-check-only" ]]; then
-  # The direct replacement for TODO.md item 4's old ">27 minutes, didn't finish" result -- same
-  # combo (ltm/1KB), same real LTM budget (VMEMKV_CONTEXT_memory_budget_bytes/target_ratio=8.0,
-  # set by the caller -- see run_bench_aws_c6id.sh), same "defragment() on an already-checkpointed
-  # store" scenario, but now with a churn ratio low enough (1%) to be representative of a single
-  # background reorg cycle rather than a from-scratch rebuild.
+  # ltm/1KB under the real LTM budget (VMEMKV_CONTEXT_memory_budget_bytes/target_ratio=8.0, set
+  # by the caller -- see run_bench_aws_c6id.sh), with a churn ratio low enough (1%) to be
+  # representative of a single background reorg cycle rather than a from-scratch rebuild.
   log "=== ltm/1KB/t1t2_steady spot check (churn_ratio=0.01) ==="
   run_probe_point ltm 1KB t1t2_steady 1.0 "churn_ratio=0.01" \
     --churn-ratio=0.01 --sweep-tag="$SWEEP_TAG"

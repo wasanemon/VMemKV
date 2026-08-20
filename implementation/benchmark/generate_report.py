@@ -284,7 +284,7 @@ def render_reorg_steady_table_html(reorg_data):
            '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
            '<th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th>',
            '<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Steady-state defragment() (churn=0.01)</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Steady-state checkpoint() (churn=0.01)</th>',
            "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
     for p in points:
         status = f'<span class="text-rose-600 font-semibold">≥{p["elapsed_sec"]:.0f}s (timeout)</span>' if p["timed_out"] else f'{p["elapsed_sec"]:.2f}s'
@@ -303,7 +303,7 @@ def render_churn_table_html(rows):
            '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>',
            '<th class="py-2 px-3 font-bold text-slate-700">Churn Ratio</th>',
            '<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">defragment() steady-state</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">checkpoint() steady-state</th>',
            "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
     for r in rows:
         status = f'<span class="text-rose-600 font-semibold">≥{r["elapsed_sec"]:.0f}s (timeout)</span>' if r["timed_out"] else f'{r["elapsed_sec"]:.2f}s'
@@ -375,12 +375,12 @@ def main():
     # reorg-scaling chart: add the new t1t2_steady series (corpus-size invariance sweep).
     html = html.replace(
         "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n      };\n      const datasets = ['t1only', 't1t2'].filter(m => rs[m] && rs[m].length).map(m => {",
-        "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n        t1t2_steady: { label: 'T1+T2 steady (reflink/punch)', color: '#059669' },\n      };\n      const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {"
+        "const modeStyle = {\n        t1only: { label: 'T1-only', color: '#6366f1' },\n        t1t2:   { label: 'T1+T2',   color: '#e11d48' },\n        t1t2_steady: { label: 'T1+T2 steady', color: '#059669' },\n      };\n      const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {"
     )
 
     # reorgLinesPlugin: previously drew one shared amber line for ALL variants' forced-reorganize
-    # seconds and one shared purple line for ALL variants' forced-defragment seconds (union across
-    # variants), which (a) silently dropped defragment triggers entirely (bug, now fixed) and
+    # seconds and one shared purple line for ALL variants' forced-checkpoint seconds (union across
+    # variants), which (a) silently dropped checkpoint triggers entirely (bug, now fixed) and
     # (b) made independent per-variant events look like a single aggregate cluster with no way to
     # tell which variant fired when. Now draws one line+marker per (variant, event), colored and
     # shaped by that variant (same shape as its pointStyle on the scan-ops line itself).
@@ -591,7 +591,7 @@ def main():
         });
       }
       reorgSecs.sort((a,b) => a-b);
-      // Forced triggers are scheduled at t=5s (reorganize()) / t=10s & t=25s (defragment()), but
+      // Forced triggers are scheduled at t=5s (reorganize()) / t=10s & t=25s (checkpoint()), but
       // under sustained write contention the actual call can be delayed arbitrarily past its
       // scheduled second -- this is intentionally unguarded (cascading is itself an experiment
       // result), and can even starve later triggers out of the 30s window entirely if an earlier
@@ -671,13 +671,13 @@ def main():
     html = html.replace(old_timeline_fn, new_timeline_fn)
 
     # Static per-tab captions describing the vertical-line legend (still said "t=15s single
-    # trigger" from the old schedule; now t=5s reorganize() / t=10s+25s defragment(), unguarded).
+    # trigger" from the old schedule; now t=5s reorganize() / t=10s+25s checkpoint(), unguarded).
     old_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー)。
           <strong class="text-amber-600">橘色の点線</strong>: t=15秒時点で強制的に1回実行されるT1 Reorganize。
         </p>"""
     new_caption = """          <strong class="text-indigo-600">藍色の点線</strong>: 自然発生のT1 Reorganize(Adaptive Soft Limitによる自動トリガー、全バリアント共通)。
-          強制トリガーはバリアントごとに独立集計(全バリアント共通の1本の線には集約しない): t=5秒予定の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(細かい点線)、t=10秒・t=25秒予定の<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>(粗い点線)を、そのバリアント自身の色+マーカー形状(スキャンQPS線をホバーした際の点と同じ形。凡例のポイント形状も対応)で描画。
-          実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。8B In-Memoryのように挿入スループットが極端に高いワークロードでは、t=5秒予定のreorganize()自体が20秒以上かかり、後続のdefragment()トリガー(t=10s/25s)がこの30秒間に一度も発火しないまま終わることもある(この場合、線は1本しか出ない)。カーソルを線に合わせると、その秒に発火したバリアント・種類・予定秒・実発火秒・所要時間を表示。
+          強制トリガーはバリアントごとに独立集計(全バリアント共通の1本の線には集約しない): t=5秒予定の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(細かい点線)、t=10秒・t=25秒予定の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>(粗い点線)を、そのバリアント自身の色+マーカー形状(スキャンQPS線をホバーした際の点と同じ形。凡例のポイント形状も対応)で描画。
+          実際に発火する秒(線の位置)は予定秒とは限らない(将棋倒しに対するガード無し、書き込み負荷次第で数十秒遅延することがある)。8B In-Memoryのように挿入スループットが極端に高いワークロードでは、t=5秒予定のreorganize()自体が20秒以上かかり、後続のcheckpoint()トリガー(t=10s/25s)がこの30秒間に一度も発火しないまま終わることもある(この場合、線は1本しか出ない)。カーソルを線に合わせると、その秒に発火したバリアント・種類・予定秒・実発火秒・所要時間を表示。
         </p>"""
     if old_caption not in html:
         raise RuntimeError("YCSB-E caption template text not found -- template drifted")
@@ -685,15 +685,11 @@ def main():
         raise RuntimeError(f"expected 4 YCSB-E caption occurrences, found {html.count(old_caption)}")
     html = html.replace(old_caption, new_caption)
 
-    # Reorg-scaling caption: mention the new t1t2_steady (reflink/punch) series. Both 藍色/赤色 use
-    # the SAME current checkpoint_and_defragment() code -- 赤色 just measures it invoked cold (no
-    # prior checkpoint to reflink from, i.e. bootstrap cost, always O(N)); 緑色 is the 2nd-or-later
-    # call against an existing prior generation (the real O(diff) steady-state this design exists
-    # for). There is no separate "old design" being measured here.
+    # Reorg-scaling caption: mention the new t1t2_steady series.
     old_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>"""
-    new_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、ただし<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。reflink元が無いのでO(N)。現行のreflink+punch実装そのものを、コールド状態で計測した数値であって別実装ではない)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既存世代からのreflink clone + hole punch、O(diff)の本来の定常状態。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
+    new_reorg_caption = """          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>"""
     if old_reorg_caption not in html:
@@ -785,7 +781,7 @@ def main():
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration (reflink clone + hole punch, O(diff), 2nd-or-later call against an existing prior generation) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior generation to reflink from) for comparison.</p>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration (2nd-or-later call against an already-checkpointed corpus) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior checkpoint) for comparison.</p>
           </div>
         </div>
         {reorg_steady_html}
@@ -800,7 +796,7 @@ def main():
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Churn-Ratio Scaling (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint_and_defragment()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last generation (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; the O(diff) design's cost still scales with how much actually changed, it isn't a fixed cheap constant.</p>
+            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last checkpoint (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; cost still scales with how much actually changed, it isn't a fixed cheap constant.</p>
           </div>
         </div>
         {churn_html}

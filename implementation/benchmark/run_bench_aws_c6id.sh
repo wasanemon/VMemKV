@@ -28,7 +28,7 @@ show_help() {
   echo "                   duration vs. corpus size (T1-only vs T1+T2) on the same instance via"
   echo "                   run_reorg_scaling_probe.sh and download its JSONL output"
   echo "  --churn-scaling-probe  After the normal matrix, additionally sweep"
-  echo "                   checkpoint_and_defragment() duration vs. churn ratio at fixed corpus"
+  echo "                   checkpoint() duration vs. churn ratio at fixed corpus"
   echo "                   size (in_memory/1KB) plus one ltm/1KB low-churn spot check, on the"
   echo "                   same instance via run_churn_scaling_probe.sh and download its JSONL"
   echo "                   output. Only runs on an instance whose --value-size is 1KB (or"
@@ -348,7 +348,7 @@ prepare_remote_storage() {
       fi
     else
       if ! sudo blkid \"\$DEV\" >/dev/null 2>&1; then
-        echo \"Formatting NVMe SSD \$DEV as XFS (reflink=1 -- checkpoint_and_defragment() requires ioctl(FICLONE), TODO.md item 5; ext4 is not supported)...\"
+        echo \"Formatting NVMe SSD \$DEV as XFS...\"
         sudo mkfs.xfs -m reflink=1 -f \"\$DEV\" >/dev/null 2>&1
       else
         echo \"NVMe SSD \$DEV already has a filesystem; mounting without reformatting...\"
@@ -937,7 +937,7 @@ VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
 fi
 
 if [[ "$CHURN_SCALING_PROBE" == "true" ]]; then
-  # Additive extra measurement (checkpoint_and_defragment() duration vs. churn ratio at fixed
+  # Additive extra measurement (checkpoint() duration vs. churn ratio at fixed
   # corpus size), same reasoning as REORG_SCALING_PROBE above for reusing this already-provisioned
   # instance rather than a dedicated one. Unlike that probe, this one's own sweep is fixed to 1KB
   # regardless of $VALUE_SIZE_LIMIT (see run_churn_scaling_probe.sh's own comment for why: it
