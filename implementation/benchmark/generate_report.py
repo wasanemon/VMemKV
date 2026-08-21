@@ -181,8 +181,9 @@ def build_reorg_scaling_data(report_dir):
 def build_checkpoint_throughput_data(report_dir):
     """Reads checkpoint_throughput_in_memory.jsonl / checkpoint_throughput_ltm.jsonl
     (run_checkpoint_throughput_probe.sh, via bench_kv --reorg-probe --mode=t1t2_steady
-    --ratio=1.0 --churn-ratio=1.0 -- full corpus, full churn, isolates the marginal per-record
-    durabilization cost from checkpoint()'s fixed per-call setup overhead) into
+    --ratio=1.0 --churn-ratio=0.25 -- full corpus size, a high-but-not-maximal churn ratio that
+    isolates the marginal per-record durabilization cost from checkpoint()'s fixed per-call setup
+    overhead without the setup/checkpoint cost of churn=1.0 on the whole corpus) into
     {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per combo."""
     data = {}
     for fname in ["checkpoint_throughput_in_memory.jsonl", "checkpoint_throughput_ltm.jsonl"]:
@@ -526,6 +527,14 @@ def main():
     for old_variant in old_reorg_caption_simplified_variants:
         html = html.replace(old_variant, new_reorg_caption_simplified)
 
+    # checkpoint-throughput probe churn ratio 1.0 -> 0.25: churn=1.0's setup/checkpoint cost blew
+    # the outer/internal timeouts on 3 of 4 combos (large in_memory/8B and ltm/1KB corpora, and
+    # ltm/64KB's checkpoint() call itself); 0.25 already isolates the marginal per-record cost
+    # about as well (see run_checkpoint_throughput_probe.sh's comment) at a quarter the cost. Best
+    # effort (not asserted), a no-op once fixed.
+    html = html.replace("checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間",
+                         "checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間")
+
     # Header title / links / description.
     old_title = f'<title>VMemKV Performance Charts ({args.template_id})</title>'
     new_title = f'<title>{args.title}</title>'
@@ -643,7 +652,7 @@ def main():
         heading="Insert vs. Checkpoint() Throughput (new experiment)",
         icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="gauge",
         title="Insert vs. Checkpoint() Throughput (new experiment)",
-        description_html='checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=1.0 to isolate the marginal per-record cost from checkpoint()\'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).',
+        description_html='checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()\'s fixed per-call setup overhead without churn=1.0\'s setup/checkpoint cost on the whole corpus -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).',
         table_html=render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data),
     )
     html = upsert_section(
@@ -768,7 +777,7 @@ def main():
           <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
         </div>
         <p class="text-sm text-slate-500">
-          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
