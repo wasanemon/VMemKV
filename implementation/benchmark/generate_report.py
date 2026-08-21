@@ -196,6 +196,119 @@ def build_churn_scaling_rows(report_dir):
     return rows
 
 
+def _defrag_value_label(value_size):
+    if isinstance(value_size, str):
+        return value_size
+    return {8: "8B", 1024: "1KB", 65536: "64KB"}.get(value_size, str(value_size))
+
+
+def build_defrag_scaling_data(report_dir):
+    """Reads defrag_scaling_in_memory.jsonl / defrag_scaling_ltm.jsonl (run_defrag_scaling_probe.sh,
+    via bench_kv --reorg-probe --mode=defrag/defrag_contention) into three row lists: the
+    corpus-size sweep (mode=defrag, churn_ratio=0, all 4 scenario/value_size combos), the
+    churn-ratio sweep (mode=defrag, ratio=1.0, in_memory/1KB only), and the concurrent-write
+    contention spot check (mode=defrag_contention, one point per combo)."""
+    corpus_rows = []
+    churn_rows_by_ratio = {}
+    contention_rows = []
+    for fname in ["defrag_scaling_in_memory.jsonl", "defrag_scaling_ltm.jsonl"]:
+        path = report_dir / fname
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            scenario_val = f'{rec["scenario"]}_{_defrag_value_label(rec.get("value_size"))}'
+            if rec.get("mode") == "defrag":
+                if (rec.get("churn_ratio") or 0) == 0:
+                    corpus_rows.append({
+                        "scenario_val": scenario_val,
+                        "ratio": rec.get("ratio"),
+                        "key_count": rec["key_count"],
+                        "elapsed_sec": rec["elapsed_sec"],
+                        "timed_out": rec["timed_out"],
+                    })
+                if rec["scenario"] == "in_memory" and rec.get("value_size") == 1024 and rec.get("ratio") == 1:
+                    churn_rows_by_ratio[rec.get("churn_ratio") or 0] = {
+                        "churn_ratio": rec.get("churn_ratio") or 0,
+                        "key_count": rec["key_count"],
+                        "elapsed_sec": rec["elapsed_sec"],
+                        "timed_out": rec["timed_out"],
+                    }
+            elif rec.get("mode") == "defrag_contention":
+                contention_rows.append({
+                    "scenario_val": scenario_val,
+                    "isolated_write_tps": rec.get("isolated_write_tps"),
+                    "concurrent_write_tps": rec.get("concurrent_write_tps"),
+                    "defrag_elapsed_sec": rec.get("defrag_elapsed_sec", rec.get("elapsed_sec")),
+                    "timed_out": rec["timed_out"],
+                    "failure_reason": rec.get("failure_reason"),
+                })
+    corpus_rows.sort(key=lambda r: (r["scenario_val"], r["ratio"] or 0))
+    churn_rows = [churn_rows_by_ratio[k] for k in sorted(churn_rows_by_ratio)]
+    return corpus_rows, churn_rows, contention_rows
+
+
+def render_defrag_scaling_html(corpus_rows, churn_rows, contention_rows):
+    if not corpus_rows and not churn_rows and not contention_rows:
+        return ""
+    out = []
+    if corpus_rows:
+        out.append('<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide">Corpus-Size Sweep (churn=0)</h4>')
+        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
+                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">defragment()</th>'
+                    '</tr></thead><tbody class="divide-y divide-slate-100">')
+        for r in corpus_rows:
+            status = f'<span class="text-rose-600 font-semibold">≥{r["elapsed_sec"]:.0f}s (timeout)</span>' if r["timed_out"] else f'{r["elapsed_sec"]:.2f}s'
+            ratio_label = f'{r["ratio"]:.0%}' if r["ratio"] is not None else "n/a"
+            out.append(f'<tr><td class="py-2 px-3">{r["scenario_val"]}</td><td class="py-2 px-3">{ratio_label}</td>'
+                        f'<td class="py-2 px-3">{r["key_count"]:,}</td><td class="py-2 px-3">{status}</td></tr>')
+        out.append("</tbody></table></div>")
+    if churn_rows:
+        out.append('<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4">Churn-Ratio Sweep (in_memory/1KB, ratio=1.0)</h4>')
+        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
+                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Churn Ratio</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">defragment()</th>'
+                    '</tr></thead><tbody class="divide-y divide-slate-100">')
+        for r in churn_rows:
+            status = f'<span class="text-rose-600 font-semibold">≥{r["elapsed_sec"]:.0f}s (timeout)</span>' if r["timed_out"] else f'{r["elapsed_sec"]:.2f}s'
+            out.append(f'<tr><td class="py-2 px-3">{r["churn_ratio"]}</td><td class="py-2 px-3">{r["key_count"]:,}</td>'
+                        f'<td class="py-2 px-3">{status}</td></tr>')
+        out.append("</tbody></table></div>")
+    if contention_rows:
+        out.append('<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4">Concurrent-Write Contention Spot Check (32 writer threads, ratio=1.0)</h4>')
+        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
+                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Isolated Write TPS</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Concurrent Write TPS</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Slowdown</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">defragment() duration</th>'
+                    '</tr></thead><tbody class="divide-y divide-slate-100">')
+        for r in contention_rows:
+            if r["failure_reason"]:
+                out.append(f'<tr><td class="py-2 px-3">{r["scenario_val"]}</td>'
+                            f'<td class="py-2 px-3 text-slate-300" colspan="3">n/a</td>'
+                            f'<td class="py-2 px-3"><span class="text-rose-600 font-semibold">did not complete ({r["failure_reason"]})</span></td></tr>')
+                continue
+            iso = r["isolated_write_tps"]
+            conc = r["concurrent_write_tps"]
+            slowdown = f'{(1 - conc / iso) * 100:.0f}%' if iso else "n/a"
+            defrag_status = f'<span class="text-rose-600 font-semibold">≥{r["defrag_elapsed_sec"]:.0f}s (timeout)</span>' if r["timed_out"] else f'{r["defrag_elapsed_sec"]:.2f}s'
+            out.append(f'<tr><td class="py-2 px-3">{r["scenario_val"]}</td>'
+                        f'<td class="py-2 px-3">{iso:,.0f}/s</td><td class="py-2 px-3">{conc:,.0f}/s</td>'
+                        f'<td class="py-2 px-3">{slowdown}</td><td class="py-2 px-3">{defrag_status}</td></tr>')
+        out.append("</tbody></table></div>")
+    return "\n".join(out)
+
+
 def compute_winners_matrix(raw_data):
     rows = []
     for workload in WORKLOADS:
@@ -332,6 +445,7 @@ def main():
     forced_events_data = build_forced_events_data(args.report_dir)
     reorg_data = build_reorg_scaling_data(args.report_dir)
     churn_rows = build_churn_scaling_rows(args.report_dir)
+    defrag_corpus_rows, defrag_churn_rows, defrag_contention_rows = build_defrag_scaling_data(args.report_dir)
     winners_rows = compute_winners_matrix(raw_data)
 
     html = html.replace(args.template_id, args.report_id)
@@ -413,7 +527,11 @@ def main():
         (f"reorg_scaling_ltm_64KB.jsonl", "Reorg Scaling, LTM 64KB"),
         (f"churn_scaling_in_memory_1KB.jsonl", "Churn Scaling, In-Mem 1KB"),
         (f"churn_scaling_ltm_1KB.jsonl", "Churn Scaling, LTM 1KB spot check"),
+        (f"defrag_scaling_in_memory.jsonl", "Defrag Scaling, In-Memory"),
+        (f"defrag_scaling_ltm.jsonl", "Defrag Scaling, LTM"),
     ]:
+        if not (args.report_dir / fname).exists():
+            continue
         links.append(
             f'<a href="../{args.report_id}/{fname}" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200">'
             f'<i data-lucide="download" class="w-3.5 h-3.5"></i> Raw {"JSONL" if fname.endswith("jsonl") else "JSON"} ({label})</a>'
@@ -499,6 +617,14 @@ def main():
         title="Churn-Ratio Scaling (new experiment)",
         description_html='Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last checkpoint (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; cost still scales with how much actually changed, it isn\'t a fixed cheap constant.',
         table_html=render_churn_table_html(churn_rows),
+    )
+    html = upsert_section(
+        html,
+        heading="Defragment Scaling & Contention (new experiment)",
+        icon_bg="bg-amber-50", icon_text="text-amber-600", icon_name="scissors",
+        title="Defragment Scaling & Contention (new experiment)",
+        description_html='<code class="bg-slate-100 px-1 rounded">defragment()</code> duration against an already-<code class="bg-slate-100 px-1 rounded">checkpoint()</code>ed corpus (a realistic pre-defragment state), across all 4 scenario/value-size combos: corpus-size sweep at churn_ratio=0, a churn-ratio sweep at fixed corpus size (in_memory/1KB only), and a concurrent-write contention spot check (isolated vs. concurrent write throughput while defragment() runs). Unlike checkpoint(), which only durabilizes the diff since the last checkpoint (its churn-ratio sweep above shows a strong dependence), defragment() rewrites the whole corpus regardless of churn, so its cost should track corpus size, not churn ratio -- and did: churn-ratio sweep durations were flat around 24.4-25.6s across churn_ratio 0-1.0 at a fixed 8M-key corpus. Several ltm points hit the 60s (or 300s outer) cap outright.',
+        table_html=render_defrag_scaling_html(defrag_corpus_rows, defrag_churn_rows, defrag_contention_rows),
     )
 
     args.out.write_text(html)

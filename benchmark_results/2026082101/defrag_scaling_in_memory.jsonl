@@ -1,0 +1,17 @@
+{"scenario":"in_memory","value_size":8,"mode":"defrag","ratio":0.25,"churn_ratio":0,"key_count":5000000,"elapsed_sec":0.917941,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"defrag","ratio":0.5,"churn_ratio":0,"key_count":10000000,"elapsed_sec":1.92763,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"defrag","ratio":0.75,"churn_ratio":0,"key_count":15000000,"elapsed_sec":2.98982,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"defrag","ratio":1,"churn_ratio":0,"key_count":20000000,"elapsed_sec":4.28767,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":0.25,"churn_ratio":0,"key_count":2000000,"elapsed_sec":6.26029,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":0.5,"churn_ratio":0,"key_count":4000000,"elapsed_sec":12.5506,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":0.75,"churn_ratio":0,"key_count":6000000,"elapsed_sec":18.8662,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":0,"key_count":8000000,"elapsed_sec":24.4879,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":0,"key_count":8000000,"elapsed_sec":24.4972,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":0.01,"key_count":8000000,"elapsed_sec":24.4161,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":0.05,"key_count":8000000,"elapsed_sec":24.5695,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":0.1,"key_count":8000000,"elapsed_sec":24.5768,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":0.25,"key_count":8000000,"elapsed_sec":24.9053,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":0.5,"key_count":8000000,"elapsed_sec":25.6388,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":1,"key_count":8000000,"elapsed_sec":24.8165,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"defrag_contention","ratio":1,"key_count":20000000,"writer_threads":32,"isolated_write_tps":127385,"concurrent_write_tps":113406,"defrag_elapsed_sec":5.70056,"timed_out":false}
+{"scenario":"in_memory","value_size":1024,"mode":"defrag_contention","ratio":1,"key_count":8000000,"writer_threads":32,"isolated_write_tps":103036,"concurrent_write_tps":22106.3,"defrag_elapsed_sec":26.4754,"timed_out":false}

@@ -50,9 +50,11 @@
           <a href="../2026082101/reorg_scaling_ltm_64KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Reorg Scaling, LTM 64KB)</a>
           <a href="../2026082101/churn_scaling_in_memory_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Churn Scaling, In-Mem 1KB)</a>
           <a href="../2026082101/churn_scaling_ltm_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Churn Scaling, LTM 1KB spot check)</a>
+          <a href="../2026082101/defrag_scaling_in_memory.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Defrag Scaling, In-Memory)</a>
+          <a href="../2026082101/defrag_scaling_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Defrag Scaling, LTM)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。</p>
+      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、これまで未計測だったdefragment()を、単体スタンドアロンrunで新規に計測(commit 49d9a53以降、--defrag-scaling-probeとしてrun_bench_aws_c6id.sh/run_4parallel_bench.shへ組み込み済み)。</p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -77,13 +79,13 @@
         <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
           <i data-lucide="cpu" class="w-3.5 h-3.5"></i> Environment
         </h2>
-        <ul class="space-y-1 text-slate-500"><li><strong>Instance</strong>: AWS i4i.8xlarge (ap-northeast-1) x4 (4並列独立インスタンス、run_4parallel_bench.sh フルラン)</li>
+        <ul class="space-y-1 text-slate-500"><li><strong>Instance</strong>: AWS i4i.8xlarge (ap-northeast-1) x4 (4並列独立インスタンス、run_4parallel_bench.sh フルラン) + defragment()計測用スタンドアロンインスタンス x1(--skip-matrix --defrag-scaling-probe)</li>
           <li><strong>CPU</strong>: Intel Xeon Platinum 8375C @ 2.90GHz (32 cores)</li>
           <li><strong>RAM</strong>: 247.7 GiB</li>
           <li><strong>RAM (Larger-Than-Memory)</strong>: cgroup で DRAM を制限し、target_ratio 相当のコーパスを構築後、cgroup内で計測(ストアごとに独立したcgroupスコープ + drop_caches)</li>
           <li><strong>Disk</strong>: Local NVMe SSD, ext4 (Swap Media for LTM。旧XFS+reflink依存は本ラウンドで撤去)</li>
           <li><strong>Kernel</strong>: 6.17.0-1019-aws</li>
-          <li><strong>Git Rev</strong>: 4a7084c (clean -- クローンT2チェックポイントのsparse-copy修正を含む)</li></ul>
+          <li><strong>Git Rev</strong>: 4a7084c(メイン4並列)/49d9a53(defragment()スタンドアロン、clean)</li></ul>
         <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5 mt-3">
           <i data-lucide="briefcase" class="w-3.5 h-3.5"></i> Workloads
         </h2>
@@ -445,6 +447,50 @@
           </table>
         </div>
       </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
+            <i data-lucide="scissors" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Defragment Scaling & Contention (new experiment)</h3>
+            <p class="text-xs text-slate-500"><code class="bg-slate-100 px-1 rounded">defragment()</code> duration against an already-<code class="bg-slate-100 px-1 rounded">checkpoint()</code>ed corpus (a realistic pre-defragment state), across all 4 scenario/value-size combos: corpus-size sweep at churn_ratio=0, a churn-ratio sweep at fixed corpus size (in_memory/1KB only), and a concurrent-write contention spot check (isolated vs. concurrent write throughput while defragment() runs). Unlike checkpoint(), which only durabilizes the diff since the last checkpoint (its churn-ratio sweep above shows a strong dependence), defragment() rewrites the whole corpus regardless of churn, so its cost should track corpus size, not churn ratio -- and did: churn-ratio sweep durations were flat around 24.4-25.6s across churn_ratio 0-1.0 at a fixed 8M-key corpus. Several ltm points hit the 60s (or 300s outer) cap outright.</p>
+          </div>
+        </div>
+        <h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide">Corpus-Size Sweep (churn=0)</h4>
+<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs"><thead><tr class="border-b border-slate-200 bg-slate-50/50"><th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th><th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th><th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th><th class="py-2 px-3 font-bold text-slate-700">defragment()</th></tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,000,000</td><td class="py-2 px-3">6.26s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,000,000</td><td class="py-2 px-3">12.55s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,000,000</td><td class="py-2 px-3">18.87s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">24.49s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">24.50s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">5,000,000</td><td class="py-2 px-3">0.92s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">10,000,000</td><td class="py-2 px-3">1.93s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">15,000,000</td><td class="py-2 px-3">2.99s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">20,000,000</td><td class="py-2 px-3">4.29s</td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,064,888</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">32,760</td><td class="py-2 px-3">36.43s</td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">65,520</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+</tbody></table></div>
+<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4">Churn-Ratio Sweep (in_memory/1KB, ratio=1.0)</h4>
+<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs"><thead><tr class="border-b border-slate-200 bg-slate-50/50"><th class="py-2 px-3 font-bold text-slate-700">Churn Ratio</th><th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th><th class="py-2 px-3 font-bold text-slate-700">defragment()</th></tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">0</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">24.50s</td></tr>
+<tr><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">24.42s</td></tr>
+<tr><td class="py-2 px-3">0.05</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">24.57s</td></tr>
+<tr><td class="py-2 px-3">0.1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">24.58s</td></tr>
+<tr><td class="py-2 px-3">0.25</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">24.91s</td></tr>
+<tr><td class="py-2 px-3">0.5</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">25.64s</td></tr>
+<tr><td class="py-2 px-3">1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">24.82s</td></tr>
+</tbody></table></div>
+<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4">Concurrent-Write Contention Spot Check (32 writer threads, ratio=1.0)</h4>
+<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs"><thead><tr class="border-b border-slate-200 bg-slate-50/50"><th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th><th class="py-2 px-3 font-bold text-slate-700">Isolated Write TPS</th><th class="py-2 px-3 font-bold text-slate-700">Concurrent Write TPS</th><th class="py-2 px-3 font-bold text-slate-700">Slowdown</th><th class="py-2 px-3 font-bold text-slate-700">defragment() duration</th></tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">127,385/s</td><td class="py-2 px-3">113,406/s</td><td class="py-2 px-3">11%</td><td class="py-2 px-3">5.70s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">103,036/s</td><td class="py-2 px-3">22,106/s</td><td class="py-2 px-3">79%</td><td class="py-2 px-3">26.48s</td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3 text-slate-300" colspan="3">n/a</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">did not complete (outer_timeout)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">8,113/s</td><td class="py-2 px-3">8,511/s</td><td class="py-2 px-3">-5%</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
+</tbody></table></div>
+      </section>
+
             <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-emerald-50 text-emerald-600 rounded-lg">

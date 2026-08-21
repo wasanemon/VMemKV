@@ -76,7 +76,8 @@
                 <p class="mb-1.5">(<a href="2026081711_charts.html" class="text-indigo-600 hover:underline">08/17</a>時点比、要点のみ):</p>
                 <ul class="list-disc pl-4 space-y-1">
                   <li>クローン用T2チェックポイントファイルのディスク枯渇バグを2件修正: (1) クローンパスがベンチマークケースごとに増分カウンタで新規生成され、ディスクを使い切るまで蓄積していたのを固定パスの再利用へ変更、(2) <code>std::filesystem::copy_file()</code>がsparse fileのホールを認識せず、論理サイズ1TiBのT2チェックポイントをクローンごとにフル実体化していたのを、<code>pread</code>/<code>pwrite</code>で実データ範囲のみコピーしホールを保持する専用ヘルパーへ変更。これにより、これまで全ての4並列フルベンチ試行を失敗させていたルート原因を解消し、本ラウンドが修正後初めて4シナリオ全てが成功したフルラン。</li>
-                  <li><code>checkpoint()</code>/<code>defragment()</code>実装のDRY/YAGNIレビューを実施し共通ヘルパーを抽出。両者とベンチマークハーネスのコメント・生成レポート文言で<code>defragment()</code>と誤表記されていた箇所(実際は全てreorganize()/checkpoint()呼び出し)を修正。<code>defragment()</code>単体を測定する新実験(<code>--mode=defrag</code>/<code>defrag_contention</code>)を追加。</li>
+                  <li><code>checkpoint()</code>/<code>defragment()</code>実装のDRY/YAGNIレビューを実施し共通ヘルパーを抽出。両者とベンチマークハーネスのコメント・生成レポート文言で<code>defragment()</code>と誤表記されていた箇所(実際は全てreorganize()/checkpoint()呼び出し)を修正。Summaryタブの「Reorganize Duration (T1-only vs T1+T2)」チャートも同様に誤解を招く表記だった(T1+T2側は実際には<code>checkpoint()</code>のブートストラップ呼び出しで、reorganize()ではない)ため凡例・見出しを修正。</li>
+                  <li><code>defragment()</code>単体を測定する新実験(<code>--mode=defrag</code>/<code>defrag_contention</code>)を追加。当初はrun_bench_aws_c6id.sh/run_4parallel_bench.shに組み込まれておらず本ラウンドの4並列フルランでは未計測だったため、<code>--defrag-scaling-probe</code>として両ランナーへ組み込み、加えて新設の<code>--skip-matrix</code>フラグでスタンドアロンインスタンス上で単体実行し、結果を本レポートに追記(Summaryタブ「Defragment Scaling & Contention」)。churn-ratio(0〜1.0)に対して所要時間がほぼ一定(24.4〜25.6秒、8M件corpus)である一方、コーパスサイズには強く依存し、ltmシナリオでは複数点が60秒(または300秒の外側バックストップ)キャップに到達。</li>
                   <li>XFS+reflink依存を完全撤去(ext4へ移行)。T2ストレージはプレーンなPOSIX I/Oのみで、reflink/punch-holeの<code>ioctl</code>依存は既に無かったため撤去は provisioning/CI/テスト基盤側のみ。</li>
                 </ul>
               </td>
