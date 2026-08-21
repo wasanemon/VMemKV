@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>VMemKV Performance Charts (2026082101)</title>
+  <title>2026-08-21 AWS Benchmark Report</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -48,13 +48,13 @@
           <a href="../2026082101/reorg_scaling_in_memory_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Reorg Scaling, In-Mem 1KB)</a>
           <a href="../2026082101/reorg_scaling_ltm_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Reorg Scaling, LTM 1KB)</a>
           <a href="../2026082101/reorg_scaling_ltm_64KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Reorg Scaling, LTM 64KB)</a>
-          <a href="../2026082101/churn_scaling_in_memory_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Churn Scaling, In-Mem 1KB)</a>
-          <a href="../2026082101/churn_scaling_ltm_1KB.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Churn Scaling, LTM 1KB spot check)</a>
+          <a href="../2026082101/checkpoint_throughput_in_memory.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Checkpoint Throughput, In-Memory)</a>
+          <a href="../2026082101/checkpoint_throughput_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Checkpoint Throughput, LTM)</a>
           <a href="../2026082101/defrag_scaling_in_memory.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Defrag Scaling, In-Memory)</a>
           <a href="../2026082101/defrag_scaling_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Defrag Scaling, LTM)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、これまで未計測だったdefragment()を、単体スタンドアロンrunで新規に計測(commit 49d9a53以降、--defrag-scaling-probeとしてrun_bench_aws_c6id.sh/run_4parallel_bench.shへ組み込み済み)。</p>
+      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、defragment()を単体スタンドアロンrunで新規に計測(commit 49d9a53)。さらに、checkpoint()関連の3つの重複した実験(ブートストラップ・コーパスサイズ不変性・churn比率スイープ)を、Insertスループットと直接比較する単一の実験(churn_ratio=1.0での定常状態スループット、commit a85250c)へ統合。ただし後者はコンボごとに1点のみの計測で、in_memory/8Bとltm/1KBはchurn=1.0を適用するセットアップ自体が300秒の外側タイムアウトに到達し、ltm/64KBは60秒の内側タイムアウトに到達したため、有効なデータはin_memory/1KBの1点のみ(records/sec ≈ 2.15M)。</p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -79,13 +79,13 @@
         <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
           <i data-lucide="cpu" class="w-3.5 h-3.5"></i> Environment
         </h2>
-        <ul class="space-y-1 text-slate-500"><li><strong>Instance</strong>: AWS i4i.8xlarge (ap-northeast-1) x4 (4並列独立インスタンス、run_4parallel_bench.sh フルラン) + defragment()計測用スタンドアロンインスタンス x1(--skip-matrix --defrag-scaling-probe)</li>
+        <ul class="space-y-1 text-slate-500"><li><strong>Instance</strong>: AWS i4i.8xlarge (ap-northeast-1) x4 (4並列独立インスタンス、run_4parallel_bench.sh フルラン) + 単体スタンドアロンインスタンス x2(defragment()計測用、checkpoint()スループット計測用、それぞれ--skip-matrix使用)</li>
           <li><strong>CPU</strong>: Intel Xeon Platinum 8375C @ 2.90GHz (32 cores)</li>
           <li><strong>RAM</strong>: 247.7 GiB</li>
           <li><strong>RAM (Larger-Than-Memory)</strong>: cgroup で DRAM を制限し、target_ratio 相当のコーパスを構築後、cgroup内で計測(ストアごとに独立したcgroupスコープ + drop_caches)</li>
           <li><strong>Disk</strong>: Local NVMe SSD, ext4 (Swap Media for LTM。旧XFS+reflink依存は本ラウンドで撤去)</li>
           <li><strong>Kernel</strong>: 6.17.0-1019-aws</li>
-          <li><strong>Git Rev</strong>: 4a7084c(メイン4並列)/49d9a53(defragment()スタンドアロン、clean)</li></ul>
+          <li><strong>Git Rev</strong>: 4a7084c(メイン4並列)/49d9a53(defragment())/a85250c(checkpoint throughput、clean)</li></ul>
         <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5 mt-3">
           <i data-lucide="briefcase" class="w-3.5 h-3.5"></i> Workloads
         </h2>
@@ -449,6 +449,27 @@
       </section>
       <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
+          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
+            <i data-lucide="gauge" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Insert vs. Checkpoint() Throughput (new experiment)</h3>
+            <p class="text-xs text-slate-500">checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=1.0 to isolate the marginal per-record cost from checkpoint()'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert's 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
+<th class="py-2 px-3 font-bold text-slate-700">checkpoint() steady-state</th>
+<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">2,152,939/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.05x)</span></td></tr>
+</tbody></table></div>
+      </section>
+
+            <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
           <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
             <i data-lucide="scissors" class="w-6 h-6"></i>
           </div>
@@ -491,56 +512,9 @@
 </tbody></table></div>
       </section>
 
-            <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-emerald-50 text-emerald-600 rounded-lg">
-            <i data-lucide="git-commit" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Corpus-Size Invariance across Generations (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration (2nd-or-later call against an already-checkpointed corpus) at fixed churn ratio (0.01), swept across corpus size. Scoped to ltm/1KB only. Same series also plotted (green) on the Reorg Scaling chart in the 1KB LTM tab, alongside the T1-only/T1+T2 bootstrap sweep (1st-ever call, no prior checkpoint) for comparison.</p>
-          </div>
-        </div>
-        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
-<thead><tr class="border-b border-slate-200 bg-slate-50/50">
-<th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th>
-<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>
-<th class="py-2 px-3 font-bold text-slate-700">Steady-state checkpoint() (churn=0.01)</th>
-</tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,064,888</td><td class="py-2 px-3">5.69s</td></tr>
-<tr><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,129,776</td><td class="py-2 px-3">9.93s</td></tr>
-<tr><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,194,664</td><td class="py-2 px-3">14.81s</td></tr>
-<tr><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">20.35s</td></tr>
-</tbody></table></div>
-      </section>
+            
 
-            <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
-            <i data-lucide="activity" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Churn-Ratio Scaling (new experiment)</h3>
-            <p class="text-xs text-slate-500">Steady-state <code class="bg-slate-100 px-1 rounded">checkpoint()</code> duration at fixed corpus size (8M keys, in_memory/1KB), swept across the fraction of the corpus mutated since the last checkpoint (churn ratio). 60s hard cap per point. One additional ltm/1KB spot check at churn_ratio=0.01. Notably, churn_ratio=0.05 -- just 400,000 of the 8M keys (5%) touched since the last checkpoint -- is already enough to blow the 60s cap; cost still scales with how much actually changed, it isn't a fixed cheap constant.</p>
-          </div>
-        </div>
-        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
-<thead><tr class="border-b border-slate-200 bg-slate-50/50">
-<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
-<th class="py-2 px-3 font-bold text-slate-700">Churn Ratio</th>
-<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>
-<th class="py-2 px-3 font-bold text-slate-700">checkpoint() steady-state</th>
-</tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">1.42s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">1.76s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.05</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">2.98s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">1.76s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.25</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">3.57s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">0.5</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">2.80s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">1</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">3.64s</td></tr>
-<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">0.01</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">20.41s</td></tr>
-</tbody></table></div>
-      </section>
+            
 
 
     </div>
@@ -689,11 +663,11 @@
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
           <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())</h2>
+          <h2 class="text-lg font-bold text-slate-900">reorganize() Duration vs. Corpus Size (T1-only)</h2>
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
+          reorganize() は T1(インメモリインデックス)のみを対象とし、T2には一切触れない。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -706,6 +680,26 @@
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
           <textarea id="memo-8b_in_memory-reorg-scaling" oninput="saveMemo('8b_in_memory-reorg-scaling', this.value)" placeholder="Reorg Scaling 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-emerald-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-8b_in_memory-checkpoint-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-8b_in_memory-checkpoint-throughput" oninput="saveMemo('8b_in_memory-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
     </div>
@@ -853,11 +847,11 @@
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
           <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())</h2>
+          <h2 class="text-lg font-bold text-slate-900">reorganize() Duration vs. Corpus Size (T1-only)</h2>
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
+          reorganize() は T1(インメモリインデックス)のみを対象とし、T2には一切触れない。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -870,6 +864,26 @@
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
           <textarea id="memo-1kb_in_memory-reorg-scaling" oninput="saveMemo('1kb_in_memory-reorg-scaling', this.value)" placeholder="Reorg Scaling 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-emerald-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_in_memory-checkpoint-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_in_memory-checkpoint-throughput" oninput="saveMemo('1kb_in_memory-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
     </div>
@@ -1017,11 +1031,11 @@
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
           <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())</h2>
+          <h2 class="text-lg font-bold text-slate-900">reorganize() Duration vs. Corpus Size (T1-only)</h2>
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
+          reorganize() は T1(インメモリインデックス)のみを対象とし、T2には一切触れない。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -1034,6 +1048,26 @@
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
           <textarea id="memo-1kb_ltm-reorg-scaling" oninput="saveMemo('1kb_ltm-reorg-scaling', this.value)" placeholder="Reorg Scaling 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-emerald-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_ltm-checkpoint-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_ltm-checkpoint-throughput" oninput="saveMemo('1kb_ltm-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
     </div>
@@ -1181,11 +1215,11 @@
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
           <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())</h2>
+          <h2 class="text-lg font-bold text-slate-900">reorganize() Duration vs. Corpus Size (T1-only)</h2>
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
-          <strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。
+          reorganize() は T1(インメモリインデックス)のみを対象とし、T2には一切触れない。
           <strong class="text-rose-600">▲マーカー</strong>はタイムアウトを示す。
         </p>
         <div class="space-y-3">
@@ -1198,6 +1232,26 @@
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
           <textarea id="memo-64kb_ltm-reorg-scaling" oninput="saveMemo('64kb_ltm-reorg-scaling', this.value)" placeholder="Reorg Scaling 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-emerald-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-64kb_ltm-checkpoint-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-64kb_ltm-checkpoint-throughput" oninput="saveMemo('64kb_ltm-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
     </div>
@@ -9627,6 +9681,13 @@
     ]
   }
 };
+    const checkpointThroughputData = {
+  "1KB_In-Memory": {
+    "key_count": 8000000,
+    "elapsed_sec": 3.71585,
+    "records_per_sec": 2152939.4351225155
+  }
+};
     const workloads = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"];
     const valSizes  = ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"];
 
@@ -9973,10 +10034,8 @@
       if (!rs) return null;
       const modeStyle = {
         t1only: { label: 'Reorganize (T1-only)', color: '#6366f1' },
-        t1t2:   { label: 'Checkpoint, bootstrap (T1+T2)', color: '#e11d48' },
-        t1t2_steady: { label: 'Checkpoint, steady (T1+T2)', color: '#059669' },
       };
-      const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {
+      const datasets = ['t1only'].filter(m => rs[m] && rs[m].length).map(m => {
         const style = modeStyle[m];
         const points = rs[m];
         return {
@@ -10035,6 +10094,71 @@
       };
     }
 
+    function makeCheckpointVsInsertConfig(valSizeKey) {
+      const cp = checkpointThroughputData[valSizeKey];
+      const insertSeries = rawData[valSizeKey] && rawData[valSizeKey]['Insert'] && rawData[valSizeKey]['Insert']['+Inline'];
+      if (!cp || !insertSeries) return null;
+      const threadLabels = [1, 4, 16, 32];
+      return {
+        type: 'line',
+        data: {
+          labels: threadLabels,
+          datasets: [
+            {
+              label: 'Insert (+Inline)',
+              data: insertSeries,
+              borderColor: '#6366f1',
+              backgroundColor: 'transparent',
+              borderWidth: 2,
+              tension: 0.2, fill: false,
+              pointRadius: 3.5,
+            },
+            {
+              label: 'checkpoint() steady-state',
+              data: threadLabels.map(() => cp.records_per_sec),
+              borderColor: '#059669',
+              backgroundColor: 'transparent',
+              borderWidth: 2,
+              borderDash: [6, 4],
+              pointRadius: 0,
+              fill: false,
+            },
+          ],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => `${items[0].label} threads`,
+                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw)}/s`
+              }
+            }
+          },
+          scales: {
+            x: {
+              title: { display:true, text:'Threads', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            },
+            y: {
+              type: 'logarithmic',
+              title: { display:true, text:'Throughput (records/sec, log scale)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            }
+          }
+        }
+      };
+    }
+
     function initCharts() {
       for (const valSize of valSizes) {
         for (const op of workloads) {
@@ -10064,6 +10188,12 @@
         if (reorgCanvas) {
           const cfg = makeReorgScalingConfig(valSize);
           if (cfg) new Chart(reorgCanvas, cfg);
+        }
+        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
+        const cpCanvas = document.getElementById('chart-' + cpEid);
+        if (cpCanvas) {
+          const cfg2 = makeCheckpointVsInsertConfig(valSize);
+          if (cfg2) new Chart(cpCanvas, cfg2);
         }
       }
     }
