@@ -643,7 +643,7 @@
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
           <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)</h2>
+          <h2 class="text-lg font-bold text-slate-900">Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())</h2>
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
@@ -807,7 +807,7 @@
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
           <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)</h2>
+          <h2 class="text-lg font-bold text-slate-900">Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())</h2>
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
@@ -971,7 +971,7 @@
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
           <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)</h2>
+          <h2 class="text-lg font-bold text-slate-900">Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())</h2>
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
@@ -1135,7 +1135,7 @@
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
           <div class="w-2 h-6 bg-rose-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)</h2>
+          <h2 class="text-lg font-bold text-slate-900">Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())</h2>
         </div>
         <p class="text-sm text-slate-500">
           単発の<code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>呼び出し1回の所要時間を、コーパスサイズ(件数)を横軸にスイープ計測。
@@ -9926,9 +9926,9 @@
       const rs = reorgScalingData[valSizeKey];
       if (!rs) return null;
       const modeStyle = {
-        t1only: { label: 'T1-only', color: '#6366f1' },
-        t1t2:   { label: 'T1+T2',   color: '#e11d48' },
-        t1t2_steady: { label: 'T1+T2 steady (reflink/punch)', color: '#059669' },
+        t1only: { label: 'Reorganize (T1-only)', color: '#6366f1' },
+        t1t2:   { label: 'Checkpoint, bootstrap (T1+T2)', color: '#e11d48' },
+        t1t2_steady: { label: 'Checkpoint, steady (T1+T2)', color: '#059669' },
       };
       const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {
         const style = modeStyle[m];

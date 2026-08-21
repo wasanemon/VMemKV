@@ -34,6 +34,16 @@ show_help() {
   echo "                   output. Only runs on an instance whose --value-size is 1KB (or"
   echo "                   unset), since the probe's own sweep is fixed to 1KB regardless of"
   echo "                   this script's --value-size."
+  echo "  --defrag-scaling-probe  After the normal matrix, additionally sweep defragment()"
+  echo "                   duration vs. corpus size and churn ratio, plus a concurrent-write"
+  echo "                   contention spot check, on the same instance via"
+  echo "                   run_defrag_scaling_probe.sh and download its JSONL output."
+  echo "  --skip-matrix    Skip the main Google Benchmark-registered CRUD/Scan/YCSB-E matrix"
+  echo "                   entirely (and its results download) -- provision/build the instance"
+  echo "                   and run only the *-scaling-probe flags passed alongside this one."
+  echo "                   For a standalone probe-only run when the matrix has already been"
+  echo "                   measured separately and only a probe (e.g. --defrag-scaling-probe)"
+  echo "                   is still needed."
   echo "  --without-rivals  Drop RocksDB/RocksDB-BlobDB/LMDB from the benchmark filter, running"
   echo "                   VMemKV variants only. Use for regression-check runs after a"
   echo "                   VMemKV-internal-only code change, where the rivals' numbers are"
@@ -46,6 +56,8 @@ SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
 REORG_SCALING_PROBE=false
 CHURN_SCALING_PROBE=false
+DEFRAG_SCALING_PROBE=false
+SKIP_MATRIX=false
 WITHOUT_RIVALS=false
 
 while [[ $# -gt 0 ]]; do
@@ -80,6 +92,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --churn-scaling-probe)
       CHURN_SCALING_PROBE=true
+      shift
+      ;;
+    --defrag-scaling-probe)
+      DEFRAG_SCALING_PROBE=true
+      shift
+      ;;
+    --skip-matrix)
+      SKIP_MATRIX=true
       shift
       ;;
     --without-rivals)
@@ -791,53 +811,58 @@ GLOBAL_TOTAL=$((total_inmem + total_ltm))
 write_progress_state "$GLOBAL_TOTAL"
 echo "Total benchmarks to run: $GLOBAL_TOTAL"
 
-if [[ "$SCENARIO_LIMIT" == "in_memory" ]]; then
-  run_scenario in_memory
-elif [[ "$SCENARIO_LIMIT" == "ltm" ]]; then
-  run_scenario ltm
-else
-  if [[ "$ORDER" == "B_FIRST" ]]; then
-    run_scenario ltm
+if [[ "$SKIP_MATRIX" != "true" ]]; then
+  if [[ "$SCENARIO_LIMIT" == "in_memory" ]]; then
     run_scenario in_memory
+  elif [[ "$SCENARIO_LIMIT" == "ltm" ]]; then
+    run_scenario ltm
   else
-    run_scenario in_memory
-    run_scenario ltm
+    if [[ "$ORDER" == "B_FIRST" ]]; then
+      run_scenario ltm
+      run_scenario in_memory
+    else
+      run_scenario in_memory
+      run_scenario ltm
+    fi
   fi
 fi
 
 # ── Retrieve Results & Save ───────────────────────────────────────────────
-echo "Downloading results..."
 RESULTS_DIR="${REPO_ROOT}/implementation/benchmark/logs"
 mkdir -p "$RESULTS_DIR"
 
-# With --without-rivals, the downloaded JSON only covers VMemKV variants; tag the filename so it
-# is never mistaken for (or silently overwritten by/onto) a full-matrix result, and so a later
-# merge step (see vmemkv_matrix::scenario_filter()'s comment re: merge_vmemkv_only_results.py) can
-# find both halves unambiguously.
-without_rivals_suffix=""
-if [[ "$WITHOUT_RIVALS" == "true" ]]; then
-  without_rivals_suffix="_vmemkv_only"
-fi
+if [[ "$SKIP_MATRIX" != "true" ]]; then
+  echo "Downloading results..."
 
-if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
-  dst_name="results_in_memory${without_rivals_suffix}.json"
-  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    dst_name="results_in_memory_${VALUE_SIZE_LIMIT}${without_rivals_suffix}.json"
+  # With --without-rivals, the downloaded JSON only covers VMemKV variants; tag the filename so it
+  # is never mistaken for (or silently overwritten by/onto) a full-matrix result, and so a later
+  # merge step (see vmemkv_matrix::scenario_filter()'s comment re: merge_vmemkv_only_results.py) can
+  # find both halves unambiguously.
+  without_rivals_suffix=""
+  if [[ "$WITHOUT_RIVALS" == "true" ]]; then
+    without_rivals_suffix="_vmemkv_only"
   fi
-  scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path in_memory)" "${RESULTS_DIR}/${dst_name}"
-fi
 
-if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
-  dst_name="results_ltm${without_rivals_suffix}.json"
-  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    dst_name="results_ltm_${VALUE_SIZE_LIMIT}${without_rivals_suffix}.json"
+  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+    dst_name="results_in_memory${without_rivals_suffix}.json"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      dst_name="results_in_memory_${VALUE_SIZE_LIMIT}${without_rivals_suffix}.json"
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path in_memory)" "${RESULTS_DIR}/${dst_name}"
   fi
-  scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path ltm)" "${RESULTS_DIR}/${dst_name}"
-fi
 
-# Retrieve YCSB-E timeline results if they exist
-echo "Downloading YCSB-E timeline logs..."
-scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/ycsb_e_timeline_*.json" "${RESULTS_DIR}/" || true
+  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+    dst_name="results_ltm${without_rivals_suffix}.json"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      dst_name="results_ltm_${VALUE_SIZE_LIMIT}${without_rivals_suffix}.json"
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path ltm)" "${RESULTS_DIR}/${dst_name}"
+  fi
+
+  # Retrieve YCSB-E timeline results if they exist
+  echo "Downloading YCSB-E timeline logs..."
+  scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/ycsb_e_timeline_*.json" "${RESULTS_DIR}/" || true
+fi
 
 if [[ "$REORG_SCALING_PROBE" == "true" ]]; then
   # Additive extra measurement (reorganize() duration vs. corpus size, T1-only vs T1+T2) on top
@@ -1005,6 +1030,87 @@ VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
 
   if [[ "$churn_probe_failed" -ne 0 ]]; then
     echo "[WARN] churn-scaling-probe had failures -- main benchmark matrix results above are still valid" >&2
+  fi
+fi
+
+if [[ "$DEFRAG_SCALING_PROBE" == "true" ]]; then
+  # Additive extra measurement (defragment() duration vs. corpus size and churn ratio, plus a
+  # concurrent-write contention spot check) on top of the normal matrix -- same reasoning and
+  # in_memory/ltm split as REORG_SCALING_PROBE above (run_defrag_scaling_probe.sh takes the same
+  # <bin> <output> <db_dir> [combo_filter] interface as run_reorg_scaling_probe.sh).
+  defrag_dst_name="defrag_scaling_in_memory.jsonl"
+  ltm_defrag_dst_name="defrag_scaling_ltm.jsonl"
+  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+    defrag_dst_name="defrag_scaling_in_memory_${VALUE_SIZE_LIMIT}.jsonl"
+    ltm_defrag_dst_name="defrag_scaling_ltm_${VALUE_SIZE_LIMIT}.jsonl"
+  fi
+
+  defrag_probe_failed=0
+
+  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+    inmem_defrag_combo_filter="in_memory"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      inmem_defrag_combo_filter="in_memory:${VALUE_SIZE_LIMIT}"
+    fi
+    inmem_defrag_probe_stdout_log="/tmp/vmemkv_defrag_probe_inmem_${KEY_NAME}.stdout.log"
+    inmem_defrag_probe_stderr_log="/tmp/vmemkv_defrag_probe_inmem_${KEY_NAME}.stderr.log"
+    : >"$inmem_defrag_probe_stdout_log"
+    : >"$inmem_defrag_probe_stderr_log"
+    inmem_defrag_probe_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+./benchmark/run_defrag_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/defrag_scaling_in_memory.jsonl' '/mnt/nvme' '$inmem_defrag_combo_filter'
+    "
+    printf -v inmem_defrag_probe_remote_cmd_quoted '%q' "$inmem_defrag_probe_remote_cmd"
+    echo "[runner] start defrag-scaling-probe scenario=in_memory combo_filter=$inmem_defrag_combo_filter"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${inmem_defrag_probe_remote_cmd_quoted}" \
+        2> >(tee -a "$inmem_defrag_probe_stderr_log" >&2); } | tee -a "$inmem_defrag_probe_stdout_log"
+    inmem_defrag_probe_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end defrag-scaling-probe scenario=in_memory status=$inmem_defrag_probe_status"
+    if [[ "$inmem_defrag_probe_status" -ne 0 ]]; then
+      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
+      echo "[WARN] defrag-scaling-probe (in_memory) failed with exit code $inmem_defrag_probe_status -- logs: $inmem_defrag_probe_stdout_log $inmem_defrag_probe_stderr_log" >&2
+      defrag_probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/defrag_scaling_in_memory.jsonl" "${RESULTS_DIR}/${defrag_dst_name}" || true
+  fi
+
+  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+    ltm_defrag_combo_filter="ltm"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      ltm_defrag_combo_filter="ltm:${VALUE_SIZE_LIMIT}"
+    fi
+    ltm_defrag_probe_stdout_log="/tmp/vmemkv_defrag_probe_ltm_${KEY_NAME}.stdout.log"
+    ltm_defrag_probe_stderr_log="/tmp/vmemkv_defrag_probe_ltm_${KEY_NAME}.stderr.log"
+    : >"$ltm_defrag_probe_stdout_log"
+    : >"$ltm_defrag_probe_stderr_log"
+    # VMEMKV_CONTEXT_memory_budget_bytes explicit here for the same reason as the ltm
+    # reorg-scaling-probe branch above.
+    ltm_defrag_probe_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
+./benchmark/run_defrag_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/defrag_scaling_ltm.jsonl' '/mnt/nvme' '$ltm_defrag_combo_filter'
+    "
+    printf -v ltm_defrag_probe_remote_cmd_quoted '%q' "$ltm_defrag_probe_remote_cmd"
+    echo "[runner] start defrag-scaling-probe scenario=ltm combo_filter=$ltm_defrag_combo_filter"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${ltm_defrag_probe_remote_cmd_quoted}" \
+        2> >(tee -a "$ltm_defrag_probe_stderr_log" >&2); } | tee -a "$ltm_defrag_probe_stdout_log"
+    ltm_defrag_probe_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end defrag-scaling-probe scenario=ltm status=$ltm_defrag_probe_status"
+    if [[ "$ltm_defrag_probe_status" -ne 0 ]]; then
+      # [WARN], not [ERROR] -- same reasoning as the in_memory branch above.
+      echo "[WARN] defrag-scaling-probe (ltm) failed with exit code $ltm_defrag_probe_status -- logs: $ltm_defrag_probe_stdout_log $ltm_defrag_probe_stderr_log" >&2
+      defrag_probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/defrag_scaling_ltm.jsonl" "${RESULTS_DIR}/${ltm_defrag_dst_name}" || true
+  fi
+
+  if [[ "$defrag_probe_failed" -ne 0 ]]; then
+    echo "[WARN] defrag-scaling-probe had failures -- main benchmark matrix results above are still valid" >&2
   fi
 fi
 

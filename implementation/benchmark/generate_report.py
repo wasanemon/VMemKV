@@ -373,6 +373,23 @@ def main():
     for old_variant in old_reorg_caption_variants:
         html = html.replace(old_variant, new_reorg_caption)
 
+    # "T1-only vs T1+T2" labeling is misleading on its own: T1-only calls reorganize(), but T1+T2
+    # calls checkpoint() (a from-scratch/bootstrap call, since run_bootstrap() always measures
+    # against a never-before-checkpointed corpus) -- not reorganize() at all, despite the section
+    # being titled "Reorganize Duration". Best effort (not asserted), a no-op once fixed.
+    html = html.replace(
+        "Reorganize Duration vs. Corpus Size (T1-only vs T1+T2)",
+        "Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())",
+    )
+    html = html.replace("t1only: { label: 'T1-only', color: '#6366f1' },",
+                         "t1only: { label: 'Reorganize (T1-only)', color: '#6366f1' },")
+    html = html.replace("t1t2:   { label: 'T1+T2',   color: '#e11d48' },",
+                         "t1t2:   { label: 'Checkpoint, bootstrap (T1+T2)', color: '#e11d48' },")
+    html = html.replace("t1t2_steady: { label: 'T1+T2 steady (reflink/punch)', color: '#059669' },",
+                         "t1t2_steady: { label: 'Checkpoint, steady (T1+T2)', color: '#059669' },")
+    html = html.replace("t1t2_steady: { label: 'T1+T2 steady', color: '#059669' },",
+                         "t1t2_steady: { label: 'Checkpoint, steady (T1+T2)', color: '#059669' },")
+
     # Header title / links / description.
     old_title = f'<title>VMemKV Performance Charts ({args.template_id})</title>'
     new_title = f'<title>{args.title}</title>'
