@@ -40,15 +40,12 @@ for task in "${TASKS[@]}"; do
   
   echo "Launching Instance for: Scenario=$scenario, ValueSize=$val_size (Log: $log_file)"
   
-  # Run the orchestrator script in the background. --reorg-scaling-probe, --churn-scaling-probe
-  # and --defrag-scaling-probe are all additive: they run after this instance's normal (scenario,
-  # value_size) matrix, on the same already-provisioned instance -- no 5th instance needed.
-  # --reorg-scaling-probe and --defrag-scaling-probe are both scoped to this instance's own combo
-  # (these 4 tasks already partition the 4 combos each sweeps). --churn-scaling-probe only
-  # actually does anything on the two value_size=1KB tasks (see its own comment in
-  # run_bench_aws_c6id.sh for why it's fixed to 1KB regardless of this instance's value_size) --
-  # passing it unconditionally to all 4 is harmless, it just no-ops on the 8B/64KB tasks.
-  extra_flags=(--reorg-scaling-probe --churn-scaling-probe --defrag-scaling-probe)
+  # Run the orchestrator script in the background. --reorg-scaling-probe,
+  # --checkpoint-throughput-probe and --defrag-scaling-probe are all additive: they run after
+  # this instance's normal (scenario, value_size) matrix, on the same already-provisioned
+  # instance -- no 5th instance needed. All three are scoped to this instance's own combo (these
+  # 4 tasks already partition the 4 combos each measures).
+  extra_flags=(--reorg-scaling-probe --checkpoint-throughput-probe --defrag-scaling-probe)
   if [[ -n "$WITHOUT_RIVALS_FLAG" ]]; then
     extra_flags+=("$WITHOUT_RIVALS_FLAG")
   fi

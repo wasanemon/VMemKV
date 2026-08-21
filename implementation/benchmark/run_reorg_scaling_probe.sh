@@ -1,28 +1,26 @@
 #!/usr/bin/env bash
-# run_reorg_scaling_probe.sh - Sweeps reorganize()/checkpoint()'s wall-clock duration as a
-# function of corpus size (--mode=t1only/t1t2), across all 4 (scenario, value_size) combinations
-# already used by the main benchmark matrix (in_memory/8B, in_memory/1KB, ltm/1KB, ltm/64KB).
+# run_reorg_scaling_probe.sh - Sweeps reorganize()'s wall-clock duration as a function of corpus
+# size (--mode=t1only), across all 4 (scenario, value_size) combinations already used by the main
+# benchmark matrix (in_memory/8B, in_memory/1KB, ltm/1KB, ltm/64KB).
 #
-# Also runs a "Corpus-Size Invariance" sweep (--mode=t1t2_steady, see bench_kv.cpp's reorg_probe
-# namespace comment for what that mode measures), scoped to ltm:1KB only. Reuses one corpus across
-# all 4 ratio points (bulk_load()ing just the incremental delta each time -- see run_steady()'s
-# own comment in bench_kv.cpp) rather than rebuilding independently at each point. Companion to
-# run_churn_scaling_probe.sh, which sweeps --churn-ratio instead of --ratio against the same mode.
+# checkpoint()'s cost is a separate question (see run_checkpoint_throughput_probe.sh): it only
+# durabilizes the tail since the last cycle, so its cost tracks churn, not corpus size, and the
+# operationally relevant number is steady-state throughput vs. Insert's rate -- not a bootstrap
+# duration swept by corpus size like reorganize()'s below.
 #
-# Not part of the Google Benchmark-registered matrix: reorganize()/checkpoint() is a single,
-# possibly very slow blocking call, not a repeatable operation GB's timing-loop model expects.
-# Each data point instead runs bench_kv's standalone `--reorg-probe` CLI mode as its own process,
-# wrapped in `timeout` twice:
-#   - bench_kv's own internal cap on the reorganize()/checkpoint() call itself (see
-#     kReorgTimeoutSeconds in bench_kv.cpp) -- this is what actually bounds the interesting
-#     measurement.
+# Not part of the Google Benchmark-registered matrix: reorganize() is a single, possibly very slow
+# blocking call, not a repeatable operation GB's timing-loop model expects. Each data point
+# instead runs bench_kv's standalone `--reorg-probe` CLI mode as its own process, wrapped in
+# `timeout` twice:
+#   - bench_kv's own internal cap on the reorganize() call itself (see kReorgTimeoutSeconds in
+#     bench_kv.cpp) -- this is what actually bounds the interesting measurement.
 #   - this script's outer OUTER_TIMEOUT_SECONDS, a generous backstop covering setup too (which
-#     the internal cap deliberately excludes), in case populate/checkpoint/churn itself hangs.
+#     the internal cap deliberately excludes), in case populate itself hangs.
 # Ratios are swept ascending (25%/50%/75%/100% of the scenario's normal target size); as soon as
 # one ratio times out (internally or via the outer backstop) or errors, escalation to larger
-# ratios stops for that (combo, mode) pair -- there is no reason to expect a larger corpus to be
-# faster. This bounds the worst-case total run time to
-# (#combos * #modes * #ratios * OUTER_TIMEOUT_SECONDS), though in practice it is far less.
+# ratios stops for that combo -- there is no reason to expect a larger corpus to be faster. This
+# bounds the worst-case total run time to (#combos * #ratios * OUTER_TIMEOUT_SECONDS), though in
+# practice it is far less.
 set -uo pipefail  # deliberately not -e: probe/timeout exit codes are inspected explicitly below
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,7 +48,6 @@ for combo in "${ALL_COMBOS[@]}"; do
     COMBOS+=("$combo")
   fi
 done
-MODES=("t1only" "t1t2")
 
 : > "$OUTPUT_PATH"
 
@@ -62,33 +59,13 @@ source "$SCRIPT_DIR/common/reorg_probe_common.sh"
 for combo in "${COMBOS[@]}"; do
   scenario="${combo%%:*}"
   value_size="${combo##*:}"
-  for mode in "${MODES[@]}"; do
-    log "=== ${scenario}/${value_size}/${mode} ==="
-    for ratio in "${RATIOS[@]}"; do
-      if ! run_probe_point "$scenario" "$value_size" "$mode" "$ratio" "ratio=${ratio}"; then
-        log "ratio=${ratio} did not complete cleanly -- stopping escalation for ${scenario}/${value_size}/${mode}"
-        break
-      fi
-    done
-  done
-done
-
-# "Corpus-Size Invariance across Generations" -- see the file header comment above. Scoped to
-# ltm:1KB only, and deliberately run *after* the t1only/t1t2 sweep above so a mid-sweep failure in
-# the (unrelated) bootstrap measurements doesn't cost this one its own results.
-STEADY_CHURN_RATIO=0.01
-STEADY_COMBO="ltm:1KB"
-if [[ -z "$COMBO_FILTER" || "$COMBO_FILTER" == "ltm" || "$COMBO_FILTER" == "$STEADY_COMBO" ]]; then
-  scenario="${STEADY_COMBO%%:*}"
-  value_size="${STEADY_COMBO##*:}"
-  log "=== ${scenario}/${value_size}/t1t2_steady (churn_ratio=${STEADY_CHURN_RATIO}) ==="
+  log "=== ${scenario}/${value_size}/t1only ==="
   for ratio in "${RATIOS[@]}"; do
-    if ! run_probe_point "$scenario" "$value_size" "t1t2_steady" "$ratio" "ratio=${ratio}" \
-      --churn-ratio="$STEADY_CHURN_RATIO" --sweep-tag=corpus_scaling; then
-      log "ratio=${ratio} did not complete cleanly -- stopping escalation for ${scenario}/${value_size}/t1t2_steady"
+    if ! run_probe_point "$scenario" "$value_size" t1only "$ratio" "ratio=${ratio}"; then
+      log "ratio=${ratio} did not complete cleanly -- stopping escalation for ${scenario}/${value_size}/t1only"
       break
     fi
   done
-fi
+done
 
 log "done. Results written to $OUTPUT_PATH"

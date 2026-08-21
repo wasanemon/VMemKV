@@ -25,15 +25,12 @@ show_help() {
   echo "  --large-value-first  Run larger-value benchmarks before smaller-value benchmarks"
   echo "  --quick          Run one workload per scenario with a short min_time"
   echo "  --reorg-scaling-probe  After the normal matrix, additionally sweep reorganize()"
-  echo "                   duration vs. corpus size (T1-only vs T1+T2) on the same instance via"
+  echo "                   duration vs. corpus size (T1-only) on the same instance via"
   echo "                   run_reorg_scaling_probe.sh and download its JSONL output"
-  echo "  --churn-scaling-probe  After the normal matrix, additionally sweep"
-  echo "                   checkpoint() duration vs. churn ratio at fixed corpus"
-  echo "                   size (in_memory/1KB) plus one ltm/1KB low-churn spot check, on the"
-  echo "                   same instance via run_churn_scaling_probe.sh and download its JSONL"
-  echo "                   output. Only runs on an instance whose --value-size is 1KB (or"
-  echo "                   unset), since the probe's own sweep is fixed to 1KB regardless of"
-  echo "                   this script's --value-size."
+  echo "  --checkpoint-throughput-probe  After the normal matrix, additionally measure"
+  echo "                   checkpoint()'s steady-state throughput (records/sec, one point per"
+  echo "                   combo) on the same instance via run_checkpoint_throughput_probe.sh"
+  echo "                   and download its JSONL output."
   echo "  --defrag-scaling-probe  After the normal matrix, additionally sweep defragment()"
   echo "                   duration vs. corpus size and churn ratio, plus a concurrent-write"
   echo "                   contention spot check, on the same instance via"
@@ -55,7 +52,7 @@ show_help() {
 SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
 REORG_SCALING_PROBE=false
-CHURN_SCALING_PROBE=false
+CHECKPOINT_THROUGHPUT_PROBE=false
 DEFRAG_SCALING_PROBE=false
 SKIP_MATRIX=false
 WITHOUT_RIVALS=false
@@ -90,8 +87,8 @@ while [[ $# -gt 0 ]]; do
       REORG_SCALING_PROBE=true
       shift
       ;;
-    --churn-scaling-probe)
-      CHURN_SCALING_PROBE=true
+    --checkpoint-throughput-probe)
+      CHECKPOINT_THROUGHPUT_PROBE=true
       shift
       ;;
     --defrag-scaling-probe)
@@ -961,75 +958,84 @@ VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
   fi
 fi
 
-if [[ "$CHURN_SCALING_PROBE" == "true" ]]; then
-  # Additive extra measurement (checkpoint() duration vs. churn ratio at fixed
-  # corpus size), same reasoning as REORG_SCALING_PROBE above for reusing this already-provisioned
-  # instance rather than a dedicated one. Unlike that probe, this one's own sweep is fixed to 1KB
-  # regardless of $VALUE_SIZE_LIMIT (see run_churn_scaling_probe.sh's own comment for why: it
-  # isolates the diff-size variable at one representative value size rather than repeating the
-  # same sweep shape at every size in the matrix) -- so it only runs on an instance whose
-  # --value-size is 1KB or unset, to avoid the in_memory/8B and ltm/64KB instances redundantly
-  # re-running the exact same 1KB sweep a second (or third) time.
-  churn_probe_failed=0
-
-  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]] &&
-     [[ -z "$VALUE_SIZE_LIMIT" || "$VALUE_SIZE_LIMIT" == "1KB" ]]; then
-    churn_inmem_stdout_log="/tmp/vmemkv_churn_probe_inmem_${KEY_NAME}.stdout.log"
-    churn_inmem_stderr_log="/tmp/vmemkv_churn_probe_inmem_${KEY_NAME}.stderr.log"
-    : >"$churn_inmem_stdout_log"
-    : >"$churn_inmem_stderr_log"
-    churn_inmem_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-./benchmark/run_churn_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/churn_scaling_in_memory.jsonl' '/mnt/nvme'
-    "
-    printf -v churn_inmem_remote_cmd_quoted '%q' "$churn_inmem_remote_cmd"
-    echo "[runner] start churn-scaling-probe scenario=in_memory"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${churn_inmem_remote_cmd_quoted}" \
-        2> >(tee -a "$churn_inmem_stderr_log" >&2); } | tee -a "$churn_inmem_stdout_log"
-    churn_inmem_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end churn-scaling-probe scenario=in_memory status=$churn_inmem_probe_status"
-    if [[ "$churn_inmem_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
-      echo "[WARN] churn-scaling-probe (in_memory) failed with exit code $churn_inmem_probe_status -- logs: $churn_inmem_probe_stdout_log $churn_inmem_probe_stderr_log" >&2
-      churn_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/churn_scaling_in_memory.jsonl" "${RESULTS_DIR}/churn_scaling_in_memory_1KB.jsonl" || true
+if [[ "$CHECKPOINT_THROUGHPUT_PROBE" == "true" ]]; then
+  # Additive extra measurement (checkpoint()'s steady-state throughput, records/sec, one point
+  # per combo) on top of the normal matrix -- same in_memory/ltm split and combo-filter interface
+  # as REORG_SCALING_PROBE/DEFRAG_SCALING_PROBE above (run_checkpoint_throughput_probe.sh takes
+  # the same <bin> <output> <db_dir> [combo_filter] interface).
+  checkpoint_throughput_dst_name="checkpoint_throughput_in_memory.jsonl"
+  ltm_checkpoint_throughput_dst_name="checkpoint_throughput_ltm.jsonl"
+  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+    checkpoint_throughput_dst_name="checkpoint_throughput_in_memory_${VALUE_SIZE_LIMIT}.jsonl"
+    ltm_checkpoint_throughput_dst_name="checkpoint_throughput_ltm_${VALUE_SIZE_LIMIT}.jsonl"
   fi
 
-  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]] &&
-     [[ -z "$VALUE_SIZE_LIMIT" || "$VALUE_SIZE_LIMIT" == "1KB" ]]; then
-    churn_ltm_stdout_log="/tmp/vmemkv_churn_probe_ltm_${KEY_NAME}.stdout.log"
-    churn_ltm_stderr_log="/tmp/vmemkv_churn_probe_ltm_${KEY_NAME}.stderr.log"
-    : >"$churn_ltm_stdout_log"
-    : >"$churn_ltm_stderr_log"
+  checkpoint_throughput_probe_failed=0
+
+  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+    inmem_checkpoint_throughput_combo_filter="in_memory"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      inmem_checkpoint_throughput_combo_filter="in_memory:${VALUE_SIZE_LIMIT}"
+    fi
+    inmem_checkpoint_throughput_probe_stdout_log="/tmp/vmemkv_checkpoint_throughput_probe_inmem_${KEY_NAME}.stdout.log"
+    inmem_checkpoint_throughput_probe_stderr_log="/tmp/vmemkv_checkpoint_throughput_probe_inmem_${KEY_NAME}.stderr.log"
+    : >"$inmem_checkpoint_throughput_probe_stdout_log"
+    : >"$inmem_checkpoint_throughput_probe_stderr_log"
+    inmem_checkpoint_throughput_probe_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+./benchmark/run_checkpoint_throughput_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/checkpoint_throughput_in_memory.jsonl' '/mnt/nvme' '$inmem_checkpoint_throughput_combo_filter'
+    "
+    printf -v inmem_checkpoint_throughput_probe_remote_cmd_quoted '%q' "$inmem_checkpoint_throughput_probe_remote_cmd"
+    echo "[runner] start checkpoint-throughput-probe scenario=in_memory combo_filter=$inmem_checkpoint_throughput_combo_filter"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${inmem_checkpoint_throughput_probe_remote_cmd_quoted}" \
+        2> >(tee -a "$inmem_checkpoint_throughput_probe_stderr_log" >&2); } | tee -a "$inmem_checkpoint_throughput_probe_stdout_log"
+    inmem_checkpoint_throughput_probe_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end checkpoint-throughput-probe scenario=in_memory status=$inmem_checkpoint_throughput_probe_status"
+    if [[ "$inmem_checkpoint_throughput_probe_status" -ne 0 ]]; then
+      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
+      echo "[WARN] checkpoint-throughput-probe (in_memory) failed with exit code $inmem_checkpoint_throughput_probe_status -- logs: $inmem_checkpoint_throughput_probe_stdout_log $inmem_checkpoint_throughput_probe_stderr_log" >&2
+      checkpoint_throughput_probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/checkpoint_throughput_in_memory.jsonl" "${RESULTS_DIR}/${checkpoint_throughput_dst_name}" || true
+  fi
+
+  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+    ltm_checkpoint_throughput_combo_filter="ltm"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      ltm_checkpoint_throughput_combo_filter="ltm:${VALUE_SIZE_LIMIT}"
+    fi
+    ltm_checkpoint_throughput_probe_stdout_log="/tmp/vmemkv_checkpoint_throughput_probe_ltm_${KEY_NAME}.stdout.log"
+    ltm_checkpoint_throughput_probe_stderr_log="/tmp/vmemkv_checkpoint_throughput_probe_ltm_${KEY_NAME}.stderr.log"
+    : >"$ltm_checkpoint_throughput_probe_stdout_log"
+    : >"$ltm_checkpoint_throughput_probe_stderr_log"
     # VMEMKV_CONTEXT_memory_budget_bytes explicit here for the same reason as the ltm
     # reorg-scaling-probe branch above.
-    churn_ltm_remote_cmd="
+    ltm_checkpoint_throughput_probe_remote_cmd="
 cd /home/ubuntu/faultkv/implementation &&
 VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
-./benchmark/run_churn_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/churn_scaling_ltm.jsonl' '/mnt/nvme' '--ltm-spot-check-only'
+./benchmark/run_checkpoint_throughput_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/checkpoint_throughput_ltm.jsonl' '/mnt/nvme' '$ltm_checkpoint_throughput_combo_filter'
     "
-    printf -v churn_ltm_remote_cmd_quoted '%q' "$churn_ltm_remote_cmd"
-    echo "[runner] start churn-scaling-probe scenario=ltm"
+    printf -v ltm_checkpoint_throughput_probe_remote_cmd_quoted '%q' "$ltm_checkpoint_throughput_probe_remote_cmd"
+    echo "[runner] start checkpoint-throughput-probe scenario=ltm combo_filter=$ltm_checkpoint_throughput_combo_filter"
     set +e
     { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
-        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${churn_ltm_remote_cmd_quoted}" \
-        2> >(tee -a "$churn_ltm_stderr_log" >&2); } | tee -a "$churn_ltm_stdout_log"
-    churn_ltm_probe_status=${PIPESTATUS[0]}
+        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${ltm_checkpoint_throughput_probe_remote_cmd_quoted}" \
+        2> >(tee -a "$ltm_checkpoint_throughput_probe_stderr_log" >&2); } | tee -a "$ltm_checkpoint_throughput_probe_stdout_log"
+    ltm_checkpoint_throughput_probe_status=${PIPESTATUS[0]}
     set -e
-    echo "[runner] end churn-scaling-probe scenario=ltm status=$churn_ltm_probe_status"
-    if [[ "$churn_ltm_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
-      echo "[WARN] churn-scaling-probe (ltm) failed with exit code $churn_ltm_probe_status -- logs: $churn_ltm_probe_stdout_log $churn_ltm_probe_stderr_log" >&2
-      churn_probe_failed=1
+    echo "[runner] end checkpoint-throughput-probe scenario=ltm status=$ltm_checkpoint_throughput_probe_status"
+    if [[ "$ltm_checkpoint_throughput_probe_status" -ne 0 ]]; then
+      # [WARN], not [ERROR] -- same reasoning as the in_memory branch above.
+      echo "[WARN] checkpoint-throughput-probe (ltm) failed with exit code $ltm_checkpoint_throughput_probe_status -- logs: $ltm_checkpoint_throughput_probe_stdout_log $ltm_checkpoint_throughput_probe_stderr_log" >&2
+      checkpoint_throughput_probe_failed=1
     fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/churn_scaling_ltm.jsonl" "${RESULTS_DIR}/churn_scaling_ltm_1KB.jsonl" || true
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/checkpoint_throughput_ltm.jsonl" "${RESULTS_DIR}/${ltm_checkpoint_throughput_dst_name}" || true
   fi
 
-  if [[ "$churn_probe_failed" -ne 0 ]]; then
-    echo "[WARN] churn-scaling-probe had failures -- main benchmark matrix results above are still valid" >&2
+  if [[ "$checkpoint_throughput_probe_failed" -ne 0 ]]; then
+    echo "[WARN] checkpoint-throughput-probe had failures -- main benchmark matrix results above are still valid" >&2
   fi
 fi
 
