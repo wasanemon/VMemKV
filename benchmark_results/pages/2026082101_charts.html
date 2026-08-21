@@ -54,7 +54,7 @@
           <a href="../2026082101/defrag_scaling_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Defrag Scaling, LTM)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、defragment()を単体スタンドアロンrunで新規に計測(commit 49d9a53)。さらに、checkpoint()関連の3つの重複した実験(ブートストラップ・コーパスサイズ不変性・churn比率スイープ)を、Insertスループットと直接比較する単一の実験(churn_ratio=1.0での定常状態スループット、commit a85250c)へ統合。ただし後者はコンボごとに1点のみの計測で、in_memory/8Bとltm/1KBはchurn=1.0を適用するセットアップ自体が300秒の外側タイムアウトに到達し、ltm/64KBは60秒の内側タイムアウトに到達したため、有効なデータはin_memory/1KBの1点のみ(records/sec ≈ 2.15M)。</p>
+      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、defragment()を単体スタンドアロンrunで新規に計測(commit 49d9a53)。さらに、checkpoint()関連の3つの重複した実験を、Insertスループットと直接比較する単一の実験(churn_ratio=0.25での定常状態スループット、commit a85250c/1a74065)へ統合し、4コンボ全てで計測完了。結果、8B/1KB In-MemoryおよびLTM/1KBではcheckpoint()がInsertの10〜30倍以上のスループットを維持し余裕で追いつく一方、LTM/64KBではcheckpoint()の定常状態スループット(約4,518 records/sec)がInsertのピーク速度(約11,832 records/sec、32スレッド)を下回り、書き込み側が生成するchurnにcheckpoint()が追いつかない可能性を示した。</p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -85,7 +85,7 @@
           <li><strong>RAM (Larger-Than-Memory)</strong>: cgroup で DRAM を制限し、target_ratio 相当のコーパスを構築後、cgroup内で計測(ストアごとに独立したcgroupスコープ + drop_caches)</li>
           <li><strong>Disk</strong>: Local NVMe SSD, ext4 (Swap Media for LTM。旧XFS+reflink依存は本ラウンドで撤去)</li>
           <li><strong>Kernel</strong>: 6.17.0-1019-aws</li>
-          <li><strong>Git Rev</strong>: 4a7084c(メイン4並列)/49d9a53(defragment())/a85250c(checkpoint throughput、clean)</li></ul>
+          <li><strong>Git Rev</strong>: 4a7084c(メイン4並列)/49d9a53(defragment())/1a74065(checkpoint throughput、clean)</li></ul>
         <h2 class="font-bold text-slate-600 uppercase tracking-wider flex items-center gap-1.5 mt-3">
           <i data-lucide="briefcase" class="w-3.5 h-3.5"></i> Workloads
         </h2>
@@ -447,14 +447,14 @@
           </table>
         </div>
       </section>
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+            <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
             <i data-lucide="gauge" class="w-6 h-6"></i>
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Insert vs. Checkpoint() Throughput (new experiment)</h3>
-            <p class="text-xs text-slate-500">checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=1.0 to isolate the marginal per-record cost from checkpoint()'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert's 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).</p>
+            <p class="text-xs text-slate-500">checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert's 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).</p>
           </div>
         </div>
         <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
@@ -464,11 +464,14 @@
 <th class="py-2 px-3 font-bold text-slate-700">checkpoint() steady-state</th>
 <th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
 </tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">2,152,939/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.05x)</span></td></tr>
+<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">4,512,870/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.03x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">2,293,223/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.05x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">343,368/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.32x)</span></td></tr>
+<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">4,519/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">❌ Falls behind (2.62x)</span></td></tr>
 </tbody></table></div>
       </section>
 
-            <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+                  <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
             <i data-lucide="scissors" class="w-6 h-6"></i>
@@ -688,7 +691,7 @@
           <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
         </div>
         <p class="text-sm text-slate-500">
-          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -872,7 +875,7 @@
           <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
         </div>
         <p class="text-sm text-slate-500">
-          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -1056,7 +1059,7 @@
           <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
         </div>
         <p class="text-sm text-slate-500">
-          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -1240,7 +1243,7 @@
           <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
         </div>
         <p class="text-sm text-slate-500">
-          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
@@ -9682,10 +9685,25 @@
   }
 };
     const checkpointThroughputData = {
+  "8B_In-Memory": {
+    "key_count": 20000000,
+    "elapsed_sec": 4.43177,
+    "records_per_sec": 4512869.575812824
+  },
   "1KB_In-Memory": {
     "key_count": 8000000,
-    "elapsed_sec": 3.71585,
-    "records_per_sec": 2152939.4351225155
+    "elapsed_sec": 3.48854,
+    "records_per_sec": 2293222.952868535
+  },
+  "1KB_LTM": {
+    "key_count": 8259552,
+    "elapsed_sec": 24.0545,
+    "records_per_sec": 343368.26789166266
+  },
+  "64KB_LTM": {
+    "key_count": 131040,
+    "elapsed_sec": 28.9997,
+    "records_per_sec": 4518.667434490701
   }
 };
     const workloads = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"];
