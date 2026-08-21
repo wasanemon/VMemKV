@@ -2,20 +2,23 @@
 # run_defrag_scaling_probe.sh - Sweeps defragment()'s wall-clock duration, via bench_kv's
 # standalone `--reorg-probe` CLI mode (see bench_kv.cpp's run_defrag()/run_defrag_contention()).
 #
-# Three sweeps, all against a corpus that's already been checkpoint()ed once (a realistic
+# Two sweeps, both against a corpus that's already been checkpoint()ed once (a realistic
 # pre-defragment state):
 #   corpus-size sweep (--mode=defrag): churn_ratio fixed at 0, --ratio swept 25%/50%/75%/100%,
 #     across all 4 (scenario, value_size) combinations already used by the main benchmark matrix.
-#   churn-ratio sweep (--mode=defrag): --ratio fixed at 1.0, --churn-ratio swept, in_memory/1KB
-#     only.
 #   contention spot check (--mode=defrag_contention): one point per combo (--ratio=1.0) measuring
 #     concurrent write throughput with and without a defragment() running at the same time.
 #     One point per combo, not a dense sweep -- it already runs two measurement phases per call
 #     (isolated baseline + concurrent), so it costs roughly double a single --mode=defrag point.
 #
+# defragment() relocates every live record regardless of which ones changed, so unlike
+# checkpoint() its cost does not depend on churn ratio -- confirmed once via a dedicated
+# in_memory/1KB churn-ratio sweep (durations stayed flat across churn_ratio 0-1.0 at a fixed
+# corpus size), not re-swept on every round since that finding does not change from run to run.
+#
 # Not part of the Google Benchmark-registered matrix, for the same reason as
-# run_reorg_scaling_probe.sh/run_churn_scaling_probe.sh: a single, possibly very slow blocking
-# call, not a repeatable operation GB's timing-loop model expects. Reuses this file's own
+# run_reorg_scaling_probe.sh/run_checkpoint_throughput_probe.sh: a single, possibly very slow
+# blocking call, not a repeatable operation GB's timing-loop model expects. Reuses this file's own
 # run_probe_point() helper (via common/reorg_probe_common.sh) for two-tier timeout handling.
 set -uo pipefail  # deliberately not -e: probe/timeout exit codes are inspected explicitly below
 
@@ -29,7 +32,6 @@ COMBO_FILTER="${4:-}"
 
 OUTER_TIMEOUT_SECONDS=300
 RATIOS=(0.25 0.5 0.75 1.0)
-CHURN_RATIOS=(0.0 0.01 0.05 0.1 0.25 0.5 1.0)
 ALL_COMBOS=("in_memory:8B" "in_memory:1KB" "ltm:1KB" "ltm:64KB")
 COMBOS=()
 for combo in "${ALL_COMBOS[@]}"; do
@@ -56,16 +58,6 @@ for combo in "${COMBOS[@]}"; do
     fi
   done
 done
-
-if [[ -z "$COMBO_FILTER" || "$COMBO_FILTER" == "in_memory" || "$COMBO_FILTER" == "in_memory:1KB" ]]; then
-  log "=== in_memory/1KB/defrag churn-ratio sweep ==="
-  for churn_ratio in "${CHURN_RATIOS[@]}"; do
-    # No early stop on timeout (mirrors run_churn_scaling_probe.sh): a slow/timed-out point here
-    # doesn't imply a larger churn ratio would also be slow for a structural reason.
-    run_probe_point in_memory 1KB defrag 1.0 "churn_ratio=${churn_ratio}" \
-      --churn-ratio="$churn_ratio" --sweep-tag=churn_scaling
-  done
-fi
 
 for combo in "${COMBOS[@]}"; do
   scenario="${combo%%:*}"
