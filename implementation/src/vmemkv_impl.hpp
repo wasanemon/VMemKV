@@ -1774,30 +1774,6 @@ class VMemKVImpl {
         }
       }
 
-      // Unconditional (not gated by any config tag): eagerly install page table entries for just
-      // the currently-valid prefix [0, bytes_used) in one bulk call per mapping, not via
-      // MAP_POPULATE on the mmap calls themselves (which would eagerly fault in the entire
-      // capacity). This
-      // matters even for already page-cache-resident data: mmap() doesn't share page *table*
-      // entries across separate VMAs of the same file, so each fresh mapping still needs its own
-      // per-page minor fault to install a PTE the first time it's touched, cache-resident or not.
-      // get_impl() reads single-page records straight through base_mmap_scan_seq, and a
-      // Uniform-distributed workload touching most of a large corpus pays for *every one* of
-      // those first-touch minor faults during the timed benchmark itself if a mapping it reads
-      // isn't pre-warmed -- measured to regress 1KB In-Memory Get/Hit/Uniform by ~250x without
-      // this. Both mappings are warmed (not just whichever one this generation's corpus happens
-      // to use), since which one is actually hit is now decided per record, not once here.
-      // Best-effort: a failure here just means the first touch of each page pays an ordinary (if
-      // still page-cache-resident-cheap) minor fault instead of finding it pre-installed.
-      if (bytes_used > 0) {
-        if (base_mmap_scan_ptr != nullptr) {
-          ::madvise(base_mmap_scan_ptr, bytes_used, MADV_POPULATE_READ);
-        }
-        if (base_mmap_scan_seq_ptr != nullptr) {
-          ::madvise(base_mmap_scan_seq_ptr, bytes_used, MADV_POPULATE_READ);
-        }
-      }
-
       // dup()'d read handle for get_impl()'s bounded pread() of large records in the same base
       // region -- see T2Memory::read_fd's doc comment for why Get reads large records via pread
       // instead of through one of the two mmaps above. Must dup() before file_descriptor is
