@@ -183,7 +183,7 @@ def build_checkpoint_throughput_data(report_dir):
     (run_checkpoint_throughput_probe.sh, via bench_kv --reorg-probe --mode=t1t2_steady
     --ratio=1.0 --churn-ratio=0.25 -- full corpus size, a high-but-not-maximal churn ratio that
     isolates the marginal per-record durabilization cost from checkpoint()'s fixed per-call setup
-    overhead without the setup/checkpoint cost of churn=1.0 on the whole corpus) into
+    overhead while keeping setup work and checkpoint() I/O proportionally bounded) into
     {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per combo."""
     data = {}
     for fname in ["checkpoint_throughput_in_memory.jsonl", "checkpoint_throughput_ltm.jsonl"]:
@@ -527,11 +527,9 @@ def main():
     for old_variant in old_reorg_caption_simplified_variants:
         html = html.replace(old_variant, new_reorg_caption_simplified)
 
-    # checkpoint-throughput probe churn ratio 1.0 -> 0.25: churn=1.0's setup/checkpoint cost blew
-    # the outer/internal timeouts on 3 of 4 combos (large in_memory/8B and ltm/1KB corpora, and
-    # ltm/64KB's checkpoint() call itself); 0.25 already isolates the marginal per-record cost
-    # about as well (see run_checkpoint_throughput_probe.sh's comment) at a quarter the cost. Best
-    # effort (not asserted), a no-op once fixed.
+    # Older report rounds' already-generated HTML says churn_ratio=1.0 in this caption; the probe
+    # measures at churn_ratio=0.25 (see run_checkpoint_throughput_probe.sh). Best effort (not
+    # asserted), a no-op once fixed.
     html = html.replace("checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間",
                          "checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間")
 
@@ -652,7 +650,7 @@ def main():
         heading="Insert vs. Checkpoint() Throughput (new experiment)",
         icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="gauge",
         title="Insert vs. Checkpoint() Throughput (new experiment)",
-        description_html='checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()\'s fixed per-call setup overhead without churn=1.0\'s setup/checkpoint cost on the whole corpus -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).',
+        description_html='checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()\'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).',
         table_html=render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data),
     )
     html = upsert_section(

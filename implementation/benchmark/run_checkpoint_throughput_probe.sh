@@ -5,14 +5,12 @@
 # that already has one checkpointed generation.
 #
 # A high (but not maximal) churn ratio is deliberate, not arbitrary: checkpoint()'s cost has a
-# large fixed per-call setup component that dominates at low churn (observed at in_memory/1KB:
-# churn=0.01 took 1.76s for 80k touched records, churn=0.25 took 3.57s, churn=1.0 took 3.64s for
-# 8M -- 0.25 already isolates the marginal per-record durabilization cost about as well as 1.0
-# does). churn=1.0 was tried first and failed on 3 of 4 combos: in_memory/8B (20M keys) and
-# ltm/1KB (8.26M keys, under memory pressure) both blew the outer timeout applying churn to 100%
-# of a large corpus -- setup cost, not checkpoint() itself -- and ltm/64KB's checkpoint() call
-# itself (131k records x 64KB under LTM) blew the internal 60s cap. 0.25 cuts both the setup work
-# and checkpoint()'s own workload to about a quarter.
+# large fixed per-call setup component that dominates at low churn (at in_memory/1KB, churn=0.01
+# takes ~1.8s for 80k touched records vs. churn=0.25's ~3.6s for 2M -- 0.25 already isolates the
+# marginal per-record durabilization cost well past that fixed-overhead-dominated region).
+# Pushing the churn ratio higher costs proportionally more corpus-wide setup work and checkpoint()
+# I/O, which risks the outer/internal timeouts on the largest combos (in_memory/8B's 20M-key
+# corpus, ltm's memory-constrained scenarios, and large-value ltm/64KB records).
 #
 # No sweep, no escalation -- unlike run_reorg_scaling_probe.sh/run_defrag_scaling_probe.sh, this
 # is exactly one data point per combo. Reuses run_probe_point()'s two-tier timeout handling (see
@@ -27,9 +25,9 @@ DB_DIR="${3:-/tmp}"
 # ("in_memory"/"ltm" or "in_memory:8B"/"ltm:64KB"). Empty (the default) means "all 4 combos".
 COMBO_FILTER="${4:-}"
 
-# Bumped from run_reorg_scaling_probe.sh/run_defrag_scaling_probe.sh's 300s: churn=1.0's setup
-# phase (applying churn to the whole corpus) blew even 300s on the two largest combos before the
-# churn ratio was lowered to 0.25 -- kept generous here as a safety margin.
+# Larger than run_reorg_scaling_probe.sh/run_defrag_scaling_probe.sh's 300s: applying churn to a
+# large corpus is itself setup work independent of checkpoint()'s own cost, and needs more
+# headroom than a single reorganize()/defragment() call does.
 OUTER_TIMEOUT_SECONDS=600
 ALL_COMBOS=("in_memory:8B" "in_memory:1KB" "ltm:1KB" "ltm:64KB")
 COMBOS=()
