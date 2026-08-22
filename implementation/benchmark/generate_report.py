@@ -205,6 +205,35 @@ def build_checkpoint_throughput_data(report_dir):
     return data
 
 
+def build_defrag_throughput_data(report_dir):
+    """Reads defrag_scaling_in_memory.jsonl / defrag_scaling_ltm.jsonl (run_defrag_scaling_probe.sh,
+    mode=defrag, ratio=1.0, churn_ratio=0 -- the full-corpus point of the existing corpus-size
+    sweep) into {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per
+    combo. Unlike checkpoint() (cost tracks churn, not corpus size), defragment() relocates the
+    whole live corpus every cycle, so its throughput is inherently a full-corpus measurement, not
+    a churn-scoped one -- reuses the sweep's own ratio=1.0 point rather than a separate probe."""
+    data = {}
+    for fname in ["defrag_scaling_in_memory.jsonl", "defrag_scaling_ltm.jsonl"]:
+        path = report_dir / fname
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec.get("mode") != "defrag" or (rec.get("ratio") or 0) != 1 or rec.get("timed_out"):
+                continue
+            scenario_key = SCENARIO_LABELS.get((rec["scenario"], _value_size_label(rec.get("value_size"))))
+            if scenario_key is None:
+                continue
+            data[scenario_key] = {
+                "key_count": rec["key_count"],
+                "elapsed_sec": rec["elapsed_sec"],
+                "records_per_sec": rec["key_count"] / rec["elapsed_sec"],
+            }
+    return data
+
+
 def _value_size_label(value_size):
     if isinstance(value_size, str):
         return value_size
@@ -417,6 +446,34 @@ def render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data)
     return "\n".join(out)
 
 
+def render_defrag_vs_insert_table_html(defrag_throughput_data, raw_data):
+    if not defrag_throughput_data:
+        return ""
+    idx32 = THREADS.index(32)
+    out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
+           '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
+           '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">defragment() full-corpus</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>',
+           "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
+    for scenario_key in ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"]:
+        df = defrag_throughput_data.get(scenario_key)
+        insert_series = raw_data.get(scenario_key, {}).get("Insert", {}).get("+Inline")
+        if not df or not insert_series or insert_series[idx32] is None:
+            continue
+        insert_rate = insert_series[idx32]
+        df_rate = df["records_per_sec"]
+        ratio = insert_rate / df_rate if df_rate else float("inf")
+        label_text, badge_class = _badge_for_checkpoint_headroom(ratio)
+        out.append(f'<tr><td class="py-2 px-3">{scenario_key}</td>'
+                    f'<td class="py-2 px-3">{insert_rate:,.0f}/s</td>'
+                    f'<td class="py-2 px-3">{df_rate:,.0f}/s</td>'
+                    f'<td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border {badge_class} font-bold w-fit">{label_text} ({ratio:.2f}x)</span></td></tr>')
+    out.append("</tbody></table></div>")
+    return "\n".join(out)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--report-id", required=True)
@@ -436,6 +493,7 @@ def main():
     forced_events_data = build_forced_events_data(args.report_dir)
     reorg_data = build_reorg_scaling_data(args.report_dir)
     checkpoint_throughput_data = build_checkpoint_throughput_data(args.report_dir)
+    defrag_throughput_data = build_defrag_throughput_data(args.report_dir)
     defrag_corpus_rows, defrag_contention_rows = build_defrag_scaling_data(args.report_dir)
     winners_rows = compute_winners_matrix(raw_data)
 
@@ -458,7 +516,8 @@ def main():
     html = replace_block(
         html, "const reorgScalingData = {", "const workloads =",
         "const reorgScalingData = " + json.dumps(reorg_data, indent=2) + ";\n    " +
-        "const checkpointThroughputData = " + json.dumps(checkpoint_throughput_data, indent=2) + ";\n    "
+        "const checkpointThroughputData = " + json.dumps(checkpoint_throughput_data, indent=2) + ";\n    " +
+        "const defragThroughputData = " + json.dumps(defrag_throughput_data, indent=2) + ";\n    "
     )
 
     # checkpoint()/defragment() mislabeling: churn-scaling, reorg-scaling and YCSB-E's forced
@@ -608,8 +667,15 @@ def main():
             winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
             return html[:winners_section_close] + section_html + html[winners_section_close:]
         section_start = html.rindex(section_open_marker, 0, heading_idx)
+        # Also consume any whitespace-only text immediately preceding the marker: without this,
+        # a re-run's fixed-format replacement (below) leaves the *previous* run's own leading
+        # indentation orphaned in place, accumulating a little more on every regeneration instead
+        # of converging -- confirmed via a 3x-idempotency check while adding this section.
+        ws_start = section_start
+        while ws_start > 0 and html[ws_start - 1] in " \t\n":
+            ws_start -= 1
         section_end = html.index("</section>", heading_idx) + len("</section>")
-        return html[:section_start] + section_html.strip("\n") + html[section_end:]
+        return html[:ws_start] + "\n" + section_html.strip("\n") + html[section_end:]
 
     def remove_section(html, heading):
         heading_idx = html.find(heading)
@@ -632,6 +698,14 @@ def main():
         title="Insert vs. Checkpoint() Throughput (new experiment)",
         description_html='checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()\'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).',
         table_html=render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data),
+    )
+    html = upsert_section(
+        html,
+        heading="Insert vs. Defragment() Throughput (new experiment)",
+        icon_bg="bg-amber-50", icon_text="text-amber-600", icon_name="gauge",
+        title="Insert vs. Defragment() Throughput (new experiment)",
+        description_html='defragment() relocates the entire live corpus every cycle (cost tracks corpus size, not churn), so unlike checkpoint() there is no single churn-scoped "steady-state" number -- the operationally relevant question is whether a full-corpus cycle (records/sec, the corpus-size sweep\'s own ratio=100% point below) completes faster than the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat defragment() full-corpus throughput reference line). Isolated (no concurrent writers) -- see the contention spot check below for how much this degrades under concurrent load.',
+        table_html=render_defrag_vs_insert_table_html(defrag_throughput_data, raw_data),
     )
     html = upsert_section(
         html,
@@ -715,6 +789,77 @@ def main():
     """
         html = html.replace("    function initCharts() {", checkpoint_config_js + "function initCharts() {")
 
+    if "function makeDefragVsInsertConfig(" not in html:
+        defrag_config_js = """    function makeDefragVsInsertConfig(valSizeKey) {
+      const df = defragThroughputData[valSizeKey];
+      const insertSeries = rawData[valSizeKey] && rawData[valSizeKey]['Insert'] && rawData[valSizeKey]['Insert']['+Inline'];
+      if (!df || !insertSeries) return null;
+      const threadLabels = [1, 4, 16, 32];
+      return {
+        type: 'line',
+        data: {
+          labels: threadLabels,
+          datasets: [
+            {
+              label: 'Insert (+Inline)',
+              data: insertSeries,
+              borderColor: '#6366f1',
+              backgroundColor: 'transparent',
+              borderWidth: 2,
+              tension: 0.2, fill: false,
+              pointRadius: 3.5,
+            },
+            {
+              label: 'defragment() full-corpus',
+              data: threadLabels.map(() => df.records_per_sec),
+              borderColor: '#d97706',
+              backgroundColor: 'transparent',
+              borderWidth: 2,
+              borderDash: [6, 4],
+              pointRadius: 0,
+              fill: false,
+            },
+          ],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => `${items[0].label} threads`,
+                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw)}/s`
+              }
+            }
+          },
+          scales: {
+            x: {
+              title: { display:true, text:'Threads', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            },
+            y: {
+              type: 'logarithmic',
+              title: { display:true, text:'Throughput (records/sec, log scale)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            }
+          }
+        }
+      };
+    }
+
+    """
+        if "    function initCharts() {" not in html:
+            raise RuntimeError("initCharts() anchor not found for defrag chart config insertion -- template drifted")
+        html = html.replace("    function initCharts() {", defrag_config_js + "function initCharts() {")
+
     if "-checkpoint-throughput'" not in html:
         wiring_marker = """        const reorgCanvas = document.getElementById('chart-' + reorgEid);
         if (reorgCanvas) {
@@ -739,6 +884,33 @@ def main():
         if wiring_marker not in html:
             raise RuntimeError("initCharts() reorg-scaling wiring marker not found -- template drifted")
         html = html.replace(wiring_marker, wiring_new)
+
+    if "-defrag-throughput'" not in html:
+        defrag_wiring_marker = """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
+        const cpCanvas = document.getElementById('chart-' + cpEid);
+        if (cpCanvas) {
+          const cfg2 = makeCheckpointVsInsertConfig(valSize);
+          if (cfg2) new Chart(cpCanvas, cfg2);
+        }
+      }
+    }"""
+        defrag_wiring_new = """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
+        const cpCanvas = document.getElementById('chart-' + cpEid);
+        if (cpCanvas) {
+          const cfg2 = makeCheckpointVsInsertConfig(valSize);
+          if (cfg2) new Chart(cpCanvas, cfg2);
+        }
+        const dfEid = valSize.toLowerCase().replace(/-/g,'_') + '-defrag-throughput';
+        const dfCanvas = document.getElementById('chart-' + dfEid);
+        if (dfCanvas) {
+          const cfg3 = makeDefragVsInsertConfig(valSize);
+          if (cfg3) new Chart(dfCanvas, cfg3);
+        }
+      }
+    }"""
+        if defrag_wiring_marker not in html:
+            raise RuntimeError("initCharts() checkpoint-throughput wiring marker not found -- template drifted")
+        html = html.replace(defrag_wiring_marker, defrag_wiring_new)
 
     for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
         slug = scenario_key.lower().replace("-", "_")
@@ -771,6 +943,41 @@ def main():
       </div>
 '''
         anchor_idx = html.index(reorg_memo_anchor)
+        close_marker = "\n      </div>\n    </div>\n"
+        close_idx = html.index(close_marker, anchor_idx) + len("\n      </div>\n")
+        html = html[:close_idx] + section_html.lstrip("\n") + html[close_idx:]
+
+    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
+        slug = scenario_key.lower().replace("-", "_")
+        anchor = f'id="memo-{slug}-defrag-throughput"'
+        if anchor in html:
+            continue
+        checkpoint_memo_anchor = f'id="memo-{slug}-checkpoint-throughput"'
+        if checkpoint_memo_anchor not in html:
+            continue
+        section_html = f'''
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-amber-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Defragment() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-amber-600">橙色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> のフルコーパススループット(コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。橙の線が藍色の線を下回る = 書き込み側の生成レートに defragment() の処理速度が追いつかない可能性を示す。単独実行(並行書き込みなし)での比較 —— 並行実行下での劣化は Defragment Scaling & Contention セクション参照。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-{slug}-defrag-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-{slug}-defrag-throughput" oninput="saveMemo('{slug}-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+'''
+        anchor_idx = html.index(checkpoint_memo_anchor)
         close_marker = "\n      </div>\n    </div>\n"
         close_idx = html.index(close_marker, anchor_idx) + len("\n      </div>\n")
         html = html[:close_idx] + section_html.lstrip("\n") + html[close_idx:]

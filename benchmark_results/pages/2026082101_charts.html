@@ -447,7 +447,30 @@
           </table>
         </div>
       </section>
-                              <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
+            <i data-lucide="gauge" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Insert vs. Defragment() Throughput (new experiment)</h3>
+            <p class="text-xs text-slate-500">defragment() relocates the entire live corpus every cycle (cost tracks corpus size, not churn), so unlike checkpoint() there is no single churn-scoped "steady-state" number -- the operationally relevant question is whether a full-corpus cycle (records/sec, the corpus-size sweep's own ratio=100% point below) completes faster than the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab (Insert's 1/4/16/32-thread line vs. a flat defragment() full-corpus throughput reference line). Isolated (no concurrent writers) -- see the contention spot check below for how much this degrades under concurrent load.</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
+<th class="py-2 px-3 font-bold text-slate-700">defragment() full-corpus</th>
+<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">6,452,154/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.02x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">365,030/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.31x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">154,560/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.70x)</span></td></tr>
+<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">4,784/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">❌ Falls behind (2.47x)</span></td></tr>
+</tbody></table></div>
+      </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
             <i data-lucide="gauge" class="w-6 h-6"></i>
@@ -470,8 +493,7 @@
 <tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">24,318/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.49x)</span></td></tr>
 </tbody></table></div>
       </section>
-
-                                    <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
             <i data-lucide="scissors" class="w-6 h-6"></i>
@@ -699,6 +721,26 @@
           <textarea id="memo-8b_in_memory-checkpoint-throughput" oninput="saveMemo('8b_in_memory-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-amber-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Defragment() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-amber-600">橙色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> のフルコーパススループット(コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。橙の線が藍色の線を下回る = 書き込み側の生成レートに defragment() の処理速度が追いつかない可能性を示す。単独実行(並行書き込みなし)での比較 —— 並行実行下での劣化は Defragment Scaling & Contention セクション参照。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-8b_in_memory-defrag-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-8b_in_memory-defrag-throughput" oninput="saveMemo('8b_in_memory-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
     </div>
     <div id="tab-1kb-inmem" class="tab-content space-y-12">
       <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -881,6 +923,26 @@
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
           <textarea id="memo-1kb_in_memory-checkpoint-throughput" oninput="saveMemo('1kb_in_memory-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-amber-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Defragment() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-amber-600">橙色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> のフルコーパススループット(コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。橙の線が藍色の線を下回る = 書き込み側の生成レートに defragment() の処理速度が追いつかない可能性を示す。単独実行(並行書き込みなし)での比較 —— 並行実行下での劣化は Defragment Scaling & Contention セクション参照。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_in_memory-defrag-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_in_memory-defrag-throughput" oninput="saveMemo('1kb_in_memory-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
     </div>
@@ -1067,6 +1129,26 @@
           <textarea id="memo-1kb_ltm-checkpoint-throughput" oninput="saveMemo('1kb_ltm-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-amber-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Defragment() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-amber-600">橙色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> のフルコーパススループット(コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。橙の線が藍色の線を下回る = 書き込み側の生成レートに defragment() の処理速度が追いつかない可能性を示す。単独実行(並行書き込みなし)での比較 —— 並行実行下での劣化は Defragment Scaling & Contention セクション参照。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_ltm-defrag-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_ltm-defrag-throughput" oninput="saveMemo('1kb_ltm-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
     </div>
     <div id="tab-64kb-ltm" class="tab-content space-y-12">
       <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -1249,6 +1331,26 @@
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
           <textarea id="memo-64kb_ltm-checkpoint-throughput" oninput="saveMemo('64kb_ltm-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-amber-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Defragment() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-amber-600">橙色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> のフルコーパススループット(コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。橙の線が藍色の線を下回る = 書き込み側の生成レートに defragment() の処理速度が追いつかない可能性を示す。単独実行(並行書き込みなし)での比較 —— 並行実行下での劣化は Defragment Scaling & Contention セクション参照。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-64kb_ltm-defrag-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-64kb_ltm-defrag-throughput" oninput="saveMemo('64kb_ltm-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
     </div>
@@ -9700,6 +9802,28 @@
     "records_per_sec": 24318.2754512354
   }
 };
+    const defragThroughputData = {
+  "8B_In-Memory": {
+    "key_count": 20000000,
+    "elapsed_sec": 3.09974,
+    "records_per_sec": 6452154.051630137
+  },
+  "1KB_In-Memory": {
+    "key_count": 8000000,
+    "elapsed_sec": 21.916,
+    "records_per_sec": 365030.1149844862
+  },
+  "1KB_LTM": {
+    "key_count": 8259552,
+    "elapsed_sec": 53.4393,
+    "records_per_sec": 154559.50957441432
+  },
+  "64KB_LTM": {
+    "key_count": 131040,
+    "elapsed_sec": 27.3907,
+    "records_per_sec": 4784.105554074923
+  }
+};
     const workloads = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"];
     const valSizes  = ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"];
 
@@ -10171,6 +10295,71 @@
       };
     }
 
+    function makeDefragVsInsertConfig(valSizeKey) {
+      const df = defragThroughputData[valSizeKey];
+      const insertSeries = rawData[valSizeKey] && rawData[valSizeKey]['Insert'] && rawData[valSizeKey]['Insert']['+Inline'];
+      if (!df || !insertSeries) return null;
+      const threadLabels = [1, 4, 16, 32];
+      return {
+        type: 'line',
+        data: {
+          labels: threadLabels,
+          datasets: [
+            {
+              label: 'Insert (+Inline)',
+              data: insertSeries,
+              borderColor: '#6366f1',
+              backgroundColor: 'transparent',
+              borderWidth: 2,
+              tension: 0.2, fill: false,
+              pointRadius: 3.5,
+            },
+            {
+              label: 'defragment() full-corpus',
+              data: threadLabels.map(() => df.records_per_sec),
+              borderColor: '#d97706',
+              backgroundColor: 'transparent',
+              borderWidth: 2,
+              borderDash: [6, 4],
+              pointRadius: 0,
+              fill: false,
+            },
+          ],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => `${items[0].label} threads`,
+                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw)}/s`
+              }
+            }
+          },
+          scales: {
+            x: {
+              title: { display:true, text:'Threads', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            },
+            y: {
+              type: 'logarithmic',
+              title: { display:true, text:'Throughput (records/sec, log scale)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            }
+          }
+        }
+      };
+    }
+
     function initCharts() {
       for (const valSize of valSizes) {
         for (const op of workloads) {
@@ -10206,6 +10395,12 @@
         if (cpCanvas) {
           const cfg2 = makeCheckpointVsInsertConfig(valSize);
           if (cfg2) new Chart(cpCanvas, cfg2);
+        }
+        const dfEid = valSize.toLowerCase().replace(/-/g,'_') + '-defrag-throughput';
+        const dfCanvas = document.getElementById('chart-' + dfEid);
+        if (dfCanvas) {
+          const cfg3 = makeDefragVsInsertConfig(valSize);
+          if (cfg3) new Chart(dfCanvas, cfg3);
         }
       }
     }
