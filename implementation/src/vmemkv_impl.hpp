@@ -430,41 +430,121 @@ class VMemKVImpl {
         return a.offset < b.offset;
       });
 
-      T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-      for (const auto &candidate : candidates) {
-        // Copy key+value+alloc_len out under the seqlock: this record can be concurrently mutated
-        // by update_impl()'s in-place T2 path (key_lock does not serialize against reorganize(),
-        // by design). alloc_len (not value_len) is what the on-disk footprint at this offset was
-        // originally sized to -- must be preserved as-is so this pwrite() never changes the
-        // record's footprint, only its contents, and any later record already sharing this
-        // generation's tail stays at the offset it was allocated. t2_.at() is called inside
-        // read_t2_record_seqlock() (as AtFunc) rather than once beforehand, since key_len/
-        // value_len/alloc_len are unsynchronized and a stale read once wouldn't be caught by the
-        // version recheck -- see that function's comment. key_copy/value_copy are reused across
-        // calls purely to avoid a per-record heap allocation.
-        //
-        // Claimed via capture_watermark_ *before* this read (see that member's comment): once
-        // this store() is visible, any in-place update racing this exact offset is guaranteed to
-        // see allow_in_place==false and redirect out-of-place instead, so the seqlock read below
-        // observes the last possible in-place write to this offset, never one that lands after.
-        // candidates are processed in ascending-offset order (see the sort above), so this is
-        // always a forward-only advance.
-        capture_watermark_.store(candidate.offset + 1, std::memory_order_release);
-
+      // Copies one candidate's current key+value+alloc_len to `offset` in the checkpoint file.
+      // Shared by both passes below -- only how offsets are batched and how the seqlock's
+      // watermark protection is claimed differs between them.
+      //
+      // Read under the seqlock: this record can be concurrently mutated by update_impl()'s
+      // in-place T2 path (key_lock does not serialize against reorganize(), by design). alloc_len
+      // (not value_len) is what the on-disk footprint at this offset was originally sized to --
+      // must be preserved as-is so this pwrite() never changes the record's footprint, only its
+      // contents, and any later record already sharing this generation's tail stays at the offset
+      // it was allocated. t2_.at() is called inside read_t2_record_seqlock() (as AtFunc) rather
+      // than once beforehand, since key_len/value_len/alloc_len are unsynchronized and a stale
+      // read once wouldn't be caught by the version recheck -- see that function's comment.
+      auto copy_one_candidate = [&](T2FlatFile::T2MemoryHandle &mem,
+                                    std::vector<std::byte> &key_buf,
+                                    std::vector<std::byte> &value_buf,
+                                    uint64_t &local_bytes_synced,
+                                    uint64_t offset) {
         uint32_t alloc_len = 0;
         uint64_t version = 0;
-        read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(candidate.offset, mem); },
+        read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(offset, mem); },
                                [&](const T2RecordView &record) -> bool {
-                                 key_copy.assign(record.key.begin(), record.key.end());
-                                 value_copy.assign(record.value.begin(), record.value.end());
+                                 key_buf.assign(record.key.begin(), record.key.end());
+                                 value_buf.assign(record.value.begin(), record.value.end());
                                  alloc_len = record.header->alloc_len;
                                  version = record.header->version;
                                  return true;
                                });
-
         const uint64_t written_through =
-            pwrite_record_at_offset(fd_guard.fd, candidate.offset, key_copy, value_copy, alloc_len, version);
-        maybe_sync_and_drop_checkpoint_cache(fd_guard.fd, written_through, bytes_synced);
+            pwrite_record_at_offset(fd_guard.fd, offset, key_buf, value_buf, alloc_len, version);
+        // fdatasync() flushes the whole fd regardless of which thread calls it, and
+        // posix_fadvise(DONTNEED) on a range is just a hint -- safe to call redundantly across
+        // callers each tracking an independent high-water mark (the parallel pass below does).
+        maybe_sync_and_drop_checkpoint_cache(fd_guard.fd, written_through, local_bytes_synced);
+      };
+
+      if (!destructive) {
+        // Pre-stop pass only: parallelize this work across a small fixed thread pool. On an
+        // LTM-scale corpus, single-threaded, queue-depth-1 reads leave NVMe bandwidth on the
+        // table -- LTM/64KB and LTM/1KB were measured to hit nearly identical total disk
+        // throughput despite a 76x difference in records/sec, meaning the bottleneck is disk
+        // bandwidth, not per-record overhead, and concurrent in-flight I/O is what closes that
+        // gap. The post-stop pass below stays single-threaded -- see its own comment for why.
+        //
+        // capture_watermark_ is claimed once, up front, to this whole batch's high end -- not
+        // incrementally per record the way the single-threaded post-stop loop below does, since
+        // out-of-order parallel completion can't offer that per-offset ordering. Still correct:
+        // the field's only job is "in-place updates to offsets below this get redirected
+        // out-of-place instead," and advancing uniformly earlier only makes that redirection more
+        // eager, never less -- it just means an in-place update racing an offset this batch
+        // hasn't physically copied *yet* gets redirected slightly earlier than a fully-incremental
+        // advance would, which is an acceptable trade given the batch itself completes faster.
+        capture_watermark_.store(candidates.back().offset + 1, std::memory_order_release);
+
+        constexpr std::size_t kCheckpointCopyThreads = 8;
+        const std::size_t worker_count = std::min(kCheckpointCopyThreads, candidates.size());
+        const std::size_t chunk_size = (candidates.size() + worker_count - 1) / worker_count;
+
+        std::vector<std::vector<uint64_t>> worker_durabilized(worker_count);
+        std::vector<std::exception_ptr> worker_exceptions(worker_count);
+        auto run_chunk = [&](std::size_t w) {
+          const std::size_t begin = w * chunk_size;
+          const std::size_t end = std::min(begin + chunk_size, candidates.size());
+          try {
+            // Each worker registers its own ThreadReferenceTracker slot (keyed by calling
+            // thread, see core/reference_tracker.hpp) -- sharing one handle across threads would
+            // leave these threads' T2Memory references invisible to stop_writers_and_wait()'s
+            // wait, letting it proceed while a worker is still mid-read against memory that's
+            // about to be swapped out.
+            T2FlatFile::T2MemoryHandle worker_mem = t2_.get_memory_handle();
+            std::vector<std::byte> worker_key_copy;
+            std::vector<std::byte> worker_value_copy;
+            uint64_t worker_bytes_synced = old_base_boundary;
+            for (std::size_t i = begin; i < end; ++i) {
+              copy_one_candidate(
+                  worker_mem, worker_key_copy, worker_value_copy, worker_bytes_synced, candidates[i].offset);
+              worker_durabilized[w].push_back(candidates[i].offset);
+            }
+          } catch (...) {
+            worker_exceptions[w] = std::current_exception();
+          }
+        };
+
+        {
+          std::vector<std::jthread> workers;
+          workers.reserve(worker_count);
+          for (std::size_t w = 0; w < worker_count; ++w) {
+            workers.emplace_back(run_chunk, w);
+          }
+        }  // jthreads joined here (destructor)
+
+        for (auto &ex : worker_exceptions) {
+          if (ex) {
+            std::rethrow_exception(ex);
+          }
+        }
+        for (const auto &offsets : worker_durabilized) {
+          durabilized.insert(offsets.begin(), offsets.end());
+        }
+        return;
+      }
+
+      // Post-stop pass: kept single-threaded. Writers are already fully stopped by the time this
+      // runs, so the parallel pass's I/O-bandwidth motivation doesn't apply here; this pass is
+      // meant to be a small stragglers catch-up, not the bulk of the work.
+      T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+      for (const auto &candidate : candidates) {
+        // Claimed via capture_watermark_ *before* this read (see that member's comment): once
+        // this store() is visible, any in-place update racing this exact offset is guaranteed to
+        // see allow_in_place==false and redirect out-of-place instead, so the read below observes
+        // the last possible in-place write to this offset, never one that lands after. candidates
+        // are processed in ascending-offset order (see the sort above), so this is always a
+        // forward-only advance -- unlike the parallel pre-stop pass above, which cannot offer
+        // that ordering and claims the batch's high end up front instead.
+        capture_watermark_.store(candidate.offset + 1, std::memory_order_release);
+        copy_one_candidate(mem, key_copy, value_copy, bytes_synced, candidate.offset);
         durabilized.insert(candidate.offset);
       }
     };

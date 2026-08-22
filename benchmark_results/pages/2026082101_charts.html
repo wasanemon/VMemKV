@@ -54,7 +54,7 @@
           <a href="../2026082101/defrag_scaling_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Defrag Scaling, LTM)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、defragment()を単体スタンドアロンrunで新規に計測(commit 49d9a53)。さらに、checkpoint()関連の3つの重複した実験を、Insertスループットと直接比較する単一の実験(churn_ratio=0.25での定常状態スループット、commit a85250c/1a74065)へ統合し、4コンボ全てで計測完了。当初、8B/1KB In-MemoryおよびLTM/1KBではcheckpoint()がInsertの10〜30倍以上のスループットを維持し余裕で追いつく一方、LTM/64KBではcheckpoint()の定常状態スループット(約4,518 records/sec)がInsertのピーク速度(約11,832 records/sec、32スレッド)を下回り、書き込み側が生成するchurnにcheckpoint()が追いつかない可能性を示していた。原因調査の結果、mmap_t2_memory()が全T2リマップ時に無条件で行っていたMADV_POPULATE_READ(既存コーパス全体を毎回イーガーに温め直す)がLTM/64KBのボトルネックと判明し、これを除去(commit 8dc60f7)。LTM/64KBのcheckpoint()定常状態スループットは約4,518→約13,015 records/secに改善し、Insertのピーク速度を上回るようになった(他3コンボも同等以上を維持)。一方この副作用として、defragment()のPhase 0(T1キー順の全コーパス走査)が、直前のcheckpoint()側mmap_t2_memory()呼び出しによる無条件ページキャッシュ温め直しの恩恵を失い、in_memory/1KB(6.26s→53.23s、ratio=0.25)やLTM/64KB(36.43s→52.08s、ratio=0.25)で大幅に悪化した。defragment()自身の先頭にプリフェッチを配置する対策(単一スレッド版・8スレッド並列版の両方)を検証したが、いずれもプリフェッチなしの状態よりさらに悪化したため断念。checkpoint()の改善(本ラウンドの主目的)を優先し、defragment()側のこの退行は許容する方針とした。</p>
+      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、defragment()を単体スタンドアロンrunで新規に計測(commit 49d9a53)。さらに、checkpoint()関連の3つの重複した実験を、Insertスループットと直接比較する単一の実験(churn_ratio=0.25での定常状態スループット、commit a85250c/1a74065)へ統合し、4コンボ全てで計測完了。当初、8B/1KB In-MemoryおよびLTM/1KBではcheckpoint()がInsertの10〜30倍以上のスループットを維持し余裕で追いつく一方、LTM/64KBではcheckpoint()の定常状態スループット(約4,518 records/sec)がInsertのピーク速度(約11,832 records/sec、32スレッド)を下回り、書き込み側が生成するchurnにcheckpoint()が追いつかない可能性を示していた。原因調査の結果、mmap_t2_memory()が全T2リマップ時に無条件で行っていたMADV_POPULATE_READ(既存コーパス全体を毎回イーガーに温め直す)がLTM/64KBのボトルネックと判明し、これを除去(commit 8dc60f7)。LTM/64KBのcheckpoint()定常状態スループットは約4,518→約13,015 records/secに改善し、Insertのピーク速度を上回るようになった(他3コンボも同等以上を維持)。一方この副作用として、defragment()のPhase 0(T1キー順の全コーパス走査)が、直前のcheckpoint()側mmap_t2_memory()呼び出しによる無条件ページキャッシュ温め直しの恩恵を失い、in_memory/1KB(6.26s→53.23s、ratio=0.25)やLTM/64KB(36.43s→52.08s、ratio=0.25)で大幅に悪化した。defragment()自身の先頭にプリフェッチを配置する対策(単一スレッド版・8スレッド並列版の両方)を検証したが、いずれもプリフェッチなしの状態よりさらに悪化したため断念。checkpoint()の改善(本ラウンドの主目的)を優先し、defragment()側のこの退行は許容する方針とした。 さらに、checkpoint()のpre-stopコピーパス(まだwriterが動いている間の先行コピー)をディスクI/O帯域を活かすため8スレッド並列化(chunk分割 + 各ワーカーが自前のT2MemoryHandleを保持)。capture_watermarkはインクリメンタルではなくバッチの最高オフセットまで一括前倒しに変更(正しさは維持——out-of-place化がより早めに発火するだけ)。post-stopパス(writer停止後の小さな取りこぼし回収)は単一スレッドのまま。効果はディスク帯域律速だったLTM系で顕著:LTM/64KBは約13,015→約24,318 records/sec(約1.87倍、Insertピークの約2倍の余裕を確保)、LTM/1KBは約1,063,000→約1,586,918 records/sec(約1.49倍)。ディスクI/Oが支配的でないIn-Memory系はほぼ横ばい(想定通り)。4コンボ全てで退行なし。</p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -447,7 +447,7 @@
           </table>
         </div>
       </section>
-                  <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+                        <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
             <i data-lucide="gauge" class="w-6 h-6"></i>
@@ -464,14 +464,14 @@
 <th class="py-2 px-3 font-bold text-slate-700">checkpoint() steady-state</th>
 <th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
 </tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">4,600,684/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.03x)</span></td></tr>
-<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">2,760,305/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.04x)</span></td></tr>
-<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">1,062,951/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.10x)</span></td></tr>
-<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">13,014/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-amber-50 text-amber-700 border-amber-200 font-bold w-fit">≈ At capacity (0.91x)</span></td></tr>
+<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">4,659,170/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.03x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">2,765,162/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.04x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">1,586,843/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.07x)</span></td></tr>
+<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">24,318/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.49x)</span></td></tr>
 </tbody></table></div>
       </section>
 
-                        <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+                              <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
           <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
             <i data-lucide="scissors" class="w-6 h-6"></i>
@@ -9674,23 +9674,23 @@
     const checkpointThroughputData = {
   "8B_In-Memory": {
     "key_count": 20000000,
-    "elapsed_sec": 4.34718,
-    "records_per_sec": 4600683.661592113
+    "elapsed_sec": 4.29261,
+    "records_per_sec": 4659170.06203685
   },
   "1KB_In-Memory": {
     "key_count": 8000000,
-    "elapsed_sec": 2.89823,
-    "records_per_sec": 2760305.4277955857
+    "elapsed_sec": 2.89314,
+    "records_per_sec": 2765161.7273965315
   },
   "1KB_LTM": {
     "key_count": 8259552,
-    "elapsed_sec": 7.7704,
-    "records_per_sec": 1062950.6846494388
+    "elapsed_sec": 5.20502,
+    "records_per_sec": 1586843.4703420927
   },
   "64KB_LTM": {
     "key_count": 131040,
-    "elapsed_sec": 10.0694,
-    "records_per_sec": 13013.685025920115
+    "elapsed_sec": 5.38854,
+    "records_per_sec": 24318.2754512354
   }
 };
     const workloads = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"];
