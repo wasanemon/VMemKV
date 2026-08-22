@@ -694,44 +694,82 @@ class VMemKVImpl {
   }
 
   // Relocates every live T2 record (base- and tail-resident alike) to fresh, sequentially
-  // assigned offsets in a brand-new T2 file, in T1's key order -- restoring the key-order /
-  // physical-offset correlation Scan depends on (low_level_design.md 4.1's "Ordering
-  // Fragmentation") and reclaiming 100% of dead space, since the *entire* old file becomes
-  // unreferenced and gets replaced wholesale. Deliberately not FALLOC_FL_PUNCH_HOLE-based:
-  // reclaiming individual dead ranges within a still-live file only succeeds at filesystem block
-  // granularity, which this project's typical small-value workloads rarely reach.
+  // assigned offsets in a brand-new T2 file -- restoring the key-order / physical-offset
+  // correlation Scan depends on (low_level_design.md 4.1's "Ordering Fragmentation") and
+  // reclaiming 100% of dead space, since the *entire* old file becomes unreferenced and gets
+  // replaced wholesale. Deliberately not FALLOC_FL_PUNCH_HOLE-based: reclaiming individual dead
+  // ranges within a still-live file only succeeds at filesystem block granularity, which this
+  // project's typical small-value workloads rarely reach.
   //
-  // Deliberately structured as checkpoint_internal() plus one extra pass at the front, reusing
-  // every synchronization primitive that function already has proven correct, rather than
-  // inventing new ones:
-  //  - capture_watermark_ (same member checkpoint_internal() uses): here set *once*, to the
-  //    current tail high-water mark, before Phase 0 starts, instead of advanced record-by-record.
-  //    checkpoint_internal() can advance it incrementally because it claims tail records in
-  //    *offset* order; Phase 0 below visits records in *key* order (the whole point is that these
-  //    two orders have decorrelated), so a single blanket freeze covering every tail record that
-  //    existed at cycle-start is the only ordering-independent way to get the same guarantee: any
-  //    in-place update targeting one of them redirects out-of-place instead of silently mutating
-  //    bytes Phase 0 already read (or is about to). Base-resident records need no such barrier --
-  //    try_in_place_update()'s `offset >= mem->base_boundary` check already excludes them
-  //    unconditionally, cycle or not. A write redirected out-of-place lands past the watermark by
-  //    construction (append-only), so it is immediately eligible for further in-place updates
-  //    within the same cycle; the catch-up passes below always re-read whatever is current at
-  //    drain time, so how many times a key bounced between offsets in between is irrelevant.
-  //  - tail_entries_ (same tracker checkpoint_internal() drains): every write forced out-of-place
-  //    by the watermark above -- and every ordinary out-of-place write that would have happened
-  //    anyway -- already records itself here via write_entry_lockfree(); Phase 0 just also
-  //    consults it afterward, through the identical peek_live()/drain_and_clear() pre-stop/
-  //    post-stop pairing checkpoint_internal() already uses, for the same reason: shrink how much
-  //    work is left for the brief writer-stop window below.
+  // Base is always key-sorted by induction: this cycle's own output is built key-sorted (see
+  // below), so the *next* cycle can once again treat "read the base region in ascending physical
+  // offset order" and "read it in key order" as the same operation.
+  //
+  // T2's live mapping (T2Memory::base) is MAP_PRIVATE: an in-place write is only ever visible in
+  // this process's own memory, never durable, until some later checkpoint_internal()/
+  // defragment_internal() cycle explicitly pwrite()s it back out -- and both only ever do that for
+  // whatever is *currently live* at the time. A record that was live once, got superseded, and was
+  // never durabilized in between simply has no bytes on disk for its old slot at all -- not zeroed,
+  // not punched, just never written. The base region is therefore NOT a dense, gap-free sequence
+  // of records a byte-by-byte walk could safely parse; every record Phase 0 below touches is
+  // addressed via an offset T1 itself vouches for right now, never inferred from a preceding
+  // record's length.
+  //
+  //  - Phase 0 (concurrent with writers): one t1_.scan() pass collects every live, non-inline
+  //    entry's full payload_bits (offset plus the embedded block-count size hint) below
+  //    old_base_boundary into `live_payloads`, sorted ascending by offset -- purely in-memory,
+  //    zero T2 I/O. Each is then read via try_read_base_record() (BaseReader::kScan, tuned for
+  //    exactly this ascending-order access pattern -- readahead-friendly for small records,
+  //    residency-checked pread() for large ones, avoiding the MADV_RANDOM primary mapping's
+  //    per-page fault cost that dominates a naive walk), falling back to an unsynchronized
+  //    t2_.at() read on the rare case that declines (offset < old_base_boundary is provably
+  //    immutable for this whole phase, per the watermark freeze below, so no seqlock is needed
+  //    either way). Live records are copied, still in ascending-offset (and therefore, by the
+  //    induction above, ascending-key) order, into a scratch file -- not the final output yet,
+  //    see Phase 1 below for why.
+  //  - capture_watermark_ is frozen *once*, to old_base_boundary, before Phase 0 starts, and never
+  //    moves again until the cycle commits or aborts. This uniformly protects every base offset
+  //    from the very first instant, so every record Phase 0 reads is guaranteed immutable for the
+  //    phase's whole duration (no seqlock needed there) -- unlike checkpoint_internal()'s
+  //    incremental, per-record advance, one blanket freeze suffices here because base-resident
+  //    records need no *individual* claiming: try_in_place_update()'s `offset >= mem->base_boundary`
+  //    check already excludes all of them unconditionally. A key updated during Phase 0 is forced
+  //    out-of-place instead, landing a fresh tail_entries_-tracked write >= old_base_boundary --
+  //    not itself protected by this freeze, but that's fine: Phase 1 below only ever begins after
+  //    stop_writers_and_wait() has returned, so by the time any tail candidate is read, no writer
+  //    remains that could still be racing it. (The previous version of this function froze
+  //    capture_watermark_ to the *current tail high-water mark* instead of old_base_boundary,
+  //    reasoning that "however many times a key bounces between offsets in between is irrelevant
+  //    since the catch-up pass re-reads whatever is current at drain time" -- true only if that
+  //    catch-up pass cannot itself race a further in-place update, which its old pre-stop
+  //    peek_live() call could: a second update landing on an already-redirected offset while
+  //    writers were still live could mutate it in place, unrecorded by tail_entries_ (see
+  //    try_in_place_update()'s comment), silently publishing a stale value. Doing all tail
+  //    catch-up strictly after stop_writers_and_wait() -- as Phase 1 does -- removes the race
+  //    instead of needing to out-run it.)
+  //  - Phase 1 (writers stopped): tail_entries_.drain_and_clear() gives the complete, final set of
+  //    tail-resident writes since the last cycle. Each is re-resolved against T1 fresh (never
+  //    trusted from record() time) and its current key/value read once -- safe unsynchronized
+  //    (via the seqlock, defensively) since no writer remains to race it. Deduplicated by offset
+  //    (the same key can appear multiple times if it was written more than once) and sorted by
+  //    *key*, not offset -- Phase 1 needs key order for the merge below, and there is no ordering
+  //    hazard left to guard against once writers are stopped.
+  //  - Final merge: the scratch file from Phase 0 (key-sorted) and the sorted tail candidates from
+  //    Phase 1 are merged like the merge step of a mergesort, by key, into the real output file --
+  //    on a key collision the tail candidate wins (it is always the more recent value; Phase 0
+  //    can only have captured a since-superseded copy). This merge is what keeps the "base is
+  //    always key-sorted" invariant intact across cycles: appending tail entries unsorted after
+  //    Phase 0's output instead would permanently break the assumption Phase 0's own merge-cursor
+  //    relies on for every future cycle.
   //  - t2_.acquire_write_handle()/stop_writers_and_wait()/resume_writers(), t1_.reorganize()'s
   //    single atomic publish point, T2Memory generation allocation/swap_memory()/retire_memory():
-  //    all reused unmodified.
+  //    all reused unmodified from checkpoint_internal().
   //
-  // The one genuinely new piece is `relocated`: a hash -> new-payload_bits map built while
-  // copying, consulted once by offset_mapper_fn at publish time. Keyed by the same (prefix, hash)
-  // identity tail_entries_/copy_live_entries() already use elsewhere in this file; a 64-bit
-  // full-key hash collision between two different live keys is the same negligible, already-
-  // accepted risk every other (prefix, hash)-keyed structure here carries, not a new one.
+  // `relocated`: hash -> new-payload_bits map built by the final merge, consulted once by
+  // offset_mapper_fn at publish time. Keyed by the same (prefix, hash) identity tail_entries_/
+  // copy_live_entries() already use elsewhere in this file; a 64-bit full-key hash collision
+  // between two different live keys is the same negligible, already-accepted risk every other
+  // (prefix, hash)-keyed structure here carries, not a new one.
   template <typename PreStopHook = NoOpPreStopHook, typename PreFinishHook = NoOpPreFinishHook>
   void defragment_internal(PreStopHook pre_stop_hook = PreStopHook{}, PreFinishHook pre_finish_hook = PreFinishHook{}) {
     using EntrySnapshot = typename T1IndexT::EntrySnapshot;
@@ -739,8 +777,9 @@ class VMemKVImpl {
 
     const uint64_t old_base_boundary = t2_.get_memory()->base_boundary;
     // Single blanket freeze for the cycle's whole duration -- see this function's own comment
-    // above for why this differs from checkpoint_internal()'s incremental, offset-ordered advance.
-    capture_watermark_.store(t2_.get_memory()->bytes_used.load(std::memory_order_acquire), std::memory_order_relaxed);
+    // above for why old_base_boundary (not the current tail high-water mark) is both correct and
+    // sufficient given Phase 1 runs entirely after stop_writers_and_wait().
+    capture_watermark_.store(old_base_boundary, std::memory_order_relaxed);
 
     const std::filesystem::path t2_chk_path = vmemkv::derive_t2_chk_path(t2_path());
     // Written to a fresh temp file, never the live one -- Wal::rotate()'s own write-then-rename
@@ -755,91 +794,339 @@ class VMemKVImpl {
     }
     FDGuard fd_guard{t2_fd};
 
+    // Phase 0's scratch output -- never published, never renamed into place; merged into
+    // fd_guard.fd (the real output) below and removed once the merge has consumed it.
+    const std::filesystem::path t2_scratch_path = t2_chk_path.string() + ".defrag_scratch";
+    const int scratch_fd = ::open(t2_scratch_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (scratch_fd < 0) {
+      throw std::system_error(errno, std::generic_category(), "open t2 defragment scratch file");
+    }
+    FDGuard scratch_guard{scratch_fd};
+
     uint64_t next_offset = 0;
     uint64_t bytes_synced = 0;
-    // hash -> fully-encoded new payload_bits (new offset | new block_count << shift). Storing the
-    // complete encoding, not just the offset, sidesteps ever needing the *old* block_count -- a
-    // freshly relocated record is packed tight (alloc_len == current value size, no slack), which
-    // is generally smaller than whatever slack the old placement had accumulated.
+    // hash -> fully-encoded new payload_bits (new offset | new block_count << shift). Populated
+    // solely by the final merge below -- Phase 0's scratch write and Phase 1's gather do not touch
+    // it, since only the merge knows each key's *final* winning offset.
     std::unordered_map<uint64_t, uint64_t> relocated;
-
     std::vector<std::pair<StoreKey, uint64_t>> drained_this_cycle;
-    std::vector<std::byte> key_copy;
-    std::vector<std::byte> value_copy;
 
-    // Copies one (prefix, hash) candidate's *current* live value to the next sequential offset in
-    // the output file, recording the relocation. Re-resolves against T1 fresh every time (never
-    // trusts a payload cached at observation time) -- same reason copy_live_entries() does, and
-    // doubly so here since Phase 0's walk can take far longer than checkpoint_internal()'s tail-
-    // only pass.
-    auto relocate_one = [&](const StoreKey &prefix, uint64_t hash) {
-      if (relocated.contains(hash)) {
-        return;  // Already relocated earlier this cycle.
+    // Appends one record in the standard on-disk format to `buf`, tight-packed (alloc_len ==
+    // value.size(), no slack) -- defragment()'s whole point is space reclamation, unlike
+    // checkpoint_internal()'s copy which must preserve the original alloc_len exactly (see that
+    // function's comment). Returns the aligned footprint just appended.
+    auto append_record = [](std::vector<std::byte> &buf,
+                            std::span<const std::byte> key,
+                            std::span<const std::byte> value,
+                            uint64_t version) -> uint64_t {
+      ValueRecordHeader header;
+      header.key_len = static_cast<uint32_t>(key.size());
+      header.value_len = static_cast<uint32_t>(value.size());
+      header.alloc_len = static_cast<uint32_t>(value.size());
+      header.version = version;
+      const uint64_t raw_len = sizeof(header) + key.size() + value.size();
+      const uint64_t aligned_len = vmemkv::align_up(raw_len);
+      const std::size_t start = buf.size();
+      buf.resize(start + aligned_len, std::byte{0});
+      std::memcpy(buf.data() + start, &header, sizeof(header));
+      std::memcpy(buf.data() + start + sizeof(header), key.data(), key.size());
+      if (!value.empty()) {
+        std::memcpy(buf.data() + start + sizeof(header) + key.size(), value.data(), value.size());
       }
-      const auto res = resolve_live_non_inline(prefix, hash);
-      if (!res) {
-        return;
+      return aligned_len;
+    };
+
+    // Buffered sequential reader over the final merge's source, Phase 0's own scratch output:
+    // wraps pread() with a refillable buffer so a record split across two reads is still returned
+    // contiguously. Scratch contains only whole, confirmed-live records back to back (Phase 0
+    // below only ever appends one via try_read_base_record()/the seqlock fallback, never touches
+    // it otherwise), so -- unlike the old T2 file itself -- walking it byte-by-byte is safe: there
+    // is no unwritten/never-durabilized gap to misparse (see this function's top comment for why
+    // that distinction matters). Max single record size is bounded (~1.04MB, see
+    // low_level_design.md 2.2's Embedded Block Count), well under kReadChunkBytes, so a record
+    // never needs more than one refill.
+    struct SeqReader {
+      int fd;
+      uint64_t limit;
+      std::vector<std::byte> buf;
+      std::size_t len = 0;
+      std::size_t pos = 0;
+      uint64_t file_pos = 0;
+
+      SeqReader(int fd_, uint64_t limit_) : fd(fd_), limit(limit_), buf(64ULL * 1024 * 1024) {}
+
+      auto exhausted() const -> bool { return file_pos >= limit && pos >= len; }
+
+      void ensure_available(std::size_t need) {
+        if (pos + need <= len) {
+          return;
+        }
+        const std::size_t remaining = len - pos;
+        std::memmove(buf.data(), buf.data() + pos, remaining);
+        len = remaining;
+        pos = 0;
+        while (len < need && file_pos < limit) {
+          const std::size_t to_read = std::min(buf.size() - len, static_cast<std::size_t>(limit - file_pos));
+          if (to_read == 0) {
+            break;
+          }
+          const ssize_t n = ::pread(fd, buf.data() + len, to_read, static_cast<off_t>(file_pos));
+          if (n <= 0) {
+            throw std::system_error(errno, std::generic_category(), "pread defragment sequential scan");
+          }
+          len += static_cast<std::size_t>(n);
+          file_pos += static_cast<uint64_t>(n);
+        }
       }
-      const uint64_t offset = res->payload_bits & kOffsetMask;
-      uint32_t alloc_len = 0;
-      uint64_t version = 0;
-      T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-      read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(offset, mem); },
-                             [&](const T2RecordView &record) -> bool {
-                               key_copy.assign(record.key.begin(), record.key.end());
-                               value_copy.assign(record.value.begin(), record.value.end());
-                               alloc_len = static_cast<uint32_t>(record.value.size());
-                               version = record.header->version;
-                               return true;
-                             });
-      const uint64_t written_through =
-          pwrite_record_at_offset(fd_guard.fd, next_offset, key_copy, value_copy, alloc_len, version);
-      const uint64_t aligned_len = written_through - next_offset;
-      const uint64_t block_count = aligned_len / kBlockAlignment;
-      assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
-      relocated.emplace(hash, next_offset | (block_count << kSizeEmbeddingShift));
-      next_offset = written_through;
-      maybe_sync_and_drop_checkpoint_cache(fd_guard.fd, next_offset, bytes_synced);
+
+      // Valid until the next call to ensure_available() (i.e. the next call to this or
+      // advance()).
+      auto current() -> const ValueRecordHeader * {
+        ensure_available(sizeof(ValueRecordHeader));
+        const auto *peek = reinterpret_cast<const ValueRecordHeader *>(buf.data() + pos);
+        const uint64_t raw_len = sizeof(ValueRecordHeader) + peek->key_len + peek->alloc_len;
+        ensure_available(static_cast<std::size_t>(vmemkv::align_up(raw_len)));
+        return reinterpret_cast<const ValueRecordHeader *>(buf.data() + pos);
+      }
+
+      void advance() {
+        const auto *header = current();
+        const uint64_t raw_len = sizeof(ValueRecordHeader) + header->key_len + header->alloc_len;
+        pos += static_cast<std::size_t>(vmemkv::align_up(raw_len));
+      }
     };
 
     try {
-      // Phase 0: full-corpus walk in T1's own key order -- long-running, entirely non-blocking.
-      // Readers keep using the live (old) generation throughout; writers keep writing (any update
-      // to a pre-existing tail record redirects out-of-place per the watermark above, landing as
-      // a fresh tail_entries_-tracked write the catch-up passes below will pick up).
-      std::array<std::byte, kStoreKeyBytes> min_key{};
-      std::array<std::byte, kStoreKeyBytes> max_key;
-      max_key.fill(std::byte{0xFF});
-      t1_.scan(std::span<const std::byte>(min_key),
-               std::span<const std::byte>(max_key),
-               [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash, uint64_t /*t2_generation*/) {
-                 if (payload == vmemkv::STORE_NOT_FOUND) {
-                   return;
-                 }
-                 StoreKey prefix{};
-                 std::memcpy(prefix.data(), index_key.data(), std::min(index_key.size(), prefix.size()));
-                 relocate_one(prefix, hash);
-               });
+      // Phase 0: base-region rewrite -- see this function's top comment for why every record here
+      // is addressed via an offset T1 vouches for right now, never inferred from a byte scan.
+      {
+        // One t1_.scan() pass, purely in-memory, collects every live non-inline entry's full
+        // payload_bits (not just the offset) below old_base_boundary, sorted ascending by offset.
+        // The embedded block-count size hint in the high bits (kSizeEmbeddingShift) is what lets
+        // try_read_base_record() below size its read without a separate T1 lookup per record.
+        std::vector<uint64_t> live_payloads;
+        {
+          std::array<std::byte, kStoreKeyBytes> min_key{};
+          std::array<std::byte, kStoreKeyBytes> max_key;
+          max_key.fill(std::byte{0xFF});
+          t1_.scan(std::span<const std::byte>(min_key),
+                   std::span<const std::byte>(max_key),
+                   [&](std::span<const std::byte> /*index_key*/,
+                       uint64_t payload,
+                       uint64_t hash,
+                       uint64_t /*t2_generation*/) {
+                     if (payload == vmemkv::STORE_NOT_FOUND) {
+                       return;
+                     }
+                     if constexpr (ConfigT::UseT1InlineValue) {
+                       if (t1_detail::is_inline(hash)) {
+                         return;
+                       }
+                     }
+                     if ((payload & kOffsetMask) < old_base_boundary) {
+                       live_payloads.push_back(payload);
+                     }
+                   });
+          std::sort(live_payloads.begin(), live_payloads.end(), [](uint64_t a, uint64_t b) {
+            return (a & kOffsetMask) < (b & kOffsetMask);
+          });
+        }
 
-      // Phase 1/2: iterative catch-up, mirroring checkpoint_internal()'s pre-stop pass -- relocates
-      // whatever tail_entries_ has accumulated since Phase 0 started (new tail writes, or an
-      // update that landed on a key Phase 0 already relocated). Non-destructive and safe to run
-      // any number of times; shrinks each pass since writers are still live only briefly between
-      // calls, same convergence argument as run_reorganize()'s own comment.
-      tail_entries_.peek_live([&](const StoreKey &prefix, uint64_t hash) { relocate_one(prefix, hash); });
+        // Ascending-offset order: readahead-friendly (try_read_base_record()'s BaseReader::kScan
+        // mode is specifically tuned for this access pattern) and reproduces T1's key order in
+        // the scratch output (base is key-sorted by induction -- see this function's top
+        // comment), without ever needing to touch a byte this cycle doesn't already know, via
+        // T1, to be live.
+        T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+        std::vector<std::byte> cold_buf;
+
+        constexpr uint64_t kFlushThresholdBytes = 64ULL * 1024 * 1024;
+        std::vector<std::byte> out_buffer;
+        out_buffer.reserve(kFlushThresholdBytes + (2 * 1024 * 1024));
+        auto flush_scratch = [&]() {
+          if (out_buffer.empty()) {
+            return;
+          }
+          std::size_t written = 0;
+          while (written < out_buffer.size()) {
+            const ssize_t n = ::write(scratch_guard.fd, out_buffer.data() + written, out_buffer.size() - written);
+            if (n < 0) {
+              throw std::system_error(errno, std::generic_category(), "write t2 defragment scratch file");
+            }
+            written += static_cast<std::size_t>(n);
+          }
+          out_buffer.clear();
+        };
+
+        for (uint64_t payload : live_payloads) {
+          auto view = try_read_base_record(mem, payload, BaseReader::kScan, &cold_buf);
+          if (view) {
+            append_record(out_buffer, view->key, view->value, view->header->version);
+          } else {
+            // Rare fallback (mincore()/pread() failure, or a defense-in-depth bounds check
+            // declined) -- t2_.at() needs no seqlock here despite being unsynchronized elsewhere
+            // in this file: offset < old_base_boundary is provably immutable for this whole
+            // phase, per the watermark freeze above (mirrors try_read_base_record()'s own
+            // BaseReader::kGet small-record case, which skips the seqlock for the same reason).
+            const T2RecordView record = t2_.at(payload & kOffsetMask, mem);
+            append_record(out_buffer, record.key, record.value, record.header->version);
+          }
+          if (out_buffer.size() >= kFlushThresholdBytes) {
+            flush_scratch();
+          }
+        }
+        flush_scratch();
+        next_offset = 0;  // Real output (fd_guard.fd) is still empty -- Phase 0 wrote to scratch.
+      }
 
       // Closes the residual window exactly like checkpoint_internal(): writer_stop_ blocks new
-      // writers from here on, so the destructive post-stop pass below is guaranteed to see the
+      // writers from here on, so tail_entries_.drain_and_clear() below is guaranteed to see the
       // complete, final live set with nothing left to arrive after it.
       const vmemkv::T2Memory *pre_swap_mem = t2_.get_memory();
       pre_stop_hook();
       t2_.stop_writers_and_wait(pre_swap_mem);
       WriterResumeGuard resume_guard{&t2_};
 
-      tail_entries_.drain_and_clear([&](const StoreKey &prefix, uint64_t hash) {
-        drained_this_cycle.emplace_back(prefix, hash);
-        relocate_one(prefix, hash);
-      });
+      // Phase 1: complete, final tail catch-up. No writer remains once stop_writers_and_wait()
+      // has returned (see this function's top comment for why that removes the race Phase 0's
+      // single watermark freeze alone could not close), so every candidate below is read exactly
+      // once, unsynchronized-but-defensively-via-seqlock, with no re-validation needed.
+      struct TailCandidate {
+        std::vector<std::byte> key;
+        std::vector<std::byte> value;
+        uint64_t version;
+        uint64_t hash;
+      };
+      std::vector<TailCandidate> tail_candidates;
+      {
+        struct Gathered {
+          StoreKey prefix;
+          uint64_t hash;
+          uint64_t offset;
+        };
+        std::vector<Gathered> gathered;
+        std::unordered_set<uint64_t> seen_offsets;
+        tail_entries_.drain_and_clear([&](const StoreKey &prefix, uint64_t hash) {
+          drained_this_cycle.emplace_back(prefix, hash);
+          const auto res = resolve_live_non_inline(prefix, hash);
+          if (!res) {
+            return;
+          }
+          const uint64_t offset = res->payload_bits & kOffsetMask;
+          if (!seen_offsets.insert(offset).second) {
+            return;  // Same key written more than once since the last cycle -- already captured.
+          }
+          gathered.push_back({prefix, res->raw_hash, offset});
+        });
+
+        T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+        tail_candidates.reserve(gathered.size());
+        for (const auto &g : gathered) {
+          TailCandidate tc;
+          tc.hash = g.hash;
+          uint64_t version = 0;
+          read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(g.offset, mem); },
+                                 [&](const T2RecordView &record) -> bool {
+                                   tc.key.assign(record.key.begin(), record.key.end());
+                                   tc.value.assign(record.value.begin(), record.value.end());
+                                   version = record.header->version;
+                                   return true;
+                                 });
+          tc.version = version;
+          tail_candidates.push_back(std::move(tc));
+        }
+        std::sort(tail_candidates.begin(), tail_candidates.end(), [](const TailCandidate &a, const TailCandidate &b) {
+          return byte_span_less(a.key, b.key);
+        });
+      }
+
+      // Final merge: Phase 0's key-sorted scratch output, merged with Phase 1's key-sorted tail
+      // candidates, into the real output file -- see this function's top comment for why this
+      // merge (not a plain append) is what keeps the base region key-sorted for the next cycle.
+      {
+        const uint64_t scratch_len = [&]() -> uint64_t {
+          struct ::stat st {};
+          if (::fstat(scratch_guard.fd, &st) != 0) {
+            throw std::system_error(errno, std::generic_category(), "fstat t2 defragment scratch file");
+          }
+          return static_cast<uint64_t>(st.st_size);
+        }();
+        SeqReader scratch_reader(scratch_guard.fd, scratch_len);
+        std::size_t tail_idx = 0;
+
+        constexpr uint64_t kFlushThresholdBytes = 64ULL * 1024 * 1024;
+        std::vector<std::byte> out_buffer;
+        out_buffer.reserve(kFlushThresholdBytes + (2 * 1024 * 1024));
+        auto flush_output = [&]() {
+          if (out_buffer.empty()) {
+            return;
+          }
+          std::size_t written = 0;
+          while (written < out_buffer.size()) {
+            const ssize_t n = ::write(fd_guard.fd, out_buffer.data() + written, out_buffer.size() - written);
+            if (n < 0) {
+              throw std::system_error(errno, std::generic_category(), "write t2 defragment temp file");
+            }
+            written += static_cast<std::size_t>(n);
+          }
+          next_offset += out_buffer.size();
+          maybe_sync_and_drop_checkpoint_cache(fd_guard.fd, next_offset, bytes_synced);
+          out_buffer.clear();
+        };
+        auto record_relocation =
+            [&](uint64_t hash, std::span<const std::byte> key, std::span<const std::byte> value, uint64_t version) {
+              const uint64_t out_offset = next_offset + out_buffer.size();
+              const uint64_t written_len = append_record(out_buffer, key, value, version);
+              const uint64_t block_count = written_len / kBlockAlignment;
+              assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
+              relocated[hash] = out_offset | (block_count << kSizeEmbeddingShift);
+              if (out_buffer.size() >= kFlushThresholdBytes) {
+                flush_output();
+              }
+            };
+
+        while (!scratch_reader.exhausted() || tail_idx < tail_candidates.size()) {
+          if (scratch_reader.exhausted()) {
+            const auto &tc = tail_candidates[tail_idx++];
+            record_relocation(tc.hash, tc.key, tc.value, tc.version);
+            continue;
+          }
+          const auto *header = scratch_reader.current();
+          const std::byte *key_begin = reinterpret_cast<const std::byte *>(header + 1);
+          const std::span<const std::byte> scratch_key(key_begin, header->key_len);
+
+          if (tail_idx >= tail_candidates.size()) {
+            const std::span<const std::byte> scratch_value(key_begin + header->key_len, header->value_len);
+            record_relocation(t1_detail::hash_full_key(scratch_key), scratch_key, scratch_value, header->version);
+            scratch_reader.advance();
+            continue;
+          }
+
+          const auto &tc = tail_candidates[tail_idx];
+          if (byte_span_less(tc.key, scratch_key)) {
+            record_relocation(tc.hash, tc.key, tc.value, tc.version);
+            ++tail_idx;
+          } else if (byte_span_less(scratch_key, tc.key)) {
+            const std::span<const std::byte> scratch_value(key_begin + header->key_len, header->value_len);
+            record_relocation(t1_detail::hash_full_key(scratch_key), scratch_key, scratch_value, header->version);
+            scratch_reader.advance();
+          } else {
+            // Same key in both: Phase 0's scratch copy is necessarily a since-superseded snapshot
+            // (base-resident, so only reachable here if a redirect created this exact tail
+            // candidate) -- the tail candidate always wins. Skip the scratch copy without writing
+            // it.
+            record_relocation(tc.hash, tc.key, tc.value, tc.version);
+            ++tail_idx;
+            scratch_reader.advance();
+          }
+        }
+        flush_output();
+      }
+
+      {
+        std::error_code remove_ec;
+        std::filesystem::remove(t2_scratch_path, remove_ec);
+      }
 
       const uint64_t new_base_boundary = next_offset;
 
@@ -911,10 +1198,12 @@ class VMemKVImpl {
       reorg_t2_count_.fetch_add(1, std::memory_order_relaxed);
     } catch (...) {
       // Nothing durable was ever published (T1 is only touched on the success path above), so
-      // this cycle's writes to the temp file are simply orphaned; remove it rather than leaving
-      // it to be silently overwritten (or mistaken for a stale one) by a future cycle.
+      // this cycle's writes to the temp/scratch files are simply orphaned; remove them rather
+      // than leaving them to be silently overwritten (or mistaken for stale ones) by a future
+      // cycle.
       std::error_code remove_ec;
       std::filesystem::remove(t2_tmp_path, remove_ec);
+      std::filesystem::remove(t2_scratch_path, remove_ec);
       for (const auto &[prefix, hash] : drained_this_cycle) {
         tail_entries_.record(prefix, hash);
       }

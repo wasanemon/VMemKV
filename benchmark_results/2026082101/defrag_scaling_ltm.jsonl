@@ -1,5 +1,10 @@
-{"scenario":"ltm","value_size":1024,"mode":"defrag","ratio":0.25,"churn_ratio":0,"key_count":2064888,"elapsed_sec":60,"timed_out":true}
-{"scenario":"ltm","value_size":65536,"mode":"defrag","ratio":0.25,"churn_ratio":0,"key_count":32760,"elapsed_sec":52.078,"timed_out":false}
-{"scenario":"ltm","value_size":65536,"mode":"defrag","ratio":0.5,"churn_ratio":0,"key_count":65520,"elapsed_sec":60,"timed_out":true}
-{"scenario":"ltm","value_size":"1KB","mode":"defrag_contention","ratio":1.0,"key_count":null,"elapsed_sec":300,"timed_out":true,"failure_reason":"outer_timeout"}
-{"scenario":"ltm","value_size":65536,"mode":"defrag_contention","ratio":1,"key_count":131040,"writer_threads":32,"isolated_write_tps":8042.01,"concurrent_write_tps":8553.22,"defrag_elapsed_sec":60,"timed_out":true}
+{"scenario":"ltm","value_size":1024,"mode":"defrag","ratio":0.25,"churn_ratio":0,"key_count":2064888,"elapsed_sec":9.69081,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"defrag","ratio":0.5,"churn_ratio":0,"key_count":4129776,"elapsed_sec":21.8369,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"defrag","ratio":0.75,"churn_ratio":0,"key_count":6194664,"elapsed_sec":29.3406,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"defrag","ratio":1,"churn_ratio":0,"key_count":8259552,"elapsed_sec":53.4393,"timed_out":false}
+{"scenario":"ltm","value_size":65536,"mode":"defrag","ratio":0.25,"churn_ratio":0,"key_count":32760,"elapsed_sec":6.88351,"timed_out":false}
+{"scenario":"ltm","value_size":65536,"mode":"defrag","ratio":0.5,"churn_ratio":0,"key_count":65520,"elapsed_sec":16.1825,"timed_out":false}
+{"scenario":"ltm","value_size":65536,"mode":"defrag","ratio":0.75,"churn_ratio":0,"key_count":98280,"elapsed_sec":20.0927,"timed_out":false}
+{"scenario":"ltm","value_size":65536,"mode":"defrag","ratio":1,"churn_ratio":0,"key_count":131040,"elapsed_sec":27.3907,"timed_out":false}
+{"scenario":"ltm","value_size":1024,"mode":"defrag_contention","ratio":1,"key_count":8259552,"writer_threads":32,"isolated_write_tps":49340.5,"concurrent_write_tps":10557.1,"defrag_elapsed_sec":60,"timed_out":true}
+{"scenario":"ltm","value_size":65536,"mode":"defrag_contention","ratio":1,"key_count":131040,"writer_threads":32,"isolated_write_tps":8096.79,"concurrent_write_tps":167.907,"defrag_elapsed_sec":60,"timed_out":true}
