@@ -787,7 +787,8 @@ def main():
     # otherwise insert a fresh section right after the Workload Winners section closes.
     section_open_marker = '<section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">'
 
-    def upsert_section(html, heading, icon_bg, icon_text, icon_name, title, description_html, table_html):
+    def upsert_section(html, heading, icon_bg, icon_text, icon_name, title, description_html, table_html,
+                       old_headings=()):
         if not table_html:
             return html
         section_html = f'''
@@ -804,7 +805,16 @@ def main():
         {table_html}
       </section>
 '''
-        heading_idx = html.find(heading)
+        # A prior report round may have used a different heading for what is now the same
+        # logical section (e.g. a rename, or dropping a "(new experiment)" suffix) -- check those
+        # first so the update-in-place path (below) still fires and the section's existing
+        # position is preserved, instead of appearing "not present" and being re-inserted
+        # elsewhere.
+        heading_idx = -1
+        for candidate in (heading, *old_headings):
+            heading_idx = html.find(candidate)
+            if heading_idx != -1:
+                break
         if heading_idx == -1:
             # Not present yet: insert right after the Workload Winners section closes.
             winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
@@ -836,44 +846,65 @@ def main():
 
     html = upsert_section(
         html,
-        heading="Insert vs. Checkpoint() Throughput (new experiment)",
+        heading="Insert vs. Checkpoint() Throughput",
         icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="gauge",
-        title="Insert vs. Checkpoint() Throughput (new experiment)",
+        title="Insert vs. Checkpoint() Throughput",
         description_html='checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()\'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).',
         table_html=render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data),
     )
     html = upsert_section(
         html,
-        heading="Insert vs. Defragment() Throughput (new experiment)",
+        heading="Insert vs. Defragment() Throughput",
         icon_bg="bg-amber-50", icon_text="text-amber-600", icon_name="gauge",
-        title="Insert vs. Defragment() Throughput (new experiment)",
-        description_html='defragment() relocates the entire live corpus every cycle (cost tracks corpus size, not churn), so unlike checkpoint() there is no single churn-scoped "steady-state" number -- the operationally relevant question is whether a full-corpus cycle (records/sec, the corpus-size sweep\'s own ratio=100% point below) completes faster than the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat defragment() full-corpus throughput reference line). Isolated (no concurrent writers) -- see the contention spot check below for how much this degrades under concurrent load.',
+        title="Insert vs. Defragment() Throughput",
+        description_html='defragment() relocates the entire live corpus every cycle (cost tracks corpus size, not churn), so unlike checkpoint() there is no single churn-scoped "steady-state" number -- the operationally relevant question is whether a full-corpus cycle (records/sec, the corpus-size sweep\'s own ratio=100% point below) completes faster than the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat defragment() full-corpus throughput reference line). Isolated (no concurrent writers) -- see the Maintenance Operations contention table at the bottom of this tab for how much this degrades under concurrent load.',
         table_html=render_defrag_vs_insert_table_html(defrag_throughput_data, raw_data),
     )
     html = upsert_section(
         html,
-        heading="Insert vs. Reorganize() Throughput (new experiment)",
+        heading="Insert vs. Reorganize() Throughput",
         icon_bg="bg-violet-50", icon_text="text-violet-600", icon_name="gauge",
-        title="Insert vs. Reorganize() Throughput (new experiment)",
+        title="Insert vs. Reorganize() Throughput",
         description_html='reorganize() (T1-only, never touches T2) rebuilds the whole T1 structure every call -- cost tracks corpus size, not churn, same character as defragment(). Full-corpus throughput (records/sec, the T1-only corpus-size sweep\'s own ratio=100% point) compared against the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab. Isolated (no concurrent writers).',
         table_html=render_reorg_vs_insert_table_html(reorg_throughput_data, raw_data),
     )
     html = upsert_section(
         html,
-        heading="Maintenance Operations: Concurrent-Write Contention (new experiment)",
-        icon_bg="bg-rose-50", icon_text="text-rose-600", icon_name="swords",
-        title="Maintenance Operations: Concurrent-Write Contention (new experiment)",
-        description_html='All three maintenance operations (checkpoint(), defragment(), reorganize()) side by side: how much does write throughput degrade while each runs concurrently (32 writer threads, full corpus), and how long does the operation itself take under that contention versus in isolation (see the Insert-vs-throughput tables above for the isolated numbers alone). reorganize()\'s own duration is often under a millisecond even at full corpus size (T1-only, in-memory) -- flagged inline where its concurrent-TPS figure is likely dominated by measurement noise rather than a real effect.',
-        table_html=render_maintenance_contention_html(defrag_contention_rows, maintenance_contention_data),
+        heading="Defragment Corpus-Size Scaling",
+        icon_bg="bg-amber-50", icon_text="text-amber-600", icon_name="scissors",
+        title="Defragment Corpus-Size Scaling",
+        description_html='<code class="bg-slate-100 px-1 rounded">defragment()</code> duration against an already-<code class="bg-slate-100 px-1 rounded">checkpoint()</code>ed corpus (a realistic pre-defragment state): a corpus-size sweep at churn_ratio=0 across all 4 scenario/value-size combos. defragment() relocates every live record regardless of which ones changed, so its cost tracks corpus size, not churn ratio -- confirmed once via a dedicated in_memory/1KB churn-ratio sweep (durations stayed flat across churn_ratio 0-1.0 at a fixed corpus size), not re-swept every round since that finding doesn\'t change from run to run. (Concurrent-write contention for defragment() is covered by the Maintenance Operations table at the bottom of this tab, alongside checkpoint() and reorganize().)',
+        table_html=render_defrag_scaling_html(defrag_corpus_rows, []),
+        old_headings=("Defragment Scaling & Contention (new experiment)", "Defragment Scaling & Contention"),
     )
     html = upsert_section(
         html,
-        heading="Defragment Scaling & Contention (new experiment)",
-        icon_bg="bg-amber-50", icon_text="text-amber-600", icon_name="scissors",
-        title="Defragment Scaling & Contention (new experiment)",
-        description_html='<code class="bg-slate-100 px-1 rounded">defragment()</code> duration against an already-<code class="bg-slate-100 px-1 rounded">checkpoint()</code>ed corpus (a realistic pre-defragment state): a corpus-size sweep at churn_ratio=0 across all 4 scenario/value-size combos, and a concurrent-write contention spot check (isolated vs. concurrent write throughput while defragment() runs). defragment() relocates every live record regardless of which ones changed, so its cost tracks corpus size, not churn ratio -- confirmed once via a dedicated in_memory/1KB churn-ratio sweep (durations stayed flat across churn_ratio 0-1.0 at a fixed corpus size), not re-swept every round since that finding doesn\'t change from run to run.',
-        table_html=render_defrag_scaling_html(defrag_corpus_rows, defrag_contention_rows),
+        heading="Maintenance Operations: Concurrent-Write Contention",
+        icon_bg="bg-rose-50", icon_text="text-rose-600", icon_name="swords",
+        title="Maintenance Operations: Concurrent-Write Contention",
+        description_html='All three maintenance operations (checkpoint(), defragment(), reorganize()) side by side: how much does write throughput degrade while each runs concurrently (32 writer threads, full corpus), and how long does the operation itself take under that contention versus in isolation (see the Insert-vs-throughput tables above for the isolated numbers alone). reorganize()\'s own duration is often under a millisecond even at full corpus size (T1-only, in-memory) -- flagged inline where its concurrent-TPS figure is likely dominated by measurement noise rather than a real effect.',
+        table_html=render_maintenance_contention_html(defrag_contention_rows, maintenance_contention_data),
     )
+    # upsert_section() only ever updates an existing section in place, never relocates it -- an
+    # earlier report round inserted "Maintenance Operations" before "Defragment Corpus-Size
+    # Scaling"; explicitly fix the order here (idempotent: no-op once already correct) rather than
+    # depend on call order alone, since call order only controls where a *never-before-seen*
+    # section lands.
+    maint_heading = "Maintenance Operations: Concurrent-Write Contention"
+    defrag_scaling_heading = "Defragment Corpus-Size Scaling"
+    maint_idx = html.find(maint_heading)
+    defrag_scaling_idx = html.find(defrag_scaling_heading)
+    if maint_idx != -1 and defrag_scaling_idx != -1 and maint_idx < defrag_scaling_idx:
+        section_start = html.rindex(section_open_marker, 0, maint_idx)
+        ws_start = section_start
+        while ws_start > 0 and html[ws_start - 1] in " \t\n":
+            ws_start -= 1
+        section_end = html.index("</section>", maint_idx) + len("</section>")
+        section_content = html[section_start:section_end].strip("\n")
+        html = html[:ws_start] + html[section_end:]
+        defrag_scaling_idx = html.find(defrag_scaling_heading)
+        anchor_close = html.index("</section>", defrag_scaling_idx) + len("</section>")
+        html = html[:anchor_close] + "\n      " + section_content + html[anchor_close:]
 
     # Per-tab "Insert vs. Checkpoint() Throughput" chart: one new canvas + section per tab,
     # inserted right after the existing Reorg Scaling Probe section (same sibling-block style),

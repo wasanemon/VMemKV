@@ -449,11 +449,110 @@
       </section>
       <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
+          <div class="p-2 bg-violet-50 text-violet-600 rounded-lg">
+            <i data-lucide="gauge" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Insert vs. Reorganize() Throughput</h3>
+            <p class="text-xs text-slate-500">reorganize() (T1-only, never touches T2) rebuilds the whole T1 structure every call -- cost tracks corpus size, not churn, same character as defragment(). Full-corpus throughput (records/sec, the T1-only corpus-size sweep's own ratio=100% point) compared against the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab. Isolated (no concurrent writers).</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
+<th class="py-2 px-3 font-bold text-slate-700">reorganize() full-corpus</th>
+<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">6,231,325/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.02x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">1,992,647/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.06x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">2,392,582/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.05x)</span></td></tr>
+<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">796,175/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.01x)</span></td></tr>
+</tbody></table></div>
+      </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
+            <i data-lucide="gauge" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Insert vs. Defragment() Throughput</h3>
+            <p class="text-xs text-slate-500">defragment() relocates the entire live corpus every cycle (cost tracks corpus size, not churn), so unlike checkpoint() there is no single churn-scoped "steady-state" number -- the operationally relevant question is whether a full-corpus cycle (records/sec, the corpus-size sweep's own ratio=100% point below) completes faster than the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab (Insert's 1/4/16/32-thread line vs. a flat defragment() full-corpus throughput reference line). Isolated (no concurrent writers) -- see the Maintenance Operations contention table at the bottom of this tab for how much this degrades under concurrent load.</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
+<th class="py-2 px-3 font-bold text-slate-700">defragment() full-corpus</th>
+<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">6,452,154/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.02x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">365,030/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.31x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">154,560/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.70x)</span></td></tr>
+<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">4,784/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">❌ Falls behind (2.47x)</span></td></tr>
+</tbody></table></div>
+      </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
+            <i data-lucide="gauge" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Insert vs. Checkpoint() Throughput</h3>
+            <p class="text-xs text-slate-500">checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert's 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
+<th class="py-2 px-3 font-bold text-slate-700">checkpoint() steady-state</th>
+<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">4,659,170/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.03x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">2,765,162/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.04x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">1,586,843/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.07x)</span></td></tr>
+<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">24,318/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.49x)</span></td></tr>
+</tbody></table></div>
+      </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
+            <i data-lucide="scissors" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Defragment Corpus-Size Scaling</h3>
+            <p class="text-xs text-slate-500"><code class="bg-slate-100 px-1 rounded">defragment()</code> duration against an already-<code class="bg-slate-100 px-1 rounded">checkpoint()</code>ed corpus (a realistic pre-defragment state): a corpus-size sweep at churn_ratio=0 across all 4 scenario/value-size combos. defragment() relocates every live record regardless of which ones changed, so its cost tracks corpus size, not churn ratio -- confirmed once via a dedicated in_memory/1KB churn-ratio sweep (durations stayed flat across churn_ratio 0-1.0 at a fixed corpus size), not re-swept every round since that finding doesn't change from run to run. (Concurrent-write contention for defragment() is covered by the Maintenance Operations table at the bottom of this tab, alongside checkpoint() and reorganize().)</p>
+          </div>
+        </div>
+        <h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide">Corpus-Size Sweep (churn=0)</h4>
+<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs"><thead><tr class="border-b border-slate-200 bg-slate-50/50"><th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th><th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th><th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th><th class="py-2 px-3 font-bold text-slate-700">defragment()</th></tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,000,000</td><td class="py-2 px-3">5.60s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,000,000</td><td class="py-2 px-3">12.33s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,000,000</td><td class="py-2 px-3">16.70s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">21.92s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">5,000,000</td><td class="py-2 px-3">0.77s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">10,000,000</td><td class="py-2 px-3">1.51s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">15,000,000</td><td class="py-2 px-3">2.28s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">20,000,000</td><td class="py-2 px-3">3.10s</td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,064,888</td><td class="py-2 px-3">9.69s</td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,129,776</td><td class="py-2 px-3">21.84s</td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,194,664</td><td class="py-2 px-3">29.34s</td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">53.44s</td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">32,760</td><td class="py-2 px-3">6.88s</td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">65,520</td><td class="py-2 px-3">16.18s</td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">98,280</td><td class="py-2 px-3">20.09s</td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">131,040</td><td class="py-2 px-3">27.39s</td></tr>
+</tbody></table></div>
+      </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
           <div class="p-2 bg-rose-50 text-rose-600 rounded-lg">
             <i data-lucide="swords" class="w-6 h-6"></i>
           </div>
           <div>
-            <h3 class="text-base font-bold text-slate-900">Maintenance Operations: Concurrent-Write Contention (new experiment)</h3>
+            <h3 class="text-base font-bold text-slate-900">Maintenance Operations: Concurrent-Write Contention</h3>
             <p class="text-xs text-slate-500">All three maintenance operations (checkpoint(), defragment(), reorganize()) side by side: how much does write throughput degrade while each runs concurrently (32 writer threads, full corpus), and how long does the operation itself take under that contention versus in isolation (see the Insert-vs-throughput tables above for the isolated numbers alone). reorganize()'s own duration is often under a millisecond even at full corpus size (T1-only, in-memory) -- flagged inline where its concurrent-TPS figure is likely dominated by measurement noise rather than a real effect.</p>
           </div>
         </div>
@@ -478,112 +577,6 @@
 <tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">checkpoint()</td><td class="py-2 px-3">7,810/s</td><td class="py-2 px-3">3,806/s</td><td class="py-2 px-3">51%</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">&ge;60s (timeout)</span></td></tr>
 <tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">defragment()</td><td class="py-2 px-3">8,097/s</td><td class="py-2 px-3">168/s</td><td class="py-2 px-3">98%</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">&ge;60s (timeout)</span></td></tr>
 <tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">reorganize()</td><td class="py-2 px-3">7,851/s</td><td class="py-2 px-3">11,539/s</td><td class="py-2 px-3">-47%</td><td class="py-2 px-3">0.01s  <span class="text-slate-400">(&lt;10ms window -- noisy, thread start/stop overhead dominates)</span></td></tr>
-</tbody></table></div>
-      </section>
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-violet-50 text-violet-600 rounded-lg">
-            <i data-lucide="gauge" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Insert vs. Reorganize() Throughput (new experiment)</h3>
-            <p class="text-xs text-slate-500">reorganize() (T1-only, never touches T2) rebuilds the whole T1 structure every call -- cost tracks corpus size, not churn, same character as defragment(). Full-corpus throughput (records/sec, the T1-only corpus-size sweep's own ratio=100% point) compared against the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab. Isolated (no concurrent writers).</p>
-          </div>
-        </div>
-        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
-<thead><tr class="border-b border-slate-200 bg-slate-50/50">
-<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
-<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
-<th class="py-2 px-3 font-bold text-slate-700">reorganize() full-corpus</th>
-<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
-</tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">6,231,325/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.02x)</span></td></tr>
-<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">1,992,647/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.06x)</span></td></tr>
-<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">2,392,582/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.05x)</span></td></tr>
-<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">796,175/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.01x)</span></td></tr>
-</tbody></table></div>
-      </section>
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
-            <i data-lucide="gauge" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Insert vs. Defragment() Throughput (new experiment)</h3>
-            <p class="text-xs text-slate-500">defragment() relocates the entire live corpus every cycle (cost tracks corpus size, not churn), so unlike checkpoint() there is no single churn-scoped "steady-state" number -- the operationally relevant question is whether a full-corpus cycle (records/sec, the corpus-size sweep's own ratio=100% point below) completes faster than the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab (Insert's 1/4/16/32-thread line vs. a flat defragment() full-corpus throughput reference line). Isolated (no concurrent writers) -- see the contention spot check below for how much this degrades under concurrent load.</p>
-          </div>
-        </div>
-        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
-<thead><tr class="border-b border-slate-200 bg-slate-50/50">
-<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
-<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
-<th class="py-2 px-3 font-bold text-slate-700">defragment() full-corpus</th>
-<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
-</tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">6,452,154/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.02x)</span></td></tr>
-<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">365,030/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.31x)</span></td></tr>
-<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">154,560/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.70x)</span></td></tr>
-<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">4,784/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">❌ Falls behind (2.47x)</span></td></tr>
-</tbody></table></div>
-      </section>
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
-            <i data-lucide="gauge" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Insert vs. Checkpoint() Throughput (new experiment)</h3>
-            <p class="text-xs text-slate-500">checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert's 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).</p>
-          </div>
-        </div>
-        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
-<thead><tr class="border-b border-slate-200 bg-slate-50/50">
-<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
-<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
-<th class="py-2 px-3 font-bold text-slate-700">checkpoint() steady-state</th>
-<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
-</tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">4,659,170/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.03x)</span></td></tr>
-<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">2,765,162/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.04x)</span></td></tr>
-<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">1,586,843/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.07x)</span></td></tr>
-<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">24,318/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.49x)</span></td></tr>
-</tbody></table></div>
-      </section>
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
-            <i data-lucide="scissors" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Defragment Scaling & Contention (new experiment)</h3>
-            <p class="text-xs text-slate-500"><code class="bg-slate-100 px-1 rounded">defragment()</code> duration against an already-<code class="bg-slate-100 px-1 rounded">checkpoint()</code>ed corpus (a realistic pre-defragment state): a corpus-size sweep at churn_ratio=0 across all 4 scenario/value-size combos, and a concurrent-write contention spot check (isolated vs. concurrent write throughput while defragment() runs). defragment() relocates every live record regardless of which ones changed, so its cost tracks corpus size, not churn ratio -- confirmed once via a dedicated in_memory/1KB churn-ratio sweep (durations stayed flat across churn_ratio 0-1.0 at a fixed corpus size), not re-swept every round since that finding doesn't change from run to run.</p>
-          </div>
-        </div>
-        <h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide">Corpus-Size Sweep (churn=0)</h4>
-<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs"><thead><tr class="border-b border-slate-200 bg-slate-50/50"><th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th><th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th><th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th><th class="py-2 px-3 font-bold text-slate-700">defragment()</th></tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,000,000</td><td class="py-2 px-3">5.60s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,000,000</td><td class="py-2 px-3">12.33s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,000,000</td><td class="py-2 px-3">16.70s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,000,000</td><td class="py-2 px-3">21.92s</td></tr>
-<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">5,000,000</td><td class="py-2 px-3">0.77s</td></tr>
-<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">10,000,000</td><td class="py-2 px-3">1.51s</td></tr>
-<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">15,000,000</td><td class="py-2 px-3">2.28s</td></tr>
-<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">20,000,000</td><td class="py-2 px-3">3.10s</td></tr>
-<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">2,064,888</td><td class="py-2 px-3">9.69s</td></tr>
-<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">4,129,776</td><td class="py-2 px-3">21.84s</td></tr>
-<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">6,194,664</td><td class="py-2 px-3">29.34s</td></tr>
-<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">8,259,552</td><td class="py-2 px-3">53.44s</td></tr>
-<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">25%</td><td class="py-2 px-3">32,760</td><td class="py-2 px-3">6.88s</td></tr>
-<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">50%</td><td class="py-2 px-3">65,520</td><td class="py-2 px-3">16.18s</td></tr>
-<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">75%</td><td class="py-2 px-3">98,280</td><td class="py-2 px-3">20.09s</td></tr>
-<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">100%</td><td class="py-2 px-3">131,040</td><td class="py-2 px-3">27.39s</td></tr>
-</tbody></table></div>
-<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4">Concurrent-Write Contention Spot Check (32 writer threads, ratio=1.0)</h4>
-<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs"><thead><tr class="border-b border-slate-200 bg-slate-50/50"><th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th><th class="py-2 px-3 font-bold text-slate-700">Isolated Write TPS</th><th class="py-2 px-3 font-bold text-slate-700">Concurrent Write TPS</th><th class="py-2 px-3 font-bold text-slate-700">Slowdown</th><th class="py-2 px-3 font-bold text-slate-700">defragment() duration</th></tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">119,679/s</td><td class="py-2 px-3">107,735/s</td><td class="py-2 px-3">10%</td><td class="py-2 px-3">4.13s</td></tr>
-<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">49,601/s</td><td class="py-2 px-3">17,683/s</td><td class="py-2 px-3">64%</td><td class="py-2 px-3">35.99s</td></tr>
-<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">49,340/s</td><td class="py-2 px-3">10,557/s</td><td class="py-2 px-3">79%</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
-<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">8,097/s</td><td class="py-2 px-3">168/s</td><td class="py-2 px-3">98%</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">≥60s (timeout)</span></td></tr>
 </tbody></table></div>
       </section>
 
