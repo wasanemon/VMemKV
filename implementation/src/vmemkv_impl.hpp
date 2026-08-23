@@ -1196,6 +1196,12 @@ class VMemKVImpl {
 
       reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
       reorg_t2_count_.fetch_add(1, std::memory_order_relaxed);
+      // Baseline for reorg_worker_loop()'s auto-trigger (defrag_growth_over_threshold()): this
+      // cycle's own output size, freshly relocated and therefore minimal for the corpus as it
+      // stands right now. Set on every successful cycle regardless of trigger source (auto or a
+      // caller's direct defragment() call), so the next automatic check always measures growth
+      // relative to the most recent actual cleanup.
+      bytes_used_at_last_defragment_.store(new_base_boundary, std::memory_order_relaxed);
     } catch (...) {
       // Nothing durable was ever published (T1 is only touched on the success path above), so
       // this cycle's writes to the temp/scratch files are simply orphaned; remove them rather
@@ -2079,6 +2085,21 @@ class VMemKVImpl {
   // reorg_worker_loop() to decide whether to call checkpoint()-equivalent behavior.
   auto wal_over_threshold() const -> bool { return wal_.size_bytes() >= ConfigT::WalMaxBytesSinceCheckpoint; }
 
+  // Whether T2's total footprint has grown enough since the last defragment_internal() cycle (or
+  // since startup, if none has ever run) to warrant another one. Used only by reorg_worker_loop().
+  // bytes_used, not base_boundary: bytes_used also counts whatever's currently in the tail, so
+  // growth here reflects total space consumed regardless of how recently checkpoint() last ran.
+  // Gated by DefragMinBytesBeforeTrigger so a store that hasn't reached a meaningful size yet
+  // doesn't pay for a cycle before there's anything worth reclaiming.
+  auto defrag_growth_over_threshold() const -> bool {
+    const uint64_t current = t2_.get_memory()->bytes_used.load(std::memory_order_acquire);
+    if (current < ConfigT::DefragMinBytesBeforeTrigger) {
+      return false;
+    }
+    const uint64_t baseline = bytes_used_at_last_defragment_.load(std::memory_order_acquire);
+    return current >= (baseline * ConfigT::DefragGrowthThresholdPercent) / 100;
+  }
+
   // Maps `capacity` bytes of `file_descriptor` MAP_PRIVATE and wraps the result in a T2Memory,
   // closing the fd in all cases. Shared by reorganize_internal()'s T2 rebuild and
   // load_checkpoint_if_present()'s fast-boot adoption. `bytes_used` is baked into the T2Memory
@@ -2374,12 +2395,15 @@ class VMemKVImpl {
         continue;
       }
       try {
-        // Explicit priority (tail-tracker pressure wins over WAL size). Note reorg_requested_
-        // (this wakeup's trigger) only ever fires on append-region/delete pressure (see
-        // maybe_reorganize_if_needed()) -- tail_entries_/WAL-size changes never themselves cause a
-        // wakeup, so this only checks them "while already awake anyway."
+        // Explicit priority: checkpoint pressure (tail-tracker or WAL size) wins over defragment
+        // growth, which wins over a plain T1-only reorganize. Note reorg_requested_ (this
+        // wakeup's trigger) only ever fires on append-region/delete pressure (see
+        // maybe_reorganize_if_needed()) -- tail_entries_/WAL-size/T2-footprint changes never
+        // themselves cause a wakeup, so this only checks them "while already awake anyway."
         if (tail_entries_.near_capacity() || wal_over_threshold()) {
           reorganize_internal(ReorgMode::Checkpoint);
+        } else if (defrag_growth_over_threshold()) {
+          reorganize_internal(ReorgMode::Defragment);
         } else {
           reorganize_internal(ReorgMode::T1Only);
         }
@@ -2519,6 +2543,11 @@ class VMemKVImpl {
   // update that's blocked slightly earlier than strictly necessary just takes the always-safe
   // out-of-place path instead.
   mutable std::atomic<uint64_t> capture_watermark_{0};
+
+  // reorg_worker_loop()'s auto-trigger baseline for defragment(): T2's total footprint
+  // (bytes_used) as of the end of the most recent successful defragment_internal() cycle, updated
+  // by that function itself regardless of trigger source. 0 until the first cycle ever completes.
+  std::atomic<uint64_t> bytes_used_at_last_defragment_{0};
 
   // Records (StoreKey prefix, hash) for every entry written into T2's tail region (offset >=
   // old_base_boundary) since the last checkpoint_internal() cycle, so copy_live_entries() can

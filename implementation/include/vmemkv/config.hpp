@@ -103,11 +103,18 @@ struct Config {
   // Default Tier 2 (T2) file storage capacity: 1 TiB.
   static constexpr size_t DefaultT2CapacityBytes = 1ULL << 40;
 
-  // Checkpoint trigger independent of T2StorageFragmentationThresholdPercent: once this many
-  // WAL bytes accumulate since the last checkpoint, a checkpoint fires regardless of
-  // fragmentation, bounding replay time for workloads that never trip the fragmentation
-  // trigger. See docs/specification/low_level_design.md 4.4.
+  // Checkpoint trigger independent of tail-tracker pressure: once this many WAL bytes accumulate
+  // since the last checkpoint, a checkpoint fires regardless of tail occupancy, bounding replay
+  // time for workloads that never trip the tail-capacity trigger. See
+  // docs/specification/low_level_design.md 4.4.
   static constexpr size_t WalMaxBytesSinceCheckpoint = 64ULL << 20;  // 64 MiB.
+
+  // defragment() auto-trigger (reorg_worker_loop()): fires once T2's total footprint has grown to
+  // DefragGrowthThresholdPercent of its size as of the last defragment cycle (200 = doubled), and
+  // only once that footprint has also passed DefragMinBytesBeforeTrigger -- avoids paying for a
+  // cycle before a store has grown large enough for accumulated dead space to matter.
+  static constexpr size_t DefragGrowthThresholdPercent = 200;
+  static constexpr size_t DefragMinBytesBeforeTrigger = 64ULL << 20;  // 64 MiB.
 
   static_assert(T1ReorganizeSoftThresholdPercent > 0 && T1ReorganizeSoftThresholdPercent < kPercentBase,
                 "T1ReorganizeSoftThresholdPercent must be in (0, 100)");
