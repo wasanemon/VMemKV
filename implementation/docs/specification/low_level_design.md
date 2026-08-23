@@ -326,7 +326,9 @@ T1 `reorganize` は、`append_region` のサイズに応じて自動的にバッ
 
 `checkpoint_internal()`(4.3 節)が解消しない Storage Fragmentation ―― Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ ―― を、`defragment_internal()` が解消する。生存中の Tier 2 record 全件を、T1 の key 順のまま新規ファイルへ連続した offset で再配置し、旧ファイルを丸ごと置き換える。
 
-`checkpoint_internal()` との違いは「record を動かすかどうか」の一点であり、それ以外の同期機構(`capture_watermark_`、`tail_entries_`、`T2FlatFile::stop_writers_and_wait()`、`t1_.reorganize()` の単一 publish ポイント、`T2Memory` 世代スワップ)は共有する。
+`checkpoint_internal()` との違いは「record を動かすかどうか」の一点であり、それ以外の同期機構(`tail_entries_`、`T2FlatFile::stop_writers_and_wait()`、`t1_.reorganize()` の単一 publish ポイント、`T2Memory` 世代スワップ、manifest commit、WAL rotate)は共有する。
+
+T2 の稼働中 mmap(`T2Memory::base`)は `MAP_PRIVATE` である(5.1 節)。in-place 更新は当該プロセスの COW ページに留まるのみで、`checkpoint_internal()`/`defragment_internal()` のいずれかが明示的に `pwrite()` するまでファイルへは反映されない。ある record が生存した後に上書きされ、その間に一度も durabilize されなかった場合、その古い slot にはファイル上のバイトが一切存在しない(ゼロ埋めでも hole でもなく、単に書かれていない)。したがって base 領域は「隙間のない record の連続」ではなく、オフセット順にバイト列を無条件でパースする方式は成立しない。Phase 0 が触れる record は例外なく、T1 が今この瞬間に保証する offset(`payload_bits`)経由でのみアドレスされ、直前の record の長さから推測することはない。
 
 **Input**
 
@@ -340,12 +342,13 @@ T1 `reorganize` は、`append_region` のサイズに応じて自動的にバッ
 
 **Procedure**
 
-1. 現在の tail 領域の生存 record 全件を対象に `capture_watermark_` を一括で前進させる(この時点の `bytes_used` へ)。以降このサイクルが完了するまで、それらの record への in-place 更新はすべて out-of-place へリダイレクトされる。base 領域の record はもとから in-place 更新の対象外のため、この barrier は不要。
-2. T1 を key 順に走査し、各生存 key の現在値を新規ファイルへ順番に `pwrite()` する。alloc_len は現在値のサイズちょうどに詰める(スラックを残さない)。この走査は writer をブロックしない。
-3. 走査中に生じた書き込みを `tail_entries_` から回収し、新規ファイルへ追記する形で再配置する(`checkpoint_internal()` の pre-stop パスと同じ反復収束)。
-4. `T2FlatFile::stop_writers_and_wait()` で新規書き込みを短時間だけ止め、直前まで残っていた差分を最後にもう一度回収・再配置する。
-5. `t1_.reorganize()` を1回呼び、生存 entry 全件の `payload_bits` を新しい offset/block_count へ、世代タグを新しい `T2Memory` の世代へ書き換える。
-6. 新しい `T2Memory` を publish し、writer を再開する。新規ファイルを正式なパスへ `rename()` する(Linux の unlink-while-open の性質により、旧ファイルの実データは既存の読者がいなくなるまで保持される ―― 明示的な `unlink()` は不要)。
+1. `capture_watermark_` をサイクル開始時に一度だけ `old_base_boundary` へ固定する(以降このサイクル中は動かさない)。base 領域の record は `try_in_place_update()` の `offset >= mem->base_boundary` チェックによりもともと in-place 更新の対象外のため、この一括固定だけで Phase 0 の全読み取りに対する不変性が保証される。tail 領域の catch-up はすべて手順4以降(writer 停止後)にのみ行うため、`checkpoint_internal()` の pre-stop パスのような record 単位の逐次前進は不要。
+2. `t1_.scan()` を1回走査し、`old_base_boundary` 未満の offset を持つ生存 entry 全件の `payload_bits`(offset + 埋め込み block_count)を `live_payloads` として収集し、offset 昇順にソートする(base 領域は前サイクルの出力自体が key 順で書かれているため、offset 昇順は key 順と一致する ―― 帰納的に次サイクルも同じ前提を維持する)。各 `payload_bits` を `try_read_base_record()`(`BaseReader::kScan`、この昇順アクセスパターン向けに調整された読み取りパス。稀に読み取りが成立しない場合は `t2_.at()` にフォールバックする ―― `offset < old_base_boundary` は手順1の固定によりこのフェーズ中不変なので、どちらの経路も seqlock は不要)で読み、スクラッチファイルへ offset 昇順(= key 順)のまま `pwrite()` する。この走査は writer をブロックしない。
+3. `T2FlatFile::stop_writers_and_wait()` で新規書き込みハンドルの発行を止め、発行済みハンドルが全て解放されるまで待つ。
+4. writer が完全に停止した状態で `tail_entries_` を `drain_and_clear()` により完全に回収する。各エントリの現在値を T1 から再解決して読み取り、key 順にソートする。writer が残っていないため、この回収は1回で生存集合を確定できる。
+5. 手順2のスクラッチファイル(offset 昇順 = key 順)と手順4の tail 候補(key 順)を、key をキーにマージソートの要領で本出力ファイルへマージする。同一 key が両方に存在する場合は tail 側が勝つ(スクラッチ側は base 領域からの読み取りであり、tail に候補があるということは既に上書きされた後の値である)。この merge が「base は常に key 順」という不変条件を次サイクルへ引き継ぐ。
+6. `t1_.reorganize()` を1回呼び、生存 entry 全件の `payload_bits` を手順5で確定した新しい offset/block_count へ、世代タグを新しい `T2Memory` の世代へ書き換える。同じ呼び出しの中で T1 checkpoint の一時ファイルを書き出す(temp + `rename`)。
+7. 新しい `T2Memory` を publish し、writer を再開する。新規ファイルを正式なパスへ `rename()` する(Linux の unlink-while-open の性質により、旧ファイルの実データは既存の読者がいなくなるまで保持される ―― 明示的な `unlink()` は不要)。manifest を書き `fsync` してアトミックに差し替え、WAL をローテーションする。
 
 **Effect**
 
