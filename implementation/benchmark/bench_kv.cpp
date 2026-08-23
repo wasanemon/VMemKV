@@ -1836,7 +1836,15 @@ namespace reorg_probe {
 
 constexpr int kReorgTimeoutSeconds = 60;
 
-enum class ProbeMode { kT1Only, kT1T2, kT1T2Steady, kDefrag, kDefragContention };
+enum class ProbeMode {
+  kT1Only,
+  kT1T2,
+  kT1T2Steady,
+  kDefrag,
+  kDefragContention,
+  kCheckpointContention,
+  kReorgContention
+};
 
 struct ProbeArgs {
   bool is_ltm = false;
@@ -1899,6 +1907,10 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
         args.mode = ProbeMode::kDefrag;
       } else if (value == "defrag_contention") {
         args.mode = ProbeMode::kDefragContention;
+      } else if (value == "checkpoint_contention") {
+        args.mode = ProbeMode::kCheckpointContention;
+      } else if (value == "reorg_contention") {
+        args.mode = ProbeMode::kReorgContention;
       } else {
         fail("unknown --mode: " + std::string(value));
       }
@@ -1914,8 +1926,8 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
-        "--mode=<t1only|t1t2|t1t2_steady|defrag|defrag_contention> --ratio=<0.0-1.0> "
-        "[--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>]");
+        "--mode=<t1only|t1t2|t1t2_steady|defrag|defrag_contention|checkpoint_contention|"
+        "reorg_contention> --ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>]");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
     fail("--ratio must be in (0.0, 1.0]");
@@ -1971,6 +1983,12 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
       break;
     case ProbeMode::kDefragContention:
       mode_name = "defrag_contention";  // Unreachable: this mode reports via its own print, below.
+      break;
+    case ProbeMode::kCheckpointContention:
+      mode_name = "checkpoint_contention";  // Unreachable: this mode reports via its own print, below.
+      break;
+    case ProbeMode::kReorgContention:
+      mode_name = "reorg_contention";  // Unreachable: this mode reports via its own print, below.
       break;
   }
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
@@ -2154,32 +2172,23 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   report_and_exit(args, key_count, elapsed_sec, timed_out);
 }
 
-// Defrag-contention mode: measures how much concurrent write throughput degrades while
-// defragment() is running, and defragment()'s own duration under that contention. Same
-// populate+checkpoint setup as run_defrag(), then two phases: an isolated write-TPS baseline
-// (fixed op count per thread, no concurrent defragment()), and a concurrent phase where writer
-// threads run continuously for defragment()'s entire duration (stop-flag controlled, joined right
-// after the timed call returns). --ratio scales corpus size; --churn-ratio is unused here.
-[[noreturn]] void run_defrag_contention(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_defragcontention_" +
-                           std::to_string(static_cast<int>(args.ratio * 100));
-
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  populate_random_order(*store, {key_count, args.val_size});
-  store->checkpoint();
-
+// Shared by run_checkpoint_contention()/run_defrag_contention()/run_reorg_contention(): measures
+// how much concurrent write throughput degrades while `run_operation` executes, and the
+// operation's own duration under that contention. Two phases: an isolated write-TPS baseline
+// (fixed op count per thread, no concurrent maintenance operation), and a concurrent phase where
+// writer threads run continuously for `run_operation`'s entire duration (stop-flag controlled,
+// joined right after the timed call returns). Returns {isolated_write_tps, concurrent_write_tps,
+// op_elapsed_sec, timed_out}; the caller (one per maintenance operation, since each prints its
+// own JSON field name for the timed duration) already did whatever corpus setup (populate/
+// checkpoint/churn) is appropriate for that operation before calling this.
+template <typename Store, typename OperationFn>
+auto run_contention_probe(Store &store, std::size_t key_count, uint32_t val_size, OperationFn &&run_operation)
+    -> std::tuple<double, double, double, bool> {
   const std::size_t writer_threads = std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 
   // stop == nullptr: run exactly fixed_ops then return. stop != nullptr: run until *stop is set,
   // ignoring fixed_ops, returning however many ops actually completed.
-  auto run_writer = [&store, key_count, val_size = args.val_size](
+  auto run_writer = [&store, key_count, val_size](
                         std::size_t seed_offset, const std::atomic<bool> *stop, std::size_t fixed_ops) -> std::size_t {
     std::mt19937_64 rng(kBenchmarkSeed + seed_offset);
     std::uniform_int_distribution<std::size_t> key_dist(0, key_count - 1);
@@ -2199,7 +2208,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     return done;
   };
 
-  // Phase A: isolated baseline -- fixed op count per thread, no concurrent defragment().
+  // Phase A: isolated baseline -- fixed op count per thread, no concurrent operation.
   constexpr std::size_t kOpsPerThreadBaseline = 20'000;
   double isolated_write_tps = 0.0;
   {
@@ -2216,7 +2225,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     isolated_write_tps = static_cast<double>(writer_threads * kOpsPerThreadBaseline) / elapsed;
   }
 
-  // Phase B: concurrent -- writer threads run continuously for defragment()'s entire duration.
+  // Phase B: concurrent -- writer threads run continuously for the operation's entire duration.
   std::atomic<bool> stop{false};
   std::vector<std::size_t> counts(writer_threads, 0);
   std::vector<std::thread> workers;
@@ -2225,7 +2234,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     workers.emplace_back([&run_writer, &counts, t, &stop] { counts[t] = run_writer(t + 1000, &stop, 0); });
   }
   const auto b0 = std::chrono::steady_clock::now();
-  auto [defrag_elapsed_sec, timed_out] = timed_run([&store]() { store->defragment(); });
+  auto [op_elapsed_sec, timed_out] = timed_run(std::forward<OperationFn>(run_operation));
   const auto b1 = std::chrono::steady_clock::now();
   stop.store(true, std::memory_order_relaxed);
   for (auto &w : workers) {
@@ -2238,12 +2247,127 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   }
   const double concurrent_write_tps = wall > 0.0 ? static_cast<double>(total_ops) / wall : 0.0;
 
+  return {isolated_write_tps, concurrent_write_tps, op_elapsed_sec, timed_out};
+}
+
+// Defrag-contention mode: same populate+checkpoint setup as run_defrag(). --ratio scales corpus
+// size; --churn-ratio is unused here.
+[[noreturn]] void run_defrag_contention(const ProbeArgs &args) {
+  using Store = vmemkv::variants::VMemKVStore;
+
+  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
+  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
+
+  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
+                           std::to_string(args.val_size) + "_defragcontention_" +
+                           std::to_string(static_cast<int>(args.ratio * 100));
+
+  auto store = make_vmemkv_fresh(
+      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+  populate_random_order(*store, {key_count, args.val_size});
+  store->checkpoint();
+
+  auto [isolated_write_tps, concurrent_write_tps, defrag_elapsed_sec, timed_out] =
+      run_contention_probe(store, key_count, args.val_size, [&store]() { store->defragment(); });
+
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
             << "," << "\"mode\":\"defrag_contention\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << writer_threads << ","
-            << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"key_count\":" << key_count << ","
+            << "\"writer_threads\":" << std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32})
+            << "," << "\"isolated_write_tps\":" << isolated_write_tps << ","
             << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
             << "\"defrag_elapsed_sec\":" << defrag_elapsed_sec << ","
+            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
+  std::_Exit(timed_out ? 124 : 0);
+}
+
+// Checkpoint-contention mode: same populate+checkpoint+pre-churn setup as run_steady()'s
+// t1t2_steady mode (a fixed 0.25 churn ratio -- isolates checkpoint()'s marginal per-record cost
+// from its fixed per-call setup overhead, same reasoning as run_checkpoint_throughput_probe.sh).
+// --ratio scales corpus size.
+[[noreturn]] void run_checkpoint_contention(const ProbeArgs &args) {
+  using Store = vmemkv::variants::VMemKVStore;
+
+  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
+  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
+
+  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
+                           std::to_string(args.val_size) + "_checkpointcontention_" +
+                           std::to_string(static_cast<int>(args.ratio * 100));
+
+  auto store = make_vmemkv_fresh(
+      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+  populate_random_order(*store, {key_count, args.val_size});
+  store->checkpoint();
+
+  constexpr double kPreChurnRatio = 0.25;
+  const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
+  std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000));
+  std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
+  std::vector<std::size_t> churn_indices(churn_count);
+  for (auto &idx : churn_indices) {
+    idx = churn_index_dist(churn_rng);
+  }
+  const std::size_t churn_threads =
+      std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
+  {
+    std::vector<std::thread> workers;
+    workers.reserve(churn_threads);
+    for (std::size_t t = 0; t < churn_threads; ++t) {
+      workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
+        for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
+          const std::size_t idx = churn_indices[i];
+          store->update(make_key(idx), make_value_for_key(idx, val_size));
+        }
+      });
+    }
+    for (auto &worker : workers) {
+      worker.join();
+    }
+  }
+
+  auto [isolated_write_tps, concurrent_write_tps, checkpoint_elapsed_sec, timed_out] =
+      run_contention_probe(store, key_count, args.val_size, [&store]() { store->checkpoint(); });
+
+  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
+            << "," << "\"mode\":\"checkpoint_contention\"," << "\"ratio\":" << args.ratio << ","
+            << "\"key_count\":" << key_count << ","
+            << "\"writer_threads\":" << std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32})
+            << "," << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
+            << "\"checkpoint_elapsed_sec\":" << checkpoint_elapsed_sec << ","
+            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
+  std::_Exit(timed_out ? 124 : 0);
+}
+
+// Reorg-contention mode: same populate+checkpoint setup as run_defrag_contention(). reorganize()
+// is T1-only (never touches T2); its cost tracks live key count, same character as
+// defragment()'s corpus-size dependence. --ratio scales corpus size.
+[[noreturn]] void run_reorg_contention(const ProbeArgs &args) {
+  using Store = vmemkv::variants::VMemKVStore;
+
+  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
+  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
+
+  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
+                           std::to_string(args.val_size) + "_reorgcontention_" +
+                           std::to_string(static_cast<int>(args.ratio * 100));
+
+  auto store = make_vmemkv_fresh(
+      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+  populate_random_order(*store, {key_count, args.val_size});
+  store->checkpoint();
+
+  auto [isolated_write_tps, concurrent_write_tps, reorg_elapsed_sec, timed_out] =
+      run_contention_probe(store, key_count, args.val_size, [&store]() { store->reorganize(); });
+
+  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
+            << "," << "\"mode\":\"reorg_contention\"," << "\"ratio\":" << args.ratio << ","
+            << "\"key_count\":" << key_count << ","
+            << "\"writer_threads\":" << std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32})
+            << "," << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
+            << "\"reorg_elapsed_sec\":" << reorg_elapsed_sec << ","
             << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
   std::_Exit(timed_out ? 124 : 0);
 }
@@ -2262,6 +2386,10 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     run_defrag(args);
   } else if (args.mode == ProbeMode::kDefragContention) {
     run_defrag_contention(args);
+  } else if (args.mode == ProbeMode::kCheckpointContention) {
+    run_checkpoint_contention(args);
+  } else if (args.mode == ProbeMode::kReorgContention) {
+    run_reorg_contention(args);
   } else {
     run_bootstrap(args);
   }

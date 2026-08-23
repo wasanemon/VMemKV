@@ -54,7 +54,7 @@
           <a href="../2026082101/defrag_scaling_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Defrag Scaling, LTM)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、defragment()を単体スタンドアロンrunで新規に計測(commit 49d9a53)。さらに、checkpoint()関連の3つの重複した実験を、Insertスループットと直接比較する単一の実験(churn_ratio=0.25での定常状態スループット、commit a85250c/1a74065)へ統合し、4コンボ全てで計測完了。当初、8B/1KB In-MemoryおよびLTM/1KBではcheckpoint()がInsertの10〜30倍以上のスループットを維持し余裕で追いつく一方、LTM/64KBではcheckpoint()の定常状態スループット(約4,518 records/sec)がInsertのピーク速度(約11,832 records/sec、32スレッド)を下回り、書き込み側が生成するchurnにcheckpoint()が追いつかない可能性を示していた。原因調査の結果、mmap_t2_memory()が全T2リマップ時に無条件で行っていたMADV_POPULATE_READ(既存コーパス全体を毎回イーガーに温め直す)がLTM/64KBのボトルネックと判明し、これを除去(commit 8dc60f7)。LTM/64KBのcheckpoint()定常状態スループットは約4,518→約13,015 records/secに改善し、Insertのピーク速度を上回るようになった(他3コンボも同等以上を維持)。一方この副作用として、defragment()のPhase 0(T1キー順の全コーパス走査)が、直前のcheckpoint()側mmap_t2_memory()呼び出しによる無条件ページキャッシュ温め直しの恩恵を失い、in_memory/1KB(6.26s→53.23s、ratio=0.25)やLTM/64KB(36.43s→52.08s、ratio=0.25)で大幅に悪化した。defragment()自身の先頭にプリフェッチを配置する対策(単一スレッド版・8スレッド並列版の両方)を検証したが、いずれもプリフェッチなしの状態よりさらに悪化したため断念。checkpoint()の改善(本ラウンドの主目的)を優先し、defragment()側のこの退行は許容する方針とした。 さらに、checkpoint()のpre-stopコピーパス(まだwriterが動いている間の先行コピー)をディスクI/O帯域を活かすため8スレッド並列化(chunk分割 + 各ワーカーが自前のT2MemoryHandleを保持)。capture_watermarkはインクリメンタルではなくバッチの最高オフセットまで一括前倒しに変更(正しさは維持——out-of-place化がより早めに発火するだけ)。post-stopパス(writer停止後の小さな取りこぼし回収)は単一スレッドのまま。効果はディスク帯域律速だったLTM系で顕著:LTM/64KBは約13,015→約24,318 records/sec(約1.87倍、Insertピークの約2倍の余裕を確保)、LTM/1KBは約1,063,000→約1,586,918 records/sec(約1.49倍)。ディスクI/Oが支配的でないIn-Memory系はほぼ横ばい(想定通り)。4コンボ全てで退行なし。 さらに、defragment()をシーケンシャル書き換え方式に再実装(T2のbase領域はMAP_PRIVATEで、生存中に一度もdurabilizeされなかったレコードは物理的に一度も書かれないため、生バイトを順次パースするブラインドスキャンは原理的に成立しない——T1が今保証するオフセットのみをtry_read_base_record()で個別に読む方式に変更)。churn=0のコーパスサイズスイープ(4コンボ×25/50/75/100%、計16点)が全て完走するようになった(旧実装はin_memory/1KB・ltm/1KB・ltm/64KBの複数点でタイムアウト)。フルコーパスでの負荷率(r=defragmentスループット/Insert実効レート、小さいほど余裕): in_memory/8B r=0.019、in_memory/1KB r=0.136、ltm/1KB r=0.319(いずれも余裕あり)。ltm/64KBのみ r=1.69で単一スレッドではInsertに追いつかない(並列化が次の課題)。さらに、並行書き込み下でのcontentionチェックで新たな重大な課題が判明: defragment()自体がltm/1KB・ltm/64KBで60秒の内部タイムアウトに到達し(単独実行なら余裕を持って完走する同じフルコーパスにもかかわらず)、同時書き込みTPSもltm/1KBで-79%、ltm/64KBで-98%(ほぼ書き込みが止まる)と大きく低下した。バックプレッシャー機構は未設計のまま。</p>
+      <p class="text-slate-500 text-sm max-w-3xl">VMemKV クローンT2チェックポイントのスパースファイル対応(commit 4a7084c)により、これまで全ての4並列フルベンチ試行を失敗させていたディスク枯渇バグを修正。本ラウンドはその修正後、初めて4シナリオ全てが成功したフルラン。加えて、defragment()を単体スタンドアロンrunで新規に計測(commit 49d9a53)。さらに、checkpoint()関連の3つの重複した実験を、Insertスループットと直接比較する単一の実験(churn_ratio=0.25での定常状態スループット、commit a85250c/1a74065)へ統合し、4コンボ全てで計測完了。当初、8B/1KB In-MemoryおよびLTM/1KBではcheckpoint()がInsertの10〜30倍以上のスループットを維持し余裕で追いつく一方、LTM/64KBではcheckpoint()の定常状態スループット(約4,518 records/sec)がInsertのピーク速度(約11,832 records/sec、32スレッド)を下回り、書き込み側が生成するchurnにcheckpoint()が追いつかない可能性を示していた。原因調査の結果、mmap_t2_memory()が全T2リマップ時に無条件で行っていたMADV_POPULATE_READ(既存コーパス全体を毎回イーガーに温め直す)がLTM/64KBのボトルネックと判明し、これを除去(commit 8dc60f7)。LTM/64KBのcheckpoint()定常状態スループットは約4,518→約13,015 records/secに改善し、Insertのピーク速度を上回るようになった(他3コンボも同等以上を維持)。一方この副作用として、defragment()のPhase 0(T1キー順の全コーパス走査)が、直前のcheckpoint()側mmap_t2_memory()呼び出しによる無条件ページキャッシュ温め直しの恩恵を失い、in_memory/1KB(6.26s→53.23s、ratio=0.25)やLTM/64KB(36.43s→52.08s、ratio=0.25)で大幅に悪化した。defragment()自身の先頭にプリフェッチを配置する対策(単一スレッド版・8スレッド並列版の両方)を検証したが、いずれもプリフェッチなしの状態よりさらに悪化したため断念。checkpoint()の改善(本ラウンドの主目的)を優先し、defragment()側のこの退行は許容する方針とした。 さらに、checkpoint()のpre-stopコピーパス(まだwriterが動いている間の先行コピー)をディスクI/O帯域を活かすため8スレッド並列化(chunk分割 + 各ワーカーが自前のT2MemoryHandleを保持)。capture_watermarkはインクリメンタルではなくバッチの最高オフセットまで一括前倒しに変更(正しさは維持——out-of-place化がより早めに発火するだけ)。post-stopパス(writer停止後の小さな取りこぼし回収)は単一スレッドのまま。効果はディスク帯域律速だったLTM系で顕著:LTM/64KBは約13,015→約24,318 records/sec(約1.87倍、Insertピークの約2倍の余裕を確保)、LTM/1KBは約1,063,000→約1,586,918 records/sec(約1.49倍)。ディスクI/Oが支配的でないIn-Memory系はほぼ横ばい(想定通り)。4コンボ全てで退行なし。 さらに、defragment()をシーケンシャル書き換え方式に再実装(T2のbase領域はMAP_PRIVATEで、生存中に一度もdurabilizeされなかったレコードは物理的に一度も書かれないため、生バイトを順次パースするブラインドスキャンは原理的に成立しない——T1が今保証するオフセットのみをtry_read_base_record()で個別に読む方式に変更)。churn=0のコーパスサイズスイープ(4コンボ×25/50/75/100%、計16点)が全て完走するようになった(旧実装はin_memory/1KB・ltm/1KB・ltm/64KBの複数点でタイムアウト)。フルコーパスでの負荷率(r=defragmentスループット/Insert実効レート、小さいほど余裕): in_memory/8B r=0.019、in_memory/1KB r=0.136、ltm/1KB r=0.319(いずれも余裕あり)。ltm/64KBのみ r=1.69で単一スレッドではInsertに追いつかない(並列化が次の課題)。さらに、並行書き込み下でのcontentionチェックで新たな重大な課題が判明: defragment()自体がltm/1KB・ltm/64KBで60秒の内部タイムアウトに到達し(単独実行なら余裕を持って完走する同じフルコーパスにもかかわらず)、同時書き込みTPSもltm/1KBで-79%、ltm/64KBで-98%(ほぼ書き込みが止まる)と大きく低下した。バックプレッシャー機構は未設計のまま。 さらに、checkpoint()とreorganize()についても、defragment()と同じ形式のInsertスループット比較(サマリータブ表+各タブチャート)を追加。両方ともフルコーパスのデータは既存のスイープを再利用(checkpoint()は定常状態churn_ratio=0.25の別プローブ、defragment()・reorganize()はcorpus-size sweepのratio=100%地点)。結果: reorganize()(T1-only)はどのコンボでもInsertを大幅に上回る(数百万rec/sec)。加えて、3種の保守処理(checkpoint()・defragment()・reorganize())を横断した並行書き込みcontention比較表を新設。ltm/64KBでcheckpoint()も並行実行下では60秒タイムアウトに到達する(単独実行なら数秒で完了)ことが判明——並行TPS問題はdefragment()だけでなくcheckpoint()にも及ぶ。reorganize()は完了が1ミリ秒未満のため、contention計測はノイズが支配的である旨を表中に明記。</p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -449,6 +449,62 @@
       </section>
       <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
+          <div class="p-2 bg-rose-50 text-rose-600 rounded-lg">
+            <i data-lucide="swords" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Maintenance Operations: Concurrent-Write Contention (new experiment)</h3>
+            <p class="text-xs text-slate-500">All three maintenance operations (checkpoint(), defragment(), reorganize()) side by side: how much does write throughput degrade while each runs concurrently (32 writer threads, full corpus), and how long does the operation itself take under that contention versus in isolation (see the Insert-vs-throughput tables above for the isolated numbers alone). reorganize()'s own duration is often under a millisecond even at full corpus size (T1-only, in-memory) -- flagged inline where its concurrent-TPS figure is likely dominated by measurement noise rather than a real effect.</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Operation</th>
+<th class="py-2 px-3 font-bold text-slate-700">Isolated Write TPS</th>
+<th class="py-2 px-3 font-bold text-slate-700">Concurrent Write TPS</th>
+<th class="py-2 px-3 font-bold text-slate-700">Slowdown</th>
+<th class="py-2 px-3 font-bold text-slate-700">Operation Duration</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">checkpoint()</td><td class="py-2 px-3">100,738/s</td><td class="py-2 px-3">72,230/s</td><td class="py-2 px-3">28%</td><td class="py-2 px-3">5.02s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">defragment()</td><td class="py-2 px-3">119,679/s</td><td class="py-2 px-3">107,735/s</td><td class="py-2 px-3">10%</td><td class="py-2 px-3">4.13s</td></tr>
+<tr><td class="py-2 px-3">in_memory_8B</td><td class="py-2 px-3">reorganize()</td><td class="py-2 px-3">125,120/s</td><td class="py-2 px-3">1,258,380/s</td><td class="py-2 px-3">-906%</td><td class="py-2 px-3">0.00s  <span class="text-slate-400">(&lt;10ms window -- noisy, thread start/stop overhead dominates)</span></td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">checkpoint()</td><td class="py-2 px-3">49,375/s</td><td class="py-2 px-3">19,027/s</td><td class="py-2 px-3">61%</td><td class="py-2 px-3">2.89s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">defragment()</td><td class="py-2 px-3">49,601/s</td><td class="py-2 px-3">17,683/s</td><td class="py-2 px-3">64%</td><td class="py-2 px-3">35.99s</td></tr>
+<tr><td class="py-2 px-3">in_memory_1KB</td><td class="py-2 px-3">reorganize()</td><td class="py-2 px-3">55,342/s</td><td class="py-2 px-3">925,014/s</td><td class="py-2 px-3">-1571%</td><td class="py-2 px-3">0.00s  <span class="text-slate-400">(&lt;10ms window -- noisy, thread start/stop overhead dominates)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">checkpoint()</td><td class="py-2 px-3">31,380/s</td><td class="py-2 px-3">6,417/s</td><td class="py-2 px-3">80%</td><td class="py-2 px-3">5.68s</td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">defragment()</td><td class="py-2 px-3">49,340/s</td><td class="py-2 px-3">10,557/s</td><td class="py-2 px-3">79%</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">&ge;60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_1KB</td><td class="py-2 px-3">reorganize()</td><td class="py-2 px-3">48,723/s</td><td class="py-2 px-3">438,606/s</td><td class="py-2 px-3">-800%</td><td class="py-2 px-3">0.00s  <span class="text-slate-400">(&lt;10ms window -- noisy, thread start/stop overhead dominates)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">checkpoint()</td><td class="py-2 px-3">7,810/s</td><td class="py-2 px-3">3,806/s</td><td class="py-2 px-3">51%</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">&ge;60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">defragment()</td><td class="py-2 px-3">8,097/s</td><td class="py-2 px-3">168/s</td><td class="py-2 px-3">98%</td><td class="py-2 px-3"><span class="text-rose-600 font-semibold">&ge;60s (timeout)</span></td></tr>
+<tr><td class="py-2 px-3">ltm_64KB</td><td class="py-2 px-3">reorganize()</td><td class="py-2 px-3">7,851/s</td><td class="py-2 px-3">11,539/s</td><td class="py-2 px-3">-47%</td><td class="py-2 px-3">0.01s  <span class="text-slate-400">(&lt;10ms window -- noisy, thread start/stop overhead dominates)</span></td></tr>
+</tbody></table></div>
+      </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-violet-50 text-violet-600 rounded-lg">
+            <i data-lucide="gauge" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Insert vs. Reorganize() Throughput (new experiment)</h3>
+            <p class="text-xs text-slate-500">reorganize() (T1-only, never touches T2) rebuilds the whole T1 structure every call -- cost tracks corpus size, not churn, same character as defragment(). Full-corpus throughput (records/sec, the T1-only corpus-size sweep's own ratio=100% point) compared against the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab. Isolated (no concurrent writers).</p>
+          </div>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
+<thead><tr class="border-b border-slate-200 bg-slate-50/50">
+<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>
+<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>
+<th class="py-2 px-3 font-bold text-slate-700">reorganize() full-corpus</th>
+<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>
+</tr></thead><tbody class="divide-y divide-slate-100">
+<tr><td class="py-2 px-3">8B_In-Memory</td><td class="py-2 px-3">141,478/s</td><td class="py-2 px-3">6,231,325/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.02x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_In-Memory</td><td class="py-2 px-3">112,199/s</td><td class="py-2 px-3">1,992,647/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.06x)</span></td></tr>
+<tr><td class="py-2 px-3">1KB_LTM</td><td class="py-2 px-3">108,825/s</td><td class="py-2 px-3">2,392,582/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.05x)</span></td></tr>
+<tr><td class="py-2 px-3">64KB_LTM</td><td class="py-2 px-3">11,832/s</td><td class="py-2 px-3">796,175/s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">✅ Keeps up (0.01x)</span></td></tr>
+</tbody></table></div>
+      </section>
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
           <div class="p-2 bg-amber-50 text-amber-600 rounded-lg">
             <i data-lucide="gauge" class="w-6 h-6"></i>
           </div>
@@ -741,6 +797,26 @@
           <textarea id="memo-8b_in_memory-defrag-throughput" oninput="saveMemo('8b_in_memory-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-violet-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Reorganize() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-violet-600">紫色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(T1-only)のフルコーパススループット(T1-only コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。単独実行(並行書き込みなし)での比較。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-8b_in_memory-reorg-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-8b_in_memory-reorg-throughput" oninput="saveMemo('8b_in_memory-reorg-throughput', this.value)" placeholder="Reorganize Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
     </div>
     <div id="tab-1kb-inmem" class="tab-content space-y-12">
       <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -943,6 +1019,26 @@
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
           <textarea id="memo-1kb_in_memory-defrag-throughput" oninput="saveMemo('1kb_in_memory-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-violet-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Reorganize() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-violet-600">紫色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(T1-only)のフルコーパススループット(T1-only コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。単独実行(並行書き込みなし)での比較。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_in_memory-reorg-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_in_memory-reorg-throughput" oninput="saveMemo('1kb_in_memory-reorg-throughput', this.value)" placeholder="Reorganize Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
     </div>
@@ -1149,6 +1245,26 @@
           <textarea id="memo-1kb_ltm-defrag-throughput" oninput="saveMemo('1kb_ltm-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-violet-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Reorganize() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-violet-600">紫色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(T1-only)のフルコーパススループット(T1-only コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。単独実行(並行書き込みなし)での比較。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-1kb_ltm-reorg-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-1kb_ltm-reorg-throughput" oninput="saveMemo('1kb_ltm-reorg-throughput', this.value)" placeholder="Reorganize Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
     </div>
     <div id="tab-64kb-ltm" class="tab-content space-y-12">
       <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -1351,6 +1467,26 @@
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
           <textarea id="memo-64kb_ltm-defrag-throughput" oninput="saveMemo('64kb_ltm-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+        </div>
+      </div>
+      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
+        <div class="flex items-center gap-3">
+          <div class="w-2 h-6 bg-violet-500 rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Reorganize() Full-Corpus Throughput</h2>
+        </div>
+        <p class="text-sm text-slate-500">
+          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-violet-600">紫色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(T1-only)のフルコーパススループット(T1-only コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。単独実行(並行書き込みなし)での比較。
+        </p>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
+            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
+            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
+          </div>
+          <div class="h-80 relative"><canvas id="chart-64kb_ltm-reorg-throughput"></canvas></div>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
+          <textarea id="memo-64kb_ltm-reorg-throughput" oninput="saveMemo('64kb_ltm-reorg-throughput', this.value)" placeholder="Reorganize Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
     </div>
@@ -9824,6 +9960,28 @@
     "records_per_sec": 4784.105554074923
   }
 };
+    const reorgThroughputData = {
+  "8B_In-Memory": {
+    "key_count": 20000000,
+    "elapsed_sec": 3.20959,
+    "records_per_sec": 6231325.496402968
+  },
+  "1KB_In-Memory": {
+    "key_count": 8000000,
+    "elapsed_sec": 4.01476,
+    "records_per_sec": 1992647.1320826153
+  },
+  "1KB_LTM": {
+    "key_count": 8259552,
+    "elapsed_sec": 3.45215,
+    "records_per_sec": 2392582.0141071505
+  },
+  "64KB_LTM": {
+    "key_count": 131040,
+    "elapsed_sec": 0.164587,
+    "records_per_sec": 796174.6675010785
+  }
+};
     const workloads = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"];
     const valSizes  = ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"];
 
@@ -10360,6 +10518,71 @@
       };
     }
 
+    function makeReorgVsInsertConfig(valSizeKey) {
+      const rg = reorgThroughputData[valSizeKey];
+      const insertSeries = rawData[valSizeKey] && rawData[valSizeKey]['Insert'] && rawData[valSizeKey]['Insert']['+Inline'];
+      if (!rg || !insertSeries) return null;
+      const threadLabels = [1, 4, 16, 32];
+      return {
+        type: 'line',
+        data: {
+          labels: threadLabels,
+          datasets: [
+            {
+              label: 'Insert (+Inline)',
+              data: insertSeries,
+              borderColor: '#6366f1',
+              backgroundColor: 'transparent',
+              borderWidth: 2,
+              tension: 0.2, fill: false,
+              pointRadius: 3.5,
+            },
+            {
+              label: 'reorganize() full-corpus',
+              data: threadLabels.map(() => rg.records_per_sec),
+              borderColor: '#7c3aed',
+              backgroundColor: 'transparent',
+              borderWidth: 2,
+              borderDash: [6, 4],
+              pointRadius: 0,
+              fill: false,
+            },
+          ],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 900, easing: 'easeInOutQuart' },
+          plugins: {
+            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: 'rgba(15,23,42,0.95)',
+              titleFont: {size:12,family:'Inter',weight:'bold'},
+              bodyFont: {size:11,family:'Inter'},
+              padding:10, cornerRadius:8,
+              callbacks: {
+                title: items => `${items[0].label} threads`,
+                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw)}/s`
+              }
+            }
+          },
+          scales: {
+            x: {
+              title: { display:true, text:'Threads', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8' }
+            },
+            y: {
+              type: 'logarithmic',
+              title: { display:true, text:'Throughput (records/sec, log scale)', font:{size:11,family:'Inter'}, color:'#64748b' },
+              grid: { color:'rgba(100,116,139,0.08)' },
+              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
+            }
+          }
+        }
+      };
+    }
+
     function initCharts() {
       for (const valSize of valSizes) {
         for (const op of workloads) {
@@ -10401,6 +10624,12 @@
         if (dfCanvas) {
           const cfg3 = makeDefragVsInsertConfig(valSize);
           if (cfg3) new Chart(dfCanvas, cfg3);
+        }
+        const rgEid = valSize.toLowerCase().replace(/-/g,'_') + '-reorg-throughput';
+        const rgCanvas = document.getElementById('chart-' + rgEid);
+        if (rgCanvas) {
+          const cfg4 = makeReorgVsInsertConfig(valSize);
+          if (cfg4) new Chart(rgCanvas, cfg4);
         }
       }
     }

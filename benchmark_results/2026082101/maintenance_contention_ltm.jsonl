@@ -1,0 +1,4 @@
+{"scenario":"ltm","value_size":1024,"mode":"checkpoint_contention","ratio":1,"key_count":8259552,"writer_threads":32,"isolated_write_tps":31379.9,"concurrent_write_tps":6416.69,"checkpoint_elapsed_sec":5.68451,"timed_out":false}
+{"scenario":"ltm","value_size":65536,"mode":"checkpoint_contention","ratio":1,"key_count":131040,"writer_threads":32,"isolated_write_tps":7809.56,"concurrent_write_tps":3806.19,"checkpoint_elapsed_sec":60,"timed_out":true}
+{"scenario":"ltm","value_size":1024,"mode":"reorg_contention","ratio":1,"key_count":8259552,"writer_threads":32,"isolated_write_tps":48723.3,"concurrent_write_tps":438606,"reorg_elapsed_sec":0.000191417,"timed_out":false}
+{"scenario":"ltm","value_size":65536,"mode":"reorg_contention","ratio":1,"key_count":131040,"writer_threads":32,"isolated_write_tps":7850.85,"concurrent_write_tps":11539.3,"reorg_elapsed_sec":0.0053405,"timed_out":false}
