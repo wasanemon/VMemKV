@@ -7,14 +7,19 @@
 - Use **Spot** Instances for the AWS EC2 instances to reduce costs.
 - Check remaining AWS EC2 instances and terminate them periodically to avoid unnecessary costs.
 - Do not consume too much disk space in the local machine.
-- Source code comments and design docs (e.g. `low_level_design.md`) must be declarative: describe
-  the current system only. Never narrate history, rationale, or process ("we had X, measured Y,
-  removed it because Z") inside them — that belongs in the commit message, not the file.
+- Source code comments and design docs (e.g. `low_level_design.md`, `*_redesign_proposal.md`) must
+  be declarative: describe the current system only. Never narrate history, rationale, or process
+  ("we had X, measured Y, removed it because Z", "deferred for now, reconsider if Y") inside them —
+  that belongs in the commit message, or in `docs/benchmark/`, not the file.
     - When removing a feature/tag/config, delete it and its comments outright. Do not leave a
       comment behind explaining that something no longer exists or why it was removed.
     - If the removal's rationale is genuinely worth preserving beyond the commit message, do not
       write it into source/docs unprompted — propose a separate, dedicated decision-record
       document and get the user's go-ahead before creating it.
+    - `docs/benchmark/*.md` (dated files, e.g. `20260809_ltm_64kb_get_hit_profiling.md`) is the one
+      place narrative belongs: measurement results, investigation write-ups, rejected alternatives,
+      and the reasoning behind a design decision may all be written there at any length. A
+      declarative doc may link to one of these for the backstory instead of inlining it.
 - Never diagnose a performance bottleneck, or propose/discuss a design change to fix one, from
   code-reading or reasoning alone. Measure first (add timers, profile, break down the call into
   its component phases) and let the numbers name the actual bottleneck before proposing a fix —
