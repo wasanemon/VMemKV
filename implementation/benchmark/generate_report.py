@@ -266,9 +266,12 @@ def build_maintenance_contention_data(report_dir):
     {scenario_val: {"checkpoint": {...}, "reorganize": {...}}}, matching build_defrag_scaling_data()'s
     own contention-row shape (isolated_write_tps/concurrent_write_tps/elapsed_sec/timed_out) so
     both can feed the same table renderer -- see render_maintenance_contention_html(). reorganize()
-    (T1-only) often completes in well under a millisecond even at full corpus size, so its
-    concurrent_write_tps figure is noisy (thread start/stop overhead dominates such a short
-    window) -- flagged inline in the rendered table rather than hidden."""
+    (T1-only) often completes in well under a millisecond even at full corpus size -- its
+    concurrent_write_tps figure is a mean over many repeated reorganize() calls spanning at least
+    a second (bench_kv's run_reorg_contention() passes min_wall_seconds=1.0 to
+    run_contention_probe() for this reason), not a single call's window, so it isn't noise despite
+    the tiny per-call duration -- flagged inline in the rendered table so the duration figure
+    itself isn't mistaken for that window."""
     data = {}
     for fname in ["maintenance_contention_in_memory.jsonl", "maintenance_contention_ltm.jsonl"]:
         path = report_dir / fname
@@ -620,7 +623,8 @@ def render_maintenance_contention_html(defrag_contention_rows, maintenance_conte
             conc = r["concurrent_write_tps"]
             status = (f'<span class="text-rose-600 font-semibold">&ge;{r["elapsed_sec"]:.0f}s (timeout)</span>'
                       if r["timed_out"] else f'{r["elapsed_sec"]:.2f}s')
-            note = ('  <span class="text-slate-400">(&lt;10ms window -- noisy, thread start/stop overhead dominates)</span>'
+            note = ('  <span class="text-slate-400">(single-call duration -- Isolated/Concurrent TPS above are '
+                    'averaged over many repeated calls spanning &ge;1s, not this one call)</span>'
                     if op == "reorganize" and r["elapsed_sec"] < 0.01 else "")
             if iso:
                 pct = (1 - conc / iso) * 100
