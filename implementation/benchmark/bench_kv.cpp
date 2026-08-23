@@ -2181,9 +2181,22 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 // op_elapsed_sec, timed_out}; the caller (one per maintenance operation, since each prints its
 // own JSON field name for the timed duration) already did whatever corpus setup (populate/
 // checkpoint/churn) is appropriate for that operation before calling this.
+//
+// `min_wall_seconds` (default 0: exactly one call, unchanged for checkpoint()/defragment()):
+// for an operation fast enough that one call's wall-clock window is comparable to writer-thread
+// scheduling jitter (T1-only reorganize(), sub-10ms even at full corpus), a single-call
+// concurrent_write_tps sample is dominated by that jitter rather than any real effect. Passing a
+// positive value repeats `run_operation` back-to-back, inside the same timed_run() call, until at
+// least that much wall-clock time has elapsed; op_elapsed_sec is then the mean per-call duration.
+// Writer threads still start once and run continuously for the whole repeated window, so this
+// doesn't add per-repetition thread start/stop overhead -- it only extends the window they get to
+// run in.
 template <typename Store, typename OperationFn>
-auto run_contention_probe(Store &store, std::size_t key_count, uint32_t val_size, OperationFn &&run_operation)
-    -> std::tuple<double, double, double, bool> {
+auto run_contention_probe(Store &store,
+                          std::size_t key_count,
+                          uint32_t val_size,
+                          OperationFn &&run_operation,
+                          double min_wall_seconds = 0.0) -> std::tuple<double, double, double, bool> {
   const std::size_t writer_threads = std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 
   // stop == nullptr: run exactly fixed_ops then return. stop != nullptr: run until *stop is set,
@@ -2234,7 +2247,14 @@ auto run_contention_probe(Store &store, std::size_t key_count, uint32_t val_size
     workers.emplace_back([&run_writer, &counts, t, &stop] { counts[t] = run_writer(t + 1000, &stop, 0); });
   }
   const auto b0 = std::chrono::steady_clock::now();
-  auto [op_elapsed_sec, timed_out] = timed_run(std::forward<OperationFn>(run_operation));
+  std::size_t reps = 0;
+  auto [op_elapsed_sec, timed_out] = timed_run([&run_operation, &reps, min_wall_seconds]() {
+    const auto loop_start = std::chrono::steady_clock::now();
+    do {
+      run_operation();
+      ++reps;
+    } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - loop_start).count() < min_wall_seconds);
+  });
   const auto b1 = std::chrono::steady_clock::now();
   stop.store(true, std::memory_order_relaxed);
   for (auto &w : workers) {
@@ -2246,8 +2266,9 @@ auto run_contention_probe(Store &store, std::size_t key_count, uint32_t val_size
     total_ops += c;
   }
   const double concurrent_write_tps = wall > 0.0 ? static_cast<double>(total_ops) / wall : 0.0;
+  const double avg_op_elapsed_sec = reps > 0 ? op_elapsed_sec / static_cast<double>(reps) : op_elapsed_sec;
 
-  return {isolated_write_tps, concurrent_write_tps, op_elapsed_sec, timed_out};
+  return {isolated_write_tps, concurrent_write_tps, avg_op_elapsed_sec, timed_out};
 }
 
 // Defrag-contention mode: same populate+checkpoint setup as run_defrag(). --ratio scales corpus
@@ -2343,6 +2364,12 @@ auto run_contention_probe(Store &store, std::size_t key_count, uint32_t val_size
 // Reorg-contention mode: same populate+checkpoint setup as run_defrag_contention(). reorganize()
 // is T1-only (never touches T2); its cost tracks live key count, same character as
 // defragment()'s corpus-size dependence. --ratio scales corpus size.
+//
+// Passes min_wall_seconds=1.0 to run_contention_probe(): a single reorganize() call is sub-10ms
+// even at full corpus, too short a window for concurrent_write_tps to reflect anything but writer
+// thread scheduling jitter (see that function's own comment) -- repeating the call for at least a
+// second gives writer threads a steady-state window to run in instead.
+constexpr double kReorgContentionMinWallSeconds = 1.0;
 [[noreturn]] void run_reorg_contention(const ProbeArgs &args) {
   using Store = vmemkv::variants::VMemKVStore;
 
@@ -2358,8 +2385,8 @@ auto run_contention_probe(Store &store, std::size_t key_count, uint32_t val_size
   populate_random_order(*store, {key_count, args.val_size});
   store->checkpoint();
 
-  auto [isolated_write_tps, concurrent_write_tps, reorg_elapsed_sec, timed_out] =
-      run_contention_probe(store, key_count, args.val_size, [&store]() { store->reorganize(); });
+  auto [isolated_write_tps, concurrent_write_tps, reorg_elapsed_sec, timed_out] = run_contention_probe(
+      store, key_count, args.val_size, [&store]() { store->reorganize(); }, kReorgContentionMinWallSeconds);
 
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
             << "," << "\"mode\":\"reorg_contention\"," << "\"ratio\":" << args.ratio << ","
