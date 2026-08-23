@@ -564,6 +564,17 @@ def render_reorg_vs_insert_table_html(reorg_throughput_data, raw_data):
     return "\n".join(out)
 
 
+def _badge_for_slowdown(pct):
+    """pct: percentage drop in concurrent write TPS vs. isolated (higher = worse). Same 3-tier
+    color language as _badge_for_ratio()'s strong tiers, just collapsed to 3 steps since slowdown
+    has no "better than isolated" side to distinguish."""
+    if pct >= 50:
+        return "bg-rose-600 text-white border-transparent shadow-sm"
+    if pct >= 20:
+        return "bg-amber-50 text-amber-700 border-amber-200"
+    return "bg-emerald-50 text-emerald-700 border-emerald-200"
+
+
 def render_maintenance_contention_html(defrag_contention_rows, maintenance_contention_data):
     # Merge defragment()'s existing contention rows into the same {scenario_val: {op: {...}}}
     # shape as maintenance_contention_data, so one loop below renders all three operations.
@@ -578,39 +589,49 @@ def render_maintenance_contention_html(defrag_contention_rows, maintenance_conte
         }
     if not combined:
         return ""
-    out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
-           '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
-           '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Operation</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Isolated Write TPS</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Concurrent Write TPS</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Slowdown</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Operation Duration</th>',
-           "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
-    for scenario_val in ["in_memory_8B", "in_memory_1KB", "ltm_1KB", "ltm_64KB"]:
-        ops = combined.get(scenario_val)
-        if not ops:
+    # Grouped by operation (one mini-table per op, matching render_defrag_scaling_html's
+    # multi-table convention) rather than by scenario: the reader's actual question is almost
+    # always "how does checkpoint() alone degrade across scenarios", not "what's every op doing
+    # for one scenario", so this ordering puts the 4 scenario rows that answer that side by side
+    # instead of scattered 3 rows apart across 3 separate scenario blocks.
+    out = []
+    op_labels = {"checkpoint": "checkpoint()", "defragment": "defragment()", "reorganize": "reorganize()"}
+    for op in ["checkpoint", "defragment", "reorganize"]:
+        rows_for_op = [(sv, combined[sv][op]) for sv in ["in_memory_8B", "in_memory_1KB", "ltm_1KB", "ltm_64KB"]
+                       if sv in combined and op in combined[sv]]
+        if not rows_for_op:
             continue
-        for op in ["checkpoint", "defragment", "reorganize"]:
-            r = ops.get(op)
-            if not r:
-                continue
+        out.append(f'<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4 first:mt-0">{op_labels[op]}</h4>')
+        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
+                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Isolated Write TPS</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Concurrent Write TPS</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Slowdown</th>'
+                    '<th class="py-2 px-3 font-bold text-slate-700">Operation Duration</th>'
+                    '</tr></thead><tbody class="divide-y divide-slate-100">')
+        for scenario_val, r in rows_for_op:
             if r.get("failure_reason"):
-                out.append(f'<tr><td class="py-2 px-3">{scenario_val}</td><td class="py-2 px-3">{op}()</td>'
-                            f'<td class="py-2 px-3 text-slate-300" colspan="3">n/a</td>'
+                out.append(f'<tr><td class="py-2 px-3">{scenario_val}</td>'
+                            f'<td class="py-2 px-3 text-slate-300" colspan="2">n/a</td>'
                             f'<td class="py-2 px-3"><span class="text-rose-600 font-semibold">did not complete ({r["failure_reason"]})</span></td></tr>')
                 continue
             iso = r["isolated_write_tps"]
             conc = r["concurrent_write_tps"]
-            slowdown = f'{(1 - conc / iso) * 100:.0f}%' if iso else "n/a"
             status = (f'<span class="text-rose-600 font-semibold">&ge;{r["elapsed_sec"]:.0f}s (timeout)</span>'
                       if r["timed_out"] else f'{r["elapsed_sec"]:.2f}s')
             note = ('  <span class="text-slate-400">(&lt;10ms window -- noisy, thread start/stop overhead dominates)</span>'
                     if op == "reorganize" and r["elapsed_sec"] < 0.01 else "")
-            out.append(f'<tr><td class="py-2 px-3">{scenario_val}</td><td class="py-2 px-3">{op}()</td>'
+            if iso:
+                pct = (1 - conc / iso) * 100
+                slowdown_html = (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
+                                  f'{_badge_for_slowdown(pct)} font-bold w-fit">{pct:.0f}%</span>')
+            else:
+                slowdown_html = "n/a"
+            out.append(f'<tr><td class="py-2 px-3">{scenario_val}</td>'
                         f'<td class="py-2 px-3">{iso:,.0f}/s</td><td class="py-2 px-3">{conc:,.0f}/s</td>'
-                        f'<td class="py-2 px-3">{slowdown}</td><td class="py-2 px-3">{status}{note}</td></tr>')
-    out.append("</tbody></table></div>")
+                        f'<td class="py-2 px-3">{slowdown_html}</td><td class="py-2 px-3">{status}{note}</td></tr>')
+        out.append("</tbody></table></div>")
     return "\n".join(out)
 
 
