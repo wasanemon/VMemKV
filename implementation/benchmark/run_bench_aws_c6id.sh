@@ -208,7 +208,7 @@ run_aws_cleanup() {
       "$SCRIPT_DIR/aws/aws_clean.sh" "$KEY_NAME" || true
     else
       local cleanup_log="/tmp/vmemkv_aws_clean_${KEY_NAME}.log"
-      nohup "$SCRIPT_DIR/aws/aws_clean.sh" >"$cleanup_log" 2>&1 < /dev/null &
+      nohup "$SCRIPT_DIR/aws/aws_clean.sh" "$KEY_NAME" >"$cleanup_log" 2>&1 < /dev/null &
       local cleanup_pid=$!
       signal_log "cleanup continued in background pid=$cleanup_pid log=$cleanup_log"
       wait "$cleanup_pid" || true

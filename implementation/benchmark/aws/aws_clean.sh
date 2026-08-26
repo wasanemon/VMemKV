@@ -4,7 +4,10 @@
 set -euo pipefail
 
 TARGET_KEY="${1:-}"
-KEY_PREFIX="vmemkv-c6id-key-"
+# Matches run_bench_aws_c6id.sh's KEY_NAME ("vmemkv-i4i-key-$$") -- stale as "vmemkv-c6id-key-"
+# since the c6id->i4i instance-type switch (see that script's INSTANCE_TYPE comment), which left
+# this fallback (no TARGET_KEY) unable to find or clean up any current run's resources.
+KEY_PREFIX="vmemkv-i4i-key-"
 
 echo "==========================================================="
 echo "   Cleaning up VMemKV Temporary AWS Benchmark Resources"
@@ -47,7 +50,7 @@ if [[ -n "$TARGET_KEY" ]]; then
     --output text)
 else
   SGS=$(aws ec2 describe-security-groups \
-    --filters "Name=group-name,Values=vmemkv-c6id-sg-*" \
+    --filters "Name=group-name,Values=vmemkv-i4i-sg-*" \
     --query "SecurityGroups[*].GroupId" \
     --output text)
 fi
@@ -110,7 +113,7 @@ echo "Cleaning up local temporary key files..."
 if [[ -n "$TARGET_KEY" ]]; then
   rm -f "/tmp/${TARGET_KEY}.pem"
 else
-  rm -f /tmp/vmemkv-c6id-key-*.pem
+  rm -f /tmp/vmemkv-i4i-key-*.pem
 fi
 
 echo "==========================================================="

@@ -197,7 +197,7 @@ class T1Index {
   }
 
  private:
-  // Shared 3-tier lookup body for get_with_hash()/get_by_prefix_hash() -- must be called from
+  // Shared 3-region lookup body for get_with_hash()/get_by_prefix_hash() -- must be called from
   // inside with_epoch_guard(). load_slot_consistent() reads (hash, payload, generation) as a
   // consistent triple via the slot's seqlock -- independent loads here could feed update_impl() a
   // torn pair and corrupt a live T2 write (see SortedSlot::version's declaration).
@@ -285,7 +285,7 @@ class T1Index {
   // - Guarantees: Writes to the append region if the key does not exist; updates the slot in-place if it does.
   // `t2_generation`: T2 generation `value` was resolved against (see SortedSlot::generation).
   // Ignored for inline/tombstone writes. Stamped atomically with hash so resolve()'s
-  // write-frozen-tier bypass can safely insert-as-new instead of blocking on reorganize().
+  // FreezableRegion bypass can safely insert-as-new instead of blocking on reorganize().
   auto put(std::span<const std::byte> key,
            Payload value,
            bool is_inline = false,
@@ -646,8 +646,8 @@ class T1Index {
 
     // Bundled with `generation` behind one atomic store so a reader can never see next_sorted
     // paired with the wrong generation tag (same reasoning as AppendGeneration). Unfreezes both
-    // guarded tiers right after: from this point, resolve() sees the new (complete, unfrozen)
-    // sorted region directly, so the bypass is no longer needed for either tier.
+    // guarded regions right after: from this point, resolve() sees the new (complete, unfrozen)
+    // sorted region directly, so the bypass is no longer needed for either one.
     sorted_snapshot_.store(new SortedSnapshot{next_sorted, generation}, std::memory_order_release);
     sorted_write_frozen_.unfreeze();
 
@@ -710,7 +710,7 @@ class T1Index {
     void unfreeze() noexcept { frozen_.store(nullptr, std::memory_order_release); }
 
     // The frozen region snapshot if one is currently in effect, nullptr otherwise. Caller runs
-    // its own tier-specific find() against the result -- this type only owns the freeze/unfreeze
+    // its own region-specific find() against the result -- this type only owns the freeze/unfreeze
     // lifecycle, not the lookup itself (append and sorted regions have unrelated find shapes).
     auto get() const noexcept -> RegionPtr { return frozen_.load(std::memory_order_acquire); }
 
@@ -1128,7 +1128,7 @@ class T1Index {
       return ResolvedSlot{slot, nullptr};
     }
 
-    // Found in either frozen tier means an in-place update would be a Lost Update this cycle
+    // Found in either frozen region means an in-place update would be a Lost Update this cycle
     // (see FreezableRegion's own comment) -- bypass to a new entry in the fresh active region
     // instead. Safe because every entry carries its own T2 generation stamp (see
     // SortedSlot::generation), so it can sit unmerged for any number of future cycles.

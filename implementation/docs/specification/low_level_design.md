@@ -505,6 +505,7 @@ T1 `reorganize` と Defragment は atomic pointer swap 機構で実現され、�
 
 - Insert / Update / Delete は T1 `reorganize` と並行してよい。
 - ただし、writer が旧世代バッファに対して行う書き込み（reserve & publish）は、再編成スレッド側のマージ開始前に実行される一段目のエポック同期バリア（`wait_until_epoch`）によって完全にドレインされる。これにより、書き込みスレッド側でのリトライや明示的なロック同期を一切不要としつつ、進行中のすべての更新がデータロストなく新旧いずれかの世代に安全に振り分けられる。
+- 上記のドレインが対象とするのは `append_region`(active/immutable の世代切り替え)のみである。**既に `sorted_region` にある key** への in-place 更新は別の機構(`FreezableRegion`)で保護する: マージがその key の値をスナップショットしてから新しい `sorted_region` を publish するまでの間、その key への書き込みは `sorted_region` を素通り(未検出扱い)し、新しい `append_region` への追記にバイパスされる。バイパスなしでは、スナップショット後・publish 前に着地した in-place 更新が新しい `sorted_region` に反映されず、静かに失われる(Lost Update)。
 
 #### Defragment vs All Operations
 
