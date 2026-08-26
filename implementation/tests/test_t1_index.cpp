@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -373,6 +374,60 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
   CHECK(reorganize_count.load() > 0);
   for (int i = 0; i < key_count; ++i) {
     CHECK(idx->get(to_span("k" + std::to_string(i))) != vmemkv::STORE_NOT_FOUND);
+  }
+}
+
+// Regression test for a Lost Update in reorganize()'s merge: put()'s in-place path used to
+// mutate an already-sorted key's live SortedSlot directly, but reorganize()'s merge loop takes
+// an earlier snapshot of that slot's value and publishes a brand-new SortedRegion built from it,
+// discarding the old one -- any write landing between the snapshot and the publish was silently
+// lost. Fixed by sorted_write_frozen_ (see WriteFrozenTier's own comment), the same bypass
+// append_immutable_ already had for the symmetric case. One dedicated writer per key (so "last
+// write" is well-defined) races a hammering reorganizer; the sleep inside offset_mapper widens
+// reorganize()'s merge-to-publish window to something close to what checkpoint_internal()'s real
+// msync()/file I/O costs in production, without which this reproduced only intermittently.
+TEST_CASE("T1Index: dedicated single writer per key survives racing reorganize with exact last value") {
+  auto idx = make_index();
+  constexpr int key_count = 8;
+  constexpr int updates_per_key = 500;
+  for (int i = 0; i < key_count; ++i) {
+    REQUIRE(idx->put(to_span("k" + std::to_string(i)), 0) == TestIndex::PutResult::Applied);
+  }
+  idx->reorganize(
+      per_entry_offset_mapper([](uint64_t payload, uint64_t, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
+        return {payload, generation};
+      }));
+
+  std::atomic<bool> stop{false};
+  std::thread reorganizer([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      idx->reorganize(
+          per_entry_offset_mapper([](uint64_t payload, uint64_t, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            return {payload, generation};
+          }));
+    }
+  });
+
+  std::vector<std::thread> writers;
+  writers.reserve(key_count);
+  for (int i = 0; i < key_count; ++i) {
+    writers.emplace_back([&, i]() {
+      for (int round = 1; round <= updates_per_key; ++round) {
+        const auto value = static_cast<uint64_t>((i << 20) | round);
+        REQUIRE(idx->put(to_span("k" + std::to_string(i)), value) == TestIndex::PutResult::Applied);
+      }
+    });
+  }
+  for (auto &writer : writers) {
+    writer.join();
+  }
+  stop.store(true, std::memory_order_relaxed);
+  reorganizer.join();
+
+  for (int i = 0; i < key_count; ++i) {
+    const auto expected = static_cast<uint64_t>((i << 20) | updates_per_key);
+    CHECK(idx->get(to_span("k" + std::to_string(i))) == expected);
   }
 }
 

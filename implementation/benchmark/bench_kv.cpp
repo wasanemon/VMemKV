@@ -806,7 +806,7 @@ static auto make_vmemkv_fresh(const std::string &path,
 
   std::error_code error_code;
   std::filesystem::remove(path, error_code);
-  std::filesystem::remove(vmemkv::derive_wal_path(path), error_code);
+  vmemkv::remove_wal_segments(vmemkv::derive_wal_path(path));
   std::filesystem::remove(vmemkv::derive_manifest_path(path), error_code);
   std::filesystem::remove(vmemkv::derive_t1_chk_path(path), error_code);
   std::filesystem::remove(vmemkv::derive_t2_chk_path(path), error_code);
@@ -931,7 +931,7 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
   const std::string instance_path = master_path + "_clone";
   std::error_code ignored;
   std::filesystem::remove(instance_path, ignored);
-  std::filesystem::remove(vmemkv::derive_wal_path(instance_path), ignored);
+  vmemkv::remove_wal_segments(vmemkv::derive_wal_path(instance_path));
   std::filesystem::remove(vmemkv::derive_manifest_path(instance_path), ignored);
 
   const auto master_t1 = vmemkv::derive_t1_chk_path(master_path);
@@ -1843,7 +1843,7 @@ enum class ProbeMode {
   kDefrag,
   kDefragContention,
   kCheckpointContention,
-  kReorgContention
+  kReorgContention,
 };
 
 struct ProbeArgs {
@@ -1853,6 +1853,9 @@ struct ProbeArgs {
   double ratio = 1.0;
   double churn_ratio = 0.0;
   std::string sweep_tag = "default";
+  // 0 = auto (min(hardware_concurrency(), 32), the historical default); lets
+  // run_contention_probe()'s writer thread count be pinned explicitly instead.
+  std::size_t writer_threads = 0;
 };
 
 [[noreturn]] void fail(const std::string &msg) {
@@ -1921,13 +1924,16 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
       args.churn_ratio = std::stod(std::string(value));
     } else if (key == "--sweep-tag") {
       args.sweep_tag = std::string(value);
+    } else if (key == "--writer-threads") {
+      args.writer_threads = static_cast<std::size_t>(std::stoul(std::string(value)));
     }
   }
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
         "--mode=<t1only|t1t2|t1t2_steady|defrag|defrag_contention|checkpoint_contention|"
-        "reorg_contention> --ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>]");
+        "reorg_contention> "
+        "--ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>] [--writer-threads=<N>]");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
     fail("--ratio must be in (0.0, 1.0]");
@@ -2196,8 +2202,11 @@ auto run_contention_probe(Store &store,
                           std::size_t key_count,
                           uint32_t val_size,
                           OperationFn &&run_operation,
-                          double min_wall_seconds = 0.0) -> std::tuple<double, double, double, bool> {
-  const std::size_t writer_threads = std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+                          double min_wall_seconds = 0.0,
+                          std::size_t writer_threads_override = 0) -> std::tuple<double, double, double, bool> {
+  const std::size_t writer_threads =
+      writer_threads_override != 0 ? writer_threads_override
+                                   : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 
   // stop == nullptr: run exactly fixed_ops then return. stop != nullptr: run until *stop is set,
   // ignoring fixed_ops, returning however many ops actually completed.
@@ -2283,19 +2292,22 @@ auto run_contention_probe(Store &store,
                            std::to_string(args.val_size) + "_defragcontention_" +
                            std::to_string(static_cast<int>(args.ratio * 100));
 
+  const std::size_t resolved_writer_threads =
+      args.writer_threads != 0 ? args.writer_threads
+                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
   populate_random_order(*store, {key_count, args.val_size});
   store->checkpoint();
 
-  auto [isolated_write_tps, concurrent_write_tps, defrag_elapsed_sec, timed_out] =
-      run_contention_probe(store, key_count, args.val_size, [&store]() { store->defragment(); });
+  auto [isolated_write_tps, concurrent_write_tps, defrag_elapsed_sec, timed_out] = run_contention_probe(
+      store, key_count, args.val_size, [&store]() { store->defragment(); }, 0.0, resolved_writer_threads);
 
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
             << "," << "\"mode\":\"defrag_contention\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << ","
-            << "\"writer_threads\":" << std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32})
-            << "," << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
+            << "\"isolated_write_tps\":" << isolated_write_tps << ","
             << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
             << "\"defrag_elapsed_sec\":" << defrag_elapsed_sec << ","
             << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
@@ -2315,6 +2327,10 @@ auto run_contention_probe(Store &store,
   const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
                            std::to_string(args.val_size) + "_checkpointcontention_" +
                            std::to_string(static_cast<int>(args.ratio * 100));
+
+  const std::size_t resolved_writer_threads =
+      args.writer_threads != 0 ? args.writer_threads
+                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
@@ -2347,14 +2363,13 @@ auto run_contention_probe(Store &store,
     }
   }
 
-  auto [isolated_write_tps, concurrent_write_tps, checkpoint_elapsed_sec, timed_out] =
-      run_contention_probe(store, key_count, args.val_size, [&store]() { store->checkpoint(); });
+  auto [isolated_write_tps, concurrent_write_tps, checkpoint_elapsed_sec, timed_out] = run_contention_probe(
+      store, key_count, args.val_size, [&store]() { store->checkpoint(); }, 0.0, resolved_writer_threads);
 
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
             << "," << "\"mode\":\"checkpoint_contention\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << ","
-            << "\"writer_threads\":" << std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32})
-            << "," << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
+            << "\"isolated_write_tps\":" << isolated_write_tps << ","
             << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
             << "\"checkpoint_elapsed_sec\":" << checkpoint_elapsed_sec << ","
             << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
@@ -2380,19 +2395,27 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
                            std::to_string(args.val_size) + "_reorgcontention_" +
                            std::to_string(static_cast<int>(args.ratio * 100));
 
+  const std::size_t resolved_writer_threads =
+      args.writer_threads != 0 ? args.writer_threads
+                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
   populate_random_order(*store, {key_count, args.val_size});
   store->checkpoint();
 
   auto [isolated_write_tps, concurrent_write_tps, reorg_elapsed_sec, timed_out] = run_contention_probe(
-      store, key_count, args.val_size, [&store]() { store->reorganize(); }, kReorgContentionMinWallSeconds);
+      store,
+      key_count,
+      args.val_size,
+      [&store]() { store->reorganize(); },
+      kReorgContentionMinWallSeconds,
+      resolved_writer_threads);
 
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
             << "," << "\"mode\":\"reorg_contention\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << ","
-            << "\"writer_threads\":" << std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32})
-            << "," << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
+            << "\"isolated_write_tps\":" << isolated_write_tps << ","
             << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
             << "\"reorg_elapsed_sec\":" << reorg_elapsed_sec << ","
             << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;

@@ -98,7 +98,7 @@ Tier 1 の `payload_bits` が Tier 2 offset を表す場合(2.1 節)、T2 への
 
 **Base/Tail Split**
 
-`T2Store` は `base_boundary` を保持する: `[0, base_boundary)` の範囲が、baseリージョン専用の読み取り経路(7.9節 -- 用途・レコードサイズ別に3つある)経由で seqlock なしに安全に読める、という不変条件を表す境界値である。`base_boundary` は、その `T2Store` インスタンスの生存期間中は**一定**であり、`checkpoint_internal()`(5.2 節)が新しい世代を作って丸ごと入れ替える時にのみ、新しい値へ進む。
+`T2Store` は `base_boundary` を保持する: `[0, base_boundary)` の範囲が、baseリージョン専用の読み取り経路(7.9節 -- 用途・レコードサイズ別に3つある)経由で seqlock なしに安全に読める、という不変条件を表す境界値である。`base_boundary` は `checkpoint_internal()`(4.3 節)の実行によってのみアトミックに前進する。
 
 - `offset < base_boundary` の record を **base** 領域、`offset >= base_boundary` の record を **tail** 領域と呼ぶ。
 - base 領域は、一度 `base_boundary` に含まれた後は二度と in-place では書き換えられない(3.3節)。そのため base 領域は、mmap の `MADV_RANDOM`(7.7節)を経由しない専用の読み取り経路で読んでも安全であり、seqlock も不要になる(経路の選び方は7.9節)。
@@ -124,7 +124,7 @@ struct VMemKV {
 };
 ```
 
-本設計では、checkpoint reload 後の新世代も同じ `T1Index` / `T2Store` 形に再構築される。
+起動時のロードや defragment 後も、`T1Index` / `T2Store` は同じ形に再構築される。
 
 ## 3. Read / Write Operations
 
@@ -246,46 +246,51 @@ T1 `reorganize` は T2 と独立に実行できる。
 - Ordering Fragmentation を解消する。
 - delete 済み entry を Tier 1 から取り除く。
 
-### 4.3 T2 Reorganize (`checkpoint_internal()`)
+### 4.3 T2 Checkpoint (`checkpoint_internal()`)
 
-T2 側の reorganize は `checkpoint_internal()`(5.2 節)一本であり、Tier 1 の `reorganize` と同じサイクルの中で必ずセットで実行される。entry 単位でインライン化されている entry(2.1.1 節、7.3 節)は Tier 2 に一切アクセスしないため、この処理の対象から外れる。
+entry 単位でインライン化されている entry(2.1.1 節、7.3 節)は Tier 2 に一切アクセスしないため、この処理の対象から外れる。
 
-`checkpoint_internal()` は Tier 2 の**単一の永続ファイル**に対する in-place な追記のみを行う: このサイクルより前に durable だったバイト(`[0, old_base_boundary)`)には一切触れず、tail 領域(`[old_base_boundary, bytes_used)`)にある生存中の record を、それぞれが既に占有している同じ offset へ `pwrite()` するだけである。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- つまり Storage Fragmentation の解消(GC)はこの処理の対象外である。Tier 1 の `payload_bits` は書き換えず、T2Memory の世代タグのみを新しい世代に張り替える。
+`checkpoint_internal()` は Tier 2 の**単一の永続ファイル**の tail 領域(`[old_base_boundary, bytes_used)`)を `msync()` で永続化する。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- Storage Fragmentation の解消(GC)はこの処理の対象外であり、4.6 節の `defragment_internal()` が担う。
 
 **Input**
 
-- T1 の `reorganize` 後 `sorted_region`
+- Tier 2 の `[old_base_boundary, bytes_used)` にある dirty page
 - T1 の現 `append_region`
-- Tier 2 の `[old_base_boundary, bytes_used)` にある生存中の record
 
 **Output**
 
-- 新しい世代の `T2Memory`(同一ファイルの再 `mmap`。offset は変わらず、`base_boundary` のみ前進する)
-- 世代タグを更新した Tier 1
+- 前進した `base_boundary`
+- T1 checkpoint ファイル(5.4 節)
 
 **Procedure**
 
-1. T1 の tail 領域(`sorted_region` 決定後の `append_region`、および tail 常駐の生存 entry)を走査し、各 live `IndexEntry.payload_bits` から Tier 2 record を取得する。
-2. 取得した record を、それが既に占有している同じ offset へ Tier 2 の永続ファイルに `pwrite()` する(alloc_len を含め、フットプリントは変更しない)。
-3. Tombstone 化されている entry と、Tier 1 から参照されない Tier 2 record は書き込まない。
-4. 新しい `base_boundary` を、この時点での Tier 2 の `bytes_used` に定める。
-5. Tier 1 の各 live entry の世代タグを、新しく `mmap` した T2Memory の世代に更新する(`payload_bits` 自体は不変)。
+1. `checkpoint_lsn = wal.next_lsn() - 1` を読む(5.3 節)。
+2. 新規 append を短時間止め(`stop_writers_and_wait()`)、この時点の `bytes_used` を `target` として確定する。
+3. 直ちに新規 append を再開する(`resume_writers()`)。in-place 更新はこの手順の間も一切止まらない。
+4. `[old_base_boundary, target)` を `msync(MS_SYNC)` する。
+5. `t1_.reorganize()` を呼ぶ。`append_region` を `sorted_region` へ統合し、T1 checkpoint ファイルを書き出す(temp + `rename`、5.4 節)。`payload_bits` も世代タグも書き換えない恒等写像を渡す。
+6. manifest に `checkpoint_lsn` と `target` を書く(5.3 節)。
+7. `base_boundary` を `target` へアトミックに前進させる。
+8. WAL を `checkpoint_lsn` までローテートする(5.5 節)。
 
 **Effect**
 
 - Tier 2 の tail 領域を永続化し、`base_boundary` を前進させる。
+- T1 の `append_region` を統合し、T1 checkpoint ファイルを更新する。
 - Storage Fragmentation は解消しない(4.1 節)。
 
 ### 4.4 Reorganize / Checkpoint Trigger
 
 `checkpoint()` を起動するトリガーは WAL サイズのみである。
 
-$$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WAL\_MAX\_BYTES\_SINCE\_CHECKPOINT} \lor \text{tail\_entries\_near\_capacity} \lor \text{Force}$$
+$$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WAL\_MAX\_BYTES\_SINCE\_CHECKPOINT} \lor \text{Force}$$
+
+$$\text{Defragment\_Trigger} = \left(\text{T2\_Bytes\_Used} \ge \text{DefragGrowthThresholdPercent} \times \text{T2\_Bytes\_Used\_At\_Last\_Defragment} \land \text{T2\_Bytes\_Used} \ge \text{DefragMinBytesBeforeTrigger}\right) \lor \text{tail\_entries\_near\_capacity} \lor \text{Force}$$
 
 * **`WAL_MAX_BYTES_SINCE_CHECKPOINT`**: 直前 checkpoint の checkpoint LSN 以降に WAL へ append されたバイト数の上限。Checkpoint はこのサイズベースのトリガーのみで判定し、書き込みレートに関わらず起動時の WAL replay 時間を有界に保つ。
-* **`tail_entries_near_capacity`**: tail 領域の生存 entry を追跡する固定容量バッファ(`checkpoint_internal()`の `copy_live_entries()`が消費する)が閾値に近づいた場合、容量枯渇を避けるため早期に checkpoint する。
-* **`Force`**: `checkpoint()` の明示呼び出し。
-* `defragment()` に自動トリガーはない。`Force`(明示呼び出し)のみで起動する。O(生存コーパス全体) のコストがかかるため、`checkpoint()` と異なり書き込み量に応じたバックグラウンド自動発火の仕組みはまだ配線されていない。
+* **`DefragGrowthThresholdPercent` / `DefragMinBytesBeforeTrigger`**: T2 の総フットプリントが前回 defragment 完了時の一定割合まで成長し、かつ最小サイズを超えた場合に発火する。
+* **`tail_entries_near_capacity`**: tail 領域の生存 entry を追跡する固定容量バッファ(`defragment_internal()` の tail catch-up パスが消費する)が閾値に近づいた場合、容量枯渇を避けるため早期に defragment する。
+* **`Force`**: `checkpoint()`/`defragment()` の明示呼び出し。
 * 公開 API は **`reorganize()`**(T1-only インメモリマージ、T2 に触れず checkpoint もしない)・**`defragment()`**・**`checkpoint()`** の3つ。`checkpoint()` は `checkpoint_internal()` を、`defragment()` は `defragment_internal()`(4.6 節)を呼ぶ。
 
 | API | 効果 |
@@ -328,7 +333,7 @@ T1 `reorganize` は、`append_region` のサイズに応じて自動的にバッ
 
 `checkpoint_internal()` との違いは「record を動かすかどうか」の一点であり、それ以外の同期機構(`tail_entries_`、`T2FlatFile::stop_writers_and_wait()`、`t1_.reorganize()` の単一 publish ポイント、`T2Memory` 世代スワップ、manifest commit、WAL rotate)は共有する。
 
-T2 の稼働中 mmap(`T2Memory::base`)は `MAP_PRIVATE` である(5.1 節)。in-place 更新は当該プロセスの COW ページに留まるのみで、`checkpoint_internal()`/`defragment_internal()` のいずれかが明示的に `pwrite()` するまでファイルへは反映されない。ある record が生存した後に上書きされ、その間に一度も durabilize されなかった場合、その古い slot にはファイル上のバイトが一切存在しない(ゼロ埋めでも hole でもなく、単に書かれていない)。したがって base 領域は「隙間のない record の連続」ではなく、オフセット順にバイト列を無条件でパースする方式は成立しない。Phase 0 が触れる record は例外なく、T1 が今この瞬間に保証する offset(`payload_bits`)経由でのみアドレスされ、直前の record の長さから推測することはない。
+base 領域は record が隙間なく連続しているとは限らない: 生存中に上書きされ、それ以降 Tier 1 から到達不能になった record の slot も、有効な形式のバイト列を保ったまま残り得る。したがって base 領域のバイト列を無条件でオフセット順にパースする方式は成立しない。Phase 0 が触れる record は例外なく、T1 が今この瞬間に保証する offset(`payload_bits`)経由でのみアドレスされ、直前の record の長さから推測することはない。
 
 **Input**
 
@@ -360,54 +365,31 @@ T2 の稼働中 mmap(`T2Memory::base`)は `MAP_PRIVATE` である(5.1 節)。in-
 
 ### 5.1 Motivation
 
-T2 の稼働中 mmap は `MAP_PRIVATE` であり、書き込みはプロセス内の COW ページに留まるだけでファイルには一切反映されない(下記 NOTE 参照)。したがって Tier 2 の tail 領域を再起動後も残るデータにするには、`checkpoint_internal()` がその内容を明示的にファイルへ `pwrite()` する必要がある。
-
-`checkpoint_internal()` は record を一切リロケーションしない(4.3 節)ため、新しい一時ファイルを構築する必要も、ファイル単位で切り替える必要もない -- Tier 2 の**単一の永続ファイル**に、既に生存中の record が占有している offset へそのまま `pwrite()` するだけで済む。旧世代(`old_base_boundary` 未満)のバイトは一切書き換えない。
+T2 の稼働中 mmap は `MAP_SHARED` である(下記 NOTE)。書き込みはページキャッシュへ直接反映されるため、`checkpoint_internal()`(4.3 節)の役割は tail 領域を `msync()` して物理ディスクへの反映を確定させることに限られる。起動時、有効な checkpoint(manifest)が存在すれば、稼働中と同じこの永続ファイルを直接 `mmap` して採用する。
 
 > [!NOTE]
-> tail 領域の record は主 mmap 経由の `pwrite()` ではなく、通常のファイル I/O としての `pwrite()` で書き出す。
-> mmap 経由で書き込みページをファイルへ反映させるには `MAP_SHARED` かつ明示的な `msync()` が必要になり、`MAP_PRIVATE` で書き込みを COW に留めている T2 の主 mmap の設計(下記 NOTE)とは別の書き込み経路が要る。`pwrite()` はカーネルページキャッシュを経由するため、書き込み先が既にページキャッシュに乗っていれば追加のマイナーページフォルトを伴わない。
+> T2 の mmap には `MAP_SHARED | MAP_NORESERVE | PROT_READ | PROT_WRITE` を使用します。
+> `MAP_NORESERVE` により、カーネルが mmap 時点でスワップ領域を一括予約するのを回避します。これにより、物理 RAM を大幅に超える仮想アドレス空間(例: 64 GB)を確保しても ENOMEM が発生しません。物理ページはアクセス時にオンデマンドで割り当てられ、通常通りスワップアウトされます。
 
-> [!NOTE]
-> T2 の mmap には `MAP_PRIVATE | MAP_NORESERVE | PROT_READ | PROT_WRITE` を使用します。
-> `MAP_PRIVATE` により書き込みはプロセス内の COW ページに留まり、ファイルには反映されません（再起動時揮発）。
-> `MAP_NORESERVE` により、カーネルが mmap 時点でスワップ領域を一括予約するのを回避します。これにより、物理 RAM を大幅に超える仮想アドレス空間（例: 64 GB）を確保しても ENOMEM が発生しません。物理ページはアクセス時にオンデマンドで割り当てられ、通常通りスワップアウトされます。
-> この設計により、mprotect による書き込みページ保護の往復（RO → RW → RO）が不要になり、書き込みパスが大幅に簡潔かつ高速になります。
+### 5.2 Flow (Startup)
 
-
-### 5.2 Flow (`checkpoint_internal()`)
-
-`checkpoint()` は内部機構 `checkpoint_internal()` を呼ぶ(4.4 節)。同一プロセス内で完結し、`fork` は使わない。
-
-1. `reorganize` トリガー(4.4 節)成立時、**先に** `checkpoint_lsn = wal.next_lsn() - 1` を読む。同時に、現行世代の `old_base_boundary` を捕捉する(この値は現行世代の生存期間中一定 -- 2.2 節)。
-2. Tier 2 の永続ファイルを開く(初回のみ `O_CREAT` で作成)。まだ一度も checkpoint していないストアでも、このファイルが Tier 2 の唯一の実体になる。
-3. Pre-stop パス(性能最適化、任意回数実行可): tail 領域(`payload_bits` の offset が `old_base_boundary` 以上)にある生存中の entry を、書き込みスレッドを止めずに走査し、各 record を seqlock 越しに読み取ってその offset へ `pwrite()` する。
-4. `T2FlatFile::stop_writers_and_wait()` で新規の書き込みハンドル発行を止め、既に発行済みのハンドルが全て解放されるまで待つ。
-5. Post-stop パス(唯一の破壊的パス、正しさの主体): pre-stop パスで見つからなかった残りの生存 entry を同様に `pwrite()` する。この時点で writer は止まっているため、tail 領域の生存集合は確定している。
-6. この時点の Tier 2 `bytes_used` を新しい `base_boundary` として確定する。
-7. 必要なら capacity を拡張(`ftruncate`)し、`fsync()` する。
-8. 拡張後の capacity で Tier 2 ファイルを新しく `mmap` し、新しい世代の `T2Memory` を構築する(`base_boundary` = 手順 6 の値)。
-9. T1 `reorganize()` を呼び出す。`offset_mapper` は record を一切リロケーションしないため、`payload_bits` を書き換えず、世代タグのみを手順 8 の新世代へ更新する。同じ呼び出しの中で、マージ済みの `sorted_region` を T1 checkpoint の一時ファイルへ書き出す(temp + `rename`、5.4 節)。
-10. in-memory の新 `T2Memory` を、既存の reorganize と同じアトミックポインタスワップで公開する(旧世代は epoch based reclamation で安全に解放する)。書き込みスレッドを再開する。
-11. manifest 一時ファイルに世代情報(`generation` = `checkpoint_lsn`)と `t2_bytes_used` を書き、`fsync` してから `rename()` でアトミックに正式パスへ差し替える。この瞬間に新世代が公式に有効化される。
-12. WAL をローテーションする(5.5 節)。
-
-このフローに stop-the-world は存在しない。手順 4-5 の writer stop は Tier 2 の生存集合を確定させるための短い barrier であり、手順 9 の T1 publish 完了までの間だけ新規書き込みをブロックする。それ以前(pre-stop パス)や以降(manifest commit・WAL rotate)は通常の並行書き込みと共存する。
-
-**クラッシュ安全性**: 手順 3・5 の `pwrite()` は、いずれも `old_base_boundary` 以上の offset にのみ書き込む。この範囲は manifest がまだ古い(小さい)`t2_bytes_used` を指している間は「未コミット」として扱われるため、サイクルが手順 11 の `rename()` 完了前に中断しても、それまでの `pwrite()` は単に参照されない孤立バイトとして残るだけである。次の成功する checkpoint サイクルは同じ `old_base_boundary` から始まり、同じ offset へ改めて `pwrite()` するため、上書きされて安全に収束する。
+1. manifest を読む。存在しない、または読み込みに失敗する場合は Tier 2 の永続ファイルを新規作成し、WAL 全体を LSN 1 から replay する(以降の手順はスキップ)。
+2. Tier 2 の永続ファイルを `mmap` し、`base_boundary` = `manifest.t2_bytes_used` として採用する。
+3. T1 checkpoint ファイル(5.4 節)を読み込み、`sorted_region` を再構築する。
+4. `checkpoint_lsn` の次の record から WAL の末尾までを replay する。
 
 **Hash Index Lifecycle in Checkpoint**
 
-- `reorganize` 直後は `append_region` が空 (size = 0) となるため、T1 checkpoint file には `sorted_region` のデータのみがシーケンシャルに書き出され、`append_index` の状態自体はファイルへシリアライズ（永続化）しない。
-- `reload` 時、新しくマッピングされた T1 インスタンスは、`append_index` を空に初期化した状態で起動し、その後の WAL リプレイおよび新規クライアント書き込み時に適宜ハッシュインデックスへの登録・更新を行う。
+- checkpoint 直後は `append_region` が空 (size = 0) となるため、T1 checkpoint file には `sorted_region` のデータのみがシーケンシャルに書き出され、`append_index` の状態自体はファイルへシリアライズ(永続化)しない。
+- 起動時、新しくマッピングされた T1 インスタンスは、`append_index` を空に初期化した状態で起動し、その後の WAL リプレイおよび新規クライアント書き込み時に適宜ハッシュインデックスへの登録・更新を行う。
 
 ### 5.3 Correctness Rule
 
-- checkpoint LSN の決定方法: `checkpoint_lsn = wal.next_lsn() - 1` を、5.2 節手順 4 の writer stop より**前**に 1 回読む。Insert / Update / Delete は T1 / T2 への適用完了後に WAL append する(3.2 節)ため、この読み取り時点で既に WAL LSN が採番済みの操作は、その T1/T2 適用も完了していることが保証される。
+- checkpoint LSN の決定方法: `checkpoint_lsn = wal.next_lsn() - 1` を、4.3 節手順 2 の writer stop より**前**に 1 回読む。Insert / Update / Delete は T1 / T2 への適用完了後に WAL append する(3.2 節)ため、この読み取り時点で既に WAL LSN が採番済みの操作は、その T1/T2 適用も完了していることが保証される。
 - checkpoint LSN を実際より低く見積もる(conservative に倒す)ことは許容される: 起動時の WAL tail replay が checkpoint に既に含まれるエントリを再度適用しても、`T1Index::put()` の overwrite-in-place 意味論により副作用がなく安全である(冪等)。
 - checkpoint LSN を実際より高く見積もってはならない: それを行うと、checkpoint に反映されていない有効な更新を tail replay がスキップしてしまい、データロストになる。
-- manifest が `rename()` で正式パスへ反映されるまで、その manifest が指す `t2_bytes_used` を超える範囲の Tier 2 ファイルの内容は、たとえ物理的に書き込まれていても信頼してはならない(上記クラッシュ安全性の節参照)。
-- 起動時は、manifest が指す T1 checkpoint ファイルと Tier 2 checkpoint ファイルを読み込み(`t2_bytes_used` を境界として採用)、その後 checkpoint LSN の次の record から WAL の末尾までを replay する。manifest が存在しない、または読み込みに失敗する場合は、T2 を破棄し WAL 全体を LSN 1 から replay する(item 1 で実装済みのフォールバック挙動)。
+- manifest に `t2_bytes_used = target` を書くのは、`[old_base_boundary, target)` の `msync(MS_SYNC)` が成功した後に限る。
+- manifest が `rename()` で正式パスへ反映されるまで、その manifest が指す `t2_bytes_used` を超える範囲の Tier 2 ファイルの内容は、たとえ物理的に書き込まれていても信頼してはならない。
 - Tier 2 checkpoint ファイルが物理的に保持しているバイト数(ファイルサイズ)は、manifest の `t2_bytes_used` **以上**であればよい(capacity は生存データより先に拡張されることがあるため)。
 
 ### 5.4 T1 Checkpoint File Format (`t1_index.chk`)
@@ -465,7 +447,8 @@ WAL は先頭からの truncate を行わない(可変長レコード列の先�
 ### 6.1 Base Assumption
 
 point operation は通常時にオンラインで進める。
-checkpoint reload は T1 `reorganize()` がトリガーする atomic pointer swap 機構で実現され、専用の stop-the-world は必要としない。
+Checkpoint は新規 append の短い静止(`stop_writers_and_wait()`)のみで完結し、専用の stop-the-world は必要としない。
+T1 `reorganize` と Defragment は atomic pointer swap 機構で実現され、同様に専用の stop-the-world を必要としない。
 
 この節では具体的な同期機構そのものではなく、各操作がどの操作と競合し、競合時に何を保証すべきかを定義する。
 
@@ -474,8 +457,9 @@ checkpoint reload は T1 `reorganize()` がトリガーする atomic pointer swa
 - Get / Scan は通常時にオンラインで実行できる。
 - Insert / Update / Delete は WAL 永続化後に T1 / T2 を更新する。
 - T1-only `reorganize` は T2 と独立して高頻度に走らせてよい。
-- T2 `reorganize` は checkpoint reload の一部としてのみ実行する。
-- checkpoint reload は T1 `reorganize()` 内の atomic pointer swap が完了した時点で有効化される。専用の stop-the-world は発生しない。
+- T2 の record リロケーションは Defragment としてのみ実行する。
+- Checkpoint は新規 append の短い静止のみを必要とし、in-place 更新はその間も止まらない。
+- T1 `reorganize` と Defragment は atomic pointer swap が完了した時点で有効化される。専用の stop-the-world は発生しない。
 - pointer swap の前後をまたいで進行する操作については、retry・snapshot・serialization のいずれかで整合を保つ。
 
 ### 6.3 Operation Concurrency Matrix
@@ -483,22 +467,23 @@ checkpoint reload は T1 `reorganize()` がトリガーする atomic pointer swa
 以下の表は、各操作の並行実行可否と必要な扱いを定義する。
 
 - `Allowed`: 特別な停止なしに並行実行してよい
+- `Allowed with brief stall`: 新規 append の発行だけが、Checkpoint の `stop_writers_and_wait()` 短時間ウィンドウの間、一時的に止まる可能性がある。in-place で完結する操作は止まらない。
 - `Allowed with retry/snapshot`: 並行実行してよいが、snapshot 読みまたは retry が必要
 - `Serialized`: 同一 key に対しては直列化が必要
-- `Single-flight`: 並行呼び出し時、実行者（leader）を 1 スレッドだけ選出する。follower の挙動は経路で異なり、soft 経路では待機せず継続、hard 経路では leader 完了まで待機する（アトミックフラグで制御）。
+- `Single-flight`: 並行呼び出し時、実行者(leader)を 1 スレッドだけ選出する。follower の挙動は経路で異なり、soft 経路では待機せず継続、hard 経路では leader 完了まで待機する(アトミックフラグで制御)。
 
-`Checkpoint reload` と `Defragment`(4.6 節)は共に `T1 reorganize` (4.4 節のトリガー成立時、または `defragment()` の明示呼び出し)の中でトリガーされ、同一の `reorg_running_` single-flight ロックを共有する。すなわち三者は同じ実行スロットを取り合う、実質的に同一操作のバリエーションである。record を動かすかどうか(4.6 節冒頭)以外、並行性の扱いに差はない。
+`T1 reorganize` と `Defragment`(4.6 節)は共に `reorganize` (4.4 節のトリガー成立時、または `defragment()` の明示呼び出し)の中でトリガーされ、atomic pointer swap 機構を共有する。`Checkpoint` はこの2者とは異なる機構(新規 append の短い静止 + `msync()`)で完結するが、manifest 書き込みの排他のため同一の `reorg_running_` single-flight ロックを共有する。
 
-| Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize | Checkpoint reload / Defragment |
+| Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize / Defragment | Checkpoint |
 | --- | --- | --- | --- | --- | --- | --- |
-| `Get` | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed with retry/snapshot |
-| `Scan` | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed with retry/snapshot |
-| `Insert` (distinct key) | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed with retry/snapshot |
-| `Insert` (same key) | Allowed | Allowed | Serialized | Serialized | Allowed with retry/snapshot | Allowed with retry/snapshot |
-| `Update/Delete` (distinct key) | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed with retry/snapshot |
-| `Update/Delete` (same key) | Allowed | Allowed | Serialized | Serialized | Allowed with retry/snapshot | Allowed with retry/snapshot |
-| `T1 reorganize` | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Single-flight | Single-flight (同一実行スロット) |
-| `Checkpoint reload / Defragment` | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Single-flight (同一実行スロット) | Single-flight |
+| `Get` | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed |
+| `Scan` | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed |
+| `Insert` (distinct key) | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed with brief stall |
+| `Insert` (same key) | Allowed | Allowed | Serialized | Serialized | Allowed with retry/snapshot | Allowed with brief stall |
+| `Update/Delete` (distinct key) | Allowed | Allowed | Allowed | Allowed | Allowed with retry/snapshot | Allowed |
+| `Update/Delete` (same key) | Allowed | Allowed | Serialized | Serialized | Allowed with retry/snapshot | Allowed |
+| `T1 reorganize / Defragment` | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Allowed with retry/snapshot | Single-flight | Single-flight (同一実行スロット) |
+| `Checkpoint` | Allowed | Allowed | Allowed with brief stall | Allowed | Single-flight (同一実行スロット) | Single-flight |
 
 ### 6.4 Conflict Resolution Rules
 
@@ -521,11 +506,17 @@ checkpoint reload は T1 `reorganize()` がトリガーする atomic pointer swa
 - Insert / Update / Delete は T1 `reorganize` と並行してよい。
 - ただし、writer が旧世代バッファに対して行う書き込み（reserve & publish）は、再編成スレッド側のマージ開始前に実行される一段目のエポック同期バリア（`wait_until_epoch`）によって完全にドレインされる。これにより、書き込みスレッド側でのリトライや明示的なロック同期を一切不要としつつ、進行中のすべての更新がデータロストなく新旧いずれかの世代に安全に振り分けられる。
 
-#### Checkpoint Reload / Defragment vs All Operations
+#### Defragment vs All Operations
 
-- Checkpoint reload と Defragment はいずれも T1 `reorganize()` の中でトリガーされ、`reorganize` と同一の atomic pointer swap 機構を用いる。したがって「T1 Reorganize vs Readers」「T1 Reorganize vs Writers」で述べた整合性規則がそのまま適用される。
-- T1 checkpoint ファイル・T2 ファイルの構築中も、Get / Scan / Insert / Update / Delete は通常通り継続してよい。これらは新世代の `append_region` へ書き込まれるか、旧世代のスナップショットを読むかのいずれかであり、進行中のファイル構築とは一切干渉しない。
+- Defragment は `reorganize` と同一の atomic pointer swap 機構を用いる。したがって「T1 Reorganize vs Readers」「T1 Reorganize vs Writers」で述べた整合性規則がそのまま適用される。
+- 新しい T2 ファイルの構築中も、Get / Scan / Insert / Update / Delete は通常通り継続してよい。これらは新世代の `append_region` へ書き込まれるか、旧世代のスナップショットを読むかのいずれかであり、進行中のファイル構築とは一切干渉しない。
 - 新世代への切り替え(manifest の `rename`、および in-memory の pointer swap)が完了するまでは、クライアントへ新世代を公開してはならない。
+
+#### Checkpoint vs All Operations
+
+- Checkpoint は新規 append を短時間止めるだけで、進行中の in-place 更新やレコードのリロケーションを一切必要としない。
+- 新規 append は `stop_writers_and_wait()` のウィンドウの間だけ一時的に発行が止まり、`bytes_used` を確定させ次第すぐに再開する。
+- `base_boundary` の前進は、manifest の `rename()` が完了した後にのみ行う(5.3 節)。
 
 ### 6.5 Implementation Candidates
 

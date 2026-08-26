@@ -9,6 +9,7 @@
 #include <cassert>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <thread>
 #include <vector>
@@ -67,31 +68,27 @@ struct T2Memory {
   // touched by an in-place update again, and is thus safe to read seqlock-free via the
   // base-region mappings below (`base_mmap_scan`/`base_mmap_scan_seq`/`read_fd`). update_impl()
   // checks this directly to decide whether an in-place update must redirect out-of-place instead
-  // (see kOffsetMask's use there). Constant for this T2Memory's entire lifetime, set once at
-  // construction from `initial_bytes_used` -- checkpoint_internal() only ever grows it by
-  // publishing a whole new generation (a fresh T2Memory) via swap_memory(), never by mutating an
-  // existing one in place, so no atomic/synchronization is needed here: publication of the new
-  // T2Memory itself (via T2FlatFile's atomic pointer swap) already establishes the necessary
-  // happens-before relationship for every plain field in it, this one included.
-  uint64_t base_boundary = 0;
+  // (see kOffsetMask's use there). checkpoint_internal() advances this in place, on this same
+  // T2Memory instance, once `msync()` over the newly-covered range has succeeded -- never
+  // regresses, only ever grows. `mutable`/atomic for the same reason `bytes_used` is: readers and
+  // the advancing writer share one T2Memory instance rather than transitioning to a new one.
+  mutable std::atomic<uint64_t> base_boundary{0};
 
   // A second, read-only mmap covering [0, capacity) of this exact generation's file -- distinct
-  // from `base`'s MAP_PRIVATE|MADV_RANDOM mapping used everywhere else, left at the kernel's
-  // default readahead policy (no madvise call). Read by scan_impl() (and get_impl()'s
-  // large-record path, via try_read_resident_base_record()) for records whose embedded size
-  // hint is larger than one page -- see `base_mmap_scan_seq` below for the small-record
-  // counterpart and the "T2 base-region reads" comment in vmemkv_impl.hpp for why there are two.
-  // Mapped full-capacity (not just bytes_used-at-creation-time): since this mapping is
-  // PROT_READ-only, it never triggers copy-on-write, so it always transparently reflects whatever
-  // the backing file's current page-cache content is, including bytes written by
-  // checkpoint_internal()'s pwrite() through a different fd -- reads are only ever gated by the
-  // `offset < base_boundary` check (scan_impl()), never by whether this specific mapping has
-  // "seen" a write. Its lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based
-  // retirement scheme that already protects `base`/`capacity`. nullptr unless explicitly set by
-  // the caller (mmap_t2_memory() in vmemkv_impl.hpp -- best-effort -- a failure to create it just
-  // means the reader falls back to the
-  // always-correct `base` + seqlock path) -- the plain T2FlatFile-owned initial mapping never
-  // sets this, since a fresh store has base_boundary == 0 and thus nothing to map yet.
+  // from `base`'s MADV_RANDOM mapping used everywhere else, left at the kernel's default readahead
+  // policy (no madvise call). Read by scan_impl() (and get_impl()'s large-record path, via
+  // try_read_resident_base_record()) for records whose embedded size hint is larger than one page
+  // -- see `base_mmap_scan_seq` below for the small-record counterpart and the "T2 base-region
+  // reads" comment in vmemkv_impl.hpp for why there are two. Mapped full-capacity (not just
+  // bytes_used-at-creation-time): since both this mapping and `base` are MAP_SHARED over the same
+  // file, they always transparently agree -- reads are only ever gated by the `offset <
+  // base_boundary` check (scan_impl()), never by whether this specific mapping has "seen" a write.
+  // Its lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based retirement
+  // scheme that already protects `base`/`capacity`. nullptr unless explicitly set by the caller
+  // (mmap_t2_memory() in vmemkv_impl.hpp -- best-effort -- a failure to create it just means the
+  // reader falls back to the always-correct `base` + seqlock path) -- the plain T2FlatFile-owned
+  // initial mapping never sets this, since a fresh store has base_boundary == 0 and thus nothing to
+  // map yet.
   // `mutable` only so the destructor (a const-safe operation) can unmap it through the same
   // `const T2Memory *` pattern bytes_used already uses; never mutated after construction
   // otherwise.
@@ -194,11 +191,23 @@ class T2FlatFile {
   // RAII handle for lock-free reader thread safety without shared_ptr copy overhead.
   using T2MemoryHandle = typename ThreadReferenceTracker<const T2Memory *>::Guard;
 
-  // Constructor. Creates or maps a T2 flat binary file on disk.
+  // Constructor. Always creates or adopts vmemkv::derive_t2_chk_path(path) -- the single,
+  // persistent T2 data file for this store's whole lifetime; `path` itself is never opened
+  // directly, only kept (see path()) as the base other sibling paths (manifest/t1chk/wal) derive
+  // from.
   // `initial_generation`: stamped on the first T2Memory this instance maps. Must come from
   // T2Memory::allocate_generation(), not an arbitrary value -- see T2Memory::generation's
   // declaration for why a fixed value is unsafe.
-  T2FlatFile(const std::filesystem::path &path, uint64_t bytes_capacity, uint64_t initial_generation);
+  // `initial_bytes_used`: nullopt (default) starts from a fresh, empty data file, discarding
+  // whatever untrusted, unpublished bytes might already be at derive_t2_chk_path(path) -- see
+  // low_level_design.md 5.1 for why those bytes carry no authority without a manifest vouching for
+  // them. A value instead adopts the file already there, trusting the caller has already
+  // validated it against a committed manifest naming exactly this many bytes used (see
+  // VMemKVImpl::adopted_t2_bytes_used()).
+  T2FlatFile(const std::filesystem::path &path,
+             uint64_t bytes_capacity,
+             uint64_t initial_generation,
+             std::optional<uint64_t> initial_bytes_used = std::nullopt);
   ~T2FlatFile() noexcept;
 
   T2FlatFile(const T2FlatFile &) = delete;
@@ -326,13 +335,19 @@ class T2FlatFile {
   }
 
   // Helper to create and pre-allocate an empty binary file on disk.
-  static auto create_empty_file(const std::filesystem::path &path, uint64_t bytes_capacity) -> uint64_t;
+  static void create_empty_file(const std::filesystem::path &path, uint64_t bytes_capacity);
 
-  void map_file(const std::filesystem::path &path, uint64_t bytes_capacity, uint64_t initial_generation);
+  void map_file(const std::filesystem::path &path,
+                uint64_t bytes_capacity,
+                uint64_t initial_generation,
+                uint64_t initial_bytes_used);
 
   void retire_memory(const T2Memory *old_mem);
 
   // ─── Member Variables ───
+  // The identity path passed to the constructor -- NOT the file actually opened/mapped (that's
+  // always vmemkv::derive_t2_chk_path(path_), see the constructor's doc comment). Sibling paths
+  // (manifest/t1chk/wal) are derived from this one, unsuffixed value.
   std::filesystem::path path_;
 
   std::atomic<const T2Memory *> t2_mem_{nullptr};

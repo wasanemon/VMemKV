@@ -134,58 +134,46 @@ VMemKV が解消したい断片化は 2 種類ある。
 
 - T1の reorganize:
   - `append_region` と `sorted_region` をマージし，ソートすることで Ordering Fragmentation を解消する．このとき，offset が tombstone のエントリ（Delete済みのもの）はスキップする．
-- T2の reorganize:
+- T2の reorganize(Defragment):
   - T1 の live entry 順に T2 からデータをコピーし，新しい単一 byte array を構築する．
   - コピー先 offset を T1 に書き戻す．
   - これらの処理において，tombstone 化されたエントリは新しい T1 に含まれず，また，参照offsetが切れているT2のrecordはコピーされないため，Storage Fragmentation が解消される．
 
-T1 の reorganize はT2とは独立して実行できる．すなわち，T1の `reorganize()` を高頻度で実施してもよい．しかし，T2の `reorganize` はオフセット（位置）の変更を伴うため，T1の `reorganize` とセットで実行しなければならない．この時の並行処理については，6.2節で詳しく述べる．
+T1 の reorganize はT2とは独立して実行できる．すなわち，T1の `reorganize()` を高頻度で実施してもよい．Defragment はオフセット（位置）の変更を伴うため，T1の `reorganize` とセットで実行する．この時の並行処理については，6.3節で詳しく述べる．
 
 ![reorganize](../images/reorganization.png)
 
 Tier 1 は単独 `reorganize` により ordering fragmentation を軽く抑えられる。
-Tier 2 は checkpoint 時の再配置により storage fragmentation をまとめて解消する。
+Tier 2 は Defragment による再配置により storage fragmentation をまとめて解消する。
 また、Tier 1 の順序に従って Tier 2 を並べ直すことで、scan 性能も向上する。
 
-### 6.2 live reload　& checkpoint
+### 6.2 checkpoint
 
-VMemKVの `reorganize` の一連の処理の結果として，T1 については新規に `sorted_region` と `append_region` が生まれ、T2 については新しい単一 byte array が生まれることになる．これを現在使用中のものと差し替えるにあたって，二つの問題がある．
+Tier 2 の稼働中 mmap は `MAP_SHARED` である。書き込みはページキャッシュへ直接反映されるため、checkpoint は tail 領域を `msync()` して物理ディスクへの反映を確定させるだけの、短時間の操作である。新規 append を短く止める以外に停止は発生しない。詳細な手順と正しさの根拠は low_level_design.md 4.3 節・5.3 節を参照。
 
-1. 停止時間を最小化したい．`reorganize` のために T1 の region と T2 の byte array を走査することになるが，その際にはオンラインで読み取りたい．(atomic pointer swap による無停止化については後述．)
-2. メモリ領域を大幅に圧迫する．フルスキャンしたうえでフルコピーを行うため，キャッシュラインに与える影響は大きく，`reorganize` 中の性能劣化は避けられない．T1は軽量のためフルスキャン＆フルコピーしても性能影響は限定的だが，T2のそれは非常に問題である．
+### 6.3 Defragment
 
-この二つの問題を解決するため，VMemKVでは，**T2のreorganize が行われる際には必ずcheckpointingを行い，ファイルを介してlive reloadする**ことで，メモリ消費を抑えつつ永続化を行う．これを `checkpoint reload` と呼ぶ．
+Defragment は Tier 2 の生存データ全件を、T1 の key 順のまま新しい単一 byte array へ再配置し、旧ファイルを置き換える。これを現在使用中のものと差し替えるにあたって、二つの要件がある。
 
-> [!IMPORTANT]
-> 旧設計では `fork()` による CoW スナップショットでこれを実現していたが、マルチスレッド環境における fork-safety(デッドロックリスク)と OOM Killer によるページ複製オーバーヘッドを避けるため、fork を使わない in-process 方式に変更した。
+1. 停止時間を最小化する。走査中はオンラインで読み取れる必要がある(atomic pointer swap による無停止化)。
+2. メモリ領域を大幅に圧迫しない。フルスキャン・フルコピーを伴うため、キャッシュラインへの影響を抑える設計が要る。
 
 ![live reload](../images/live_reload_checkpoint.svg)
 
-概略は次のとおりである。T1 の `reorganize()` 呼び出しの中で checkpoint LSN を確定し(6.1節および WAL サイズ上限のトリガー成立時)、新しい `sorted_region` と新しい T2 ファイルを一時ファイルへ書き出したうえで、manifest の `rename()` を新世代の有効化点として atomic pointer swap で公開し、最後に不要になった WAL レコードと旧世代のファイルを片付ける。詳細な手順と正しさの根拠は low_level_design.md 5.2 節 (Flow) および 5.3 節 (Correctness Rule) を参照。
+概略は次のとおりである。T1 の `reorganize()` 呼び出しの中で checkpoint LSN を確定し、新しい `sorted_region` と新しい T2 ファイルを一時ファイルへ書き出したうえで、manifest の `rename()` を新世代の有効化点として atomic pointer swap で公開し、最後に不要になった WAL レコードと旧世代のファイルを片付ける。詳細な手順と正しさの根拠は low_level_design.md 4.6 節を参照。
 
 このフローにおいて、旧世代バッファへの書き込みがまだ進行中の状態でマージが進まないよう、pointer swapの直後（マージ開始前）に「一段目のエポック同期バリア」を挟み、旧世代のすべての書き込みスレッドの完了を待機する。
 
-このフローに stop-the-world や、fork 版が必要としていたジャイアントロックは存在しない(理由は low_level_design.md 5.2 節末尾を参照)．
-
-### 6.3 reorganize と checkpoint reloadの違い
-
-`reorganize` と checkpoint reloadは強く関連するが、同一の操作ではない。後者が前者に依存している．
-
-- `reorganize`: Tier 1 では `append_region` を `sorted_region` に吸収し、Tier 2 では live record を新しい byte array に詰め直して、**断片化**を解消するための処理
-- checkpoint reload: 永続化済みの一貫した世代を新たに作り、**durability**を保証する処理 (checkpoint)．また，reorganize後のT2のデータをチェックポイントファイルを介して`mmap` で読み込むことで，メモリ負荷を抑えるアプローチ (reload)．
-
-この分離は重要である。特に Tier 1 はホットなインデックス層なので、読み性能を維持するために checkpoint より高い頻度で単独 `reorganize` される。したがって，Tier 1 は「チェックポイントファイルを書き出さない reorganize」も存在する．
-
-一方 Tier 2 の `reorganize` は必ずチェックポイントを伴う．
+このフローに stop-the-world は存在しない。
 
 ## 7. 障害耐性と WAL
 
 以下の要素で、VMemKV は永続性を保証する。
 
-- Tier 1 / Tier 2 はいずれも、それ自体がディスクへ書き戻される経路を持たない(Tier 2 は `MAP_PRIVATE` で mmap されるため書き込みは元ファイルへ反映されず、Tier 1 は純粋な RAM 上構造体である)。そのため両者は volatile であり、起動のたびに WAL からの replay で再構築される。
+- Tier 1 は純粋な RAM 上構造体であり、それ自体がディスクへ書き戻される経路を持たない。起動のたびに、T1 checkpoint ファイル(存在すれば)と WAL からの replay で再構築される。
 - 更新は、まず Tier 2 / Tier 1 に適用し、それが成功して初めて WAL append + `fsync` を行う。呼び出し元への成功応答は WAL の `fsync` 完了後にのみ返す。適用失敗を WAL に残さないための順序であり、詳細な理由は low_level_design.md 3.2 節 Failure Rule を参照。
 - 障害時は checkpoint の読み込み + WAL replay で復旧する
-- checkpoint 完了後、不要になった旧世代の checkpoint ファイルは削除し、WAL は low_level_design.md 5.5 節の手順でローテートする
+- checkpoint 完了後、WAL は low_level_design.md 5.5 節の手順でローテートする
 
 ## 8. 最適化の全体像
 

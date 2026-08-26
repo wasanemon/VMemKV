@@ -118,7 +118,7 @@ TEST_CASE("Wal: fresh file starts at LSN 1 with empty replay") {
                                        uint64_t /*lsn*/) { FAIL("replay callback invoked on empty WAL"); });
   CHECK(count == 0);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: insert/update/delete assign strictly increasing LSNs") {
@@ -139,7 +139,7 @@ TEST_CASE("Wal: insert/update/delete assign strictly increasing LSNs") {
   CHECK(lsn2 < lsn3);
   CHECK(wal.next_lsn() > lsn3);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: replay after reopen round-trips type/key/value/order") {
@@ -178,7 +178,7 @@ TEST_CASE("Wal: replay after reopen round-trips type/key/value/order") {
   CHECK(records[0].lsn < records[1].lsn);
   CHECK(records[1].lsn < records[2].lsn);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: delete record replays with empty value span") {
@@ -198,7 +198,7 @@ TEST_CASE("Wal: delete record replays with empty value span") {
   });
   CHECK(saw_record);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: LSN numbering continues across reopen, does not reset") {
@@ -215,7 +215,7 @@ TEST_CASE("Wal: LSN numbering continues across reopen, does not reset") {
   const uint64_t lsn = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
   CHECK(lsn > last_lsn_before_reopen);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: repeated open/close with zero appends stays empty") {
@@ -233,29 +233,30 @@ TEST_CASE("Wal: repeated open/close with zero appends stays empty") {
                                        uint64_t /*lsn*/) { FAIL("replay callback invoked on empty WAL"); });
   CHECK(count == 0);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
   const auto path = reserve_wal_path();
+  const auto seg1 = vmemkv::derive_wal_segment_path(path, 1);
   uint64_t valid_end = 0;
   uint64_t first_lsn = 0;
   {
     vmemkv::Wal wal(path);
     first_lsn = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
-    valid_end = std::filesystem::file_size(path);
+    valid_end = std::filesystem::file_size(seg1);
   }
 
   // Simulate a crash mid-append: append raw bytes shorter than a full header, bypassing Wal entirely.
   {
-    std::ofstream out(path, std::ios::binary | std::ios::app);
+    std::ofstream out(seg1, std::ios::binary | std::ios::app);
     constexpr std::array<char, 10> garbage{};
     out.write(garbage.data(), garbage.size());
   }
-  REQUIRE(std::filesystem::file_size(path) == valid_end + 10);
+  REQUIRE(std::filesystem::file_size(seg1) == valid_end + 10);
 
   vmemkv::Wal wal(path);
-  CHECK(std::filesystem::file_size(path) == valid_end);
+  CHECK(std::filesystem::file_size(seg1) == valid_end);
   CHECK(wal.next_lsn() == first_lsn + 1);
 
   const uint64_t lsn = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
@@ -270,17 +271,18 @@ TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
   CHECK(keys[0] == "a");
   CHECK(keys[1] == "b");
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: torn trailing record with full header but truncated payload is discarded") {
   const auto path = reserve_wal_path();
+  const auto seg1 = vmemkv::derive_wal_segment_path(path, 1);
   uint64_t valid_end = 0;
   uint64_t first_lsn = 0;
   {
     vmemkv::Wal wal(path);
     first_lsn = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
-    valid_end = std::filesystem::file_size(path);
+    valid_end = std::filesystem::file_size(seg1);
   }
 
   {
@@ -294,7 +296,7 @@ TEST_CASE("Wal: torn trailing record with full header but truncated payload is d
     header.value_len = 5;
     header.type = static_cast<uint8_t>(vmemkv::WalRecordType::Insert);
 
-    std::ofstream out(path, std::ios::binary | std::ios::app);
+    std::ofstream out(seg1, std::ios::binary | std::ios::app);
     out.write(reinterpret_cast<const char *>(&header), sizeof(header));
     // Declares a 10-byte payload but only 3 bytes actually follow -- torn payload.
     constexpr std::array<char, 3> partial_payload{'x', 'y', 'z'};
@@ -302,27 +304,28 @@ TEST_CASE("Wal: torn trailing record with full header but truncated payload is d
   }
 
   vmemkv::Wal wal(path);
-  CHECK(std::filesystem::file_size(path) == valid_end);
+  CHECK(std::filesystem::file_size(seg1) == valid_end);
   CHECK(wal.next_lsn() == first_lsn + 1);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier records survive") {
   const auto path = reserve_wal_path();
+  const auto seg1 = vmemkv::derive_wal_segment_path(path, 1);
   uint64_t after_first = 0;
   uint64_t first_lsn = 0;
   {
     vmemkv::Wal wal(path);
     first_lsn = append_insert(wal, as_span(bytes_of("keep")), as_span(bytes_of("v1")));
-    after_first = std::filesystem::file_size(path);
+    after_first = std::filesystem::file_size(seg1);
     append_insert(wal, as_span(bytes_of("corrupt")), as_span(bytes_of("v2")));
   }
 
   {
     const auto offset = static_cast<std::streamoff>(after_first) +
                         static_cast<std::streamoff>(offsetof(vmemkv::WalRecordHeader, checksum));
-    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    std::fstream file(seg1, std::ios::binary | std::ios::in | std::ios::out);
     file.seekg(offset);
     char original = 0;
     file.read(&original, 1);
@@ -332,7 +335,7 @@ TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier reco
   }
 
   vmemkv::Wal wal(path);
-  CHECK(std::filesystem::file_size(path) == after_first);
+  CHECK(std::filesystem::file_size(seg1) == after_first);
   CHECK(wal.next_lsn() == first_lsn + 1);
 
   std::vector<std::string> keys;
@@ -343,7 +346,7 @@ TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier reco
   REQUIRE(keys.size() == 1);
   CHECK(keys[0] == "keep");
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: concurrent appends from multiple threads yield unique LSNs that all survive replay") {
@@ -396,7 +399,7 @@ TEST_CASE("Wal: concurrent appends from multiple threads yield unique LSNs that 
   std::sort(replayed_lsns.begin(), replayed_lsns.end());
   CHECK(replayed_lsns == acknowledged_lsns);  // Every acknowledged append survives replay, and no others do.
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: zero-length value on Insert round-trips distinctly from Delete") {
@@ -420,7 +423,7 @@ TEST_CASE("Wal: zero-length value on Insert round-trips distinctly from Delete")
   });
   CHECK(saw_record);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: large (>64KB) key/value payloads round-trip") {
@@ -448,18 +451,19 @@ TEST_CASE("Wal: large (>64KB) key/value payloads round-trip") {
   });
   CHECK(saw_record);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
-TEST_CASE("Wal: rotate() drops records at or before checkpoint_lsn, keeps the tail") {
+TEST_CASE(
+    "Wal: rotate_segment() rolls onto a new segment, replay() still sees everything (nothing 2 rollovers old yet)") {
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
 
-  const uint64_t lsn_a = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
-  const uint64_t lsn_b = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
-  const uint64_t lsn_c = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
+  append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
+  append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
+  append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
 
-  wal.rotate(lsn_b);  // Keep only records with lsn > lsn_b, i.e. just "c".
+  wal.rotate_segment();  // First rollover: generation 1 -> 2 -- nothing is 2 rollovers old yet.
 
   std::vector<ReplayedRecord> records;
   const uint64_t count = wal.replay(
@@ -467,91 +471,121 @@ TEST_CASE("Wal: rotate() drops records at or before checkpoint_lsn, keeps the ta
         records.push_back(ReplayedRecord{type, span_to_string(key), span_to_string(value), lsn});
       });
 
-  CHECK(count == 1);
-  REQUIRE(records.size() == 1);
-  CHECK(records[0].key == "c");
-  CHECK(records[0].lsn == lsn_c);
-  CHECK(lsn_a < lsn_b);  // Sanity on the fixture, not the code under test.
+  CHECK(count == 3);
+  REQUIRE(records.size() == 3);
+  CHECK(records[0].key == "a");
+  CHECK(records[1].key == "b");
+  CHECK(records[2].key == "c");
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
-TEST_CASE("Wal: rotate() keeps LSN numbering continuous, does not reset") {
+TEST_CASE("Wal: rotate_segment() deletes the generation two rollovers back") {
+  const auto path = reserve_wal_path();
+  vmemkv::Wal wal(path);
+
+  const uint64_t lsn_a = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
+  wal.rotate_segment();  // Generation 1 -> 2: nothing to delete yet.
+  CHECK(std::filesystem::exists(vmemkv::derive_wal_segment_path(path, 1)));
+
+  const uint64_t lsn_b = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
+  wal.rotate_segment();  // Generation 2 -> 3: generation 1 is now two rollovers back -- deleted.
+  CHECK_FALSE(std::filesystem::exists(vmemkv::derive_wal_segment_path(path, 1)));
+  CHECK(std::filesystem::exists(vmemkv::derive_wal_segment_path(path, 2)));
+
+  std::vector<ReplayedRecord> records;
+  wal.replay(
+      [&](vmemkv::WalRecordType type, std::span<const std::byte> key, std::span<const std::byte> value, uint64_t lsn) {
+        records.push_back(ReplayedRecord{type, span_to_string(key), span_to_string(value), lsn});
+      });
+  REQUIRE(records.size() == 1);  // "a" (generation 1) is gone; "b" (generation 2) survives.
+  CHECK(records[0].key == "b");
+  CHECK(records[0].lsn == lsn_b);
+  CHECK(lsn_a < lsn_b);  // Sanity on the fixture, not the code under test.
+
+  vmemkv::remove_wal_segments(path);
+}
+
+TEST_CASE("Wal: rotate_segment() keeps LSN numbering continuous, does not reset") {
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
 
   append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
   const uint64_t lsn_b = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
 
-  wal.rotate(lsn_b);
+  wal.rotate_segment();
   CHECK(wal.next_lsn() > lsn_b);
 
   const uint64_t lsn_after = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
   CHECK(lsn_after > lsn_b);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
-TEST_CASE("Wal: rotate() with an empty tail (checkpoint_lsn == latest) still preserves LSN continuity") {
+TEST_CASE("Wal: rotate_segment() with nothing written since the last rollover still preserves LSN continuity") {
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
 
   const uint64_t lsn_a = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
-  wal.rotate(lsn_a);  // Nothing has a higher lsn -- the rotated file is empty.
+  wal.rotate_segment();  // Generation 2 becomes active, empty.
+  wal.rotate_segment();  // Rotates again with nothing written to generation 2; generation 1 ("a") is deleted.
 
   CHECK(wal.next_lsn() > lsn_a);
 
-  const uint64_t count = wal.replay([](vmemkv::WalRecordType /*type*/,
-                                       std::span<const std::byte> /*key*/,
-                                       std::span<const std::byte> /*value*/,
-                                       uint64_t /*lsn*/) { FAIL("replay callback invoked on empty rotated WAL"); });
+  const uint64_t count =
+      wal.replay([](vmemkv::WalRecordType /*type*/,
+                    std::span<const std::byte> /*key*/,
+                    std::span<const std::byte> /*value*/,
+                    uint64_t /*lsn*/) { FAIL("replay callback invoked but no record should survive"); });
   CHECK(count == 0);
 
   const uint64_t lsn_after = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
   CHECK(lsn_after > lsn_a);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
-TEST_CASE("Wal: rotate() shrinks the on-disk file size, not just what replay() reports") {
+TEST_CASE("Wal: rotate_segment() starts the new active segment empty") {
   const auto path = reserve_wal_path();
-  uint64_t size_after_one_record = 0;
-  uint64_t lsn_first = 0;
+  uint64_t size_before = 0;
   {
     vmemkv::Wal wal(path);
-    lsn_first = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
-    size_after_one_record = std::filesystem::file_size(path);
+    append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
     for (int i = 0; i < 50; ++i) {
       append_insert(wal, as_span(bytes_of("k" + std::to_string(i))), as_span(bytes_of("v")));
     }
-    REQUIRE(std::filesystem::file_size(path) > size_after_one_record);
+    size_before = std::filesystem::file_size(vmemkv::derive_wal_segment_path(path, 1));
+    REQUIRE(size_before > 0);
 
-    wal.rotate(lsn_first);  // Drop only the very first record.
+    wal.rotate_segment();
   }
 
-  // A fresh Wal reopening the rotated file must also see the correct (shrunk) state -- this
-  // is the actual crash-recovery-relevant property, not just the live object's own view.
+  const auto seg2 = vmemkv::derive_wal_segment_path(path, 2);
+  REQUIRE(std::filesystem::exists(seg2));
+  CHECK(std::filesystem::file_size(seg2) == 0);
+
+  // A fresh Wal reopening after the rollover must also see the correct state -- this is the
+  // actual crash-recovery-relevant property, not just the live object's own view. Generation 1
+  // hasn't been deleted yet (only one rollover has happened), so all 51 records still replay.
   vmemkv::Wal reopened(path);
-  CHECK(reopened.next_lsn() > lsn_first);
   uint64_t replayed_count = reopened.replay([](vmemkv::WalRecordType /*type*/,
                                                std::span<const std::byte> /*key*/,
                                                std::span<const std::byte> /*value*/,
                                                uint64_t lsn) { CHECK(lsn > 0); });
-  CHECK(replayed_count == 50);
+  CHECK(replayed_count == 51);
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
-TEST_CASE("Wal: rotate() survives reopen -- rotated file replays correctly from a new Wal instance") {
+TEST_CASE("Wal: rotate_segment() survives reopen -- every existing segment replays from a new Wal instance") {
   const auto path = reserve_wal_path();
-  uint64_t lsn_b = 0;
   uint64_t lsn_c = 0;
   {
     vmemkv::Wal wal(path);
     append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
-    lsn_b = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
+    append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
     lsn_c = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
-    wal.rotate(lsn_b);
+    wal.rotate_segment();  // Generation 1 (a, b, c) retained; generation 2 becomes active, empty.
   }
 
   vmemkv::Wal reopened(path);
@@ -562,10 +596,12 @@ TEST_CASE("Wal: rotate() survives reopen -- rotated file replays correctly from 
                       std::span<const std::byte> key,
                       std::span<const std::byte> /*value*/,
                       uint64_t /*lsn*/) { keys.push_back(span_to_string(key)); });
-  REQUIRE(keys.size() == 1);
-  CHECK(keys[0] == "c");
+  REQUIRE(keys.size() == 3);
+  CHECK(keys[0] == "a");
+  CHECK(keys[1] == "b");
+  CHECK(keys[2] == "c");
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -596,7 +632,7 @@ TEST_CASE("Wal: append after reopening a non-empty WAL does not hang") {
   REQUIRE(keys.size() == 3);
   CHECK(keys[2] == "c");
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: concurrent appends replay with exactly the content each thread wrote, keyed by LSN") {
@@ -647,7 +683,7 @@ TEST_CASE("Wal: concurrent appends replay with exactly the content each thread w
     CHECK(it->second.value == expected.value);
   }
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: append storm exceeding ring capacity does not corrupt or duplicate records") {
@@ -702,10 +738,10 @@ TEST_CASE("Wal: append storm exceeding ring capacity does not corrupt or duplica
     CHECK(it->second == expected_key);
   }
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }
 
-TEST_CASE("Wal: rotate() under concurrent appends returns promptly and preserves the tail") {
+TEST_CASE("Wal: rotate_segment() under concurrent appends returns promptly and loses nothing") {
   const auto path = reserve_wal_path();
   vmemkv::Wal wal(path);
 
@@ -739,13 +775,7 @@ TEST_CASE("Wal: rotate() under concurrent appends returns promptly and preserves
     REQUIRE(appended_count.load(std::memory_order_relaxed) >= 50);
   }
 
-  uint64_t checkpoint_lsn = 0;
-  {
-    std::lock_guard<std::mutex> lock(recorded_mutex);
-    checkpoint_lsn = all_lsns[all_lsns.size() / 2];
-  }
-
-  const bool rotate_completed = run_with_timeout([&]() { wal.rotate(checkpoint_lsn); }, std::chrono::seconds(10));
+  const bool rotate_completed = run_with_timeout([&]() { wal.rotate_segment(); }, std::chrono::seconds(10));
   REQUIRE(rotate_completed);
 
   stop.store(true, std::memory_order_relaxed);
@@ -757,14 +787,21 @@ TEST_CASE("Wal: rotate() under concurrent appends returns promptly and preserves
                  std::span<const std::byte> /*key*/,
                  std::span<const std::byte> /*value*/,
                  uint64_t lsn) { replayed_lsns.push_back(lsn); });
-
   std::sort(replayed_lsns.begin(), replayed_lsns.end());
   CHECK(std::adjacent_find(replayed_lsns.begin(), replayed_lsns.end()) == replayed_lsns.end());  // no duplicates
-  for (uint64_t lsn : replayed_lsns) {
-    CHECK(lsn > checkpoint_lsn);  // rotate() must have dropped everything at or before checkpoint_lsn
-  }
 
-  std::filesystem::remove(path);
+  std::vector<uint64_t> expected_lsns;
+  {
+    std::lock_guard<std::mutex> lock(recorded_mutex);
+    expected_lsns = all_lsns;
+  }
+  std::sort(expected_lsns.begin(), expected_lsns.end());
+  // Only one rollover happened, so nothing is two rollovers old yet -- every record this writer
+  // ever appended must still be present (see rotate_segment()'s doc comment for the retention
+  // scheme), regardless of which segment it physically landed in.
+  CHECK(replayed_lsns == expected_lsns);
+
+  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding callers without hanging") {
@@ -773,7 +810,8 @@ TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding caller
 
   // Establish a small baseline so later writes past this size trigger EFBIG.
   append_insert(wal, as_span(bytes_of("seed")), as_span(bytes_of("1")));
-  const auto size_after_seed = static_cast<rlim_t>(std::filesystem::file_size(path));
+  const auto size_after_seed =
+      static_cast<rlim_t>(std::filesystem::file_size(vmemkv::derive_wal_segment_path(path, 1)));
 
   struct rlimit original_limit {};
   REQUIRE(getrlimit(RLIMIT_FSIZE, &original_limit) == 0);
@@ -826,5 +864,5 @@ TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding caller
   // attempting another syscall.
   CHECK_THROWS(append_insert(wal, as_span(bytes_of("after")), as_span(bytes_of("z"))));
 
-  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(path);
 }

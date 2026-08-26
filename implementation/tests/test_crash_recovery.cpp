@@ -3,7 +3,7 @@
 // Each scenario simulates a "restart" by constructing two (or more) store
 // instances over the same on-disk path -- destroying the first before
 // constructing the second, exactly like a process crash-and-restart. Torn
-// and corrupted WAL bytes are injected directly via vmemkv::derive_wal_path(),
+// and corrupted WAL bytes are injected directly via vmemkv::find_active_wal_segment(),
 // bypassing vmemkv::Wal entirely, to simulate a crash mid-append.
 
 #include <doctest/doctest.h>
@@ -36,7 +36,7 @@ auto reserve_crash_temp_path() -> std::filesystem::path {
 void cleanup_store_files(const std::filesystem::path &t2_path) {
   std::error_code ignored;
   std::filesystem::remove(t2_path, ignored);
-  std::filesystem::remove(vmemkv::derive_wal_path(t2_path), ignored);
+  vmemkv::remove_wal_segments(vmemkv::derive_wal_path(t2_path));
   std::filesystem::remove(vmemkv::derive_manifest_path(t2_path), ignored);
   std::filesystem::remove(vmemkv::derive_t1_chk_path(t2_path), ignored);
   std::filesystem::remove(vmemkv::derive_t2_chk_path(t2_path), ignored);
@@ -59,9 +59,11 @@ auto get_bytes(StorePtr &store, const std::string &key) -> std::optional<std::st
 }
 
 // Simulates a crash mid-append: raw bytes shorter than a full WAL record header, appended
-// directly to the WAL file, bypassing vmemkv::Wal.
+// directly to the WAL's active segment file, bypassing vmemkv::Wal.
 void append_torn_header_bytes(const std::filesystem::path &t2_path) {
-  std::ofstream out(vmemkv::derive_wal_path(t2_path), std::ios::binary | std::ios::app);
+  const auto active = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(t2_path));
+  REQUIRE(active.has_value());
+  std::ofstream out(*active, std::ios::binary | std::ios::app);
   constexpr std::array<char, 10> garbage{};
   out.write(garbage.data(), garbage.size());
 }
@@ -77,20 +79,23 @@ void append_torn_payload_bytes(const std::filesystem::path &t2_path) {
   header.value_len = 5;
   header.type = static_cast<uint8_t>(vmemkv::WalRecordType::Insert);
 
-  std::ofstream out(vmemkv::derive_wal_path(t2_path), std::ios::binary | std::ios::app);
+  const auto active = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(t2_path));
+  REQUIRE(active.has_value());
+  std::ofstream out(*active, std::ios::binary | std::ios::app);
   out.write(reinterpret_cast<const char *>(&header), sizeof(header));
   constexpr std::array<char, 3> partial_payload{'x', 'y', 'z'};
   out.write(partial_payload.data(), partial_payload.size());
 }
 
-// Flips the checksum field of the WAL record starting at `record_start_offset`, corrupting it
-// while leaving header/payload lengths intact -- simulates bit rot on an already-fsynced record
-// rather than a literal crash.
+// Flips the checksum field of the WAL record starting at `record_start_offset` in the active
+// segment, corrupting it while leaving header/payload lengths intact -- simulates bit rot on an
+// already-fsynced record rather than a literal crash.
 void corrupt_record_checksum(const std::filesystem::path &t2_path, uint64_t record_start_offset) {
-  const auto wal_path = vmemkv::derive_wal_path(t2_path);
+  const auto active = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(t2_path));
+  REQUIRE(active.has_value());
   const auto offset = static_cast<std::streamoff>(record_start_offset) +
                       static_cast<std::streamoff>(offsetof(vmemkv::WalRecordHeader, checksum));
-  std::fstream file(wal_path, std::ios::binary | std::ios::in | std::ios::out);
+  std::fstream file(*active, std::ios::binary | std::ios::in | std::ios::out);
   file.seekg(offset);
   char original = 0;
   file.read(&original, 1);
@@ -262,7 +267,9 @@ TEST_CASE_TEMPLATE("crash recovery: corrupted checksum on last record discarded,
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
-    offset_before_last = std::filesystem::file_size(vmemkv::derive_wal_path(path));
+    const auto active = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(path));
+    REQUIRE(active.has_value());
+    offset_before_last = std::filesystem::file_size(*active);
     REQUIRE(store->insert("doomed", make_value(999)));
   }
   corrupt_record_checksum(path, offset_before_last);
@@ -535,19 +542,25 @@ TEST_CASE_TEMPLATE("checkpoint: explicit checkpoint() persists a manifest and su
   cleanup_store_files(path);
 }
 
-TEST_CASE("checkpoint: rotates the WAL down to just the post-checkpoint tail") {
+TEST_CASE("checkpoint: rolls the WAL onto a fresh, empty active segment") {
   const auto path = reserve_crash_temp_path();
   constexpr int kKeyCount = 200;
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < kKeyCount; ++i) {
     REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
   }
-  const uint64_t wal_size_before = std::filesystem::file_size(vmemkv::derive_wal_path(path));
+  const auto wal_path = vmemkv::derive_wal_path(path);
+  const auto active_before = vmemkv::find_active_wal_segment(wal_path);
+  REQUIRE(active_before.has_value());
+  const uint64_t wal_size_before = std::filesystem::file_size(*active_before);
 
   store->impl().checkpoint();
 
-  const uint64_t wal_size_after = std::filesystem::file_size(vmemkv::derive_wal_path(path));
-  CHECK(wal_size_after < wal_size_before);  // Rotation dropped everything up to checkpoint_lsn.
+  const auto active_after = vmemkv::find_active_wal_segment(wal_path);
+  REQUIRE(active_after.has_value());
+  CHECK(*active_after != *active_before);  // rotate_segment() rolled onto a new generation.
+  const uint64_t wal_size_after = std::filesystem::file_size(*active_after);
+  CHECK(wal_size_after < wal_size_before);  // The new active segment starts empty.
 
   cleanup_store_files(path);
 }
@@ -749,59 +762,75 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
   cleanup_store_files(path);
 }
 
-// Regression test for a real race, confirmed via direct reproduction (not just reasoned about):
-// checkpoint_internal()'s pre-stop pass (copy_live_entries(/*destructive=*/false)) used to capture
-// a tail-resident record's current bytes and mark it durabilized with no barrier stopping an
-// in-place update from landing on that exact offset immediately afterward; the post-stop pass
-// then skipped it (already durabilized), so the checkpoint file kept the stale, pre-update bytes.
-// Once the cycle published a fresh T2Memory generation with base_boundary advanced past this
-// offset, the record became base-resident -- read through the seqlock-free base-region mmaps
-// (7.9), which reflect the *file's* stale bytes, not the in-place update's private COW page. Live
-// reads reverted to the pre-update value immediately, with no crash or restart involved; only a
-// subsequent restart (WAL replay of the update, whose LSN is always > checkpoint_lsn) corrected
-// it.
-//
-// Fixed on the write side (capture_watermark_, see its own declaration and
-// try_in_place_update()'s allow_in_place check): checkpoint_internal() claims a record's offset
-// -- advancing capture_watermark_ past it -- *before* reading it, so any in-place update racing
-// that exact offset is guaranteed to see allow_in_place==false and redirect out-of-place instead
-// of mutating a record the checkpoint has already (or is about to) durabilize. This makes the
-// race impossible rather than detecting and correcting it after the fact.
-TEST_CASE(
-    "checkpoint: an in-place update racing the pre-stop/writer-stop window stays visible live and survives a restart") {
+// Stress/regression test: in-place updates racing concurrent checkpoint() cycles never observe
+// (live) or recover to (after restart) a stale value. Purely black-box -- no internal hook is
+// needed: checkpoint_internal() never reads a record's bytes into a separate buffer at all
+// (durabilization is a byte-range msync() over the live mapping itself, low_level_design.md 4.3
+// 節), so there is no window in which a captured snapshot can go stale out from under a racing
+// update. Each key gets its own dedicated updater thread so the last value each one wrote is
+// known precisely (update() only returns once its WAL record is fsynced, low_level_design.md 3.2
+// 節), and a separate thread hammers checkpoint() throughout.
+TEST_CASE("checkpoint: in-place updates racing concurrent checkpoint() stay correct live and survive a restart") {
   const auto path = reserve_crash_temp_path();
-  const std::string v1(200, 'a');
-  const std::string v2(200, 'b');
+  constexpr int kKeyCount = 8;
+  constexpr int kUpdatesPerKey = 500;
+  constexpr std::size_t kValueBytes = 200;
+
+  auto key_for = [](int i) { return "racer" + std::to_string(i); };
+  auto value_for = [](int i, int round) {
+    return std::string(kValueBytes, static_cast<char>('a' + ((i + round) % 26)));
+  };
+
+  std::array<std::string, kKeyCount> last_written;
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
-    REQUIRE(store->insert("racer", v1));  // Tail-resident: no checkpoint has run yet.
+    for (int i = 0; i < kKeyCount; ++i) {
+      REQUIRE(store->insert(key_for(i), value_for(i, 0)));
+    }
 
-    std::thread racer;
-    using ImplT = std::decay_t<decltype(store->impl())>;
-    store->impl().reorganize_internal(ImplT::ReorgMode::Checkpoint,
-                                      /*pre_stop_hook=*/[&] {
-                                        // Fires after the pre-stop copy_live_entries() pass has already captured
-                                        // "racer"=v1 and before stop_writers_and_wait() blocks new writers -- the exact
-                                        // window under suspicion. update() itself waits for WAL durability, so joining
-                                        // here is sufficient to guarantee the racing write is fully applied (T2 and
-                                        // WAL) before this hook returns.
-                                        racer = std::thread([&] { REQUIRE(store->update("racer", v2)); });
-                                        racer.join();
-                                      });
+    std::atomic<bool> stop{false};
+    std::thread checkpointer([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        store->checkpoint();
+      }
+    });
 
-    // Live reads must already reflect v2 regardless of what the checkpoint file captured -- T2's
-    // live mapping was updated in place independently of checkpoint_internal()'s file I/O.
-    const auto live = get_bytes(store, "racer");
-    REQUIRE(live.has_value());
-    CHECK(*live == v2);
+    std::vector<std::thread> updaters;
+    updaters.reserve(kKeyCount);
+    for (int i = 0; i < kKeyCount; ++i) {
+      updaters.emplace_back([&, i] {
+        for (int round = 1; round <= kUpdatesPerKey; ++round) {
+          REQUIRE(store->update(key_for(i), value_for(i, round)));
+        }
+      });
+    }
+    for (auto &updater : updaters) {
+      updater.join();
+    }
+    for (int i = 0; i < kKeyCount; ++i) {
+      last_written[static_cast<std::size_t>(i)] = value_for(i, kUpdatesPerKey);
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    checkpointer.join();
+
+    // Live reads must reflect each key's actual last-written value, never a stale snapshot from
+    // a checkpoint cycle that raced it.
+    for (int i = 0; i < kKeyCount; ++i) {
+      const auto live = get_bytes(store, key_for(i));
+      REQUIRE(live.has_value());
+      CHECK(*live == last_written[static_cast<std::size_t>(i)]);
+    }
   }
-  // Restart without another checkpoint: if the checkpoint file's "racer" slot captured a stale
-  // v1 and the store trusted it without correction, this would read back v1.
+  // Restart without a final checkpoint: recovery must reach the same state via WAL replay,
+  // regardless of what any racing checkpoint cycle durabilized.
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
-    const auto val = get_bytes(store, "racer");
-    REQUIRE(val.has_value());
-    CHECK(*val == v2);
+    for (int i = 0; i < kKeyCount; ++i) {
+      const auto val = get_bytes(store, key_for(i));
+      REQUIRE(val.has_value());
+      CHECK(*val == last_written[static_cast<std::size_t>(i)]);
+    }
   }
   cleanup_store_files(path);
 }

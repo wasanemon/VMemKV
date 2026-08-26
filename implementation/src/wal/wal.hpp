@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -39,9 +40,19 @@ inline constexpr size_t kWalRecordHeaderBytes = 32;
 static_assert(sizeof(WalRecordHeader) == kWalRecordHeaderBytes);
 static_assert(std::is_standard_layout_v<WalRecordHeader>);
 
-// Derives the sibling WAL path for a given T2 flat-file path (path + ".wal").
+// Derives the sibling WAL identity path for a given T2 flat-file path (path + ".wal"). Not a file
+// itself -- see derive_wal_segment_path() for the actual on-disk segment files this identity
+// names.
 inline auto derive_wal_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
   return {t2_path.string() + ".wal"};
+}
+
+// Derives one segment's on-disk path: <wal_path>.<generation>. The WAL is a sequence of these,
+// oldest generation first; see Wal::rotate_segment()'s doc comment for the two-generation
+// retention scheme that keeps at most two on disk at a time in steady state.
+inline auto derive_wal_segment_path(const std::filesystem::path &wal_path,
+                                    uint64_t generation) -> std::filesystem::path {
+  return {wal_path.string() + "." + std::to_string(generation)};
 }
 
 using WalReplayCallback = std::function<void(
@@ -73,9 +84,13 @@ using WalReplayCallback = std::function<void(
 // wal.cpp's Wal::drain_pending()/Wal::release_leadership() for how a leader absorbs backlog that
 // arrives mid-flush and how leadership is handed off without stranding a follower.
 //
-// The constructor scans the file once and truncates at the first invalid record (torn header,
-// torn payload, bad magic, unrecognized format_version, or checksum mismatch), guaranteeing the
-// file is clean by the time construction completes.
+// The WAL is a sequence of segment files (derive_wal_segment_path()), not one growing file.
+// rotate_segment() (called once per checkpoint cycle) is how old segments get reclaimed -- see
+// its own doc comment for why this needs no per-record scan. The constructor discovers every
+// segment already on disk, replays them in generation order to restore next_lsn_, and truncates
+// at the first invalid record (torn header, torn payload, bad magic, unrecognized format_version,
+// or checksum mismatch) found in the newest (active) one -- see validate_and_recover_tail()'s
+// comment for why only the active segment can legitimately have a torn tail.
 class Wal {
  public:
   // One caller's fully-serialized record, queued for a group-commit round. Heap-allocated and
@@ -125,19 +140,27 @@ class Wal {
   // NOLINTNEXTLINE(modernize-use-nodiscard) -- recover_from_wal() legitimately ignores the count.
   auto replay(const WalReplayCallback &callback) const -> uint64_t;
 
-  // Drops every record with lsn <= checkpoint_lsn: copies the tail into a fresh file and
-  // atomically renames it over this Wal's path (low_level_design.md 5.5). Briefly becomes
-  // group-commit leader so no append_*() can be writing against the fd being replaced; appends
-  // during the copy are drained first, and any arriving during rename/swap are handled by
-  // whoever becomes leader next. Does not re-validate the source file -- only ever runs against a
-  // Wal this process has appended to since a clean construction.
-  void rotate(uint64_t checkpoint_lsn);
+  // Every generation with an existing segment file on disk for `wal_path`, ascending. Empty if
+  // none exist yet. Public so tests/tooling can enumerate segments at the filesystem level
+  // (inspection, corruption injection, cleanup) without a live Wal instance -- production code
+  // never needs this, since a constructed Wal already tracks its own active fd.
+  static auto discover_segments(const std::filesystem::path &wal_path) -> std::vector<uint64_t>;
+
+  // Rolls over to a fresh segment (low_level_design.md 5.5): opens
+  // derive_wal_segment_path(path_, generation+1), publishes it as the new active fd, and deletes
+  // the segment two generations back (safe by construction -- see the doc comment on the .cpp
+  // definition for the argument). Takes no LSN: unlike the old single-file design, this needs no
+  // knowledge of checkpoint_lsn at all, and thus no per-record scan to find where it falls.
+  // Briefly becomes group-commit leader only to swap fd_ without racing an in-flight
+  // write_and_fsync_batch() against the old fd -- does not drain first (a record landing in
+  // either the old or new segment is equally correct, see that same comment).
+  void rotate_segment();
 
   [[nodiscard]] auto next_lsn() const noexcept -> uint64_t;
 
-  // Current on-disk size. Since rotate() leaves only the post-checkpoint tail in this file,
-  // this doubles as "bytes accumulated since the last checkpoint" for the WAL-size trigger
-  // (low_level_design.md 4.4).
+  // Current active segment's on-disk size -- doubles as "bytes accumulated since the last
+  // checkpoint" for the WAL-size trigger (low_level_design.md 4.4), since rotate_segment() starts
+  // a fresh, empty active segment exactly once per checkpoint cycle.
   [[nodiscard]] auto size_bytes() const -> uint64_t;
 
  private:
@@ -153,7 +176,16 @@ class Wal {
   [[nodiscard]] auto reserve_record(WalRecordType type,
                                     std::span<const std::byte> key,
                                     std::span<const std::byte> value) -> PendingRecord *;
-  void validate_and_recover_tail();  // ctor-only: classify+truncate corrupt tail.
+
+  // Scans one segment fd from the beginning, validating each record's magic/format/checksum and
+  // detecting torn payloads, returning the last valid lsn found (0 if none). `allow_truncate`
+  // must be true only for the active (newest) segment -- the only one that could have been
+  // mid-write at crash time, since every older segment was retired under rotate_segment()'s
+  // exclusive leadership, which by construction cannot overlap an in-flight
+  // write_and_fsync_batch() (see that method's own comment). A torn tail found with
+  // allow_truncate=false is therefore a genuine integrity failure, not an ordinary crash
+  // artifact, and throws instead of silently truncating.
+  auto scan_and_validate(int fd, bool allow_truncate) const -> uint64_t;
 
   // Drains and writes+fsyncs everything assigned an LSN so far, looping to absorb backlog that
   // arrives mid-flush. Caller must already hold leadership. Returns the next_lsn_ snapshot caught
@@ -185,16 +217,20 @@ class Wal {
   // or once another thread has already reclaimed leadership.
   auto release_leadership(uint64_t observed_target) -> bool;
 
-  // Shared pread wrappers used by validate_and_recover_tail()/replay()/rotate(), which otherwise
-  // each hand-rolled an identical "pread this many bytes at this offset or throw" sequence.
-  [[nodiscard]] auto read_header_at(uint64_t offset) const -> WalRecordHeader;
-  [[nodiscard]] auto read_payload_at(uint64_t offset, uint64_t payload_len) const -> std::vector<std::byte>;
+  // Shared pread wrappers used by scan_and_validate()/replay(), which otherwise would each
+  // hand-roll an identical "pread this many bytes at this offset or throw" sequence. Take an
+  // explicit fd (not fd_) since both callers read arbitrary segments, not just the active one.
+  [[nodiscard]] auto read_header_at(int fd, uint64_t offset) const -> WalRecordHeader;
+  [[nodiscard]] auto read_payload_at(int fd, uint64_t offset, uint64_t payload_len) const -> std::vector<std::byte>;
 
-  // Atomic because replay()/size_bytes() can read fd_ concurrently with rotate()'s
+  // Atomic because replay()/size_bytes() can read fd_ concurrently with rotate_segment()'s
   // close()-then-reassign; a plain int would be a data race (UB) and risk a
   // close-then-fd-number-reused hazard.
   std::atomic<int> fd_{-1};
   std::filesystem::path path_;
+  // The active segment's generation number. Touched only by whoever holds flushing_ leadership
+  // (rotate_segment() is its only writer), so -- like next_to_flush_ -- no atomic is needed.
+  uint64_t active_generation_ = 1;
 
   // Slots hold pointers only; record lifetime is governed by PendingRecord::refcount,
   // independent of slot reuse.
@@ -217,5 +253,25 @@ class Wal {
   // fatal to the process, not just to WAL calls.
   std::atomic<bool> poisoned_{false};
 };
+
+// Test/tooling helper: the currently-active (highest-generation) segment's on-disk path, or
+// nullopt if none exist yet. Lets tests inspect or inject bytes into the WAL at the filesystem
+// level, bypassing the Wal class entirely -- no production code needs this, since a live Wal
+// instance already tracks its own active fd.
+inline auto find_active_wal_segment(const std::filesystem::path &wal_path) -> std::optional<std::filesystem::path> {
+  const auto generations = Wal::discover_segments(wal_path);
+  if (generations.empty()) {
+    return std::nullopt;
+  }
+  return derive_wal_segment_path(wal_path, generations.back());
+}
+
+// Test/tooling helper: removes every existing segment file for this WAL identity.
+inline void remove_wal_segments(const std::filesystem::path &wal_path) {
+  for (const uint64_t generation : Wal::discover_segments(wal_path)) {
+    std::error_code ignored;
+    std::filesystem::remove(derive_wal_segment_path(wal_path, generation), ignored);
+  }
+}
 
 }  // namespace vmemkv

@@ -138,7 +138,7 @@ class T1Index {
 
   ~T1Index() noexcept {
     delete_generation(append_active_.load(std::memory_order_relaxed));
-    delete_generation(append_immutable_.load(std::memory_order_relaxed));
+    delete_generation(append_immutable_.get());
     delete_snapshot(sorted_snapshot_.load(std::memory_order_relaxed));
   }
 
@@ -214,7 +214,7 @@ class T1Index {
     }
 
     // 2. check immutable append region if exists
-    if (const AppendGeneration *imm_gen = append_immutable_.load(std::memory_order_acquire)) {
+    if (const AppendGeneration *imm_gen = append_immutable_.get()) {
       const AppendRegion *imm = imm_gen->region;
       if (const AppendSlot *slot = imm->find_with_index(*imm_gen->index, prefix, hash)) {
         const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
@@ -283,11 +283,9 @@ class T1Index {
   // Inserts or updates the 64-bit payload for a given key prefix.
   // - Thread-safety: Safe for concurrent writers (guarded internally by slot-level atomic operations or table locks).
   // - Guarantees: Writes to the append region if the key does not exist; updates the slot in-place if it does.
-  // - Note on Concurrency: This write method does not require a SeqLock retry loop because
-  //   concurrent writes with reorganize are reconciled by the re-check of write_version_ during Phase 2 of reorganize.
   // `t2_generation`: T2 generation `value` was resolved against (see SortedSlot::generation).
   // Ignored for inline/tombstone writes. Stamped atomically with hash so resolve()'s
-  // immutable-region bypass can safely insert-as-new instead of blocking on reorganize().
+  // write-frozen-tier bypass can safely insert-as-new instead of blocking on reorganize().
   auto put(std::span<const std::byte> key,
            Payload value,
            bool is_inline = false,
@@ -360,7 +358,7 @@ class T1Index {
       const auto snapshot = sorted_snapshot_.load(std::memory_order_acquire);
       const SortedRegion *sorted = snapshot->region;
       const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
-      const AppendGeneration *imm_gen = append_immutable_.load(std::memory_order_acquire);
+      const AppendGeneration *imm_gen = append_immutable_.get();
       const AppendRegion *imm = imm_gen != nullptr ? imm_gen->region : nullptr;
 
       // Fast path: if neither append region can contain a key in range, stream straight from the
@@ -536,7 +534,7 @@ class T1Index {
     // store is a single atomic pointer store, so a reader can never observe a region paired with
     // the wrong generation's index (see AppendGeneration's declaration).
     AppendGeneration *old_active_gen = append_active_.load(std::memory_order_acquire);
-    append_immutable_.store(old_active_gen, std::memory_order_release);
+    append_immutable_.freeze(old_active_gen);
     append_active_.store(next_active_gen, std::memory_order_release);
 
     post_freeze_hook();
@@ -551,6 +549,11 @@ class T1Index {
 
     // 3. Rebuild sorted region from sorted_region and append_immutable
     const auto sorted = sorted_snapshot_.load(std::memory_order_acquire)->region;
+    // Freeze *before* the merge loop below reads a single slot: from here until the new
+    // sorted_snapshot_ publishes, `sorted`'s contents are frozen for writers -- see
+    // FreezableRegion's own comment for why put()'s in-place path must bypass instead of
+    // mutating this region once its values start feeding `merged`.
+    sorted_write_frozen_.freeze(sorted);
     AppendRegion *old_active = old_active_gen->region;
     const size_t imm_n = old_active->size();
 
@@ -642,11 +645,14 @@ class T1Index {
     auto *next_sorted = new SortedRegion(merged);
 
     // Bundled with `generation` behind one atomic store so a reader can never see next_sorted
-    // paired with the wrong generation tag (same reasoning as AppendGeneration).
+    // paired with the wrong generation tag (same reasoning as AppendGeneration). Unfreezes both
+    // guarded tiers right after: from this point, resolve() sees the new (complete, unfrozen)
+    // sorted region directly, so the bypass is no longer needed for either tier.
     sorted_snapshot_.store(new SortedSnapshot{next_sorted, generation}, std::memory_order_release);
+    sorted_write_frozen_.unfreeze();
 
     // 4. Safely retire the old buffers
-    append_immutable_.store(nullptr, std::memory_order_release);
+    append_immutable_.unfreeze();
 
     // Advance epoch and wait for all epoch readers to exit
     uint64_t target_epoch = reorg_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -676,6 +682,42 @@ class T1Index {
 
  private:
   // ─── Private Type Definitions ──────────────────────────────────────────
+
+  // Guards a region that reorganize() is about to replace wholesale with a freshly-built
+  // snapshot (append_immutable_'s region, and the sorted region while reorganize()'s merge loop
+  // is reading it). Between the moment a region's contents are snapshotted into `merged` and the
+  // moment the replacement is published, an in-place write landing on the *pre-snapshot* region
+  // physically succeeds but is never reflected in the replacement -- a silent Lost Update,
+  // invisible to the writer (put() returns Applied) and to every reader once the swap lands.
+  //
+  // This type is the single place that hazard is closed: while frozen, resolve()'s write-path
+  // lookup must treat any key found via `get()`'s returned region as not-found instead, forcing
+  // put() to insert into the live append region (whose own retry/displacement machinery already
+  // handles a fresh insert safely -- see put()'s own comment). Any future region built the same
+  // way (snapshot-then-atomic-swap) must route its write-path lookup through an instance of this
+  // type rather than re-deriving its own bypass by hand -- exactly the mistake that originally
+  // left the sorted region unguarded (see the regression test "T1Index: dedicated single writer
+  // per key survives racing reorganize with exact last value").
+  //
+  // Read paths are unaffected: a frozen region's bytes are still the live, correct view of the
+  // world until the replacement publishes, so get()/scan() keep reading through it directly
+  // (e.g. lookup_by_prefix_hash() reads append_immutable_ itself, not through this guard) --
+  // only put()'s write-target resolution needs to refuse to hand back a doomed slot.
+  template <typename RegionPtr>
+  class FreezableRegion {
+   public:
+    void freeze(RegionPtr region) noexcept { frozen_.store(region, std::memory_order_release); }
+    void unfreeze() noexcept { frozen_.store(nullptr, std::memory_order_release); }
+
+    // The frozen region snapshot if one is currently in effect, nullptr otherwise. Caller runs
+    // its own tier-specific find() against the result -- this type only owns the freeze/unfreeze
+    // lifecycle, not the lookup itself (append and sorted regions have unrelated find shapes).
+    auto get() const noexcept -> RegionPtr { return frozen_.load(std::memory_order_acquire); }
+
+   private:
+    std::atomic<RegionPtr> frozen_{nullptr};
+  };
+
   struct SortedSlot {
     Key key{};
     // Atomic: put()'s in-place update path mutates a live, published SortedSlot's hash
@@ -1086,20 +1128,28 @@ class T1Index {
       return ResolvedSlot{slot, nullptr};
     }
 
-    // If the key exists in append_immutable_, don't update in-place: it's already been
-    // snapshotted by reorganize()'s collect_live_entries(), so an in-place update would be a
-    // Lost Update this cycle. Bypass to a new entry in the fresh active region instead -- safe
-    // because every entry carries its own T2 generation stamp (see SortedSlot::generation), so
-    // it can sit unmerged for any number of future cycles.
-    if (AppendGeneration *imm_gen = append_immutable_.load(std::memory_order_acquire)) {
+    // Found in either frozen tier means an in-place update would be a Lost Update this cycle
+    // (see FreezableRegion's own comment) -- bypass to a new entry in the fresh active region
+    // instead. Safe because every entry carries its own T2 generation stamp (see
+    // SortedSlot::generation), so it can sit unmerged for any number of future cycles.
+    if (AppendGeneration *imm_gen = append_immutable_.get()) {
       if (imm_gen->region->find_with_index(*imm_gen->index, key, hash) != nullptr) {
         return ResolvedSlot{};
       }
     }
 
-    const auto sorted = sorted_snapshot_.load(std::memory_order_acquire)->region;
-    if (const SortedSlot *slot = find_sorted(*sorted, key, hash)) {
-      return ResolvedSlot{nullptr, slot};
+    if (const SortedRegion *frozen_sorted = sorted_write_frozen_.get()) {
+      // While frozen, sorted_snapshot_ points at this exact same region (reorganize() pairs the
+      // freeze/unfreeze around the merge and publish), so checking it again below would be
+      // redundant -- not found here means not found in the live sorted region either.
+      if (find_sorted(*frozen_sorted, key, hash) != nullptr) {
+        return ResolvedSlot{};
+      }
+    } else {
+      const auto sorted = sorted_snapshot_.load(std::memory_order_acquire)->region;
+      if (const SortedSlot *slot = find_sorted(*sorted, key, hash)) {
+        return ResolvedSlot{nullptr, slot};
+      }
     }
 
     return ResolvedSlot{};
@@ -1140,7 +1190,12 @@ class T1Index {
 
   std::atomic<const SortedSnapshot *> sorted_snapshot_{nullptr};
   std::atomic<AppendGeneration *> append_active_{nullptr};
-  std::atomic<AppendGeneration *> append_immutable_{nullptr};
+  FreezableRegion<AppendGeneration *> append_immutable_;
+  // See FreezableRegion's own comment. Frozen for the duration of reorganize()'s merge loop
+  // (the same SortedRegion sorted_snapshot_ currently points at), unfrozen right after the
+  // replacement publishes -- closes the sorted-region counterpart of the Lost Update hazard
+  // append_immutable_ already guarded against.
+  FreezableRegion<const SortedRegion *> sorted_write_frozen_;
 
   mutable ThreadReferenceTracker<uint64_t> active_epochs_;
 };

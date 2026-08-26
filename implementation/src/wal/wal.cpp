@@ -43,20 +43,47 @@ constexpr uint64_t kIterationsPerMillionForLog = 1'000'000;
 }  // namespace
 
 Wal::Wal(const std::filesystem::path &path) : path_(path) {
-  const int local_fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, kWalFilePermissions);
-  if (local_fd < 0) {
-    throw std::system_error(errno, std::generic_category(), "open wal");
+  const std::vector<uint64_t> generations = discover_segments(path_);
+
+  if (generations.empty()) {
+    active_generation_ = 1;
+    const auto seg_path = derive_wal_segment_path(path_, active_generation_);
+    const int local_fd = ::open(seg_path.c_str(), O_RDWR | O_CREAT | O_APPEND, kWalFilePermissions);
+    if (local_fd < 0) {
+      throw std::system_error(errno, std::generic_category(), "open wal segment");
+    }
+    fd_.store(local_fd, std::memory_order_relaxed);
+  } else {
+    active_generation_ = generations.back();
+    uint64_t last_valid_lsn = 0;
+    for (const uint64_t generation : generations) {
+      const bool is_active = (generation == active_generation_);
+      const auto seg_path = derive_wal_segment_path(path_, generation);
+      const int seg_fd = ::open(seg_path.c_str(), is_active ? (O_RDWR | O_APPEND) : O_RDONLY, kWalFilePermissions);
+      if (seg_fd < 0) {
+        throw std::system_error(errno, std::generic_category(), "open wal segment");
+      }
+      try {
+        // 0 means "this segment contributed nothing" (lsn 0 never exists) -- must not overwrite
+        // a real value already found in an earlier generation, e.g. when the active segment is
+        // still empty right after a rollover.
+        const uint64_t found = scan_and_validate(seg_fd, is_active);
+        if (found > 0) {
+          last_valid_lsn = found;
+        }
+      } catch (...) {
+        ::close(seg_fd);
+        throw;
+      }
+      if (is_active) {
+        fd_.store(seg_fd, std::memory_order_relaxed);
+      } else {
+        ::close(seg_fd);
+      }
+    }
+    next_lsn_.store(last_valid_lsn + 1, std::memory_order_relaxed);
   }
-  fd_.store(local_fd, std::memory_order_relaxed);
-  try {
-    validate_and_recover_tail();
-  } catch (...) {
-    // Thrown mid-construction: ~Wal() will never run for this partially-constructed
-    // object, so fd_ must be closed here or it leaks for the life of the process.
-    ::close(local_fd);
-    fd_.store(-1, std::memory_order_relaxed);
-    throw;
-  }
+
   // Relaxed is fine (nothing concurrent yet); this line is about correctness, not ordering --
   // without it, next_to_flush_ would stay at 1 while next_lsn_ is already far ahead on a
   // reopened WAL, and the first leader would spin forever waiting for ring slots that were
@@ -71,11 +98,32 @@ Wal::~Wal() noexcept {
   }
 }
 
-void Wal::validate_and_recover_tail() {
-  const int local_fd = fd_.load(std::memory_order_relaxed);
+auto Wal::discover_segments(const std::filesystem::path &wal_path) -> std::vector<uint64_t> {
+  std::vector<uint64_t> generations;
+  const std::filesystem::path dir = wal_path.has_parent_path() ? wal_path.parent_path() : ".";
+  if (!std::filesystem::exists(dir)) {
+    return generations;
+  }
+  const std::string prefix = wal_path.filename().string() + ".";
+  for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+    const std::string name = entry.path().filename().string();
+    if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) {
+      continue;
+    }
+    const std::string suffix = name.substr(prefix.size());
+    // Pure-digit suffixes only: guards against unrelated files sharing the prefix.
+    if (!suffix.empty() && suffix.find_first_not_of("0123456789") == std::string::npos) {
+      generations.push_back(std::stoull(suffix));
+    }
+  }
+  std::sort(generations.begin(), generations.end());
+  return generations;
+}
+
+auto Wal::scan_and_validate(int fd, bool allow_truncate) const -> uint64_t {
   struct stat file_stat {};
-  if (::fstat(local_fd, &file_stat) != 0) {
-    throw std::system_error(errno, std::generic_category(), "fstat wal");
+  if (::fstat(fd, &file_stat) != 0) {
+    throw std::system_error(errno, std::generic_category(), "fstat wal segment");
   }
   const auto file_size = static_cast<uint64_t>(file_stat.st_size);
 
@@ -83,23 +131,23 @@ void Wal::validate_and_recover_tail() {
   uint64_t last_valid_lsn = 0;
 
   while (file_size - offset >= sizeof(WalRecordHeader)) {
-    const WalRecordHeader header = read_header_at(offset);
+    const WalRecordHeader header = read_header_at(fd, offset);
 
     if (header.magic != kWalRecordMagic || header.format_version != kWalFormatVersion) {
-      break;  // Corrupt, or a record layout this build doesn't understand: stop and truncate here.
+      break;  // Corrupt, or a record layout this build doesn't understand: stop here.
     }
 
     const uint64_t payload_len = static_cast<uint64_t>(header.key_len) + header.value_len;
     if (file_size - offset - sizeof(WalRecordHeader) < payload_len) {
-      break;  // Torn payload: stop and truncate at this offset.
+      break;  // Torn payload: stop here.
     }
 
-    const std::vector<std::byte> payload = read_payload_at(offset + sizeof(WalRecordHeader), payload_len);
+    const std::vector<std::byte> payload = read_payload_at(fd, offset + sizeof(WalRecordHeader), payload_len);
 
     const std::span<const std::byte> key_span(payload.data(), header.key_len);
     const std::span<const std::byte> value_span(payload.data() + header.key_len, header.value_len);
     if (compute_checksum(header, key_span, value_span) != header.checksum) {
-      break;  // Corrupt: stop and truncate at this offset.
+      break;  // Corrupt: stop here.
     }
 
     offset += sizeof(WalRecordHeader) + payload_len;
@@ -107,29 +155,30 @@ void Wal::validate_and_recover_tail() {
   }
 
   if (offset < file_size) {
-    if (::ftruncate(local_fd, static_cast<off_t>(offset)) != 0) {
+    if (!allow_truncate) {
+      throw std::runtime_error("wal: corrupt tail found in a retired (non-active) segment");
+    }
+    if (::ftruncate(fd, static_cast<off_t>(offset)) != 0) {
       throw std::system_error(errno, std::generic_category(), "ftruncate wal");
     }
   }
 
-  next_lsn_.store(last_valid_lsn + 1, std::memory_order_relaxed);
+  return last_valid_lsn;
 }
 
-auto Wal::read_header_at(uint64_t offset) const -> WalRecordHeader {
+auto Wal::read_header_at(int fd, uint64_t offset) const -> WalRecordHeader {
   WalRecordHeader header;
-  const ssize_t header_read =
-      ::pread(fd_.load(std::memory_order_acquire), &header, sizeof(header), static_cast<off_t>(offset));
+  const ssize_t header_read = ::pread(fd, &header, sizeof(header), static_cast<off_t>(offset));
   if (header_read != static_cast<ssize_t>(sizeof(header))) {
     throw std::system_error(errno, std::generic_category(), "pread wal header");
   }
   return header;
 }
 
-auto Wal::read_payload_at(uint64_t offset, uint64_t payload_len) const -> std::vector<std::byte> {
+auto Wal::read_payload_at(int fd, uint64_t offset, uint64_t payload_len) const -> std::vector<std::byte> {
   std::vector<std::byte> payload(payload_len);
   if (payload_len > 0) {
-    const ssize_t payload_read =
-        ::pread(fd_.load(std::memory_order_acquire), payload.data(), payload_len, static_cast<off_t>(offset));
+    const ssize_t payload_read = ::pread(fd, payload.data(), payload_len, static_cast<off_t>(offset));
     if (payload_read != static_cast<ssize_t>(payload_len)) {
       throw std::system_error(errno, std::generic_category(), "pread wal payload");
     }
@@ -440,140 +489,100 @@ auto Wal::reserve_delete(std::span<const std::byte> key) -> PendingRecord * {
 }
 
 auto Wal::replay(const WalReplayCallback &callback) const -> uint64_t {
-  const int local_fd = fd_.load(std::memory_order_acquire);
-  struct stat file_stat {};
-  if (::fstat(local_fd, &file_stat) != 0) {
-    throw std::system_error(errno, std::generic_category(), "fstat wal replay");
-  }
-  const auto file_size = static_cast<uint64_t>(file_stat.st_size);
-
-  uint64_t offset = 0;
   uint64_t count = 0;
 
-  while (file_size - offset >= sizeof(WalRecordHeader)) {
-    const WalRecordHeader header = read_header_at(offset);
-    const uint64_t payload_len = static_cast<uint64_t>(header.key_len) + header.value_len;
-    const std::vector<std::byte> payload = read_payload_at(offset + sizeof(WalRecordHeader), payload_len);
+  for (const uint64_t generation : discover_segments(path_)) {
+    const auto seg_path = derive_wal_segment_path(path_, generation);
+    const int seg_fd = ::open(seg_path.c_str(), O_RDONLY);
+    if (seg_fd < 0) {
+      throw std::system_error(errno, std::generic_category(), "open wal segment for replay");
+    }
+    struct FdGuard {
+      int local_fd;
+      ~FdGuard() {
+        if (local_fd >= 0) {
+          ::close(local_fd);
+        }
+      }
+    } fd_guard{seg_fd};
 
-    const std::span<const std::byte> key_span(payload.data(), header.key_len);
-    const std::span<const std::byte> value_span(payload.data() + header.key_len, header.value_len);
+    struct stat file_stat {};
+    if (::fstat(seg_fd, &file_stat) != 0) {
+      throw std::system_error(errno, std::generic_category(), "fstat wal segment replay");
+    }
+    const auto file_size = static_cast<uint64_t>(file_stat.st_size);
 
-    callback(static_cast<WalRecordType>(header.type), key_span, value_span, header.lsn);
-    ++count;
+    uint64_t offset = 0;
+    while (file_size - offset >= sizeof(WalRecordHeader)) {
+      const WalRecordHeader header = read_header_at(seg_fd, offset);
+      const uint64_t payload_len = static_cast<uint64_t>(header.key_len) + header.value_len;
+      const std::vector<std::byte> payload = read_payload_at(seg_fd, offset + sizeof(WalRecordHeader), payload_len);
 
-    offset += sizeof(WalRecordHeader) + payload_len;
+      const std::span<const std::byte> key_span(payload.data(), header.key_len);
+      const std::span<const std::byte> value_span(payload.data() + header.key_len, header.value_len);
+
+      callback(static_cast<WalRecordType>(header.type), key_span, value_span, header.lsn);
+      ++count;
+
+      offset += sizeof(WalRecordHeader) + payload_len;
+    }
   }
 
   return count;
 }
 
-void Wal::rotate(uint64_t checkpoint_lsn) {
+// Retention argument for why deleting generation (new_generation - 2) is always safe: checkpoint
+// cycles run single-flight (reorg_running_), so this call retires exactly the generation active
+// during the *previous* cycle. That generation holds two kinds of record: what was already
+// covered by the previous cycle's own checkpoint_lsn, plus whatever landed there from writers
+// racing that cycle's own execution (reserved after checkpoint_lsn but before this rollover) --
+// records this rotate_segment() doesn't know about individually. But *this* cycle's checkpoint_lsn
+// (captured before this call, in the current VMemKVImpl::checkpoint_internal()) is itself >=
+// everything reserved as of the previous rollover, precisely because that rollover already
+// happened before this cycle could start (again, single-flight) -- so by the time *this* call
+// runs, the previous generation is fully covered by the checkpoint about to commit. One
+// generation of slack (never deleting the immediately-previous one, only the one before that) is
+// exactly what covers that in-between spillover, with no per-record bookkeeping at all.
+void Wal::rotate_segment() {
   if (poisoned_.load(std::memory_order_acquire)) {
     throw std::runtime_error("WAL is poisoned, refusing to rotate");
   }
 
   // Become leader ourselves rather than "wait until flushing_ is false" -- the latter has a TOCTOU
-  // where another thread could grab leadership between this call waking and acting on fd_.
+  // where another thread could grab leadership between this call waking and acting on fd_. Unlike
+  // the old file-copy design, no drain_pending() first: a record that reserved its lsn just before
+  // this swap may still end up physically written to either the old or the new segment depending
+  // on exactly when its own group-commit round runs (write_and_fsync_batch() reads fd_ fresh) --
+  // both are correct, since replay() reads every segment currently on disk regardless of which one
+  // a given record landed in (see this file's own comment above and low_level_design.md 5.5).
+  // Leadership here exists only so no write_and_fsync_batch() round is ever mid-flight against the
+  // fd being closed below.
   while (flushing_.exchange(true, std::memory_order_acq_rel)) {
     flushing_.wait(true, std::memory_order_acquire);
   }
 
-  (void)drain_pending();  // Catch up on any backlog before touching fd_ at all.
-
   const int old_fd = fd_.load(std::memory_order_acquire);
-  struct stat file_stat {};
-  if (::fstat(old_fd, &file_stat) != 0) {
-    fail_all_pending_and_release_leadership(
-        std::make_exception_ptr(std::system_error(errno, std::generic_category(), "fstat wal (rotate)")));
-    throw std::system_error(errno, std::generic_category(), "fstat wal (rotate)");
-  }
-  const auto file_size = static_cast<uint64_t>(file_stat.st_size);
-
-  const std::filesystem::path temp_path = path_.string() + ".rotate_tmp";
-  const int new_fd = ::open(temp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, kWalFilePermissions);
+  const uint64_t new_generation = active_generation_ + 1;
+  const auto new_path = derive_wal_segment_path(path_, new_generation);
+  const int new_fd = ::open(new_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_APPEND, kWalFilePermissions);
   if (new_fd < 0) {
-    const auto err =
-        std::make_exception_ptr(std::system_error(errno, std::generic_category(), "open wal rotation temp file"));
+    const auto err = std::make_exception_ptr(std::system_error(errno, std::generic_category(), "open new wal segment"));
     fail_all_pending_and_release_leadership(err);
     std::rethrow_exception(err);
   }
 
-  struct NewFdGuard {
-    int local_fd;
-    ~NewFdGuard() {
-      if (local_fd >= 0) {
-        ::close(local_fd);
-      }
-    }
-  } new_fd_guard{new_fd};
-
-  try {
-    uint64_t offset = 0;
-
-    // Source file trusted as-is: rotate() only runs against a Wal this process has appended to
-    // since a clean construction, so no magic/checksum re-validation is needed here.
-    while (file_size - offset >= sizeof(WalRecordHeader)) {
-      const WalRecordHeader header = read_header_at(offset);
-      const uint64_t record_len = sizeof(header) + header.key_len + header.value_len;
-
-      if (header.lsn > checkpoint_lsn) {
-        const std::vector<std::byte> record_buf = read_payload_at(offset, record_len);
-        const ssize_t written = ::write(new_fd, record_buf.data(), record_len);
-        if (written != static_cast<ssize_t>(record_len)) {
-          throw std::system_error(errno, std::generic_category(), "write wal record (rotate)");
-        }
-      }
-
-      offset += record_len;
-    }
-
-    if (::fsync(new_fd) != 0) {
-      throw std::system_error(errno, std::generic_category(), "fsync rotated wal");
-    }
-
-    std::error_code rename_ec;
-    std::filesystem::rename(temp_path, path_, rename_ec);
-    if (rename_ec) {
-      throw std::system_error(rename_ec, "rename rotated wal");
-    }
-  } catch (...) {
-    fail_all_pending_and_release_leadership(std::current_exception());
-    throw;
-  }
+  fd_.store(new_fd, std::memory_order_release);
+  active_generation_ = new_generation;
+  flushing_.store(false, std::memory_order_release);
+  flushing_.notify_all();
 
   ::close(old_fd);
-  fd_.store(new_fd_guard.local_fd, std::memory_order_release);
-  new_fd_guard.local_fd = -1;  // Ownership transferred to fd_; the guard must not close it too.
-  // Deliberately NOT touching next_lsn_ here: a producer can fetch_add+publish a new LSN into the
-  // ring while this scan is running, invisible to this file-based scan since it isn't on disk yet.
-  // Resetting next_lsn_ from scan results could roll it backward past an already-handed-out LSN,
-  // corrupting the "byte-offset order == LSN order" invariant replay/recovery depend on. next_lsn_
-  // is self-sufficient; rotation only discards old survivors, it never renumbers anyone.
 
-  // Flush whatever accumulated in the ring while we held leadership for the file swap, then hand
-  // off leadership -- deliberately not release_leadership()'s caller-loops-forever reclaim retry
-  // (used by the steady-state write path at the top of this file): under sustained concurrent
-  // write load, every backlogged writer is parked waiting on highest_settled_lsn_, not competing
-  // for `flushing_`, until its own LSN settles -- so rotate()'s thread was structurally the only
-  // party ever re-attempting that reclaim, kept "winning" against its own moving target, and never
-  // returned (measured directly: hung 10+ seconds under 19 concurrent insert threads with zero
-  // other reclaim attempts).
-  //
-  // A single bounded reclaim (not a loop) still closes a real gap a plain release leaves open: a
-  // writer that reserves an LSN and reaches its own `await_durable()` leadership check in the
-  // exact window between this drain's snapshot and the release below observes `flushing_` still
-  // true, so it parks on highest_settled_lsn_ as a follower -- but that LSN was never covered by
-  // any drain, and a plain release only wakes flushing_'s own waiters, not this follower. One more
-  // bounded drain (still snapshot-once, so it can't itself chase a moving target) covers exactly
-  // that writer before the final release. A writer reserving strictly after this final release
-  // makes its own fresh `!flushing_.exchange(true)` attempt and becomes leader or follower for a
-  // now-current leader, same as any other moment with no rotation in progress -- so this never
-  // needs a third round.
-  const uint64_t drained_to = drain_pending();
-  if (release_leadership(drained_to)) {
-    (void)drain_pending();
-    flushing_.store(false, std::memory_order_release);
-    flushing_.notify_all();
+  // Safe even if generation (new_generation - 2) doesn't exist (first two cycles) or was already
+  // deleted by an interrupted prior cycle -- see this function's own doc comment.
+  if (new_generation >= 2) {
+    std::error_code ignored;
+    std::filesystem::remove(derive_wal_segment_path(path_, new_generation - 2), ignored);
   }
 }
 

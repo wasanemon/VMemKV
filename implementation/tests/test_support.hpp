@@ -41,7 +41,7 @@ inline auto reserve_unique_temp_path(std::string_view prefix,
   std::error_code ignored;
   std::filesystem::remove(temp_path, ignored);
   if (also_remove_wal_sibling) {
-    std::filesystem::remove(vmemkv::derive_wal_path(temp_path), ignored);
+    vmemkv::remove_wal_segments(vmemkv::derive_wal_path(temp_path));
   }
   return temp_path;
 }

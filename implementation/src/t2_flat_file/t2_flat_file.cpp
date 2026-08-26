@@ -9,9 +9,12 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <system_error>
 #include <thread>
 #include <vmemkv/config.hpp>
+
+#include "../checkpoint/checkpoint.hpp"
 
 namespace vmemkv {
 
@@ -46,9 +49,18 @@ void write_record(std::byte *record_base, std::span<const std::byte> key, std::s
 
 }  // namespace
 
-T2FlatFile::T2FlatFile(const std::filesystem::path &path, uint64_t bytes_capacity, uint64_t initial_generation)
+T2FlatFile::T2FlatFile(const std::filesystem::path &path,
+                       uint64_t bytes_capacity,
+                       uint64_t initial_generation,
+                       std::optional<uint64_t> initial_bytes_used)
     : path_(path) {
-  map_file(path, create_empty_file(path, bytes_capacity), initial_generation);
+  const std::filesystem::path data_path = vmemkv::derive_t2_chk_path(path);
+  if (!initial_bytes_used.has_value()) {
+    std::error_code ignored;
+    std::filesystem::remove(data_path, ignored);
+    create_empty_file(data_path, bytes_capacity);
+  }
+  map_file(data_path, bytes_capacity, initial_generation, initial_bytes_used.value_or(0));
 }
 
 T2FlatFile::~T2FlatFile() noexcept {
@@ -148,7 +160,10 @@ void T2FlatFile::retire_memory(const T2Memory *old_mem) {
   delete old_mem;
 }
 
-void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capacity, uint64_t initial_generation) {
+void T2FlatFile::map_file(const std::filesystem::path &path,
+                          uint64_t bytes_capacity,
+                          uint64_t initial_generation,
+                          uint64_t initial_bytes_used) {
   const int file_descriptor = ::open(path.c_str(), O_RDWR);
   if (file_descriptor < 0) {
     throw std::system_error(errno, std::generic_category(), "open");
@@ -166,27 +181,79 @@ void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capa
     throw std::invalid_argument("T2 file is smaller than capacity");
   }
 
-  // MAP_PRIVATE: changes are not written back to the underlying file (volatile on restart).
+  // MAP_SHARED: writes land directly in the page cache and are coherent across every mapping of
+  // this file (including the base-region scan mappings below), so checkpoint_internal()'s
+  // msync() durabilizes exactly what readers already see. See
+  // docs/specification/why_vmemkv_does_not_need_undo_log.md for why this needs no undo log, and
+  // low_level_design.md 4.3/5.1 for the full contract.
   // MAP_NORESERVE: bypasses the kernel's upfront swap-space reservation check, allowing
   // virtual address spaces much larger than physical RAM + swap without ENOMEM.
   // Physical pages are allocated on demand and can be swapped out normally.
   void *mapped = ::mmap(nullptr,
                         static_cast<size_t>(bytes_capacity),
                         PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_NORESERVE,
+                        MAP_SHARED | MAP_NORESERVE,
                         file_descriptor,
                         0);
   const int mmap_errno = errno;
-  ::close(file_descriptor);
   if (mapped == MAP_FAILED) {
+    ::close(file_descriptor);
     throw std::system_error(mmap_errno, std::generic_category(), "mmap");
   }
+  // Unconditional: measured to help in-memory small-value Get/Hit by ~5% (low_level_design.md
+  // 7.7). Removing it (an ablation
+  // prototyped and measured, then deleted -- see docs/benchmark/20260810_t2_no_madvise_random.md)
+  // wins big on large-value LTM Get/Hit at low concurrency (up to 8x at threads:1) by letting
+  // swap-in readahead batch multi-page reads, but that win decays with concurrency and inverts by
+  // threads:32 (0.65-0.69x, worse than leaving this on) as the readahead's excess bytes-read
+  // start competing with other threads for real disk bandwidth. No known deployment runs at the
+  // low, fixed concurrency the win requires, so the ablation isn't worth carrying as a toggle --
+  // re-derive it from the doc above if that ever changes.
+  if (::madvise(mapped, static_cast<size_t>(bytes_capacity), MADV_RANDOM) != 0) {
+    const int err = errno;
+    ::close(file_descriptor);
+    throw std::system_error(err, std::generic_category(), "madvise MADV_RANDOM");
+  }
 
-  t2_mem_.store(new T2Memory(static_cast<std::byte *>(mapped), bytes_capacity, initial_generation),
-                std::memory_order_release);
+  // Best-effort base-region scan mappings/read handle -- see T2Memory::base_mmap_scan's and
+  // T2Memory::read_fd's doc comments for who reads these and why. A failure here is silently
+  // non-fatal: the primary mapping above already provides full correctness (scan_impl()'s
+  // seqlock fallback), these are purely a speed optimization. Set up unconditionally, even when
+  // initial_bytes_used == 0 (a fresh store), so a later checkpoint's incremental base_boundary
+  // promotion has real mappings to extend without ever remapping.
+  std::byte *base_mmap_scan_ptr = nullptr;
+  std::byte *base_mmap_scan_seq_ptr = nullptr;
+  int read_fd_dup = -1;
+  {
+    void *base_mapped_scan =
+        ::mmap(nullptr, static_cast<size_t>(bytes_capacity), PROT_READ, MAP_SHARED, file_descriptor, 0);
+    if (base_mapped_scan != MAP_FAILED) {
+      base_mmap_scan_ptr = static_cast<std::byte *>(base_mapped_scan);
+    }
+
+    void *base_mapped_scan_seq =
+        ::mmap(nullptr, static_cast<size_t>(bytes_capacity), PROT_READ, MAP_SHARED, file_descriptor, 0);
+    if (base_mapped_scan_seq != MAP_FAILED) {
+      if (::madvise(base_mapped_scan_seq, static_cast<size_t>(bytes_capacity), MADV_SEQUENTIAL) == 0) {
+        base_mmap_scan_seq_ptr = static_cast<std::byte *>(base_mapped_scan_seq);
+      } else {
+        ::munmap(base_mapped_scan_seq, static_cast<size_t>(bytes_capacity));
+      }
+    }
+
+    // Must dup() before file_descriptor is closed below.
+    read_fd_dup = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
+  }
+
+  ::close(file_descriptor);
+  auto *mem = new T2Memory(static_cast<std::byte *>(mapped), bytes_capacity, initial_generation, initial_bytes_used);
+  mem->base_mmap_scan = base_mmap_scan_ptr;
+  mem->base_mmap_scan_seq = base_mmap_scan_seq_ptr;
+  mem->read_fd = read_fd_dup;
+  t2_mem_.store(mem, std::memory_order_release);
 }
 
-auto T2FlatFile::create_empty_file(const std::filesystem::path &path, uint64_t bytes_capacity) -> uint64_t {
+void T2FlatFile::create_empty_file(const std::filesystem::path &path, uint64_t bytes_capacity) {
   if (bytes_capacity == 0) {
     throw std::invalid_argument("T2Store capacity must be greater than zero");
   }
@@ -211,7 +278,6 @@ auto T2FlatFile::create_empty_file(const std::filesystem::path &path, uint64_t b
   }
 
   ::close(file_descriptor);
-  return bytes_capacity;
 }
 
 }  // namespace vmemkv
