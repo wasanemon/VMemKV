@@ -173,7 +173,10 @@ def build_reorg_scaling_data(report_dir):
                 "timed_out": rec["timed_out"],
             })
         for mode_points in modes.values():
-            mode_points.sort(key=lambda p: p["key_count"])
+            # key_count is null for an outer_timeout record (run_probe_point()'s synthesized
+            # failure fallback, reorg_probe_common.sh) -- setup never even reported a corpus size.
+            # Sorts last: it represents "went further than the largest point that did complete."
+            mode_points.sort(key=lambda p: (p["key_count"] is None, p["key_count"]))
         reorg_data[scenario_key] = modes
     return reorg_data
 
@@ -362,8 +365,11 @@ def render_defrag_scaling_html(corpus_rows, contention_rows):
         for r in corpus_rows:
             status = f'<span class="text-rose-600 font-semibold">≥{r["elapsed_sec"]:.0f}s (timeout)</span>' if r["timed_out"] else f'{r["elapsed_sec"]:.2f}s'
             ratio_label = f'{r["ratio"]:.0%}' if r["ratio"] is not None else "n/a"
+            # key_count is null for an outer_timeout record (run_probe_point()'s synthesized
+            # failure fallback) -- setup never even reported a corpus size.
+            key_count_label = f'{r["key_count"]:,}' if r["key_count"] is not None else "n/a"
             out.append(f'<tr><td class="py-2 px-3">{r["scenario_val"]}</td><td class="py-2 px-3">{ratio_label}</td>'
-                        f'<td class="py-2 px-3">{r["key_count"]:,}</td><td class="py-2 px-3">{status}</td></tr>')
+                        f'<td class="py-2 px-3">{key_count_label}</td><td class="py-2 px-3">{status}</td></tr>')
         out.append("</tbody></table></div>")
     if contention_rows:
         out.append('<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4">Concurrent-Write Contention Spot Check (32 writer threads, ratio=1.0)</h4>')
