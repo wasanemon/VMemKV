@@ -1,0 +1,2 @@
+{"scenario":"in_memory","value_size":8,"mode":"checkpoint_contention","ratio":1,"key_count":20000000,"writer_threads":32,"isolated_write_tps":118247,"concurrent_write_tps":128792,"checkpoint_elapsed_sec":7.03919,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"reorg_contention","ratio":1,"key_count":20000000,"writer_threads":32,"isolated_write_tps":121672,"concurrent_write_tps":139924,"reorg_elapsed_sec":8.57066e-08,"timed_out":false}
