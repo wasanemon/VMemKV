@@ -2110,6 +2110,34 @@ class VMemKVImpl {
   }
 
   void maybe_reorganize_if_needed() {
+    // Without this check, reorg_requested_ (the only thing that wakes reorg_worker_loop() out of
+    // its idle poll to actually evaluate wal_over_threshold()) was set *exclusively* by the two
+    // entry-count thresholds below (T1 append-region size, tail_entries_ size) -- never by WAL
+    // bytes accumulated, even though wal_over_threshold() (WalMaxBytesSinceCheckpoint, 64MiB by
+    // default) is supposed to be an independent safety net. For large-value workloads (64KB) this
+    // is not a minor gap: T1's append-region soft threshold alone (2^22 entries * 50%)
+    // corresponds to ~137GB of 64KB values, and tail_entries_'s (2^20 entries * 50%) to ~34GB --
+    // both vastly more than the 64MiB the byte threshold is meant to bound checkpoint's tail to.
+    // Confirmed directly: a sustained insert-heavy 64KB workload left wal_over_threshold() never
+    // evaluated at all for the whole length of a multi-minute test (T2's un-checkpointed backlog
+    // grew unboundedly the entire time), and shrinking the entry-count threshold artificially low
+    // was enough to make checkpoint fire and the backlog stabilize, isolating this exact gap as
+    // the cause.
+    //
+    // wal_over_threshold() -> Wal::size_bytes() does an fstat() -- unlike append_size/tail_size
+    // below (plain atomic loads), that's a real syscall, too expensive to pay on every single
+    // write the way this function is called. Sampled once every kWalCheckStride writes instead:
+    // at most that many writes' worth of extra delay (a few MB at most for any value size this
+    // project benchmarks) past the intended byte threshold, which is a rounding error against the
+    // threshold itself (64MiB by default) and immaterial next to the ~34-137GB gap this fixes.
+    constexpr uint64_t kWalCheckStride = 64;
+    if (wal_check_counter_.fetch_add(1, std::memory_order_relaxed) % kWalCheckStride == 0) {
+      if (wal_over_threshold()) {
+        reorg_requested_.store(true, std::memory_order_release);
+        reorg_requested_.notify_all();
+      }
+    }
+
     const size_t append_size = t1_.append_size();
     const size_t append_capacity = T1IndexT::APPEND_CAP;
 
@@ -2245,6 +2273,11 @@ class VMemKVImpl {
   // base_boundary never publishes past an offset whose in-place write is still physically in
   // flight -- see InPlaceUpdateBarrier's own contract.
   mutable InPlaceUpdateBarrier in_place_update_barrier_;
+
+  // Strides maybe_reorganize_if_needed()'s wal_over_threshold() sampling (see that call site's
+  // own comment) -- wal_over_threshold() -> Wal::size_bytes() is an fstat(), too expensive to
+  // call on every write.
+  mutable std::atomic<uint64_t> wal_check_counter_{0};
 
   // reorg_worker_loop()'s auto-trigger baseline for defragment(): T2's total footprint
   // (bytes_used) as of the end of the most recent successful defragment_internal() cycle, updated

@@ -676,20 +676,19 @@ TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file
   cleanup_store_files(path);
 }
 
-namespace {
-struct TinyWalCheckpointConfig : vmemkv::Config<> {
-  static constexpr size_t WalMaxBytesSinceCheckpoint = 2048;  // Small enough to trip quickly.
-};
-using VMemKV_TinyWalCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyWalCheckpointConfig>>;
-}  // namespace
-
 // Regression test for checkpoint()'s first-ever call: this store has never committed a checkpoint
 // before, so checkpoint_internal() must create the T2 checkpoint file (O_CREAT) rather than
 // assume one already exists, even for an insert-only workload that never generates fragmentation
-// on its own.
+// on its own. Deliberately the default (large) WalMaxBytesSinceCheckpoint, not a tiny override --
+// this test's exact t2_reorg_count assertions are about the *explicit* checkpoint() call below,
+// and a small threshold would let reorg_worker_loop()'s own auto-trigger race that explicit call
+// (both incrementing the same counter), making the exact-count assertion flaky (found the hard
+// way: maybe_reorganize_if_needed() used to never actually evaluate the byte-threshold check for
+// small corpora regardless of how small WalMaxBytesSinceCheckpoint was set -- a real bug, now
+// fixed -- so a tiny override here used to be silently inert rather than actually racy).
 TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint file") {
   const auto path = reserve_crash_temp_path();
-  auto store = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < 200; ++i) {
     REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
   }
@@ -712,10 +711,12 @@ TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint f
 
 // Regression test: repeated checkpoint() calls each durabilize the tail written since the last
 // cycle in place (same T1/T2 checkpoint file paths throughout, checkpoint_lsn still advancing
-// every cycle), and a restart after several cycles correctly adopts the final state.
+// every cycle), and a restart after several cycles correctly adopts the final state. Default
+// (large) WalMaxBytesSinceCheckpoint -- see the previous test case's own comment for why a tiny
+// override would make this test's exact t2_reorg_count assertion race auto-triggered cycles.
 TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survive restart") {
   const auto path = reserve_crash_temp_path();
-  auto store = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
 
   REQUIRE(store->insert("seed", make_value(-1)));
   store->impl().checkpoint();
@@ -749,7 +750,7 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
 
   // A genuine restart adopts the final checkpoint correctly.
   store.reset();
-  auto restarted = std::make_unique<VMemKV_TinyWalCheckpoint>(path, kStoreCapacityBytes);
+  auto restarted = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   CHECK(get_bytes(restarted, "seed").has_value());
   for (int cycle = 0; cycle < kCycles; ++cycle) {
     for (int i = 0; i < kKeysPerCycle; ++i) {
