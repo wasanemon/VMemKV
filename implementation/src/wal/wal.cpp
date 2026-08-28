@@ -557,9 +557,19 @@ void Wal::rotate_segment() {
   // a given record landed in (see this file's own comment above and low_level_design.md 5.5).
   // Leadership here exists only so no write_and_fsync_batch() round is ever mid-flight against the
   // fd being closed below.
+  //
+  // Timed (see last_rotate_leader_wait_us()'s own comment): under sustained concurrent writers,
+  // this wait -- not open()/close()/the generation-2-back unlink() below, all consistently
+  // sub-millisecond -- is what dominates rotate_segment()'s, and therefore checkpoint_internal()'s,
+  // wall-clock cost.
+  const auto leader_wait_start = std::chrono::steady_clock::now();
   while (flushing_.exchange(true, std::memory_order_acq_rel)) {
     flushing_.wait(true, std::memory_order_acquire);
   }
+  last_rotate_leader_wait_us_.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                              std::chrono::steady_clock::now() - leader_wait_start)
+                                                              .count()),
+                                    std::memory_order_relaxed);
 
   const int old_fd = fd_.load(std::memory_order_acquire);
   const uint64_t new_generation = active_generation_ + 1;

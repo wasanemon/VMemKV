@@ -223,6 +223,11 @@ class VMemKVImpl {
     load_checkpoint_if_present(t2_path);
     recover_from_wal();
     recovering_ = false;
+    // Only meaningful when ConfigT::CheckpointIntervalMs > 0 -- see checkpoint_trigger_due()'s
+    // own comment. Set here, before reorg_worker_ starts, so the interval is measured from
+    // construction rather than from an arbitrary (and much earlier) steady_clock epoch, which
+    // would otherwise make the very first wakeup see an enormous "elapsed" and fire immediately.
+    last_checkpoint_time_.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
     reorg_worker_ = std::jthread(&VMemKVImpl::reorg_worker_loop, this);  // Started after recovery completes.
   }
 
@@ -349,6 +354,17 @@ class VMemKVImpl {
   template <typename PreStopHook = NoOpPreStopHook, typename PreFinishHook = NoOpPreFinishHook>
   void checkpoint_internal(PreStopHook pre_stop_hook = PreStopHook{}, PreFinishHook pre_finish_hook = PreFinishHook{}) {
     using EntrySnapshot = typename T1IndexT::EntrySnapshot;
+    // Phase-breakdown timing (see VMemKVStatistics::last_checkpoint_*) -- measures where
+    // checkpoint_internal()'s wall-clock cost actually goes: msync() (should scale with the
+    // synced delta, i.e. with trigger frequency) vs t1_.reorganize() (always O(total corpus),
+    // independent of trigger frequency). Only touched here, single-flight via reorg_running_, so
+    // plain local variables suffice; published to the atomics below once, at the very end.
+    const auto fn_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration msync_duration{0};
+    std::chrono::steady_clock::duration t1_reorganize_duration{0};
+    std::chrono::steady_clock::duration stop_writers_duration{0};
+    std::chrono::steady_clock::duration barrier_drain_duration{0};
+    std::chrono::steady_clock::duration wal_rotate_duration{0};
     const uint64_t checkpoint_lsn = wal_.next_lsn() - 1;
     const uint64_t old_base_boundary = t2_.get_memory()->base_boundary.load(std::memory_order_acquire);
 
@@ -362,7 +378,11 @@ class VMemKVImpl {
     // TEST-ONLY: lets a test register a writer's handle to mem_to_drain before the stop flag goes
     // up. No-op in production -- see NoOpPreStopHook.
     pre_stop_hook();
-    t2_.stop_writers_and_wait(mem_to_drain);
+    {
+      const auto stop_start = std::chrono::steady_clock::now();
+      t2_.stop_writers_and_wait(mem_to_drain);
+      stop_writers_duration = std::chrono::steady_clock::now() - stop_start;
+    }
     uint64_t target = old_base_boundary;
     {
       WriterResumeGuard resume_guard{&t2_};
@@ -381,7 +401,11 @@ class VMemKVImpl {
     // InPlaceUpdateBarrier's own contract and try_in_place_update()'s enter() call. Without this,
     // such a write could still be in flight when msync() reads this range, or when base_boundary
     // publishes past it below.
-    in_place_update_barrier_.wait_until_retired(target);
+    {
+      const auto barrier_start = std::chrono::steady_clock::now();
+      in_place_update_barrier_.wait_until_retired(target);
+      barrier_drain_duration = std::chrono::steady_clock::now() - barrier_start;
+    }
 
     try {
       if (target > old_base_boundary) {
@@ -391,7 +415,10 @@ class VMemKVImpl {
         static const uint64_t kPageSize = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
         const uint64_t aligned_start = old_base_boundary - (old_base_boundary % kPageSize);
         const vmemkv::T2Memory *mem = t2_.get_memory();
-        if (::msync(mem->base + aligned_start, target - aligned_start, MS_SYNC) != 0) {
+        const auto msync_start = std::chrono::steady_clock::now();
+        const int msync_rc = ::msync(mem->base + aligned_start, target - aligned_start, MS_SYNC);
+        msync_duration = std::chrono::steady_clock::now() - msync_start;
+        if (msync_rc != 0) {
           throw std::system_error(errno, std::generic_category(), "msync t2 checkpoint");
         }
       }
@@ -408,7 +435,9 @@ class VMemKVImpl {
       auto chk_writer_fn = [&](std::span<const EntrySnapshot> merged) {
         vmemkv::write_t1_checkpoint(vmemkv::derive_t1_chk_path(t2_path()), merged);
       };
+      const auto t1_reorganize_start = std::chrono::steady_clock::now();
       t1_.reorganize(offset_mapper_fn, chk_writer_fn, t2_.get_memory()->generation);
+      t1_reorganize_duration = std::chrono::steady_clock::now() - t1_reorganize_start;
 
       vmemkv::write_manifest(vmemkv::derive_manifest_path(t2_path()), checkpoint_lsn, target);
     } catch (...) {
@@ -424,11 +453,45 @@ class VMemKVImpl {
     // No checkpoint_lsn needed here (low_level_design.md 5.5): rotate_segment() only ever retires
     // the generation active during the *previous* cycle, which this cycle's manifest already
     // covers by construction -- see that function's own doc comment for the retention argument.
-    wal_.rotate_segment();
+    {
+      const auto rotate_start = std::chrono::steady_clock::now();
+      wal_.rotate_segment();
+      wal_rotate_duration = std::chrono::steady_clock::now() - rotate_start;
+    }
 
     reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
     reorg_t2_count_.fetch_add(1, std::memory_order_relaxed);
     reset_tombstone_counters();
+    // Published last (after t2_reorg_count_ above), so a poller that wakes on t2_reorg_count_
+    // changing always sees this cycle's own numbers, never a torn mix with the next cycle's.
+    {
+      const auto total_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - fn_start).count();
+      last_checkpoint_duration_us_.store(static_cast<uint64_t>(total_us), std::memory_order_relaxed);
+      last_checkpoint_msync_duration_us_.store(
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(msync_duration).count()),
+          std::memory_order_relaxed);
+      last_checkpoint_t1_reorganize_duration_us_.store(
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t1_reorganize_duration).count()),
+          std::memory_order_relaxed);
+      last_checkpoint_stop_writers_duration_us_.store(
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(stop_writers_duration).count()),
+          std::memory_order_relaxed);
+      last_checkpoint_barrier_drain_duration_us_.store(
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(barrier_drain_duration).count()),
+          std::memory_order_relaxed);
+      last_checkpoint_wal_rotate_duration_us_.store(
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(wal_rotate_duration).count()),
+          std::memory_order_relaxed);
+      last_checkpoint_wal_rotate_leader_wait_us_.store(wal_.last_rotate_leader_wait_us(), std::memory_order_relaxed);
+      last_checkpoint_bytes_synced_.store(target - old_base_boundary, std::memory_order_relaxed);
+      last_checkpoint_corpus_bytes_.store(target, std::memory_order_relaxed);
+    }
+    // Only meaningful when ConfigT::CheckpointIntervalMs > 0 (see checkpoint_trigger_due()'s
+    // own comment) -- harmless to always update regardless, since the byte-based trigger never
+    // reads this field. Updated here (not in reorg_worker_loop()) so a manually-forced
+    // store.checkpoint() call resets the clock too, not just auto-triggered cycles.
+    last_checkpoint_time_.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
   }
 
   // Relocates every live T2 record (base- and tail-resident alike) to fresh, sequentially
@@ -1057,9 +1120,18 @@ class VMemKVImpl {
   // against that, unlike a genuinely hot per-call path.
   void wait_until_reorg_not_running() const {
     constexpr auto kIdlePollInterval = std::chrono::milliseconds(10);
+    const auto wait_start = std::chrono::steady_clock::now();
     while (reorg_running_.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(kIdlePollInterval);
     }
+    // Total wall-clock time writer threads spend genuinely blocked here, summed across all
+    // callers -- the actual QPS cost a checkpoint/reorg cycle imposes on writers, as opposed to
+    // checkpoint_internal()'s own wall-clock duration (most of which overlaps unblocked writer
+    // progress -- checkpoint_internal() resumes writers via WriterResumeGuard immediately after
+    // capturing its target, well before msync()/t1_.reorganize()/wal_.rotate_segment() run).
+    const auto waited_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start).count();
+    total_hard_stall_duration_us_.fetch_add(static_cast<uint64_t>(waited_us), std::memory_order_relaxed);
   }
 
   // Shared wait/CAS/run/retry loop for the three public methods below. `decide` is invoked fresh
@@ -1151,9 +1223,25 @@ class VMemKVImpl {
   }
 
   auto get_statistics() const noexcept -> vmemkv::VMemKVStatistics {
-    return vmemkv::VMemKVStatistics{.t1_reorg_count = reorg_t1_count_.load(std::memory_order_relaxed),
-                                    .t2_reorg_count = reorg_t2_count_.load(std::memory_order_relaxed),
-                                    .hard_stall_count = hard_stall_count_.load(std::memory_order_relaxed)};
+    return vmemkv::VMemKVStatistics{
+        .t1_reorg_count = reorg_t1_count_.load(std::memory_order_relaxed),
+        .t2_reorg_count = reorg_t2_count_.load(std::memory_order_relaxed),
+        .hard_stall_count = hard_stall_count_.load(std::memory_order_relaxed),
+        .last_checkpoint_duration_us = last_checkpoint_duration_us_.load(std::memory_order_relaxed),
+        .last_checkpoint_msync_duration_us = last_checkpoint_msync_duration_us_.load(std::memory_order_relaxed),
+        .last_checkpoint_t1_reorganize_duration_us =
+            last_checkpoint_t1_reorganize_duration_us_.load(std::memory_order_relaxed),
+        .last_checkpoint_stop_writers_duration_us =
+            last_checkpoint_stop_writers_duration_us_.load(std::memory_order_relaxed),
+        .last_checkpoint_barrier_drain_duration_us =
+            last_checkpoint_barrier_drain_duration_us_.load(std::memory_order_relaxed),
+        .last_checkpoint_wal_rotate_duration_us =
+            last_checkpoint_wal_rotate_duration_us_.load(std::memory_order_relaxed),
+        .last_checkpoint_wal_rotate_leader_wait_us =
+            last_checkpoint_wal_rotate_leader_wait_us_.load(std::memory_order_relaxed),
+        .last_checkpoint_bytes_synced = last_checkpoint_bytes_synced_.load(std::memory_order_relaxed),
+        .last_checkpoint_corpus_bytes = last_checkpoint_corpus_bytes_.load(std::memory_order_relaxed),
+        .total_hard_stall_duration_us = total_hard_stall_duration_us_.load(std::memory_order_relaxed)};
   }
 
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
@@ -1833,8 +1921,33 @@ class VMemKVImpl {
   }
 
   // Whether enough WAL has accumulated since the last checkpoint to need truncating. Used only by
-  // reorg_worker_loop() to decide whether to call checkpoint()-equivalent behavior.
+  // reorg_worker_loop() to decide whether to call checkpoint()-equivalent behavior. Only called
+  // when ConfigT::CheckpointIntervalMs == 0 -- see checkpoint_trigger_due()'s own comment.
   auto wal_over_threshold() const -> bool { return wal_.size_bytes() >= ConfigT::WalMaxBytesSinceCheckpoint; }
+
+  // Whether checkpoint_internal() should fire on this reorg_worker_loop() wakeup. Two entirely
+  // separate, mutually exclusive trigger mechanisms (ConfigT::CheckpointIntervalMs == 0
+  // selects between them at compile time, never both at once):
+  //   - byte-based (default): wal_over_threshold(), as it always was.
+  //   - time-based (CheckpointIntervalMs > 0): fires once at least that many seconds have
+  //     passed since checkpoint_internal() last completed, regardless of WAL size -- lets a
+  //     measurement deliberately decouple checkpoint() frequency from write volume, e.g. to ask
+  //     "what if checkpoint() only fired every 10 seconds" independent of how many WAL bytes that
+  //     happens to accumulate at a given write rate. last_checkpoint_time_ is updated by
+  //     checkpoint_internal() itself (both auto-triggered and manually-forced calls), so a forced
+  //     store.checkpoint() call also resets this clock.
+  auto checkpoint_trigger_due() const -> bool {
+    if constexpr (ConfigT::CheckpointIntervalMs > 0) {
+      const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+      const auto last = last_checkpoint_time_.load(std::memory_order_relaxed);
+      const auto elapsed_ns = now - last;
+      return elapsed_ns >= std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                               std::chrono::milliseconds(ConfigT::CheckpointIntervalMs))
+                               .count();
+    } else {
+      return wal_over_threshold();
+    }
+  }
 
   // Whether T2's total footprint has grown enough since the last defragment_internal() cycle (or
   // since startup, if none has ever run) to warrant another one. Used only by reorg_worker_loop().
@@ -2094,7 +2207,7 @@ class VMemKVImpl {
         // pressure (see maybe_reorganize_if_needed()) -- tail_entries_/WAL-size/T2-footprint
         // changes never themselves cause a wakeup, so this only checks them "while already awake
         // anyway."
-        if (wal_over_threshold()) {
+        if (checkpoint_trigger_due()) {
           reorganize_internal(ReorgMode::Checkpoint);
         } else if (tail_entries_.near_capacity() || defrag_growth_over_threshold()) {
           reorganize_internal(ReorgMode::Defragment);
@@ -2111,28 +2224,29 @@ class VMemKVImpl {
 
   void maybe_reorganize_if_needed() {
     // Without this check, reorg_requested_ (the only thing that wakes reorg_worker_loop() out of
-    // its idle poll to actually evaluate wal_over_threshold()) was set *exclusively* by the two
-    // entry-count thresholds below (T1 append-region size, tail_entries_ size) -- never by WAL
-    // bytes accumulated, even though wal_over_threshold() (WalMaxBytesSinceCheckpoint, 64MiB by
-    // default) is supposed to be an independent safety net. For large-value workloads (64KB) this
-    // is not a minor gap: T1's append-region soft threshold alone (2^22 entries * 50%)
-    // corresponds to ~137GB of 64KB values, and tail_entries_'s (2^20 entries * 50%) to ~34GB --
-    // both vastly more than the 64MiB the byte threshold is meant to bound checkpoint's tail to.
-    // Confirmed directly: a sustained insert-heavy 64KB workload left wal_over_threshold() never
-    // evaluated at all for the whole length of a multi-minute test (T2's un-checkpointed backlog
-    // grew unboundedly the entire time), and shrinking the entry-count threshold artificially low
-    // was enough to make checkpoint fire and the backlog stabilize, isolating this exact gap as
-    // the cause.
+    // its idle poll to actually evaluate checkpoint_trigger_due()) was set *exclusively* by the
+    // two entry-count thresholds below (T1 append-region size, tail_entries_ size) -- never by
+    // WAL bytes accumulated, even though checkpoint_trigger_due()'s own byte-threshold
+    // (WalMaxBytesSinceCheckpoint, 64MiB by default) is supposed to be an independent safety net.
+    // For large-value workloads (64KB) this is not a minor gap: T1's append-region soft threshold
+    // alone (2^22 entries * 50%) corresponds to ~137GB of 64KB values, and tail_entries_'s (2^20
+    // entries * 50%) to ~34GB -- both is vastly more than the 64MiB the byte threshold is meant
+    // to bound checkpoint's tail to. Confirmed directly: a sustained insert-heavy 64KB workload
+    // left checkpoint_trigger_due() never evaluated at all for the whole length of a multi-minute
+    // test (T2's un-checkpointed backlog grew unboundedly the entire time -- see docs/benchmark/
+    // for the measurement), and shrinking the entry-count threshold artificially low was enough
+    // to make checkpoint fire and the backlog stabilize, isolating this exact gap as the cause.
     //
-    // wal_over_threshold() -> Wal::size_bytes() does an fstat() -- unlike append_size/tail_size
-    // below (plain atomic loads), that's a real syscall, too expensive to pay on every single
-    // write the way this function is called. Sampled once every kWalCheckStride writes instead:
-    // at most that many writes' worth of extra delay (a few MB at most for any value size this
-    // project benchmarks) past the intended byte threshold, which is a rounding error against the
-    // threshold itself (64MiB by default) and immaterial next to the ~34-137GB gap this fixes.
+    // checkpoint_trigger_due() -> wal_over_threshold() -> Wal::size_bytes() does an fstat() --
+    // unlike append_size/tail_size below (plain atomic loads), that's a real syscall, too
+    // expensive to pay on every single write the way this function is called. Sampled once every
+    // kWalCheckStride writes instead: at most that many writes' worth of extra delay (a few MB at
+    // most for any value size this project benchmarks) past the intended byte threshold, which is
+    // a rounding error against the threshold itself (64MiB by default) and immaterial next to the
+    // ~34-137GB gap this fixes.
     constexpr uint64_t kWalCheckStride = 64;
     if (wal_check_counter_.fetch_add(1, std::memory_order_relaxed) % kWalCheckStride == 0) {
-      if (wal_over_threshold()) {
+      if (checkpoint_trigger_due()) {
         reorg_requested_.store(true, std::memory_order_release);
         reorg_requested_.notify_all();
       }
@@ -2251,6 +2365,8 @@ class VMemKVImpl {
   std::atomic<uint64_t> reorg_t1_count_{0};
   std::atomic<uint64_t> reorg_t2_count_{0};
   std::atomic<uint64_t> hard_stall_count_{0};
+  // See wait_until_reorg_not_running()'s own comment.
+  mutable std::atomic<uint64_t> total_hard_stall_duration_us_{0};
 
   bool recovering_ = false;  // True only during the constructor's initial WAL replay.
 
@@ -2274,10 +2390,29 @@ class VMemKVImpl {
   // flight -- see InPlaceUpdateBarrier's own contract.
   mutable InPlaceUpdateBarrier in_place_update_barrier_;
 
-  // Strides maybe_reorganize_if_needed()'s wal_over_threshold() sampling (see that call site's
-  // own comment) -- wal_over_threshold() -> Wal::size_bytes() is an fstat(), too expensive to
-  // call on every write.
+  // Only meaningful when ConfigT::CheckpointIntervalMs > 0 -- see checkpoint_trigger_due()'s
+  // own comment for the mechanism this drives. steady_clock::time_point isn't itself atomic, so
+  // stored as its time_since_epoch().count() (the clock's native duration-tick representation)
+  // instead. Set at construction and updated by every checkpoint_internal() completion
+  // (auto-triggered or manually-forced); never read at all when CheckpointIntervalMs == 0.
+  mutable std::atomic<std::chrono::steady_clock::duration::rep> last_checkpoint_time_{0};
+
+  // Strides maybe_reorganize_if_needed()'s checkpoint_trigger_due() sampling (see that call
+  // site's own comment) -- checkpoint_trigger_due() -> wal_over_threshold() -> Wal::size_bytes()
+  // is an fstat(), too expensive to call on every write.
   mutable std::atomic<uint64_t> wal_check_counter_{0};
+
+  // Phase-breakdown timing published by checkpoint_internal() -- see VMemKVStatistics::
+  // last_checkpoint_* and this file's own comment at that function's timing instrumentation.
+  mutable std::atomic<uint64_t> last_checkpoint_duration_us_{0};
+  mutable std::atomic<uint64_t> last_checkpoint_msync_duration_us_{0};
+  mutable std::atomic<uint64_t> last_checkpoint_t1_reorganize_duration_us_{0};
+  mutable std::atomic<uint64_t> last_checkpoint_stop_writers_duration_us_{0};
+  mutable std::atomic<uint64_t> last_checkpoint_barrier_drain_duration_us_{0};
+  mutable std::atomic<uint64_t> last_checkpoint_wal_rotate_duration_us_{0};
+  mutable std::atomic<uint64_t> last_checkpoint_wal_rotate_leader_wait_us_{0};
+  mutable std::atomic<uint64_t> last_checkpoint_bytes_synced_{0};
+  mutable std::atomic<uint64_t> last_checkpoint_corpus_bytes_{0};
 
   // reorg_worker_loop()'s auto-trigger baseline for defragment(): T2's total footprint
   // (bytes_used) as of the end of the most recent successful defragment_internal() cycle, updated

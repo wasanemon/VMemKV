@@ -106,8 +106,22 @@ struct Config {
   // Checkpoint trigger independent of tail-tracker pressure: once this many WAL bytes accumulate
   // since the last checkpoint, a checkpoint fires regardless of tail occupancy, bounding replay
   // time for workloads that never trip the tail-capacity trigger. See
-  // docs/specification/low_level_design.md 4.4.
+  // docs/specification/low_level_design.md 4.4. Ignored (the byte-based check is skipped
+  // entirely) whenever CheckpointIntervalMs below is nonzero -- see that constant's own
+  // comment.
   static constexpr size_t WalMaxBytesSinceCheckpoint = 64ULL << 20;  // 64 MiB.
+
+  // Time-based alternative to WalMaxBytesSinceCheckpoint, for measuring how checkpoint()'s own
+  // duration and steady-state write throughput scale with a deliberately larger/smaller tail than
+  // the byte threshold would naturally produce -- e.g. to ask "what if checkpoint() only fired
+  // every 10 seconds instead of every ~0.2 seconds" independent of how many WAL bytes that
+  // happens to accumulate. 0 (the default) means disabled: reorg_worker_loop()'s checkpoint
+  // trigger uses WalMaxBytesSinceCheckpoint as before. Nonzero replaces that check entirely
+  // (never both at once) with "at least this many milliseconds since checkpoint_internal() last
+  // completed" -- see wal_over_threshold()'s call site in reorg_worker_loop(). Milliseconds (not
+  // seconds) so a sub-second interval like the "~0.2 seconds" comparison point above can actually
+  // be expressed.
+  static constexpr size_t CheckpointIntervalMs = 0;
 
   // defragment() auto-trigger (reorg_worker_loop()): fires once T2's total footprint has grown to
   // DefragGrowthThresholdPercent of its size as of the last defragment cycle (200 = doubled), and
@@ -136,6 +150,29 @@ struct VMemKVStatistics {
   uint64_t t1_reorg_count = 0;
   uint64_t t2_reorg_count = 0;
   uint64_t hard_stall_count = 0;
+
+  // Phase breakdown for the most recently completed checkpoint_internal() cycle (auto-triggered
+  // or manually-forced), for measuring how checkpoint's own cost scales with data volume and
+  // trigger frequency. All 0 until the first checkpoint ever completes.
+  uint64_t last_checkpoint_duration_us = 0;
+  uint64_t last_checkpoint_msync_duration_us = 0;
+  uint64_t last_checkpoint_t1_reorganize_duration_us = 0;
+  uint64_t last_checkpoint_stop_writers_duration_us = 0;   // Writer-pause window for new appends.
+  uint64_t last_checkpoint_barrier_drain_duration_us = 0;  // In-place-update drain.
+  uint64_t last_checkpoint_wal_rotate_duration_us = 0;
+  // Subset of last_checkpoint_wal_rotate_duration_us spent waiting to become the WAL's
+  // group-commit leader (see Wal::last_rotate_leader_wait_us()'s own comment) -- found to
+  // dominate wal_rotate under sustained concurrent writers, far more than the open()/close()/
+  // unlink() calls rotate_segment() also makes.
+  uint64_t last_checkpoint_wal_rotate_leader_wait_us = 0;
+  uint64_t last_checkpoint_bytes_synced = 0;  // target - old_base_boundary: the msync()'d delta.
+  uint64_t last_checkpoint_corpus_bytes = 0;  // target: total T2 footprint as of this cycle.
+
+  // Cumulative wall-clock time, summed across all writer threads, actually spent blocked in
+  // wait_until_reorg_not_running() (hard backpressure) -- the real writer-facing cost of a
+  // reorg/checkpoint cycle, as opposed to that cycle's own wall-clock duration (most of which
+  // overlaps unblocked writer progress).
+  uint64_t total_hard_stall_duration_us = 0;
 };
 
 }  // namespace vmemkv

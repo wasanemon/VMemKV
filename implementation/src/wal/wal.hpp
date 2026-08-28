@@ -163,6 +163,16 @@ class Wal {
   // a fresh, empty active segment exactly once per checkpoint cycle.
   [[nodiscard]] auto size_bytes() const -> uint64_t;
 
+  // How long the most recent rotate_segment() call spent waiting to become group-commit leader
+  // (see that function's own comment) before it could safely swap fd_ -- found, via direct
+  // measurement, to dominate checkpoint_internal()'s own wall-clock cost under sustained
+  // concurrent writers, far more than the msync()/T1-reorganize work checkpoint's duration was
+  // originally assumed to be spent on. Scales with how continuously busy the WAL's group-commit
+  // leader stays, not with data volume or checkpoint trigger frequency.
+  [[nodiscard]] auto last_rotate_leader_wait_us() const noexcept -> uint64_t {
+    return last_rotate_leader_wait_us_.load(std::memory_order_relaxed);
+  }
+
  private:
   // Sized above the 256-way key-stripe locking's max concurrent callers (throughput/backpressure
   // tuning only -- NOT what makes wraparound safe; that's collect_batch()'s per-pass bound plus
@@ -227,6 +237,8 @@ class Wal {
   // close()-then-reassign; a plain int would be a data race (UB) and risk a
   // close-then-fd-number-reused hazard.
   std::atomic<int> fd_{-1};
+  // Published by rotate_segment(); see last_rotate_leader_wait_us()'s own comment.
+  std::atomic<uint64_t> last_rotate_leader_wait_us_{0};
   std::filesystem::path path_;
   // The active segment's generation number. Touched only by whoever holds flushing_ leadership
   // (rotate_segment() is its only writer), so -- like next_to_flush_ -- no atomic is needed.
