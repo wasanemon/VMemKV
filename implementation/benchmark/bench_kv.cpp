@@ -264,6 +264,25 @@ static inline std::optional<std::size_t> read_size_from_env(const char *name) {
   }
 }
 
+// Diagnostic-only, used by run_steady()'s VMEMKV_STEADY_TELEMETRY monitor thread (see there):
+// this process's own resident set, for correlating against VMemKVStatistics under LTM pressure.
+static inline std::size_t read_process_rss_kb() {
+  FILE *file = std::fopen("/proc/self/status", "r");
+  if (file == nullptr) {
+    return 0;
+  }
+  char line[256];
+  std::size_t rss_kb = 0;
+  while (std::fgets(line, sizeof(line), file) != nullptr) {
+    if (std::strncmp(line, "VmRSS:", 6) == 0) {
+      std::sscanf(line + 6, "%zu", &rss_kb);
+      break;
+    }
+  }
+  std::fclose(file);
+  return rss_kb;
+}
+
 static inline std::size_t detect_machine_memory_bytes() {
   constexpr std::size_t kHugeLimitThreshold = 1ULL << 60;
 
@@ -2120,6 +2139,37 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   }
   const std::size_t churn_threads =
       std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
+
+  // Diagnostic-only, off by default: prints VMemKVStatistics + RSS to stderr at ~1Hz through
+  // churn and the final checkpoint() below, to correlate T1 AppendRegion generation count/RSS
+  // growth against wall-clock progress under real LTM pressure -- see TODO.md item 6. Started
+  // here (not earlier) since the baseline checkpoint()/bulk_load above aren't what that item
+  // investigates.
+  const bool telemetry = std::getenv("VMEMKV_STEADY_TELEMETRY") != nullptr;
+  std::atomic<bool> stop_telemetry{false};
+  std::atomic<bool> in_final_checkpoint{false};
+  std::thread telemetry_thread;
+  if (telemetry) {
+    telemetry_thread = std::thread([&]() {
+      const auto t0 = std::chrono::steady_clock::now();
+      while (!stop_telemetry.load(std::memory_order_relaxed)) {
+        const auto stats = store->get_statistics();
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr,
+                     "[steady-telemetry] t=%.1fs phase=%s rss_kb=%zu append_region_live=%ld peak=%ld t1_reorg=%lu "
+                     "hard_stall=%lu\n",
+                     t,
+                     in_final_checkpoint.load(std::memory_order_relaxed) ? "checkpoint" : "churn",
+                     read_process_rss_kb(),
+                     stats.append_region_live_count,
+                     stats.append_region_peak_count,
+                     stats.t1_reorg_count,
+                     stats.hard_stall_count);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      }
+    });
+  }
+
   {
     std::vector<std::thread> workers;
     workers.reserve(churn_threads);
@@ -2136,7 +2186,13 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     }
   }
 
+  in_final_checkpoint.store(true, std::memory_order_relaxed);
   auto [elapsed_sec, timed_out] = timed_run([&store]() { store->checkpoint(); });
+
+  if (telemetry) {
+    stop_telemetry.store(true, std::memory_order_relaxed);
+    telemetry_thread.join();
+  }
 
   if (!timed_out) {
     std::ofstream marker(count_marker_path, std::ios::trunc);
