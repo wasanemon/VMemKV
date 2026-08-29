@@ -2110,6 +2110,44 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
         path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
   }
 
+  // Diagnostic-only, off by default: prints VMemKVStatistics + RSS to stderr at ~1Hz across the
+  // *entire* bulk_load -> baseline checkpoint -> churn -> final checkpoint sequence below, to
+  // correlate T1 AppendRegion generation count/RSS growth against wall-clock progress under real
+  // LTM pressure -- see TODO.md item 6. Started here, before bulk_load, not just around churn:
+  // an earlier version started it only before churn and produced an empty log under real LTM
+  // pressure, meaning the untimed bulk_load()/baseline checkpoint() phase can itself be where a
+  // 180s repro timeout gets consumed, not only the phases this experiment nominally measures.
+  const bool telemetry = std::getenv("VMEMKV_STEADY_TELEMETRY") != nullptr;
+  std::atomic<bool> stop_telemetry{false};
+  std::atomic<int> telemetry_phase{0};  // 0=bulk_load, 1=baseline_checkpoint, 2=churn, 3=final_checkpoint
+  std::thread telemetry_thread;
+  if (telemetry) {
+    telemetry_thread = std::thread([&]() {
+      static const char *kPhaseNames[] = {"bulk_load", "baseline_checkpoint", "churn", "final_checkpoint"};
+      const auto t0 = std::chrono::steady_clock::now();
+      while (!stop_telemetry.load(std::memory_order_relaxed)) {
+        const auto stats = store->get_statistics();
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr,
+                     "[steady-telemetry] t=%.1fs phase=%s rss_kb=%zu append_region_live=%ld peak=%ld t1_reorg=%lu "
+                     "hard_stall=%lu\n",
+                     t,
+                     kPhaseNames[telemetry_phase.load(std::memory_order_relaxed)],
+                     read_process_rss_kb(),
+                     stats.append_region_live_count,
+                     stats.append_region_peak_count,
+                     stats.t1_reorg_count,
+                     stats.hard_stall_count);
+        // stderr is fully (not line-) buffered once redirected to a file/pipe, so without this a
+        // process killed mid-stall (e.g. by an outer `timeout`) loses every line written since
+        // the last flush -- confirmed directly: a 180s-timeout run under real LTM pressure
+        // produced an empty log until this was added.
+        std::fflush(stderr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      }
+    });
+  }
+
   if (key_count > prev_count) {
     const std::size_t delta = key_count - prev_count;
     store->bulk_load(
@@ -2120,6 +2158,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 
   // Untimed: establishes a clean single-generation baseline before churn, same as any real
   // caller would do -- not part of what this experiment measures.
+  telemetry_phase.store(1, std::memory_order_relaxed);
   store->checkpoint();
 
   // Untimed, and deliberately multi-threaded: update() is WAL-durable (an fsync-equivalent wait
@@ -2140,41 +2179,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   const std::size_t churn_threads =
       std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
 
-  // Diagnostic-only, off by default: prints VMemKVStatistics + RSS to stderr at ~1Hz through
-  // churn and the final checkpoint() below, to correlate T1 AppendRegion generation count/RSS
-  // growth against wall-clock progress under real LTM pressure -- see TODO.md item 6. Started
-  // here (not earlier) since the baseline checkpoint()/bulk_load above aren't what that item
-  // investigates.
-  const bool telemetry = std::getenv("VMEMKV_STEADY_TELEMETRY") != nullptr;
-  std::atomic<bool> stop_telemetry{false};
-  std::atomic<bool> in_final_checkpoint{false};
-  std::thread telemetry_thread;
-  if (telemetry) {
-    telemetry_thread = std::thread([&]() {
-      const auto t0 = std::chrono::steady_clock::now();
-      while (!stop_telemetry.load(std::memory_order_relaxed)) {
-        const auto stats = store->get_statistics();
-        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr,
-                     "[steady-telemetry] t=%.1fs phase=%s rss_kb=%zu append_region_live=%ld peak=%ld t1_reorg=%lu "
-                     "hard_stall=%lu\n",
-                     t,
-                     in_final_checkpoint.load(std::memory_order_relaxed) ? "checkpoint" : "churn",
-                     read_process_rss_kb(),
-                     stats.append_region_live_count,
-                     stats.append_region_peak_count,
-                     stats.t1_reorg_count,
-                     stats.hard_stall_count);
-        // stderr is fully (not line-) buffered once redirected to a file/pipe, so without this a
-        // process killed mid-stall (e.g. by an outer `timeout`) loses every line written since
-        // the last flush -- confirmed directly: a 180s-timeout run under real LTM pressure
-        // produced an empty log until this was added.
-        std::fflush(stderr);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      }
-    });
-  }
-
+  telemetry_phase.store(2, std::memory_order_relaxed);
   {
     std::vector<std::thread> workers;
     workers.reserve(churn_threads);
@@ -2191,7 +2196,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     }
   }
 
-  in_final_checkpoint.store(true, std::memory_order_relaxed);
+  telemetry_phase.store(3, std::memory_order_relaxed);
   auto [elapsed_sec, timed_out] = timed_run([&store]() { store->checkpoint(); });
 
   if (telemetry) {
