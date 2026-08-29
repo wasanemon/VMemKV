@@ -131,12 +131,19 @@ class T1Index {
   // T1Index callers with no such pairing.
   explicit T1Index(uint64_t initial_generation = 0) {
     auto *active_region = new AppendRegion();
+    note_append_region_created();
     auto *active_index = new AppendIndex();
     append_active_.store(new AppendGeneration{active_region, active_index}, std::memory_order_release);
     sorted_snapshot_.store(new SortedSnapshot{new SortedRegion(), initial_generation}, std::memory_order_release);
   }
 
   ~T1Index() noexcept {
+    if (AppendGeneration *active = append_active_.load(std::memory_order_relaxed); active != nullptr) {
+      note_append_region_destroyed();
+    }
+    if (AppendGeneration *imm = append_immutable_.get(); imm != nullptr) {
+      note_append_region_destroyed();
+    }
     delete_generation(append_active_.load(std::memory_order_relaxed));
     delete_generation(append_immutable_.get());
     delete_snapshot(sorted_snapshot_.load(std::memory_order_relaxed));
@@ -239,6 +246,19 @@ class T1Index {
 
   [[nodiscard]] auto append_size() const noexcept -> size_t {
     return with_epoch_guard([&]() noexcept { return append_active_.load(std::memory_order_acquire)->region->size(); });
+  }
+
+  // Number of AppendRegion instances (active + any not-yet-EBR-reclaimed retiring generation)
+  // currently resident, and the high-water mark across this instance's lifetime. Each carries a
+  // fixed APPEND_CAP * sizeof(AppendSlot) mmap'd footprint that becomes almost fully resident
+  // from even light occupancy (open-addressing page-scatter -- see TODO.md item 6), independent
+  // of actual corpus size, so how many pile up live at once directly bounds T1's own RSS
+  // contribution under sustained reorganize() churn.
+  [[nodiscard]] auto append_region_live_count() const noexcept -> int64_t {
+    return append_region_live_count_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] auto append_region_peak_count() const noexcept -> int64_t {
+    return append_region_peak_count_.load(std::memory_order_relaxed);
   }
 
   [[nodiscard]] auto live_bytes() const noexcept -> uint64_t {
@@ -527,6 +547,7 @@ class T1Index {
 
     // 1. Prepare new active buffers
     auto *next_active_region = new AppendRegion();
+    note_append_region_created();
     auto *next_active_index = new AppendIndex();
     auto *next_active_gen = new AppendGeneration{next_active_region, next_active_index};
 
@@ -659,6 +680,7 @@ class T1Index {
     active_epochs_.wait_until_epoch(target_epoch);
 
     delete old_active_gen->region;
+    note_append_region_destroyed();
     delete old_active_gen->index;
     delete old_active_gen;
     delete_snapshot(old_snapshot);
@@ -1074,6 +1096,14 @@ class T1Index {
     delete generation;
   }
 
+  void note_append_region_created() noexcept {
+    int64_t live = append_region_live_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    int64_t peak = append_region_peak_count_.load(std::memory_order_relaxed);
+    while (live > peak && !append_region_peak_count_.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
+    }
+  }
+  void note_append_region_destroyed() noexcept { append_region_live_count_.fetch_sub(1, std::memory_order_relaxed); }
+
   // ─── Helper Methods: Key and Lookup ────────────────────────────────────
   // Helper to generate prefix and hash representation of a key span.
   auto prepare_key_and_hash(std::span<const std::byte> key) const noexcept -> std::pair<StoreKey, uint64_t> {
@@ -1191,6 +1221,8 @@ class T1Index {
   std::atomic<const SortedSnapshot *> sorted_snapshot_{nullptr};
   std::atomic<AppendGeneration *> append_active_{nullptr};
   FreezableRegion<AppendGeneration *> append_immutable_;
+  std::atomic<int64_t> append_region_live_count_{0};
+  std::atomic<int64_t> append_region_peak_count_{0};
   // See FreezableRegion's own comment. Frozen for the duration of reorganize()'s merge loop
   // (the same SortedRegion sorted_snapshot_ currently points at), unfrozen right after the
   // replacement publishes -- closes the sorted-region counterpart of the Lost Update hazard

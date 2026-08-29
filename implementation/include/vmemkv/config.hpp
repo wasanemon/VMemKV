@@ -83,9 +83,31 @@ struct Config {
   static constexpr size_t T1ReorganizeSoftThresholdPercent = 50;
   static constexpr size_t T1ReorganizeHardThresholdPercent = 95;
 
-  // T1 append region capacity (ablation knob).
-  // Keep this as a power of two to preserve cache-friendly masking behavior.
-  static constexpr size_t T1AppendCapacityLog2 = 22;
+  // T1 append region capacity (ablation knob). Keep this as a power of two to preserve
+  // cache-friendly masking behavior.
+  //
+  // Every AppendRegion (one per reorganize() generation, so at least one is always live) mmaps
+  // T1AppendCapacityEntries * sizeof(AppendSlot) unconditionally, regardless of actual corpus
+  // size. Because AppendSlot placement is open-addressed (effectively uniform-random over the
+  // capacity), even light occupancy touches nearly every page: measured locally, inserting only
+  // 258K entries (6.15% load factor) into a 2^22-slot region drove RSS to 98.4% of the region's
+  // full 224MB (see TODO.md item 6, 2026-08-29) -- a birthday-paradox effect, not a probabilistic
+  // edge case. This makes T1's own baseline RSS contribution (>= one region, typically two while
+  // a generation is being reclaimed -- measured peak 2, never more, under sustained unthrottled
+  // churn) close to T1AppendCapacityEntries * sizeof(AppendSlot) almost regardless of how much
+  // data is actually live, which is punishing on a memory-constrained (LTM) host.
+  //
+  // 21 (not 22) is a measured, not guessed, floor: the worst case for how many entries can pile
+  // up in one generation before checkpoint_trigger_due()'s WalMaxBytesSinceCheckpoint (64MiB)
+  // threshold forces a reorganize() is a sustained, unthrottled, maximally-concurrent insert
+  // burst of the smallest value size the benchmark matrix tests (8 bytes, kInlineValueBytes in
+  // bench_kv.cpp) -- measured locally at a peak append_size() of 1,198,470 (16 threads, 3M
+  // inserts, 250s, 0 hard-stalls). 2^20's hard threshold (95% of 1,048,576 = 996,147) sits BELOW
+  // that measured peak -- confirmed by the same measurement to already regress that workload with
+  // real hard-stalls even outside any LTM/pressure scenario. 2^21's hard threshold (95% of
+  // 2,097,152 = 1,992,294) keeps ~66% headroom above the measured peak while halving every
+  // region's footprint (224MB -> 112MB).
+  static constexpr size_t T1AppendCapacityLog2 = 21;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
   // Capacity of the tail-entry tracker that feeds checkpoint_internal()'s copy_live_entries()
@@ -173,6 +195,13 @@ struct VMemKVStatistics {
   // reorg/checkpoint cycle, as opposed to that cycle's own wall-clock duration (most of which
   // overlaps unblocked writer progress).
   uint64_t total_hard_stall_duration_us = 0;
+
+  // T1Index::AppendRegion instances currently resident, and the high-water mark across this
+  // store's lifetime. See T1Index::append_region_live_count()'s own comment: each carries a
+  // fixed-size mmap'd footprint that becomes almost fully resident regardless of occupancy, so
+  // this bounds T1's own RSS contribution under sustained reorganize() churn.
+  int64_t append_region_live_count = 0;
+  int64_t append_region_peak_count = 0;
 };
 
 }  // namespace vmemkv

@@ -1241,7 +1241,9 @@ class VMemKVImpl {
             last_checkpoint_wal_rotate_leader_wait_us_.load(std::memory_order_relaxed),
         .last_checkpoint_bytes_synced = last_checkpoint_bytes_synced_.load(std::memory_order_relaxed),
         .last_checkpoint_corpus_bytes = last_checkpoint_corpus_bytes_.load(std::memory_order_relaxed),
-        .total_hard_stall_duration_us = total_hard_stall_duration_us_.load(std::memory_order_relaxed)};
+        .total_hard_stall_duration_us = total_hard_stall_duration_us_.load(std::memory_order_relaxed),
+        .append_region_live_count = t1_.append_region_live_count(),
+        .append_region_peak_count = t1_.append_region_peak_count()};
   }
 
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
