@@ -2165,6 +2165,11 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
                      stats.append_region_peak_count,
                      stats.t1_reorg_count,
                      stats.hard_stall_count);
+        // stderr is fully (not line-) buffered once redirected to a file/pipe, so without this a
+        // process killed mid-stall (e.g. by an outer `timeout`) loses every line written since
+        // the last flush -- confirmed directly: a 180s-timeout run under real LTM pressure
+        // produced an empty log until this was added.
+        std::fflush(stderr);
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       }
     });
