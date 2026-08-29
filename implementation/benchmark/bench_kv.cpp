@@ -2297,33 +2297,58 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 // Writer threads still start once and run continuously for the whole repeated window, so this
 // doesn't add per-repetition thread start/stop overhead -- it only extends the window they get to
 // run in.
+// kUpdateExisting: update() a uniformly-random existing key -- for a key still resident in base
+// (see try_in_place_update()'s allow_in_place check, vmemkv_impl.hpp), this takes exactly the
+// same write_entry_lockfree()/append path as an insert; for a key already in tail (e.g. one this
+// same call already touched once), it takes the cheap in-place seqlock path instead. Which of the
+// two a given call hits depends on this run's own touch history and on how far a concurrently
+// running checkpoint() has advanced base_boundary -- see must_read_papers/
+// mmap_shared_vs_private_continued.md for why this mix isn't a clean "the cost of an update"
+// number by itself. kInsertFresh sidesteps the ambiguity entirely: every key is guaranteed never
+// touched before (drawn from a shared counter starting past key_count), so every call takes the
+// append path deterministically, every time.
+enum class WriteWorkload { kUpdateExisting, kInsertFresh };
+
 template <typename Store, typename OperationFn>
 auto run_contention_probe(Store &store,
                           std::size_t key_count,
                           uint32_t val_size,
                           OperationFn &&run_operation,
                           double min_wall_seconds = 0.0,
-                          std::size_t writer_threads_override = 0) -> std::tuple<double, double, double, bool> {
+                          std::size_t writer_threads_override = 0,
+                          WriteWorkload workload = WriteWorkload::kUpdateExisting)
+    -> std::tuple<double, double, double, bool> {
   const std::size_t writer_threads =
       writer_threads_override != 0 ? writer_threads_override
                                    : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 
+  // Shared across every writer thread and both phases (A then B) so kInsertFresh never reuses a
+  // key within one run_contention_probe() call, regardless of how many total ops end up issued.
+  std::atomic<std::size_t> next_fresh_key{key_count};
+
   // stop == nullptr: run exactly fixed_ops then return. stop != nullptr: run until *stop is set,
   // ignoring fixed_ops, returning however many ops actually completed.
-  auto run_writer = [&store, key_count, val_size](
+  auto run_writer = [&store, key_count, val_size, workload, &next_fresh_key](
                         std::size_t seed_offset, const std::atomic<bool> *stop, std::size_t fixed_ops) -> std::size_t {
     std::mt19937_64 rng(kBenchmarkSeed + seed_offset);
     std::uniform_int_distribution<std::size_t> key_dist(0, key_count - 1);
     std::size_t done = 0;
-    if (stop == nullptr) {
-      for (; done < fixed_ops; ++done) {
+    auto do_one_op = [&]() {
+      if (workload == WriteWorkload::kInsertFresh) {
+        const std::size_t idx = next_fresh_key.fetch_add(1, std::memory_order_relaxed);
+        store->insert(make_key(idx), make_value_for_key(idx, val_size));
+      } else {
         const std::size_t idx = key_dist(rng);
         store->update(make_key(idx), make_value_for_key(idx, val_size));
       }
+    };
+    if (stop == nullptr) {
+      for (; done < fixed_ops; ++done) {
+        do_one_op();
+      }
     } else {
       while (!stop->load(std::memory_order_relaxed)) {
-        const std::size_t idx = key_dist(rng);
-        store->update(make_key(idx), make_value_for_key(idx, val_size));
+        do_one_op();
         ++done;
       }
     }
@@ -2418,28 +2443,70 @@ auto run_contention_probe(Store &store,
 // t1t2_steady mode (a fixed 0.25 churn ratio -- isolates checkpoint()'s marginal per-record cost
 // from its fixed per-call setup overhead, same reasoning as run_checkpoint_throughput_probe.sh).
 // --ratio scales corpus size.
+// VMEMKV_BENCH_WORKLOAD selects what run_contention_probe()'s writer threads do, and what setup
+// this function does to make that measurement mean what its name says:
+//  - "update_cold" (default, original behavior): 25%-of-corpus pre-churn, then (if reused) one
+//    more checkpoint() that re-bases everything -- so at measurement time every key is base-
+//    resident, and a write_entry_lockfree()/in-place split emerges from this run's own touch
+//    history plus the concurrently-running checkpoint()'s base_boundary advancement. Kept as the
+//    original reference point; interpret its isolated/concurrent split with the caveat in
+//    must_read_papers/mmap_shared_vs_private_continued.md.
+//  - "update_warm": every key is update()'d once (moving it to tail) *without* a following
+//    checkpoint(), so at measurement time every key is guaranteed tail-resident -- every
+//    update() during measurement takes the cheap in-place seqlock path (see
+//    try_in_place_update()'s allow_in_place check, vmemkv_impl.hpp), a clean "cost of an
+//    in-place update" number rather than a mix.
+//  - "insert": no pre-churn at all -- corpus stays exactly as populated. Measurement uses fresh,
+//    never-before-used keys (WriteWorkload::kInsertFresh in run_contention_probe()), so every
+//    call deterministically takes the append path, the same one a base-resident update() takes.
+enum class ContentionWorkload { kUpdateCold, kUpdateWarm, kInsert };
+
+auto parse_contention_workload() -> ContentionWorkload {
+  const char *env = std::getenv("VMEMKV_BENCH_WORKLOAD");
+  if (env == nullptr) return ContentionWorkload::kUpdateCold;
+  const std::string_view value(env);
+  if (value == "update_warm") return ContentionWorkload::kUpdateWarm;
+  if (value == "insert") return ContentionWorkload::kInsert;
+  return ContentionWorkload::kUpdateCold;
+}
+
+auto contention_workload_name(ContentionWorkload workload) -> const char * {
+  switch (workload) {
+    case ContentionWorkload::kUpdateWarm:
+      return "update_warm";
+    case ContentionWorkload::kInsert:
+      return "insert";
+    case ContentionWorkload::kUpdateCold:
+    default:
+      return "update_cold";
+  }
+}
+
 [[noreturn]] void run_checkpoint_contention(const ProbeArgs &args) {
   using Store = vmemkv::variants::VMemKVStore;
 
+  const ContentionWorkload workload = parse_contention_workload();
   const std::size_t full_key_count = corpus_size_for_value(args.val_size);
   const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
 
   const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
                            std::to_string(args.val_size) + "_checkpointcontention_" +
+                           contention_workload_name(workload) + "_" +
                            std::to_string(static_cast<int>(args.ratio * 100));
 
   const std::size_t resolved_writer_threads =
       args.writer_threads != 0 ? args.writer_threads
                                : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 
-  // Reuse-if-present: population + baseline checkpoint() + pre-churn are setup, not what this
-  // mode measures, and under real LTM memory pressure they can themselves take far longer than
-  // the measured phase (confirmed directly: a 32-thread, memory-pressured 1.25x-corpus pre-churn
-  // took 300+s). VMEMKV_BENCH_REUSE_PREBUILT=1 skips straight to recovery-from-manifest (fast:
-  // mmap + WAL replay, no data movement) when `path` already has one, matching run_steady()'s own
-  // reuse pattern. Building `path` unconstrained first (no cgroup) and then pointing multiple
-  // cgroup-constrained trials at *copies* of it keeps the measured phase free of setup-phase
-  // memory-pressure contamination -- see must_read_papers/mmap_shared_vs_private_continued.md.
+  // Reuse-if-present: population + baseline checkpoint() + pre-churn/warm-up are setup, not what
+  // this mode measures, and under real LTM memory pressure they can themselves take far longer
+  // than the measured phase (confirmed directly: a 32-thread, memory-pressured 1.25x-corpus
+  // pre-churn took 300+s). VMEMKV_BENCH_REUSE_PREBUILT=1 skips straight to recovery-from-manifest
+  // (fast: mmap + WAL replay, no data movement) when `path` already has one, matching
+  // run_steady()'s own reuse pattern. Building `path` unconstrained first (no cgroup) and then
+  // pointing multiple cgroup-constrained trials at *copies* of it keeps the measured phase free
+  // of setup-phase memory-pressure contamination -- see must_read_papers/
+  // mmap_shared_vs_private_continued.md.
   const bool reuse_prebuilt = std::getenv("VMEMKV_BENCH_REUSE_PREBUILT") != nullptr;
   const bool manifest_exists = reuse_prebuilt && std::filesystem::exists(vmemkv::derive_manifest_path(path));
 
@@ -2452,35 +2519,59 @@ auto run_contention_probe(Store &store,
     populate_random_order(*store, {key_count, args.val_size});
     store->checkpoint();
 
-    constexpr double kPreChurnRatio = 0.25;
-    const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
-    std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000));
-    std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
-    std::vector<std::size_t> churn_indices(churn_count);
-    for (auto &idx : churn_indices) {
-      idx = churn_index_dist(churn_rng);
+    if (workload == ContentionWorkload::kUpdateWarm) {
+      // Every key, once, via the real update() API (WAL-durable, same call the measurement phase
+      // itself makes) -- moves every key to tail. Deliberately *not* followed by a checkpoint()
+      // here: base_boundary must stay put so every key is still tail-resident (offset >=
+      // base_boundary) once this is durable and (if reused) recovered via WAL replay elsewhere.
+      const std::size_t warm_threads =
+          std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}});
+      std::vector<std::thread> workers;
+      workers.reserve(warm_threads);
+      for (std::size_t t = 0; t < warm_threads; ++t) {
+        workers.emplace_back([&store, key_count, val_size = args.val_size, t, warm_threads]() {
+          for (std::size_t idx = t; idx < key_count; idx += warm_threads) {
+            store->update(make_key(idx), make_value_for_key(idx, val_size));
+          }
+        });
+      }
+      for (auto &worker : workers) {
+        worker.join();
+      }
+    } else if (workload == ContentionWorkload::kUpdateCold) {
+      constexpr double kPreChurnRatio = 0.25;
+      const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
+      std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000));
+      std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
+      std::vector<std::size_t> churn_indices(churn_count);
+      for (auto &idx : churn_indices) {
+        idx = churn_index_dist(churn_rng);
+      }
+      const std::size_t churn_threads =
+          std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
+      std::vector<std::thread> workers;
+      workers.reserve(churn_threads);
+      for (std::size_t t = 0; t < churn_threads; ++t) {
+        workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
+          for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
+            const std::size_t idx = churn_indices[i];
+            store->update(make_key(idx), make_value_for_key(idx, val_size));
+          }
+        });
+      }
+      for (auto &worker : workers) {
+        worker.join();
+      }
+      // Reused by a later invocation (VMEMKV_BENCH_REUSE_PREBUILT=1) only if this prebuild step
+      // itself set that same env var -- otherwise make_vmemkv_fresh() wipes it again next time,
+      // same as every other non-reuse caller. Re-bases the pre-churned keys back to base -- see
+      // this branch's own doc comment above for why kUpdateWarm deliberately skips this.
+      if (reuse_prebuilt) {
+        store->checkpoint();
+      }
     }
-    const std::size_t churn_threads =
-        std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
-    std::vector<std::thread> workers;
-    workers.reserve(churn_threads);
-    for (std::size_t t = 0; t < churn_threads; ++t) {
-      workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
-        for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
-          const std::size_t idx = churn_indices[i];
-          store->update(make_key(idx), make_value_for_key(idx, val_size));
-        }
-      });
-    }
-    for (auto &worker : workers) {
-      worker.join();
-    }
-    // Reused by a later invocation (VMEMKV_BENCH_REUSE_PREBUILT=1) only if this prebuild step
-    // itself set that same env var -- otherwise make_vmemkv_fresh() wipes it again next time,
-    // same as every other non-reuse caller.
-    if (reuse_prebuilt) {
-      store->checkpoint();
-    }
+    // kInsert: no pre-churn/warm-up at all -- the populated+checkpointed corpus is exactly what
+    // the measurement phase's fresh-key inserts will be appended after.
   }
 
   // Setup-only invocation (meant to run unconstrained, ahead of a separate cgroup-constrained
@@ -2492,12 +2583,21 @@ auto run_contention_probe(Store &store,
     std::_Exit(0);
   }
 
+  const WriteWorkload write_workload =
+      workload == ContentionWorkload::kInsert ? WriteWorkload::kInsertFresh : WriteWorkload::kUpdateExisting;
   auto [isolated_write_tps, concurrent_write_tps, checkpoint_elapsed_sec, timed_out] = run_contention_probe(
-      store, key_count, args.val_size, [&store]() { store->checkpoint(); }, 0.0, resolved_writer_threads);
+      store,
+      key_count,
+      args.val_size,
+      [&store]() { store->checkpoint(); },
+      0.0,
+      resolved_writer_threads,
+      write_workload);
 
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"checkpoint_contention\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
+            << "," << "\"mode\":\"checkpoint_contention\"," << "\"workload\":\"" << contention_workload_name(workload)
+            << "\"," << "\"ratio\":" << args.ratio << "," << "\"key_count\":" << key_count << ","
+            << "\"writer_threads\":" << resolved_writer_threads << ","
             << "\"isolated_write_tps\":" << isolated_write_tps << ","
             << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
             << "\"checkpoint_elapsed_sec\":" << checkpoint_elapsed_sec << ","
