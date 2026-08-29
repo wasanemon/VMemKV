@@ -1854,7 +1854,21 @@ void register_all_benchmarks() {
 //     and run_reorg_scaling_probe.sh's t1t2_steady sweep, respectively.
 namespace reorg_probe {
 
-constexpr int kReorgTimeoutSeconds = 60;
+constexpr int kReorgTimeoutSecondsDefault = 60;
+
+// Overridable so a single-call reorganize()/checkpoint()/defragment() timeout can be tightened for
+// a specific experiment (e.g. a 30s checkpoint_contention comparison) without changing the default
+// used everywhere else this timeout applies.
+static inline int reorg_timeout_seconds() {
+  if (const char *override_seconds = std::getenv("VMEMKV_BENCH_REORG_TIMEOUT_SECONDS")) {
+    char *end = nullptr;
+    const long parsed = std::strtol(override_seconds, &end, 10);
+    if (end != override_seconds && *end == '\0' && parsed > 0) {
+      return static_cast<int>(parsed);
+    }
+  }
+  return kReorgTimeoutSecondsDefault;
+}
 
 enum class ProbeMode {
   kT1Only,
@@ -1974,11 +1988,12 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
 }
 
 // Times a single call to `fn` (reorganize()/checkpoint()) in a detached background thread capped
-// at kReorgTimeoutSeconds -- see the file-level comment above this namespace for why
+// at reorg_timeout_seconds() -- see the file-level comment above this namespace for why
 // google-benchmark's iteration model doesn't fit timing exactly one, possibly very slow, blocking
 // call.
 template <typename Fn>
 auto timed_run(Fn &&fn) -> std::pair<double, bool> {
+  const int timeout_seconds = reorg_timeout_seconds();
   std::promise<void> done_promise;
   auto done_future = done_promise.get_future();
   const auto t0 = std::chrono::steady_clock::now();
@@ -1988,9 +2003,9 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   });
   worker.detach();
 
-  const auto status = done_future.wait_for(std::chrono::seconds(kReorgTimeoutSeconds));
+  const auto status = done_future.wait_for(std::chrono::seconds(timeout_seconds));
   const bool timed_out = status != std::future_status::ready;
-  const double elapsed_sec = timed_out ? static_cast<double>(kReorgTimeoutSeconds)
+  const double elapsed_sec = timed_out ? static_cast<double>(timeout_seconds)
                                        : std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return {elapsed_sec, timed_out};
 }
