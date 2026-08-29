@@ -2860,8 +2860,14 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
     // Matches benchmark_matrix.sh's real scenario_env_prefix() for "ltm" -- corpus_size_for_value()
     // below only scales with VMEMKV_BENCH_TARGET_RATIO when VMEMKV_BENCH_LTM is set (see that
     // function's in-memory fixed-constant branches), so both must be set before it's first called.
+    // overwrite=0 on the ratio: this is a default matching benchmark_matrix.sh's own "ltm"
+    // scenario, not a mandate -- a caller (e.g. a ratio sweep) that already exported
+    // VMEMKV_BENCH_TARGET_RATIO before invoking this binary must win. Previously this was
+    // overwrite=1, silently clobbering every external override back to 8.0 -- confirmed directly
+    // (see TODO.md item 6) that this made an entire ratio sweep (8.0 down to 1.0) actually run
+    // every point at 8.0, since --scenario=ltm always hit this line.
     ::setenv("VMEMKV_BENCH_LTM", "1", 1);
-    ::setenv("VMEMKV_BENCH_TARGET_RATIO", "8.0", 1);
+    ::setenv("VMEMKV_BENCH_TARGET_RATIO", "8.0", 0);
   }
   if (args.mode == ProbeMode::kT1T2Steady) {
     run_steady(args);
