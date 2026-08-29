@@ -2432,22 +2432,36 @@ auto run_contention_probe(Store &store,
       args.writer_threads != 0 ? args.writer_threads
                                : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  populate_random_order(*store, {key_count, args.val_size});
-  store->checkpoint();
+  // Reuse-if-present: population + baseline checkpoint() + pre-churn are setup, not what this
+  // mode measures, and under real LTM memory pressure they can themselves take far longer than
+  // the measured phase (confirmed directly: a 32-thread, memory-pressured 1.25x-corpus pre-churn
+  // took 300+s). VMEMKV_BENCH_REUSE_PREBUILT=1 skips straight to recovery-from-manifest (fast:
+  // mmap + WAL replay, no data movement) when `path` already has one, matching run_steady()'s own
+  // reuse pattern. Building `path` unconstrained first (no cgroup) and then pointing multiple
+  // cgroup-constrained trials at *copies* of it keeps the measured phase free of setup-phase
+  // memory-pressure contamination -- see must_read_papers/mmap_shared_vs_private_continued.md.
+  const bool reuse_prebuilt = std::getenv("VMEMKV_BENCH_REUSE_PREBUILT") != nullptr;
+  const bool manifest_exists = reuse_prebuilt && std::filesystem::exists(vmemkv::derive_manifest_path(path));
 
-  constexpr double kPreChurnRatio = 0.25;
-  const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
-  std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000));
-  std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
-  std::vector<std::size_t> churn_indices(churn_count);
-  for (auto &idx : churn_indices) {
-    idx = churn_index_dist(churn_rng);
-  }
-  const std::size_t churn_threads =
-      std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
-  {
+  std::unique_ptr<Store> store;
+  if (manifest_exists) {
+    store = std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes);
+  } else {
+    store = make_vmemkv_fresh(
+        path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+    populate_random_order(*store, {key_count, args.val_size});
+    store->checkpoint();
+
+    constexpr double kPreChurnRatio = 0.25;
+    const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
+    std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000));
+    std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
+    std::vector<std::size_t> churn_indices(churn_count);
+    for (auto &idx : churn_indices) {
+      idx = churn_index_dist(churn_rng);
+    }
+    const std::size_t churn_threads =
+        std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
     std::vector<std::thread> workers;
     workers.reserve(churn_threads);
     for (std::size_t t = 0; t < churn_threads; ++t) {
@@ -2461,6 +2475,21 @@ auto run_contention_probe(Store &store,
     for (auto &worker : workers) {
       worker.join();
     }
+    // Reused by a later invocation (VMEMKV_BENCH_REUSE_PREBUILT=1) only if this prebuild step
+    // itself set that same env var -- otherwise make_vmemkv_fresh() wipes it again next time,
+    // same as every other non-reuse caller.
+    if (reuse_prebuilt) {
+      store->checkpoint();
+    }
+  }
+
+  // Setup-only invocation (meant to run unconstrained, ahead of a separate cgroup-constrained
+  // measurement run pointed at a copy of `path`): stop here, before run_contention_probe()'s own
+  // isolated-baseline writes and checkpoint() would otherwise measure (and mutate) this exact
+  // process's run instead of the later, real one.
+  if (std::getenv("VMEMKV_BENCH_PREBUILD_ONLY") != nullptr) {
+    std::cout << "{\"prebuild_only\":true,\"key_count\":" << key_count << "}" << std::endl;
+    std::_Exit(0);
   }
 
   auto [isolated_write_tps, concurrent_write_tps, checkpoint_elapsed_sec, timed_out] = run_contention_probe(
