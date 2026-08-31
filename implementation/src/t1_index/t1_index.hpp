@@ -251,9 +251,9 @@ class T1Index {
   // Number of AppendRegion instances (active + any not-yet-EBR-reclaimed retiring generation)
   // currently resident, and the high-water mark across this instance's lifetime. Each carries a
   // fixed APPEND_CAP * sizeof(AppendSlot) mmap'd footprint that becomes almost fully resident
-  // from even light occupancy (open-addressing page-scatter -- see TODO.md item 6), independent
-  // of actual corpus size, so how many pile up live at once directly bounds T1's own RSS
-  // contribution under sustained reorganize() churn.
+  // from even light occupancy (open-addressing page-scatter), independent of actual corpus size,
+  // so how many pile up live at once directly bounds T1's own RSS contribution under sustained
+  // reorganize() churn.
   [[nodiscard]] auto append_region_live_count() const noexcept -> int64_t {
     return append_region_live_count_.load(std::memory_order_relaxed);
   }

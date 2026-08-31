@@ -96,3 +96,66 @@ private t3: isolated=99948  concurrent=13982   checkpoint=4.49s
 2. 64KB値サイズでも同じ prebuild+reuse 方式で計測する(投入自体は無制約なら高速なはず)
 3. ratio を変えて(0.5, 1.0, 2.0)傾向が変わるか確認する
 4. 8/25の-12%〜-19%を再現する条件を特定し、直接比較できる形に揃える
+
+## 実験結果(2026-08-30) -- スケール修正版
+
+### 前回(8/29)の数字は誤ったスケールで測っていた
+
+`ratio`はホストの実メモリ(247GB)やcgroupの`memory.max`に対する倍率ではなく、正規の
+`benchmark_matrix.sh`では**固定1GiB**(`VMEMKV_CONTEXT_memory_budget_bytes`)に対する倍率
+(LTMは`ratio=8.0`固定)。8/29の`ratio=1.5`は実メモリ相対で計算してしまっており、意図しない
+スケール(数百GB〜数千万キー)で測っていた疑いがある。正しくは
+`VMEMKV_CONTEXT_memory_budget_bytes=1073741824` + `VMEMKV_BENCH_TARGET_RATIO=8.0`で
+**固定8GiB corpus**(1KBなら key_count=8,259,552 -- 8/21の旧ベースラインと一致)。
+**以後、ratioは常に8.0固定とする。**
+
+### 計測を阻んでいた2つの副問題(今回切り分け・対処)
+
+1. **defragment()の即時自動発火**: `bytes_used_at_last_defragment_`の初期値が0のため、
+   `defrag_growth_over_threshold()`が新規storeでは初回から常にtrueになり、populate直後に
+   ほぼ即defragmentが自動発火する。defragmentは既知の低速問題(future work)なので、
+   `defragment_internal()`を一時的にno-op化(`bytes_used_at_last_defragment_`更新と
+   `tail_entries_.drain_and_clear()`だけ行う)して両コードベースから除外して計測。
+2. **populate中の自動checkpoint発火がprivateで極端に遅い**: `bulk_load()`の各keyごとに
+   `maybe_reorganize_if_needed()`がT1 append領域のhard threshold超過を検知して
+   `reorganize_internal(Checkpoint)`を自動発火しうる。privateのcheckpointは同時書き込み
+   負荷下で壊滅的に遅い(後述の-91.6%)ため、populate中に繰り返し自動発火すると
+   populateそのものが数十分〜完走不能になる(2回のgdbで同一スタックフレームを確認)。
+   `VMEMKV_SUPPRESS_AUTO_REORG`環境変数を追加し、setup(populate+初回checkpoint+warm-up)
+   期間中だけ**自動Checkpointのみ**を抑制(T1Only/Defragmentの自動発火は温存 -- T1 append
+   領域は8.26Mキーに対し容量2^21しかなく、完全抑制すると領域が溢れてハングするため)。
+
+### 結果 (ltm/1KB, ratio=8.0固定, key_count=8,259,552, 32並行書き込み, defragment無効化)
+
+| workload=insert | isolated_write_tps | concurrent_write_tps | checkpoint_elapsed_sec |
+|---|---|---|---|
+| **shared** (MAP_SHARED+msync, 現HEAD) | 73,236 | 72,103 (-1.5%) | 12.47 |
+| **private** (MAP_PRIVATE+pwrite, `6c41d6d`) | 101,695 | 8,518 (**-91.6%**) | 9.22 |
+
+isolatedはprivateの方が速い(mmap経由でないぶん素の追記が軽い)が、checkpoint同時実行下の
+書き込みスループットはprivateが壊滅的、sharedはほぼ無傷 -- 8/25の採用根拠を、defragmentの
+混入を排除した正しいスケールで再確認できた。
+
+`update_warm`(全キーをupdate()でtailへ移す既存データワークロード)はsharedでは成功
+(isolated=40,662 concurrent=48,010 [+18%逆転、8/29のsharedと同傾向] checkpoint=12.44s)。
+privateは`VMEMKV_SUPPRESS_AUTO_REORG`適用後もT1Only自動reorgの側で同様のスタック停滞
+(2回のgdbで同一フレーム)が再現し、40分経過してもpopulate完了(初回checkpoint)にすら
+到達しなかったため、**private側のupdate_warm比較は今回見送り**(T1Only側の深追いは
+defragmentと同じくfuture work扱い)。
+
+### 議論: なぜprivateでもcheckpointは完走したのか
+
+当初「LTMならページフォルト連発でcheckpointが一切終わらないはず」という想定だったが、
+上記の`insert`ワークロードでは私9.22秒で完走した。理由は**insertが常に新規キーのみを
+追記するホット(直近書き込み済み)データしか触らない**ため: checkpointのpwrite()は
+「スワップアウト済みのソースページを同期的にフォルトインする」必要がなく、8/25の
+"60秒非完走"ほどには苦しまない。
+
+8/25の壊滅的な非完走は`ltm/64KB checkpoint_contention`(populate後に corpus の25%を
+**ランダムに** update()でpre-churnしてから計測)で観測されたもので、これは corpus 全体に
+散らばった**コールドな**(スワップアウトされ得る)データにランダムアクセスする、insertとは
+質的に異なるワークロード。今回`update_warm`(全キーをupdate()でtailへ移す、insertより
+さらに徹底してコールドデータ全体を触る設計)がprivate側で深い停滞を踏んだのは、
+**むしろこの仮説と整合的**(コールドデータへの全面アクセスが絡むと、まさに壊滅的に遅くなる
+挙動が再現している)。今回計測を諦めたT1Only停滞も、根っこは同じ「同時書き込み+コールド
+データアクセス下でreorg機構全体が破綻する」という8/25の発見の延長線上にあると考えられる。

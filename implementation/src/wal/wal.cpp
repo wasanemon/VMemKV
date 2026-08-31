@@ -325,15 +325,13 @@ void Wal::write_and_fsync_batch(const std::vector<PendingRecord *> &batch) {
 
 auto Wal::drain_pending() -> uint64_t {
   // Snapshot the target once, not fresh on every iteration: under sustained concurrent writers,
-  // next_lsn_ keeps advancing, so re-reading it each pass chases a moving target and never
-  // returns (measured directly: rotate()'s post-swap drain hung 10+ seconds under 19 concurrent
-  // insert threads, even though it kept making real, useful progress -- see rotate()'s own
-  // comment). Everything reserved as of this call's start (this snapshot) is what durability up
-  // to "now" means; anything reserved after is the next drain_pending() call's job -- via
+  // next_lsn_ keeps advancing, so re-reading it each pass would chase a moving target and never
+  // return. Everything reserved as of this call's start (this snapshot) is what durability up to
+  // "now" means; anything reserved after is the next drain_pending() call's job -- via
   // release_leadership()'s own single-retry handling for its callers, not this function chasing
   // it internally. The loop below still repeats -- collect_batch() caps each round at
   // kWalRingCapacity, so more than one round can be needed to reach even a fixed target -- but
-  // that's now bounded by the backlog size at entry, not by how long writers keep arriving.
+  // that's bounded by the backlog size at entry, not by how long writers keep arriving.
   const uint64_t target = next_lsn_.load(std::memory_order_acquire);
   while (next_to_flush_ != target) {
     try {
@@ -424,11 +422,7 @@ auto Wal::await_durable(PendingRecord *rec) -> uint64_t {
   bool is_leader = !flushing_.exchange(true, std::memory_order_acq_rel);
 
   if (!is_leader) {
-    // Bounded wait_for(), not a plain condition-variable wait(): a PAUSE-spin-then-yield() hybrid
-    // (mirroring RocksDB's WriteThread::AwaitState()) was tried here to let the leader's notify
-    // skip its wake syscall. It helped in an isolated WAL-only benchmark but made the full system
-    // worse -- spinning steals cycles from other concurrent work that isn't free outside
-    // isolation.
+    // Bounded wait_for(), not a spin: spinning steals cycles from other concurrent work.
     //
     // A short timeout closes a gap a plain (unbounded) wait cannot: this follower's own leader
     // may hand off leadership to a third thread in the gap between `flushing_`'s release and this

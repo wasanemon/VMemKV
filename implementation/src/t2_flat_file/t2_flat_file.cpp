@@ -200,15 +200,9 @@ void T2FlatFile::map_file(const std::filesystem::path &path,
     ::close(file_descriptor);
     throw std::system_error(mmap_errno, std::generic_category(), "mmap");
   }
-  // Unconditional: measured to help in-memory small-value Get/Hit by ~5% (low_level_design.md
-  // 7.7). Removing it (an ablation
-  // prototyped and measured, then deleted -- see docs/benchmark/20260810_t2_no_madvise_random.md)
-  // wins big on large-value LTM Get/Hit at low concurrency (up to 8x at threads:1) by letting
-  // swap-in readahead batch multi-page reads, but that win decays with concurrency and inverts by
-  // threads:32 (0.65-0.69x, worse than leaving this on) as the readahead's excess bytes-read
-  // start competing with other threads for real disk bandwidth. No known deployment runs at the
-  // low, fixed concurrency the win requires, so the ablation isn't worth carrying as a toggle --
-  // re-derive it from the doc above if that ever changes.
+  // Unconditional (low_level_design.md 7.7): kept on because its win at low concurrency inverts
+  // to a loss under sustained concurrent access, and no known deployment runs at the low, fixed
+  // concurrency where turning it off would win -- see docs/benchmark/20260810_t2_no_madvise_random.md.
   if (::madvise(mapped, static_cast<size_t>(bytes_capacity), MADV_RANDOM) != 0) {
     const int err = errno;
     ::close(file_descriptor);

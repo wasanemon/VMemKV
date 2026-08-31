@@ -264,25 +264,6 @@ static inline std::optional<std::size_t> read_size_from_env(const char *name) {
   }
 }
 
-// Diagnostic-only, used by run_steady()'s VMEMKV_STEADY_TELEMETRY monitor thread (see there):
-// this process's own resident set, for correlating against VMemKVStatistics under LTM pressure.
-static inline std::size_t read_process_rss_kb() {
-  FILE *file = std::fopen("/proc/self/status", "r");
-  if (file == nullptr) {
-    return 0;
-  }
-  char line[256];
-  std::size_t rss_kb = 0;
-  while (std::fgets(line, sizeof(line), file) != nullptr) {
-    if (std::strncmp(line, "VmRSS:", 6) == 0) {
-      std::sscanf(line + 6, "%zu", &rss_kb);
-      break;
-    }
-  }
-  std::fclose(file);
-  return rss_kb;
-}
-
 static inline std::size_t detect_machine_memory_bytes() {
   constexpr std::size_t kHugeLimitThreshold = 1ULL << 60;
 
@@ -842,8 +823,7 @@ static auto make_vmemkv_fresh(const std::string &path,
 // originally constructed with), almost all of which is an untouched sparse hole beyond
 // `live_bytes` for any real corpus. std::filesystem::copy_file() has no notion of holes and
 // copies the full logical extent byte-for-byte, turning a multi-GB-real/1-TiB-logical sparse
-// master into a 1-TiB-real, fully-allocated clone -- confirmed directly: this exhausted a
-// multi-TB NVMe partway through a single AWS benchmark run.
+// master into a 1-TiB-real, fully-allocated clone -- easily exhausting disk space on a real host.
 static void copy_t2_checkpoint_sparse(const std::filesystem::path &source,
                                       const std::filesystem::path &dest,
                                       uint64_t live_bytes) {
@@ -946,8 +926,7 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
   // means every subsequent clone's own remove-then-rebuild below (already required, to discard
   // whatever the *previous* master-build or clone left there) also bounds this master's cumulative
   // on-disk clone footprint to one clone's worth instead of accumulating a fresh multi-GB copy per
-  // benchmark case for the rest of the process's run -- this alone was enough to exhaust a
-  // multi-TB NVMe partway through a run that never got past ~50 of ~200 benchmark cases.
+  // benchmark case for the rest of the process's run.
   const std::string instance_path = master_path + "_clone";
   std::error_code ignored;
   std::filesystem::remove(instance_path, ignored);
@@ -1543,14 +1522,10 @@ static void register_insert_benchmark(Holder insert_holder,
       // LTM mode's pre-populated starting corpus is exactly the same (val_size, corpus_size)
       // fully-populated/committed state every other scenario's shared master represents (see
       // make_fresh_corpus_checkpoint()'s comment) -- clone from it instead of independently
-      // bulk_load()ing + checkpoint()ing once per thread-count registration. Directly
-      // fixes a measured regression: under an LTM-sized corpus inside a memory-constrained
-      // cgroup, VMemKV's independent per-thread-count populate blew out to 200-1200s (vs.
-      // ~20-30s unconstrained) -- paying that once via the shared master instead of up to
-      // 4 times (one per thread_counts entry) is a direct multiplier reduction, and letting
-      // that one remaining build happen outside the cgroup (see run_bench.sh's priming pass)
-      // avoids paying the cgroup penalty on it at all. Non-LTM mode keeps `make` unchanged
-      // (measures inserting into a genuinely empty store).
+      // bulk_load()ing + checkpoint()ing once per thread-count registration, so that cost is paid
+      // once (outside the cgroup, via run_bench.sh's priming pass) rather than once per
+      // thread-count entry. Non-LTM mode keeps `make` unchanged (measures inserting into a
+      // genuinely empty store).
       [make, make_fresh_corpus_checkpoint, val_size, corpus_size, ltm_insert_mode]() {
         if (ltm_insert_mode) {
           return make_fresh_corpus_checkpoint(val_size, corpus_size);
@@ -1878,9 +1853,6 @@ enum class ProbeMode {
   kDefragContention,
   kCheckpointContention,
   kReorgContention,
-  kCheckpointTimeline,
-  kCheckpointBacklog,
-  kCheckpointPhases,
 };
 
 struct ProbeArgs {
@@ -1951,12 +1923,6 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
         args.mode = ProbeMode::kCheckpointContention;
       } else if (value == "reorg_contention") {
         args.mode = ProbeMode::kReorgContention;
-      } else if (value == "checkpoint_timeline") {
-        args.mode = ProbeMode::kCheckpointTimeline;
-      } else if (value == "checkpoint_backlog") {
-        args.mode = ProbeMode::kCheckpointBacklog;
-      } else if (value == "checkpoint_phases") {
-        args.mode = ProbeMode::kCheckpointPhases;
       } else {
         fail("unknown --mode: " + std::string(value));
       }
@@ -1975,7 +1941,7 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
         "--mode=<t1only|t1t2|t1t2_steady|defrag|defrag_contention|checkpoint_contention|"
-        "reorg_contention|checkpoint_timeline|checkpoint_backlog|checkpoint_phases> "
+        "reorg_contention> "
         "--ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>] [--writer-threads=<N>]");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
@@ -2039,15 +2005,6 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
       break;
     case ProbeMode::kReorgContention:
       mode_name = "reorg_contention";  // Unreachable: this mode reports via its own print, below.
-      break;
-    case ProbeMode::kCheckpointTimeline:
-      mode_name = "checkpoint_timeline";  // Unreachable: this mode reports via its own print, below.
-      break;
-    case ProbeMode::kCheckpointBacklog:
-      mode_name = "checkpoint_backlog";  // Unreachable: this mode reports via its own print, below.
-      break;
-    case ProbeMode::kCheckpointPhases:
-      mode_name = "checkpoint_phases";  // Unreachable: this mode reports via its own print, below.
       break;
   }
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
@@ -2125,44 +2082,6 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
         path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
   }
 
-  // Diagnostic-only, off by default: prints VMemKVStatistics + RSS to stderr at ~1Hz across the
-  // *entire* bulk_load -> baseline checkpoint -> churn -> final checkpoint sequence below, to
-  // correlate T1 AppendRegion generation count/RSS growth against wall-clock progress under real
-  // LTM pressure -- see TODO.md item 6. Started here, before bulk_load, not just around churn:
-  // an earlier version started it only before churn and produced an empty log under real LTM
-  // pressure, meaning the untimed bulk_load()/baseline checkpoint() phase can itself be where a
-  // 180s repro timeout gets consumed, not only the phases this experiment nominally measures.
-  const bool telemetry = std::getenv("VMEMKV_STEADY_TELEMETRY") != nullptr;
-  std::atomic<bool> stop_telemetry{false};
-  std::atomic<int> telemetry_phase{0};  // 0=bulk_load, 1=baseline_checkpoint, 2=churn, 3=final_checkpoint
-  std::thread telemetry_thread;
-  if (telemetry) {
-    telemetry_thread = std::thread([&]() {
-      static const char *kPhaseNames[] = {"bulk_load", "baseline_checkpoint", "churn", "final_checkpoint"};
-      const auto t0 = std::chrono::steady_clock::now();
-      while (!stop_telemetry.load(std::memory_order_relaxed)) {
-        const auto stats = store->get_statistics();
-        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr,
-                     "[steady-telemetry] t=%.1fs phase=%s rss_kb=%zu append_region_live=%ld peak=%ld t1_reorg=%lu "
-                     "hard_stall=%lu\n",
-                     t,
-                     kPhaseNames[telemetry_phase.load(std::memory_order_relaxed)],
-                     read_process_rss_kb(),
-                     stats.append_region_live_count,
-                     stats.append_region_peak_count,
-                     stats.t1_reorg_count,
-                     stats.hard_stall_count);
-        // stderr is fully (not line-) buffered once redirected to a file/pipe, so without this a
-        // process killed mid-stall (e.g. by an outer `timeout`) loses every line written since
-        // the last flush -- confirmed directly: a 180s-timeout run under real LTM pressure
-        // produced an empty log until this was added.
-        std::fflush(stderr);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      }
-    });
-  }
-
   if (key_count > prev_count) {
     const std::size_t delta = key_count - prev_count;
     store->bulk_load(
@@ -2173,7 +2092,6 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 
   // Untimed: establishes a clean single-generation baseline before churn, same as any real
   // caller would do -- not part of what this experiment measures.
-  telemetry_phase.store(1, std::memory_order_relaxed);
   store->checkpoint();
 
   // Untimed, and deliberately multi-threaded: update() is WAL-durable (an fsync-equivalent wait
@@ -2194,7 +2112,6 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   const std::size_t churn_threads =
       std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
 
-  telemetry_phase.store(2, std::memory_order_relaxed);
   {
     std::vector<std::thread> workers;
     workers.reserve(churn_threads);
@@ -2211,13 +2128,7 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     }
   }
 
-  telemetry_phase.store(3, std::memory_order_relaxed);
   auto [elapsed_sec, timed_out] = timed_run([&store]() { store->checkpoint(); });
-
-  if (telemetry) {
-    stop_telemetry.store(true, std::memory_order_relaxed);
-    telemetry_thread.join();
-  }
 
   if (!timed_out) {
     std::ofstream marker(count_marker_path, std::ios::trunc);
@@ -2499,14 +2410,11 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
                                : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 
   // Reuse-if-present: population + baseline checkpoint() + pre-churn/warm-up are setup, not what
-  // this mode measures, and under real LTM memory pressure they can themselves take far longer
-  // than the measured phase (confirmed directly: a 32-thread, memory-pressured 1.25x-corpus
-  // pre-churn took 300+s). VMEMKV_BENCH_REUSE_PREBUILT=1 skips straight to recovery-from-manifest
-  // (fast: mmap + WAL replay, no data movement) when `path` already has one, matching
-  // run_steady()'s own reuse pattern. Building `path` unconstrained first (no cgroup) and then
-  // pointing multiple cgroup-constrained trials at *copies* of it keeps the measured phase free
-  // of setup-phase memory-pressure contamination -- see must_read_papers/
-  // mmap_shared_vs_private_continued.md.
+  // this mode measures, and can themselves dominate wall time under real LTM memory pressure.
+  // VMEMKV_BENCH_REUSE_PREBUILT=1 skips straight to recovery-from-manifest (fast: mmap + WAL
+  // replay, no data movement) when `path` already has one, matching run_steady()'s own reuse
+  // pattern -- build `path` unconstrained first, then point cgroup-constrained trials at copies
+  // of it to keep the measured phase free of setup-phase contamination.
   const bool reuse_prebuilt = std::getenv("VMEMKV_BENCH_REUSE_PREBUILT") != nullptr;
   const bool manifest_exists = reuse_prebuilt && std::filesystem::exists(vmemkv::derive_manifest_path(path));
 
@@ -2514,6 +2422,12 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
   if (manifest_exists) {
     store = std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes);
   } else {
+    // Suppressed for the whole setup phase below (population + initial checkpoint + optional
+    // pre-churn/warm-up), not just population: an auto-triggered checkpoint mid-warm-up would hit
+    // the exact same "concurrent with an active writer" cost this mode exists to isolate. Lifted
+    // again right before run_contention_probe() -- see its own explicit checkpoint() lambda, which
+    // this never touches (that's a manually requested call, not the auto-trigger this gates).
+    setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
     store = make_vmemkv_fresh(
         path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
     populate_random_order(*store, {key_count, args.val_size});
@@ -2572,6 +2486,7 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
     }
     // kInsert: no pre-churn/warm-up at all -- the populated+checkpointed corpus is exactly what
     // the measurement phase's fresh-key inserts will be appended after.
+    unsetenv("VMEMKV_SUPPRESS_AUTO_REORG");
   }
 
   // Setup-only invocation (meant to run unconstrained, ahead of a separate cgroup-constrained
@@ -2594,6 +2509,7 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
       resolved_writer_threads,
       write_workload);
 
+  const auto final_stats = store->impl().get_statistics();
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
             << "," << "\"mode\":\"checkpoint_contention\"," << "\"workload\":\"" << contention_workload_name(workload)
             << "\"," << "\"ratio\":" << args.ratio << "," << "\"key_count\":" << key_count << ","
@@ -2601,356 +2517,15 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
             << "\"isolated_write_tps\":" << isolated_write_tps << ","
             << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
             << "\"checkpoint_elapsed_sec\":" << checkpoint_elapsed_sec << ","
-            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
+            << "\"timed_out\":" << (timed_out ? "true" : "false") << ","
+            << "\"last_checkpoint_msync_us\":" << final_stats.last_checkpoint_msync_duration_us << ","
+            << "\"last_checkpoint_t1_reorganize_us\":" << final_stats.last_checkpoint_t1_reorganize_duration_us << ","
+            << "\"last_checkpoint_stop_writers_us\":" << final_stats.last_checkpoint_stop_writers_duration_us << ","
+            << "\"last_checkpoint_barrier_drain_us\":" << final_stats.last_checkpoint_barrier_drain_duration_us << ","
+            << "\"last_checkpoint_wal_rotate_us\":" << final_stats.last_checkpoint_wal_rotate_duration_us << ","
+            << "\"last_checkpoint_bytes_synced\":" << final_stats.last_checkpoint_bytes_synced << ","
+            << "\"last_checkpoint_corpus_bytes\":" << final_stats.last_checkpoint_corpus_bytes << "}" << std::endl;
   std::_Exit(timed_out ? 124 : 0);
-}
-
-// checkpoint_timeline mode: per-second write-throughput timeline around one forced checkpoint()
-// call, purely a write workload (run_contention_probe()'s own store->update() loop -- same
-// mechanism checkpoint_contention already uses, 0% scan/insert mix), unlike YCSB-E's own timeline
-// (95% scan / 5% insert -- too read-heavy to isolate checkpoint()'s effect on a write-heavy
-// workload, since its own insert rate is far below what checkpoint_contention/Insert/Update/
-// Delete measure elsewhere). Answers directly: how large is the QPS dip when checkpoint() fires,
-// and how long does it last, on a per-second-resolved timeline instead of a single window-average
-// number (which run_checkpoint_contention() above already provides, but averaged over the whole
-// concurrent phase -- exactly the kind of run-to-run noise this mode is meant to cut through).
-//
-// Same populate+initial-checkpoint+pre-churn setup as run_checkpoint_contention(), for the same
-// reason: checkpoint() needs a non-trivial tail to durabilize, and the pre-churn from that
-// function's own comment applies unchanged here.
-// VMEMKV_CHECKPOINT_TIMELINE_SECONDS overrides the window length -- useful when comparing a
-// frequent (default, byte-threshold-triggered, ~0.2s under heavy 64KB write load) checkpoint()
-// cadence against a deliberately slower one (ConfigT::CheckpointIntervalSeconds, config.hpp): a
-// short window only shows one or two cycles of the frequent case, but a slow cadence needs a
-// longer window to show any cycles at all.
-auto checkpoint_timeline_duration_seconds() -> int {
-  if (const char *env = std::getenv("VMEMKV_CHECKPOINT_TIMELINE_SECONDS")) {
-    return std::stoi(env);
-  }
-  return 20;
-}
-
-[[noreturn]] void run_checkpoint_timeline(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_checkpointtimeline_" +
-                           std::to_string(static_cast<int>(args.ratio * 100));
-
-  const std::size_t resolved_writer_threads =
-      args.writer_threads != 0 ? args.writer_threads
-                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
-
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  populate_random_order(*store, {key_count, args.val_size});
-  store->checkpoint();
-
-  constexpr double kPreChurnRatio = 0.25;
-  const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
-  std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000));
-  std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
-  std::vector<std::size_t> churn_indices(churn_count);
-  for (auto &idx : churn_indices) {
-    idx = churn_index_dist(churn_rng);
-  }
-  const std::size_t churn_threads =
-      std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
-  {
-    std::vector<std::thread> workers;
-    workers.reserve(churn_threads);
-    for (std::size_t t = 0; t < churn_threads; ++t) {
-      workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
-        for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
-          const std::size_t idx = churn_indices[i];
-          store->update(make_key(idx), make_value_for_key(idx, val_size));
-        }
-      });
-    }
-    for (auto &worker : workers) {
-      worker.join();
-    }
-  }
-
-  const int duration_seconds = checkpoint_timeline_duration_seconds();
-
-  // Per-thread, per-second op counters -- same alignas(64)-per-thread-row shape as
-  // YCSBTimelineCollector::ThreadCounter, for the same false-sharing reason. Runtime-sized
-  // (duration_seconds is env-overridable, see checkpoint_timeline_duration_seconds()'s own
-  // comment), so a plain std::vector<std::atomic<uint64_t>> per thread instead of a fixed-size
-  // std::array.
-  struct ThreadCounter {
-    alignas(64) std::vector<std::atomic<uint64_t>> counts;
-    explicit ThreadCounter(int n) : counts(n) {}
-  };
-  std::vector<ThreadCounter> counters;
-  counters.reserve(resolved_writer_threads);
-  for (std::size_t t = 0; t < resolved_writer_threads; ++t) {
-    counters.emplace_back(duration_seconds);
-  }
-  std::atomic<bool> stop{false};
-  const auto start_time = std::chrono::steady_clock::now();
-
-  std::vector<std::thread> writers;
-  writers.reserve(resolved_writer_threads);
-  for (std::size_t t = 0; t < resolved_writer_threads; ++t) {
-    writers.emplace_back(
-        [&store, &counters, &stop, &start_time, key_count, val_size = args.val_size, t, duration_seconds]() {
-          std::mt19937_64 rng(kBenchmarkSeed + t + 1000);
-          std::uniform_int_distribution<std::size_t> key_dist(0, key_count - 1);
-          while (!stop.load(std::memory_order_relaxed)) {
-            const std::size_t idx = key_dist(rng);
-            store->update(make_key(idx), make_value_for_key(idx, val_size));
-            const auto elapsed =
-                std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
-            if (elapsed >= 0 && elapsed < duration_seconds) {
-              counters[t].counts[elapsed].fetch_add(1, std::memory_order_relaxed);
-            }
-          }
-        });
-  }
-
-  // Samples get_statistics().t2_reorg_count (incremented by checkpoint_internal() and
-  // defragment_internal() alike -- indistinguishable here, but this experiment's caller is
-  // expected to have raised DefragMinBytesBeforeTrigger enough that defragment() never
-  // auto-triggers during the window, making every delta attributable to checkpoint()) once per
-  // second, recording which second each *new* reorg completion landed in -- attributes the
-  // update_ops timeline's dips to actual checkpoint() completions without needing a dedicated
-  // forced-call thread, so this works identically whether checkpoint() is firing on the default
-  // byte threshold (~every 0.2s under heavy 64KB writes) or the time-based
-  // ConfigT::CheckpointIntervalSeconds override.
-  std::vector<uint64_t> reorg_ops(duration_seconds, 0);
-  std::thread reorg_sampler([&store, &start_time, &reorg_ops, duration_seconds]() {
-    uint64_t last_count = store->impl().get_statistics().t2_reorg_count;
-    while (true) {
-      const auto elapsed =
-          std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
-      if (elapsed >= duration_seconds) {
-        break;
-      }
-      const uint64_t cur_count = store->impl().get_statistics().t2_reorg_count;
-      if (cur_count > last_count && elapsed >= 0) {
-        reorg_ops[elapsed] += (cur_count - last_count);
-        last_count = cur_count;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-  });
-
-  std::this_thread::sleep_until(start_time + std::chrono::seconds(duration_seconds));
-  stop.store(true, std::memory_order_relaxed);
-  for (auto &w : writers) {
-    w.join();
-  }
-  reorg_sampler.join();
-
-  std::vector<uint64_t> total_ops(duration_seconds, 0);
-  for (const auto &tc : counters) {
-    for (int i = 0; i < duration_seconds; ++i) {
-      total_ops[i] += tc.counts[i].load(std::memory_order_relaxed);
-    }
-  }
-
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"checkpoint_timeline\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
-            << "\"duration_seconds\":" << duration_seconds << "," << "\"timeline\":[";
-  for (int i = 0; i < duration_seconds; ++i) {
-    std::cout << "{\"sec\":" << (i + 1) << ",\"update_ops\":" << total_ops[i] << ",\"reorg_ops\":" << reorg_ops[i]
-              << "}";
-    if (i + 1 < duration_seconds) std::cout << ",";
-  }
-  std::cout << "]}" << std::endl;
-  std::_Exit(0);
-}
-
-// checkpoint_backlog mode: the direct, real-VMemKV analog of the standalone mmap_checkpoint_bench
-// experiment that found a diverging backlog under sustained load (see docs/benchmark/ for that
-// finding). Insert-heavy (unlike checkpoint_timeline's update-heavy workload) -- Insert
-// unconditionally grows T2's tail (bytes_used), which is exactly what makes it the right
-// operation to stress checkpoint_internal()'s own real trigger (the default byte-threshold
-// WalMaxBytesSinceCheckpoint, unmodified -- this mode does NOT force or schedule checkpoint()
-// calls itself, unlike checkpoint_timeline).
-//
-// The real backlog metric: `bytes_used - base_boundary` on T2's live T2Memory -- bytes written
-// into the tail but not yet covered by a completed checkpoint_internal() cycle. Exactly the same
-// quantity mmap_checkpoint_bench.cpp tracked (bytes_written - bytes_synced) for the standalone
-// microbenchmark; sampled here every second for direct comparison. A bounded/flat trend means
-// checkpoint() is keeping up; a sustained upward trend over the whole window means it structurally
-// cannot at this write rate -- the "queue that never catches up" failure mode.
-//
-// Runs for VMEMKV_CHECKPOINT_BACKLOG_SECONDS (default 180 -- the mmap microbenchmark's own
-// backlog trend only became unambiguous after ~100s, so a short window risks a false "looks
-// stable" read the same way the first, too-short pass at that experiment did).
-auto checkpoint_backlog_duration_seconds() -> int {
-  if (const char *env = std::getenv("VMEMKV_CHECKPOINT_BACKLOG_SECONDS")) {
-    return std::stoi(env);
-  }
-  return 180;
-}
-
-[[noreturn]] void run_checkpoint_backlog(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_checkpointbacklog";
-
-  const std::size_t resolved_writer_threads =
-      args.writer_threads != 0 ? args.writer_threads
-                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
-
-  // Fresh, empty store -- insert-heavy means growing from nothing, not churning an existing
-  // corpus (unlike checkpoint_timeline's populate-then-update workload).
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-
-  const int duration_sec = checkpoint_backlog_duration_seconds();
-  std::atomic<bool> stop{false};
-  std::atomic<uint64_t> next_index{0};
-  std::atomic<uint64_t> total_inserted{0};
-
-  std::vector<std::thread> writers;
-  writers.reserve(resolved_writer_threads);
-  for (std::size_t t = 0; t < resolved_writer_threads; ++t) {
-    writers.emplace_back([&store, &stop, &next_index, &total_inserted, val_size = args.val_size]() {
-      while (!stop.load(std::memory_order_relaxed)) {
-        const uint64_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
-        store->insert(make_key(idx), make_value_for_key(idx, val_size));
-        total_inserted.fetch_add(1, std::memory_order_relaxed);
-      }
-    });
-  }
-
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"checkpoint_backlog\"," << "\"writer_threads\":" << resolved_writer_threads << ","
-            << "\"duration_seconds\":" << duration_sec << "," << "\"timeline\":[";
-  uint64_t last_inserted = 0;
-  uint64_t last_reorg_count = store->impl().get_statistics().t2_reorg_count;
-  for (int s = 0; s < duration_sec; ++s) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    const vmemkv::T2Memory *mem = store->impl().t2().get_memory();
-    const uint64_t bytes_used = mem->bytes_used.load(std::memory_order_acquire);
-    const uint64_t base_boundary = mem->base_boundary.load(std::memory_order_acquire);
-    const uint64_t backlog = bytes_used - base_boundary;
-    const uint64_t cur_inserted = total_inserted.load(std::memory_order_relaxed);
-    const auto stats = store->impl().get_statistics();
-    const uint64_t cur_reorg_count = stats.t2_reorg_count;
-    if (s > 0) std::cout << ",";
-    std::cout << "{\"sec\":" << (s + 1) << ",\"ops_per_sec\":" << (cur_inserted - last_inserted)
-              << ",\"backlog_mb\":" << (static_cast<double>(backlog) / 1e6)
-              << ",\"bytes_used_mb\":" << (static_cast<double>(bytes_used) / 1e6)
-              << ",\"checkpoints_this_sec\":" << (cur_reorg_count - last_reorg_count)
-              << ",\"t1_reorg_count\":" << stats.t1_reorg_count << ",\"hard_stall_count\":" << stats.hard_stall_count
-              << "}";
-    std::cout.flush();
-    last_inserted = cur_inserted;
-    last_reorg_count = cur_reorg_count;
-  }
-  std::cout << "]}" << std::endl;
-
-  stop.store(true, std::memory_order_relaxed);
-  for (auto &w : writers) {
-    w.join();
-  }
-  std::_Exit(0);
-}
-
-// Phase-breakdown mode: same insert-heavy workload as run_checkpoint_backlog(), but polls at
-// kPollIntervalMs (fine enough to resolve individual checkpoint_internal() calls, which are
-// typically sub-second to low-single-digit-seconds) instead of once a second, and records each
-// completed checkpoint's own phase breakdown (VMemKVStatistics::last_checkpoint_*) as a discrete
-// event alongside a dense total_inserted time series -- together these let post-processing slice
-// out exactly what QPS looked like during vs. outside each checkpoint's own wall-clock window,
-// and how msync()/t1_.reorganize() cost individually trend against corpus size and against
-// ConfigT::CheckpointIntervalSeconds (a compile-time knob -- vary it by editing config.hpp and
-// rebuilding between runs, not at runtime).
-auto checkpoint_phases_duration_seconds() -> int {
-  if (const char *env = std::getenv("VMEMKV_CHECKPOINT_PHASES_SECONDS")) {
-    return std::stoi(env);
-  }
-  return 120;
-}
-
-[[noreturn]] void run_checkpoint_phases(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-  using Clock = std::chrono::steady_clock;
-
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_checkpointphases";
-
-  const std::size_t resolved_writer_threads =
-      args.writer_threads != 0 ? args.writer_threads
-                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
-
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-
-  const int duration_sec = checkpoint_phases_duration_seconds();
-  constexpr int kPollIntervalMs = 25;
-  std::atomic<bool> stop{false};
-  std::atomic<uint64_t> next_index{0};
-  std::atomic<uint64_t> total_inserted{0};
-
-  std::vector<std::thread> writers;
-  writers.reserve(resolved_writer_threads);
-  for (std::size_t t = 0; t < resolved_writer_threads; ++t) {
-    writers.emplace_back([&store, &stop, &next_index, &total_inserted, val_size = args.val_size]() {
-      while (!stop.load(std::memory_order_relaxed)) {
-        const uint64_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
-        store->insert(make_key(idx), make_value_for_key(idx, val_size));
-        total_inserted.fetch_add(1, std::memory_order_relaxed);
-      }
-    });
-  }
-
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"checkpoint_phases\"," << "\"writer_threads\":" << resolved_writer_threads << ","
-            << "\"duration_seconds\":" << duration_sec << "," << "\"poll_interval_ms\":" << kPollIntervalMs << ",";
-
-  const auto t_start = Clock::now();
-  uint64_t last_reorg_count = store->impl().get_statistics().t2_reorg_count;
-  const int total_polls = duration_sec * 1000 / kPollIntervalMs;
-
-  std::cout << "\"samples\":[";
-  bool first_event = true;
-  std::vector<std::string> events;
-  for (int p = 0; p < total_polls; ++p) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
-    const auto t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t_start).count();
-    const uint64_t n = total_inserted.load(std::memory_order_relaxed);
-    const auto stats = store->impl().get_statistics();
-    if (p > 0) std::cout << ",";
-    std::cout << "[" << t_ms << "," << n << "," << stats.hard_stall_count << "," << stats.total_hard_stall_duration_us
-              << "]";
-
-    if (stats.t2_reorg_count != last_reorg_count) {
-      std::ostringstream ev;
-      ev << (first_event ? "" : ",") << "{\"t_ms\":" << t_ms << ",\"duration_us\":" << stats.last_checkpoint_duration_us
-         << ",\"msync_us\":" << stats.last_checkpoint_msync_duration_us
-         << ",\"t1_reorganize_us\":" << stats.last_checkpoint_t1_reorganize_duration_us
-         << ",\"stop_writers_us\":" << stats.last_checkpoint_stop_writers_duration_us
-         << ",\"barrier_drain_us\":" << stats.last_checkpoint_barrier_drain_duration_us
-         << ",\"wal_rotate_us\":" << stats.last_checkpoint_wal_rotate_duration_us
-         << ",\"wal_rotate_leader_wait_us\":" << stats.last_checkpoint_wal_rotate_leader_wait_us
-         << ",\"bytes_synced\":" << stats.last_checkpoint_bytes_synced
-         << ",\"corpus_bytes\":" << stats.last_checkpoint_corpus_bytes << "}";
-      events.push_back(ev.str());
-      first_event = false;
-      last_reorg_count = stats.t2_reorg_count;
-    }
-  }
-  std::cout << "],\"checkpoint_events\":[";
-  for (const auto &e : events) std::cout << e;
-  std::cout << "]}" << std::endl;
-
-  stop.store(true, std::memory_order_relaxed);
-  for (auto &w : writers) {
-    w.join();
-  }
-  std::_Exit(0);
 }
 
 // Reorg-contention mode: same populate+checkpoint setup as run_defrag_contention(). reorganize()
@@ -3006,10 +2581,7 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
     // function's in-memory fixed-constant branches), so both must be set before it's first called.
     // overwrite=0 on the ratio: this is a default matching benchmark_matrix.sh's own "ltm"
     // scenario, not a mandate -- a caller (e.g. a ratio sweep) that already exported
-    // VMEMKV_BENCH_TARGET_RATIO before invoking this binary must win. Previously this was
-    // overwrite=1, silently clobbering every external override back to 8.0 -- confirmed directly
-    // (see TODO.md item 6) that this made an entire ratio sweep (8.0 down to 1.0) actually run
-    // every point at 8.0, since --scenario=ltm always hit this line.
+    // VMEMKV_BENCH_TARGET_RATIO before invoking this binary must win.
     ::setenv("VMEMKV_BENCH_LTM", "1", 1);
     ::setenv("VMEMKV_BENCH_TARGET_RATIO", "8.0", 0);
   }
@@ -3023,12 +2595,6 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
     run_checkpoint_contention(args);
   } else if (args.mode == ProbeMode::kReorgContention) {
     run_reorg_contention(args);
-  } else if (args.mode == ProbeMode::kCheckpointBacklog) {
-    run_checkpoint_backlog(args);
-  } else if (args.mode == ProbeMode::kCheckpointTimeline) {
-    run_checkpoint_timeline(args);
-  } else if (args.mode == ProbeMode::kCheckpointPhases) {
-    run_checkpoint_phases(args);
   } else {
     run_bootstrap(args);
   }
