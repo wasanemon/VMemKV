@@ -119,9 +119,8 @@ class StoreAdapter {
   // Bulk-loads `count` entries generated on demand by make_key(index)/make_value(index). Throws
   // on failure. Much faster than `count` individual insert() calls, but unlike insert()/update()
   // gives no durability guarantee by itself -- see each backend's bulk_load_impl() (VMemKVImpl,
-  // e.g., skips its WAL entirely; callers needing crash survival must checkpoint afterward, e.g.
-  // defragment() or checkpoint()). Upsert semantics (no existing-key check), and not safe for concurrent
-  // access during the call.
+  // e.g., skips its WAL entirely; callers needing crash survival must checkpoint() afterward).
+  // Upsert semantics (no existing-key check), and not safe for concurrent access during the call.
   template <typename KeyFn, typename ValueFn>
   void bulk_load(std::size_t count, KeyFn &&make_key, ValueFn &&make_value) {
     impl_.bulk_load_impl(count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
@@ -146,16 +145,6 @@ class StoreAdapter {
   // define their own no-op reorganize() (they self-manage compaction), so this delegates
   // unconditionally rather than needing an is_rival_store_v branch.
   void reorganize() { impl_.reorganize(); }
-
-  // Currently a bookkeeping-only placeholder: does not relocate T2 records, reclaim space, or
-  // persist a checkpoint. Rival backends self-compact/self-manage storage -- no-op for them too.
-  void defragment() {
-    if constexpr (detail::is_rival_store_v<KVSImpl>) {
-      // no-op: rivals self-manage compaction, same rationale as reorganize()'s rival no-op.
-    } else {
-      impl_.defragment();
-    }
-  }
 
   // Always persists a checkpoint via the cheapest available path (see VMemKVImpl::checkpoint()).
   // No-op for rival backends -- they have no equivalent checkpoint/manifest concept exposed here.

@@ -208,42 +208,13 @@ def build_checkpoint_throughput_data(report_dir):
     return data
 
 
-def build_defrag_throughput_data(report_dir):
-    """Reads defrag_scaling_in_memory.jsonl / defrag_scaling_ltm.jsonl (run_defrag_scaling_probe.sh,
-    mode=defrag, ratio=1.0, churn_ratio=0 -- the full-corpus point of the existing corpus-size
-    sweep) into {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per
-    combo. Unlike checkpoint() (cost tracks churn, not corpus size), defragment() relocates the
-    whole live corpus every cycle, so its throughput is inherently a full-corpus measurement, not
-    a churn-scoped one -- reuses the sweep's own ratio=1.0 point rather than a separate probe."""
-    data = {}
-    for fname in ["defrag_scaling_in_memory.jsonl", "defrag_scaling_ltm.jsonl"]:
-        path = report_dir / fname
-        if not path.exists():
-            continue
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            if rec.get("mode") != "defrag" or (rec.get("ratio") or 0) != 1 or rec.get("timed_out"):
-                continue
-            scenario_key = SCENARIO_LABELS.get((rec["scenario"], _value_size_label(rec.get("value_size"))))
-            if scenario_key is None:
-                continue
-            data[scenario_key] = {
-                "key_count": rec["key_count"],
-                "elapsed_sec": rec["elapsed_sec"],
-                "records_per_sec": rec["key_count"] / rec["elapsed_sec"],
-            }
-    return data
-
-
 def build_reorg_throughput_data(report_dir):
     """Reads reorg_scaling_<scenario>_<value_size>.jsonl (run_reorg_scaling_probe.sh, mode=t1only,
     ratio=1.0 -- the full-corpus point of the existing T1-only corpus-size sweep) into
     {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per combo.
-    reorganize() is T1-only (never touches T2) and, like defragment(), rebuilds the whole
-    structure every call -- cost tracks corpus size, not churn, so this reuses the sweep's own
-    ratio=1.0 point rather than a separate probe."""
+    reorganize() is T1-only (never touches T2) and rebuilds the whole structure every call --
+    cost tracks corpus size, not churn, so this reuses the sweep's own ratio=1.0 point rather
+    than a separate probe."""
     data = {}
     for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
         path = report_dir / f"reorg_scaling_{scenario}_{val_size}.jsonl"
@@ -266,9 +237,9 @@ def build_reorg_throughput_data(report_dir):
 def build_maintenance_contention_data(report_dir):
     """Reads maintenance_contention_in_memory.jsonl / maintenance_contention_ltm.jsonl
     (run_maintenance_contention_probe.sh, modes checkpoint_contention/reorg_contention) into
-    {scenario_val: {"checkpoint": {...}, "reorganize": {...}}}, matching build_defrag_scaling_data()'s
-    own contention-row shape (isolated_write_tps/concurrent_write_tps/elapsed_sec/timed_out) so
-    both can feed the same table renderer -- see render_maintenance_contention_html(). reorganize()
+    {scenario_val: {"checkpoint": {...}, "reorganize": {...}}} (isolated_write_tps/
+    concurrent_write_tps/elapsed_sec/timed_out per op) -- see render_maintenance_contention_html().
+    reorganize()
     (T1-only) often completes in well under a millisecond even at full corpus size -- its
     concurrent_write_tps figure is a mean over many repeated reorganize() calls spanning at least
     a second (bench_kv's run_reorg_contention() passes min_wall_seconds=1.0 to
@@ -306,96 +277,6 @@ def _value_size_label(value_size):
     if isinstance(value_size, str):
         return value_size
     return {8: "8B", 1024: "1KB", 65536: "64KB"}.get(value_size, str(value_size))
-
-
-def build_defrag_scaling_data(report_dir):
-    """Reads defrag_scaling_in_memory.jsonl / defrag_scaling_ltm.jsonl (run_defrag_scaling_probe.sh,
-    via bench_kv --reorg-probe --mode=defrag/defrag_contention) into two row lists: the
-    corpus-size sweep (mode=defrag, churn_ratio=0, all 4 scenario/value_size combos) and the
-    concurrent-write contention spot check (mode=defrag_contention, one point per combo).
-    defragment() relocates every live record regardless of which ones changed, so its cost
-    doesn't depend on churn ratio -- confirmed once via a dedicated sweep, not re-swept/re-plotted
-    every round (see run_defrag_scaling_probe.sh's own comment)."""
-    corpus_rows = []
-    contention_rows = []
-    for fname in ["defrag_scaling_in_memory.jsonl", "defrag_scaling_ltm.jsonl"]:
-        path = report_dir / fname
-        if not path.exists():
-            continue
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            scenario_val = f'{rec["scenario"]}_{_value_size_label(rec.get("value_size"))}'
-            if rec.get("mode") == "defrag":
-                if (rec.get("churn_ratio") or 0) == 0:
-                    corpus_rows.append({
-                        "scenario_val": scenario_val,
-                        "ratio": rec.get("ratio"),
-                        "key_count": rec["key_count"],
-                        "elapsed_sec": rec["elapsed_sec"],
-                        "timed_out": rec["timed_out"],
-                    })
-            elif rec.get("mode") == "defrag_contention":
-                contention_rows.append({
-                    "scenario_val": scenario_val,
-                    "isolated_write_tps": rec.get("isolated_write_tps"),
-                    "concurrent_write_tps": rec.get("concurrent_write_tps"),
-                    "defrag_elapsed_sec": rec.get("defrag_elapsed_sec", rec.get("elapsed_sec")),
-                    "timed_out": rec["timed_out"],
-                    "failure_reason": rec.get("failure_reason"),
-                })
-    corpus_rows.sort(key=lambda r: (r["scenario_val"], r["ratio"] or 0))
-    return corpus_rows, contention_rows
-
-
-def render_defrag_scaling_html(corpus_rows, contention_rows):
-    if not corpus_rows and not contention_rows:
-        return ""
-    out = []
-    if corpus_rows:
-        out.append('<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide">Corpus-Size Sweep (churn=0)</h4>')
-        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
-                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Corpus Ratio</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Corpus (keys)</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">defragment()</th>'
-                    '</tr></thead><tbody class="divide-y divide-slate-100">')
-        for r in corpus_rows:
-            status = f'<span class="text-rose-600 font-semibold">≥{r["elapsed_sec"]:.0f}s (timeout)</span>' if r["timed_out"] else f'{r["elapsed_sec"]:.2f}s'
-            ratio_label = f'{r["ratio"]:.0%}' if r["ratio"] is not None else "n/a"
-            # key_count is null for an outer_timeout record (run_probe_point()'s synthesized
-            # failure fallback) -- setup never even reported a corpus size.
-            key_count_label = f'{r["key_count"]:,}' if r["key_count"] is not None else "n/a"
-            out.append(f'<tr><td class="py-2 px-3">{r["scenario_val"]}</td><td class="py-2 px-3">{ratio_label}</td>'
-                        f'<td class="py-2 px-3">{key_count_label}</td><td class="py-2 px-3">{status}</td></tr>')
-        out.append("</tbody></table></div>")
-    if contention_rows:
-        out.append('<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4">Concurrent-Write Contention Spot Check (32 writer threads, ratio=1.0)</h4>')
-        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
-                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Isolated Write TPS</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Concurrent Write TPS</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Slowdown</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">defragment() duration</th>'
-                    '</tr></thead><tbody class="divide-y divide-slate-100">')
-        for r in contention_rows:
-            if r["failure_reason"]:
-                out.append(f'<tr><td class="py-2 px-3">{r["scenario_val"]}</td>'
-                            f'<td class="py-2 px-3 text-slate-300" colspan="3">n/a</td>'
-                            f'<td class="py-2 px-3"><span class="text-rose-600 font-semibold">did not complete ({r["failure_reason"]})</span></td></tr>')
-                continue
-            iso = r["isolated_write_tps"]
-            conc = r["concurrent_write_tps"]
-            slowdown = f'{(1 - conc / iso) * 100:.0f}%' if iso else "n/a"
-            defrag_status = f'<span class="text-rose-600 font-semibold">≥{r["defrag_elapsed_sec"]:.0f}s (timeout)</span>' if r["timed_out"] else f'{r["defrag_elapsed_sec"]:.2f}s'
-            out.append(f'<tr><td class="py-2 px-3">{r["scenario_val"]}</td>'
-                        f'<td class="py-2 px-3">{iso:,.0f}/s</td><td class="py-2 px-3">{conc:,.0f}/s</td>'
-                        f'<td class="py-2 px-3">{slowdown}</td><td class="py-2 px-3">{defrag_status}</td></tr>')
-        out.append("</tbody></table></div>")
-    return "\n".join(out)
 
 
 def compute_winners_matrix(raw_data):
@@ -517,34 +398,6 @@ def render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data)
     return "\n".join(out)
 
 
-def render_defrag_vs_insert_table_html(defrag_throughput_data, raw_data):
-    if not defrag_throughput_data:
-        return ""
-    idx32 = THREADS.index(32)
-    out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
-           '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
-           '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">defragment() full-corpus</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>',
-           "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
-    for scenario_key in ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"]:
-        df = defrag_throughput_data.get(scenario_key)
-        insert_series = raw_data.get(scenario_key, {}).get("Insert", {}).get("+Inline")
-        if not df or not insert_series or insert_series[idx32] is None:
-            continue
-        insert_rate = insert_series[idx32]
-        df_rate = df["records_per_sec"]
-        ratio = insert_rate / df_rate if df_rate else float("inf")
-        label_text, badge_class = _badge_for_checkpoint_headroom(ratio)
-        out.append(f'<tr><td class="py-2 px-3">{scenario_key}</td>'
-                    f'<td class="py-2 px-3">{insert_rate:,.0f}/s</td>'
-                    f'<td class="py-2 px-3">{df_rate:,.0f}/s</td>'
-                    f'<td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border {badge_class} font-bold w-fit">{label_text} ({ratio:.2f}x)</span></td></tr>')
-    out.append("</tbody></table></div>")
-    return "\n".join(out)
-
-
 def render_reorg_vs_insert_table_html(reorg_throughput_data, raw_data):
     if not reorg_throughput_data:
         return ""
@@ -584,30 +437,19 @@ def _badge_for_slowdown(pct):
     return "bg-emerald-50 text-emerald-700 border-emerald-200"
 
 
-def render_maintenance_contention_html(defrag_contention_rows, maintenance_contention_data):
-    # Merge defragment()'s existing contention rows into the same {scenario_val: {op: {...}}}
-    # shape as maintenance_contention_data, so one loop below renders all three operations.
-    combined = {k: dict(v) for k, v in maintenance_contention_data.items()}
-    for row in defrag_contention_rows:
-        combined.setdefault(row["scenario_val"], {})["defragment"] = {
-            "isolated_write_tps": row["isolated_write_tps"],
-            "concurrent_write_tps": row["concurrent_write_tps"],
-            "elapsed_sec": row["defrag_elapsed_sec"],
-            "timed_out": row["timed_out"],
-            "failure_reason": row.get("failure_reason"),
-        }
-    if not combined:
+def render_maintenance_contention_html(maintenance_contention_data):
+    if not maintenance_contention_data:
         return ""
-    # Grouped by operation (one mini-table per op, matching render_defrag_scaling_html's
-    # multi-table convention) rather than by scenario: the reader's actual question is almost
-    # always "how does checkpoint() alone degrade across scenarios", not "what's every op doing
-    # for one scenario", so this ordering puts the 4 scenario rows that answer that side by side
-    # instead of scattered 3 rows apart across 3 separate scenario blocks.
+    # Grouped by operation (one mini-table per op) rather than by scenario: the reader's actual
+    # question is almost always "how does checkpoint() alone degrade across scenarios", not
+    # "what's every op doing for one scenario", so this ordering puts the 4 scenario rows that
+    # answer that side by side instead of scattered rows apart across separate scenario blocks.
     out = []
-    op_labels = {"checkpoint": "checkpoint()", "defragment": "defragment()", "reorganize": "reorganize()"}
-    for op in ["checkpoint", "defragment", "reorganize"]:
-        rows_for_op = [(sv, combined[sv][op]) for sv in ["in_memory_8B", "in_memory_1KB", "ltm_1KB", "ltm_64KB"]
-                       if sv in combined and op in combined[sv]]
+    op_labels = {"checkpoint": "checkpoint()", "reorganize": "reorganize()"}
+    for op in ["checkpoint", "reorganize"]:
+        rows_for_op = [(sv, maintenance_contention_data[sv][op])
+                       for sv in ["in_memory_8B", "in_memory_1KB", "ltm_1KB", "ltm_64KB"]
+                       if sv in maintenance_contention_data and op in maintenance_contention_data[sv]]
         if not rows_for_op:
             continue
         out.append(f'<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4 first:mt-0">{op_labels[op]}</h4>')
@@ -664,10 +506,8 @@ def main():
     forced_events_data = build_forced_events_data(args.report_dir)
     reorg_data = build_reorg_scaling_data(args.report_dir)
     checkpoint_throughput_data = build_checkpoint_throughput_data(args.report_dir)
-    defrag_throughput_data = build_defrag_throughput_data(args.report_dir)
     reorg_throughput_data = build_reorg_throughput_data(args.report_dir)
     maintenance_contention_data = build_maintenance_contention_data(args.report_dir)
-    defrag_corpus_rows, defrag_contention_rows = build_defrag_scaling_data(args.report_dir)
     winners_rows = compute_winners_matrix(raw_data)
 
     html = html.replace(args.template_id, args.report_id)
@@ -690,7 +530,6 @@ def main():
         html, "const reorgScalingData = {", "const workloads =",
         "const reorgScalingData = " + json.dumps(reorg_data, indent=2) + ";\n    " +
         "const checkpointThroughputData = " + json.dumps(checkpoint_throughput_data, indent=2) + ";\n    " +
-        "const defragThroughputData = " + json.dumps(defrag_throughput_data, indent=2) + ";\n    " +
         "const reorgThroughputData = " + json.dumps(reorg_throughput_data, indent=2) + ";\n    "
     )
 
@@ -769,8 +608,6 @@ def main():
         (f"reorg_scaling_ltm_64KB.jsonl", "Reorg Scaling, LTM 64KB"),
         (f"checkpoint_throughput_in_memory.jsonl", "Checkpoint Throughput, In-Memory"),
         (f"checkpoint_throughput_ltm.jsonl", "Checkpoint Throughput, LTM"),
-        (f"defrag_scaling_in_memory.jsonl", "Defrag Scaling, In-Memory"),
-        (f"defrag_scaling_ltm.jsonl", "Defrag Scaling, LTM"),
     ]:
         if not (args.report_dir / fname).exists():
             continue
@@ -869,11 +706,62 @@ def main():
         section_end = html.index("</section>", heading_idx) + len("</section>")
         return html[:section_start] + html[section_end:]
 
+    # Per-tab chart blocks (inserted by the checkpoint/reorg/defrag-throughput migration loops
+    # below) aren't wrapped in a <section>, so remove_section() can't reach them. Each block ends
+    # with exactly one <textarea>...</textarea> immediately followed by its own two closing divs
+    # (space-y-1.5 wrapper, then the block itself) -- unlike the tab-container's own close, this
+    # pair immediately follows every block regardless of how many siblings come after it, so it's
+    # a safe per-block boundary to search for starting from the anchor (searching for the next
+    # "double close" from the anchor alone would overshoot into a later sibling block instead).
+    def remove_mt12_block(html, anchor_text):
+        anchor_idx = html.find(anchor_text)
+        if anchor_idx == -1:
+            return html
+        block_marker = '<div class="mt-12 border-t border-slate-200 pt-8 space-y-6">'
+        block_start = html.rindex(block_marker, 0, anchor_idx)
+        ws_start = block_start
+        while ws_start > 0 and html[ws_start - 1] in " \t\n":
+            ws_start -= 1
+        close_marker = "</textarea>\n        </div>\n      </div>\n"
+        block_end = html.index(close_marker, anchor_idx) + len(close_marker)
+        return html[:ws_start] + html[block_end:]
+
     # Both superseded by the Insert-vs-checkpoint-throughput chart/table below: checkpoint()'s
     # cost tracks churn, not corpus size, so a corpus-size sweep (bootstrap-only, or steady-state
     # scoped to ltm/1KB) was never the right measurement for "does checkpoint keep up".
     html = remove_section(html, "Corpus-Size Invariance across Generations (new experiment)")
     html = remove_section(html, "Churn-Ratio Scaling (new experiment)")
+    # defragment() has been removed entirely (round 3) -- strip these sections from any older
+    # template being regenerated. Older heading names are tried only as a fallback (never both):
+    # "Defragment Scaling & Contention" is also a substring of unrelated body text elsewhere in
+    # older templates, so it must not be searched once the current heading has already matched.
+    html = remove_section(html, "Insert vs. Defragment() Throughput")
+    if "Defragment Corpus-Size Scaling" in html:
+        html = remove_section(html, "Defragment Corpus-Size Scaling")
+    elif "Defragment Scaling & Contention (new experiment)" in html:
+        html = remove_section(html, "Defragment Scaling & Contention (new experiment)")
+    elif "<h3 class=\"text-base font-bold text-slate-900\">Defragment Scaling & Contention</h3>" in html:
+        html = remove_section(html, "<h3 class=\"text-base font-bold text-slate-900\">Defragment Scaling & Contention</h3>")
+    # Per-tab defrag-throughput blocks, one per scenario/value combo -- not <section>s, so the
+    # remove_section() calls above don't reach them.
+    while True:
+        html = remove_mt12_block(html, "Insert Throughput vs. Defragment() Full-Corpus Throughput")
+        if "Insert Throughput vs. Defragment() Full-Corpus Throughput" not in html:
+            break
+    # Orphaned JS an older template's already-migrated initCharts() wiring still calls -- must go
+    # together, in either order, or the surviving half is a dangling reference/definition.
+    orphaned_wiring = """        const dfEid = valSize.toLowerCase().replace(/-/g,'_') + '-defrag-throughput';
+        const dfCanvas = document.getElementById('chart-' + dfEid);
+        if (dfCanvas) {
+          const cfg3 = makeDefragVsInsertConfig(valSize);
+          if (cfg3) new Chart(dfCanvas, cfg3);
+        }
+"""
+    html = html.replace(orphaned_wiring, "")
+    if "function makeDefragVsInsertConfig(" in html:
+        func_start = html.index("    function makeDefragVsInsertConfig(")
+        func_end = html.index("\n\n    ", func_start) + len("\n\n")
+        html = html[:func_start] + html[func_end:]
 
     html = upsert_section(
         html,
@@ -885,57 +773,20 @@ def main():
     )
     html = upsert_section(
         html,
-        heading="Insert vs. Defragment() Throughput",
-        icon_bg="bg-amber-50", icon_text="text-amber-600", icon_name="gauge",
-        title="Insert vs. Defragment() Throughput",
-        description_html='defragment() relocates the entire live corpus every cycle (cost tracks corpus size, not churn), so unlike checkpoint() there is no single churn-scoped "steady-state" number -- the operationally relevant question is whether a full-corpus cycle (records/sec, the corpus-size sweep\'s own ratio=100% point below) completes faster than the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat defragment() full-corpus throughput reference line). Isolated (no concurrent writers) -- see the Maintenance Operations contention table at the bottom of this tab for how much this degrades under concurrent load.',
-        table_html=render_defrag_vs_insert_table_html(defrag_throughput_data, raw_data),
-    )
-    html = upsert_section(
-        html,
         heading="Insert vs. Reorganize() Throughput",
         icon_bg="bg-violet-50", icon_text="text-violet-600", icon_name="gauge",
         title="Insert vs. Reorganize() Throughput",
-        description_html='reorganize() (T1-only, never touches T2) rebuilds the whole T1 structure every call -- cost tracks corpus size, not churn, same character as defragment(). Full-corpus throughput (records/sec, the T1-only corpus-size sweep\'s own ratio=100% point) compared against the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab. Isolated (no concurrent writers).',
+        description_html='reorganize() (T1-only, never touches T2) rebuilds the whole T1 structure every call -- cost tracks corpus size, not churn. Full-corpus throughput (records/sec, the T1-only corpus-size sweep\'s own ratio=100% point) compared against the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab. Isolated (no concurrent writers).',
         table_html=render_reorg_vs_insert_table_html(reorg_throughput_data, raw_data),
-    )
-    html = upsert_section(
-        html,
-        heading="Defragment Corpus-Size Scaling",
-        icon_bg="bg-amber-50", icon_text="text-amber-600", icon_name="scissors",
-        title="Defragment Corpus-Size Scaling",
-        description_html='<code class="bg-slate-100 px-1 rounded">defragment()</code> duration against an already-<code class="bg-slate-100 px-1 rounded">checkpoint()</code>ed corpus (a realistic pre-defragment state): a corpus-size sweep at churn_ratio=0 across all 4 scenario/value-size combos. defragment() relocates every live record regardless of which ones changed, so its cost tracks corpus size, not churn ratio -- confirmed once via a dedicated in_memory/1KB churn-ratio sweep (durations stayed flat across churn_ratio 0-1.0 at a fixed corpus size), not re-swept every round since that finding doesn\'t change from run to run. (Concurrent-write contention for defragment() is covered by the Maintenance Operations table at the bottom of this tab, alongside checkpoint() and reorganize().)',
-        table_html=render_defrag_scaling_html(defrag_corpus_rows, []),
-        old_headings=("Defragment Scaling & Contention (new experiment)", "Defragment Scaling & Contention"),
     )
     html = upsert_section(
         html,
         heading="Maintenance Operations: Concurrent-Write Contention",
         icon_bg="bg-rose-50", icon_text="text-rose-600", icon_name="swords",
         title="Maintenance Operations: Concurrent-Write Contention",
-        description_html='All three maintenance operations (checkpoint(), defragment(), reorganize()) side by side: how much does write throughput degrade while each runs concurrently (32 writer threads, full corpus), and how long does the operation itself take under that contention versus in isolation (see the Insert-vs-throughput tables above for the isolated numbers alone). reorganize()\'s own duration is often under a millisecond even at full corpus size (T1-only, in-memory) -- flagged inline where its concurrent-TPS figure is likely dominated by measurement noise rather than a real effect.',
-        table_html=render_maintenance_contention_html(defrag_contention_rows, maintenance_contention_data),
+        description_html='Both maintenance operations (checkpoint(), reorganize()) side by side: how much does write throughput degrade while each runs concurrently (32 writer threads, full corpus), and how long does the operation itself take under that contention versus in isolation (see the Insert-vs-throughput tables above for the isolated numbers alone). reorganize()\'s own duration is often under a millisecond even at full corpus size (T1-only, in-memory) -- flagged inline where its concurrent-TPS figure is likely dominated by measurement noise rather than a real effect.',
+        table_html=render_maintenance_contention_html(maintenance_contention_data),
     )
-    # upsert_section() only ever updates an existing section in place, never relocates it -- an
-    # earlier report round inserted "Maintenance Operations" before "Defragment Corpus-Size
-    # Scaling"; explicitly fix the order here (idempotent: no-op once already correct) rather than
-    # depend on call order alone, since call order only controls where a *never-before-seen*
-    # section lands.
-    maint_heading = "Maintenance Operations: Concurrent-Write Contention"
-    defrag_scaling_heading = "Defragment Corpus-Size Scaling"
-    maint_idx = html.find(maint_heading)
-    defrag_scaling_idx = html.find(defrag_scaling_heading)
-    if maint_idx != -1 and defrag_scaling_idx != -1 and maint_idx < defrag_scaling_idx:
-        section_start = html.rindex(section_open_marker, 0, maint_idx)
-        ws_start = section_start
-        while ws_start > 0 and html[ws_start - 1] in " \t\n":
-            ws_start -= 1
-        section_end = html.index("</section>", maint_idx) + len("</section>")
-        section_content = html[section_start:section_end].strip("\n")
-        html = html[:ws_start] + html[section_end:]
-        defrag_scaling_idx = html.find(defrag_scaling_heading)
-        anchor_close = html.index("</section>", defrag_scaling_idx) + len("</section>")
-        html = html[:anchor_close] + "\n      " + section_content + html[anchor_close:]
 
     # Per-tab "Insert vs. Checkpoint() Throughput" chart: one new canvas + section per tab,
     # inserted right after the existing Reorg Scaling Probe section (same sibling-block style),
@@ -1009,77 +860,6 @@ def main():
 
     """
         html = html.replace("    function initCharts() {", checkpoint_config_js + "function initCharts() {")
-
-    if "function makeDefragVsInsertConfig(" not in html:
-        defrag_config_js = """    function makeDefragVsInsertConfig(valSizeKey) {
-      const df = defragThroughputData[valSizeKey];
-      const insertSeries = rawData[valSizeKey] && rawData[valSizeKey]['Insert'] && rawData[valSizeKey]['Insert']['+Inline'];
-      if (!df || !insertSeries) return null;
-      const threadLabels = [1, 4, 16, 32];
-      return {
-        type: 'line',
-        data: {
-          labels: threadLabels,
-          datasets: [
-            {
-              label: 'Insert (+Inline)',
-              data: insertSeries,
-              borderColor: '#6366f1',
-              backgroundColor: 'transparent',
-              borderWidth: 2,
-              tension: 0.2, fill: false,
-              pointRadius: 3.5,
-            },
-            {
-              label: 'defragment() full-corpus',
-              data: threadLabels.map(() => df.records_per_sec),
-              borderColor: '#d97706',
-              backgroundColor: 'transparent',
-              borderWidth: 2,
-              borderDash: [6, 4],
-              pointRadius: 0,
-              fill: false,
-            },
-          ],
-        },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          animation: { duration: 900, easing: 'easeInOutQuart' },
-          plugins: {
-            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
-            tooltip: {
-              mode: 'index', intersect: false,
-              backgroundColor: 'rgba(15,23,42,0.95)',
-              titleFont: {size:12,family:'Inter',weight:'bold'},
-              bodyFont: {size:11,family:'Inter'},
-              padding:10, cornerRadius:8,
-              callbacks: {
-                title: items => `${items[0].label} threads`,
-                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw)}/s`
-              }
-            }
-          },
-          scales: {
-            x: {
-              title: { display:true, text:'Threads', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8' }
-            },
-            y: {
-              type: 'logarithmic',
-              title: { display:true, text:'Throughput (records/sec, log scale)', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
-            }
-          }
-        }
-      };
-    }
-
-    """
-        if "    function initCharts() {" not in html:
-            raise RuntimeError("initCharts() anchor not found for defrag chart config insertion -- template drifted")
-        html = html.replace("    function initCharts() {", defrag_config_js + "function initCharts() {")
 
     if "function makeReorgVsInsertConfig(" not in html:
         reorg_config_js = """    function makeReorgVsInsertConfig(valSizeKey) {
@@ -1177,47 +957,20 @@ def main():
             raise RuntimeError("initCharts() reorg-scaling wiring marker not found -- template drifted")
         html = html.replace(wiring_marker, wiring_new)
 
-    if "-defrag-throughput'" not in html:
-        defrag_wiring_marker = """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
-        const cpCanvas = document.getElementById('chart-' + cpEid);
-        if (cpCanvas) {
-          const cfg2 = makeCheckpointVsInsertConfig(valSize);
-          if (cfg2) new Chart(cpCanvas, cfg2);
-        }
-      }
-    }"""
-        defrag_wiring_new = """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
-        const cpCanvas = document.getElementById('chart-' + cpEid);
-        if (cpCanvas) {
-          const cfg2 = makeCheckpointVsInsertConfig(valSize);
-          if (cfg2) new Chart(cpCanvas, cfg2);
-        }
-        const dfEid = valSize.toLowerCase().replace(/-/g,'_') + '-defrag-throughput';
-        const dfCanvas = document.getElementById('chart-' + dfEid);
-        if (dfCanvas) {
-          const cfg3 = makeDefragVsInsertConfig(valSize);
-          if (cfg3) new Chart(dfCanvas, cfg3);
-        }
-      }
-    }"""
-        if defrag_wiring_marker not in html:
-            raise RuntimeError("initCharts() checkpoint-throughput wiring marker not found -- template drifted")
-        html = html.replace(defrag_wiring_marker, defrag_wiring_new)
-
     if "-reorg-throughput'" not in html:
-        reorg_wiring_marker = """        const dfEid = valSize.toLowerCase().replace(/-/g,'_') + '-defrag-throughput';
-        const dfCanvas = document.getElementById('chart-' + dfEid);
-        if (dfCanvas) {
-          const cfg3 = makeDefragVsInsertConfig(valSize);
-          if (cfg3) new Chart(dfCanvas, cfg3);
+        reorg_wiring_marker = """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
+        const cpCanvas = document.getElementById('chart-' + cpEid);
+        if (cpCanvas) {
+          const cfg2 = makeCheckpointVsInsertConfig(valSize);
+          if (cfg2) new Chart(cpCanvas, cfg2);
         }
       }
     }"""
-        reorg_wiring_new = """        const dfEid = valSize.toLowerCase().replace(/-/g,'_') + '-defrag-throughput';
-        const dfCanvas = document.getElementById('chart-' + dfEid);
-        if (dfCanvas) {
-          const cfg3 = makeDefragVsInsertConfig(valSize);
-          if (cfg3) new Chart(dfCanvas, cfg3);
+        reorg_wiring_new = """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
+        const cpCanvas = document.getElementById('chart-' + cpEid);
+        if (cpCanvas) {
+          const cfg2 = makeCheckpointVsInsertConfig(valSize);
+          if (cfg2) new Chart(cpCanvas, cfg2);
         }
         const rgEid = valSize.toLowerCase().replace(/-/g,'_') + '-reorg-throughput';
         const rgCanvas = document.getElementById('chart-' + rgEid);
@@ -1228,7 +981,7 @@ def main():
       }
     }"""
         if reorg_wiring_marker not in html:
-            raise RuntimeError("initCharts() defrag-throughput wiring marker not found -- template drifted")
+            raise RuntimeError("initCharts() checkpoint-throughput wiring marker not found -- template drifted")
         html = html.replace(reorg_wiring_marker, reorg_wiring_new)
 
     for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
@@ -1268,46 +1021,11 @@ def main():
 
     for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
         slug = scenario_key.lower().replace("-", "_")
-        anchor = f'id="memo-{slug}-defrag-throughput"'
+        anchor = f'id="memo-{slug}-reorg-throughput"'
         if anchor in html:
             continue
         checkpoint_memo_anchor = f'id="memo-{slug}-checkpoint-throughput"'
         if checkpoint_memo_anchor not in html:
-            continue
-        section_html = f'''
-      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
-        <div class="flex items-center gap-3">
-          <div class="w-2 h-6 bg-amber-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Defragment() Full-Corpus Throughput</h2>
-        </div>
-        <p class="text-sm text-slate-500">
-          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-amber-600">橙色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">defragment()</code> のフルコーパススループット(コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。橙の線が藍色の線を下回る = 書き込み側の生成レートに defragment() の処理速度が追いつかない可能性を示す。単独実行(並行書き込みなし)での比較 —— 並行実行下での劣化は Defragment Scaling & Contention セクション参照。
-        </p>
-        <div class="space-y-3">
-          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
-            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
-            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
-          </div>
-          <div class="h-80 relative"><canvas id="chart-{slug}-defrag-throughput"></canvas></div>
-        </div>
-        <div class="space-y-1.5">
-          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
-          <textarea id="memo-{slug}-defrag-throughput" oninput="saveMemo('{slug}-defrag-throughput', this.value)" placeholder="Defragment Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
-        </div>
-      </div>
-'''
-        anchor_idx = html.index(checkpoint_memo_anchor)
-        close_marker = "\n      </div>\n    </div>\n"
-        close_idx = html.index(close_marker, anchor_idx) + len("\n      </div>\n")
-        html = html[:close_idx] + section_html.lstrip("\n") + html[close_idx:]
-
-    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
-        slug = scenario_key.lower().replace("-", "_")
-        anchor = f'id="memo-{slug}-reorg-throughput"'
-        if anchor in html:
-            continue
-        defrag_memo_anchor = f'id="memo-{slug}-defrag-throughput"'
-        if defrag_memo_anchor not in html:
             continue
         section_html = f'''
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
@@ -1331,7 +1049,7 @@ def main():
         </div>
       </div>
 '''
-        anchor_idx = html.index(defrag_memo_anchor)
+        anchor_idx = html.index(checkpoint_memo_anchor)
         close_marker = "\n      </div>\n    </div>\n"
         close_idx = html.index(close_marker, anchor_idx) + len("\n      </div>\n")
         html = html[:close_idx] + section_html.lstrip("\n") + html[close_idx:]

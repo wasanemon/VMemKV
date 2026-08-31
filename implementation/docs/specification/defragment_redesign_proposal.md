@@ -1,6 +1,9 @@
 # T2 Defragment 再設計提案：逐次書き換え方式
 
-**ステータス**: 設計・実装されたが、現在は no-op に戻されている -- §8参照
+**ステータス**: 設計・実装・測定され、ゲート評価(6節)で FAIL 判定を受けて no-op に戻され
+(round 1)、その後 API ごとコードベースから完全に削除された(round 3)。`defragment()`/
+`defragment_internal()` は現在存在しない。将来 Tier 2 再配置が必要になった際の設計参照として
+本書を残す -- §8参照。
 
 ## 1. ゴール
 
@@ -12,6 +15,10 @@
 ## 2. 前提
 
 defragment() の各サイクルの出力(新しい base 領域)は常にキー順で構築される。したがって**前回サイクルの base は既にキー順にソート済み**であり、「base を物理オフセット順に読む」ことと「base をキー順に読む」ことは同一操作になる。
+
+> ⚠ **この前提は誤り**: 実装(`T2FlatFile::map_file()`)は `MAP_SHARED` を使用しており、
+> `MAP_PRIVATE` ではない(`vmemkv_impl.hpp` 自身のコメントも "T2's live mmap is MAP_SHARED" と
+> 明記している)。以下の議論はこの誤った前提の上に成り立っており、妥当性は再検証されていない。
 
 T2 の生きているマッピング(`T2Memory::base`)は **MAP_PRIVATE** である。in-place の書き込みはこのプロセスのメモリ上にしか存在せず、`checkpoint_internal()`/`defragment_internal()` が明示的に `pwrite()` するまでディスク上には現れない。両者とも、その時点で**生きているものだけ**を `pwrite()` する。したがって、一度も再durabilize されないまま死んだレコードは、そのスロットに一度もバイトが書かれたことがない(ゼロ埋めでもホールパンチでもなく、単に未書き込み)。base 領域は密に詰まった連続レコード列ではなく、**生バイトをヘッダーとして順次パースする走査は成立しない**。
 
@@ -73,5 +80,6 @@ defragment() の swap サイクルが直近の書き込みレートに対して�
 
 ## 8. 現在の状態
 
-`defragment_internal()`は現在no-opであり、T2の空間を回収しない。実測値は
+`defragment_internal()` および公開 API `defragment()` は round 1 で no-op 化された後、round 3 で
+コードベースから完全に削除された。T2 の空間回収・再配置を行う仕組みは現在存在しない。実測値は
 `docs/benchmark/20260823_defragment_scaling_measurements.md`を参照。

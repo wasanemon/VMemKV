@@ -61,7 +61,7 @@ template <typename PerEntryFn>
 auto per_entry_offset_mapper(PerEntryFn fn) {
   return [fn = std::move(fn)](auto merged) {
     for (auto &entry : merged) {
-      std::tie(entry.payload_bits, entry.generation) = fn(entry.payload_bits, entry.hash, entry.generation);
+      entry.payload_bits = fn(entry.payload_bits, entry.hash);
     }
   };
 }
@@ -115,8 +115,7 @@ TEST_CASE("T1Index: reorganize merges append region into sorted region, keeps li
   }
   CHECK(idx->append_size() == static_cast<size_t>(key_count));
 
-  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                              -> std::pair<uint64_t, uint64_t> { return {payload, generation}; }));
+  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
 
   CHECK(idx->append_size() == 0);
   for (int i = 0; i < key_count; ++i) {
@@ -130,8 +129,7 @@ TEST_CASE("T1Index: reorganize drops tombstoned entries") {
   CHECK(idx->put(to_span("b"), 2) == TestIndex::PutResult::Applied);
   CHECK(idx->put(to_span("a"), vmemkv::STORE_NOT_FOUND) == TestIndex::PutResult::Applied);
 
-  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                              -> std::pair<uint64_t, uint64_t> { return {payload, generation}; }));
+  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
 
   CHECK(idx->get(to_span("a")) == vmemkv::STORE_NOT_FOUND);
   CHECK(idx->get(to_span("b")) == 2U);
@@ -142,10 +140,7 @@ TEST_CASE("T1Index: reorganize's offset_mapper remaps every live payload") {
   CHECK(idx->put(to_span("a"), 10) == TestIndex::PutResult::Applied);
   CHECK(idx->put(to_span("b"), 20) == TestIndex::PutResult::Applied);
 
-  idx->reorganize(per_entry_offset_mapper(
-      [](uint64_t payload, uint64_t /*hash*/, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
-        return {payload + 1000, generation};
-      }));
+  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload + 1000; }));
 
   CHECK(idx->get(to_span("a")) == 1010U);
   CHECK(idx->get(to_span("b")) == 1020U);
@@ -161,8 +156,7 @@ TEST_CASE("T1Index: reorganize's chk_writer sees exactly the merged, sorted, off
 
   std::vector<TestIndex::EntrySnapshot> observed;
   idx->reorganize(
-      per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                  -> std::pair<uint64_t, uint64_t> { return {payload + 100, generation}; }),
+      per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload + 100; }),
       [&](std::span<const TestIndex::EntrySnapshot> merged) { observed.assign(merged.begin(), merged.end()); });
 
   REQUIRE(observed.size() == 2);
@@ -208,8 +202,7 @@ TEST_CASE("T1Index: concurrent put/get_with_hash/append_size/live_bytes survive 
 
   std::thread reorganizer([&]() {
     while (!stop.load(std::memory_order_relaxed)) {
-      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                                  -> std::pair<uint64_t, uint64_t> { return {payload, generation}; }));
+      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
       reorganize_count.fetch_add(1, std::memory_order_relaxed);
     }
   });
@@ -259,10 +252,10 @@ TEST_CASE("T1Index: concurrent put/get_with_hash/append_size/live_bytes survive 
 // entry against an append-region entry for the same key by comparing raw EntrySnapshot::hash,
 // which missed an inline<->non-inline transition and let a put() racing resolve()'s
 // "immutable-region bypass" (inserts a *new* active-region entry instead of updating the frozen
-// one in place, to avoid a Lost Update) create two live entries for the same key. Fix: every
-// entry now carries the T2 generation its offset was resolved against (SortedSlot::generation /
-// AppendSlot::generation), so a bypass-inserted entry surviving into a later reorganize() cycle
-// is examined against the right generation instead of assuming the current one.
+// one in place, to avoid a Lost Update) create two live entries for the same key. Fixed by
+// comparing *clean* hash instead (t1_detail::kCleanHashMask strips the inline-metadata bits an
+// inline<->non-inline transition changes), so both sides of the transition are recognized as the
+// same logical key.
 struct TinyInlineConfig : vmemkv::Config<vmemkv::T1InlineValue> {
   static constexpr size_t T1AppendCapacityLog2 = 8;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
@@ -282,13 +275,12 @@ TEST_CASE(
   std::atomic<bool> reorg1_entered_offset_mapper{false};
   std::atomic<bool> proceed{false};
   std::thread reorg1([&] {
-    idx->reorganize(per_entry_offset_mapper(
-        [&](uint64_t payload, uint64_t /*hash*/, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
-          reorg1_entered_offset_mapper.store(true, std::memory_order_release);
-          reorg1_entered_offset_mapper.notify_all();
-          proceed.wait(false, std::memory_order_acquire);
-          return {payload, generation};
-        }));
+    idx->reorganize(per_entry_offset_mapper([&](uint64_t payload, uint64_t /*hash*/) {
+      reorg1_entered_offset_mapper.store(true, std::memory_order_release);
+      reorg1_entered_offset_mapper.notify_all();
+      proceed.wait(false, std::memory_order_acquire);
+      return payload;
+    }));
   });
 
   reorg1_entered_offset_mapper.wait(false, std::memory_order_acquire);
@@ -309,8 +301,7 @@ TEST_CASE(
   // correctly recognizes them as the same logical key.
   std::vector<InlineTestIndex::EntrySnapshot> merged_out;
   idx->reorganize(
-      per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                  -> std::pair<uint64_t, uint64_t> { return {payload, generation}; }),
+      per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }),
       [&](std::span<const InlineTestIndex::EntrySnapshot> merged) { merged_out.assign(merged.begin(), merged.end()); });
 
   const auto k_prefix = t1_detail::prefix_from_bytes(to_span("k"));
@@ -336,8 +327,7 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
   }
   // Moves every key into sorted_region, so put()'s in-place update reaches store_hash() on a
   // SortedSlot -- the path under test.
-  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                              -> std::pair<uint64_t, uint64_t> { return {payload, generation}; }));
+  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
   REQUIRE(idx->append_size() == 0);
 
   std::atomic<bool> stop{false};
@@ -345,8 +335,7 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
 
   std::thread reorganizer([&]() {
     while (!stop.load(std::memory_order_relaxed)) {
-      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                                  -> std::pair<uint64_t, uint64_t> { return {payload, generation}; }));
+      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
       reorganize_count.fetch_add(1, std::memory_order_relaxed);
     }
   });
@@ -393,19 +382,15 @@ TEST_CASE("T1Index: dedicated single writer per key survives racing reorganize w
   for (int i = 0; i < key_count; ++i) {
     REQUIRE(idx->put(to_span("k" + std::to_string(i)), 0) == TestIndex::PutResult::Applied);
   }
-  idx->reorganize(
-      per_entry_offset_mapper([](uint64_t payload, uint64_t, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
-        return {payload, generation};
-      }));
+  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t) { return payload; }));
 
   std::atomic<bool> stop{false};
   std::thread reorganizer([&]() {
     while (!stop.load(std::memory_order_relaxed)) {
-      idx->reorganize(
-          per_entry_offset_mapper([](uint64_t payload, uint64_t, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-            return {payload, generation};
-          }));
+      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        return payload;
+      }));
     }
   });
 
@@ -458,13 +443,12 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
     std::atomic<bool> reorg1_entered_offset_mapper{false};
     std::atomic<bool> proceed{false};
     std::thread reorg1([&] {
-      idx->reorganize(per_entry_offset_mapper(
-          [&](uint64_t payload, uint64_t /*hash*/, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
-            reorg1_entered_offset_mapper.store(true, std::memory_order_release);
-            reorg1_entered_offset_mapper.notify_all();
-            proceed.wait(false, std::memory_order_acquire);
-            return {payload, generation};
-          }));
+      idx->reorganize(per_entry_offset_mapper([&](uint64_t payload, uint64_t /*hash*/) {
+        reorg1_entered_offset_mapper.store(true, std::memory_order_release);
+        reorg1_entered_offset_mapper.notify_all();
+        proceed.wait(false, std::memory_order_acquire);
+        return payload;
+      }));
     });
     reorg1_entered_offset_mapper.wait(false, std::memory_order_acquire);
 
@@ -499,62 +483,11 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
 
     std::vector<TestIndex::EntrySnapshot> merged_out;
     idx->reorganize(
-        per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                    -> std::pair<uint64_t, uint64_t> { return {payload, generation}; }),
+        per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }),
         [&](std::span<const TestIndex::EntrySnapshot> merged) { merged_out.assign(merged.begin(), merged.end()); });
 
     const auto hot_prefix = t1_detail::prefix_from_bytes(to_span(hot_key));
     const auto count_for_hot = std::ranges::count(merged_out, hot_prefix, &TestIndex::EntrySnapshot::key);
     CHECK(count_for_hot == 1);
   }
-}
-
-// Deterministic regression test for a T1Index::reorganize()-level property: an entry that lands in
-// the fresh post-freeze active region during one reorganize() call is not part of that call's
-// `merged`, and survives -- still stamped with whatever generation it was written under -- into
-// whatever's active when the call returns. A *second* reorganize() call that then examines this
-// entry sees it paired with its original, now possibly-stale generation, not whatever generation
-// that second call itself was invoked with.
-//
-// Not reachable from vmemkv_impl.hpp's checkpoint_internal(), which calls
-// t1_.reorganize() exactly once per rebuild cycle, only after T2FlatFile::stop_writers_and_wait()
-// has already guaranteed no new T2-append-backed entry can appear. The property remains true and
-// worth guarding here purely as T1Index's own contract, verified in isolation via reorganize()'s
-// post_freeze_hook (a test-only seam) to land a fresh entry in the post-freeze active region on
-// demand, then simulating a generation bump before the next reorganize() examines it.
-TEST_CASE(
-    "T1Index: an entry inserted right after reorganize()'s freeze can still be examined by a "
-    "later cycle stamped with a T2 generation the caller has already moved past") {
-  auto idx = make_index();
-  constexpr uint64_t kGenBeforeRebuild = 5;  // Whatever T2 generation is current when "k" lands.
-  constexpr uint64_t kGenAfterRebuild = 6;   // The generation a caller's rebuild then produces.
-
-  // Pass 1: post_freeze_hook fires right after the freeze, landing "k" in the fresh post-freeze
-  // active region -- like a concurrent write racing this reorg's freeze in production.
-  idx->reorganize(
-      per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/, uint64_t generation)
-                                  -> std::pair<uint64_t, uint64_t> { return {payload, generation}; }),
-      [](auto) {},
-      kGenBeforeRebuild,
-      [&] { REQUIRE(idx->put(to_span("k"), 111, false, 0, kGenBeforeRebuild) == TestIndex::PutResult::Applied); });
-  REQUIRE(idx->append_size() == 1);  // "k" is live in the active region, untouched by pass 1.
-
-  // A second reorganize() call is where this would surface -- "k" is still paired with
-  // kGenBeforeRebuild going into it, regardless of what generation that second call itself runs
-  // under.
-  uint64_t observed_generation = 0;
-  std::vector<TestIndex::EntrySnapshot> merged_out;
-  idx->reorganize(
-      per_entry_offset_mapper(
-          [&](uint64_t payload, uint64_t /*hash*/, uint64_t generation) -> std::pair<uint64_t, uint64_t> {
-            observed_generation = generation;
-            return {payload, kGenAfterRebuild};
-          }),
-      [&](std::span<const TestIndex::EntrySnapshot> merged) { merged_out.assign(merged.begin(), merged.end()); },
-      kGenAfterRebuild);
-
-  REQUIRE(merged_out.size() == 1);
-  // The gap: the caller believes it's pairing this read against kGenAfterRebuild, but "k"'s own
-  // stamp is still kGenBeforeRebuild.
-  CHECK(observed_generation == kGenBeforeRebuild);
 }

@@ -11,9 +11,9 @@ This document outlines the roadmap to implement the full, robust architecture of
   - If a Swap file is not configured or fails validation under memory-constrained environments, raise an initialization warning/error or exit gracefully.
 
 ## 5. Scan-side offset-order read reordering (no storage compaction)
-* **Status**: 🔴 **Not Implemented** -- live again now that `defragment()` is a no-op (see
-  `docs/specification/defragment_redesign_proposal.md`); it was the codebase's only implemented
-  mitigation for key-order/physical-offset decorrelation, and it no longer reclaims anything.
+* **Status**: 🔴 **Not Implemented** -- higher priority now that `defragment()` has been removed
+  entirely (round 3; see `docs/specification/defragment_redesign_proposal.md`). No mechanism in
+  the codebase mitigates key-order/physical-offset decorrelation at all anymore.
 * **Idea**: Scan already reads in bounded batches. Within one batch, sort the batch's candidates
   by *T2 physical offset* before reading them (instead of T1's key order), then re-sort the
   fetched results back to key order before invoking the caller's callback. No writer-stop, no

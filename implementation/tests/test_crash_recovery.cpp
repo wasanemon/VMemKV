@@ -393,7 +393,6 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
     CHECK(live_count == kInsertCount - kRemoveCount);
 
     store->reorganize();  // T1-only fast path.
-    store->defragment();  // T1-only placeholder (5.2) -- exercised here for survival, not GC.
 
     for (int i = kRemoveCount; i < kInsertCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));

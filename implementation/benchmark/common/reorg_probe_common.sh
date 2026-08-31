@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # reorg_probe_common.sh - Shared driver logic for bench_kv's standalone `--reorg-probe` CLI mode,
-# used by run_reorg_scaling_probe.sh, run_defrag_scaling_probe.sh, run_checkpoint_throughput_probe.sh,
-# and run_maintenance_contention_probe.sh. See each script's header comment for its own experiment;
+# used by run_reorg_scaling_probe.sh, run_checkpoint_throughput_probe.sh, and
+# run_maintenance_contention_probe.sh. See each script's header comment for its own experiment;
 # this file only holds the per-data-point execution/timeout-handling they share.
 
 # Runs one --reorg-probe data point, applies two-tier timeout handling, and appends its JSONL

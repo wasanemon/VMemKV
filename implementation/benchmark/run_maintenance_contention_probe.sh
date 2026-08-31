@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # run_maintenance_contention_probe.sh - Concurrent-write contention spot check for checkpoint()
 # and reorganize() (T1-only), via bench_kv's standalone `--reorg-probe` CLI mode (see
-# bench_kv.cpp's run_checkpoint_contention()/run_reorg_contention()). defragment()'s own
-# contention check already lives in run_defrag_scaling_probe.sh; this script covers the other two
-# maintenance operations so all three can be compared side by side.
+# bench_kv.cpp's run_checkpoint_contention()/run_reorg_contention()).
 #
 # One point per combo per mode (--ratio=1.0, full corpus) -- not a sweep. checkpoint_contention
 # pre-churns the corpus (fixed 0.25 ratio, matching run_checkpoint_throughput_probe.sh's
@@ -13,10 +11,10 @@
 # reorganize() completes in well under a second even at full corpus size (T1-only, in-memory) --
 # short enough that the concurrent-write-TPS window may be dominated by thread start/stop
 # overhead rather than steady-state throughput. Reported as-is; treat with more skepticism than
-# the checkpoint()/defragment() points, which run for seconds.
+# the checkpoint() points, which run for seconds.
 #
 # Not part of the Google Benchmark-registered matrix, for the same reason as
-# run_defrag_scaling_probe.sh: a single, possibly slow blocking call, not a repeatable operation
+# run_reorg_scaling_probe.sh: a single, possibly slow blocking call, not a repeatable operation
 # GB's timing-loop model expects. Reuses this file's own run_probe_point() helper (via
 # common/reorg_probe_common.sh) for two-tier timeout handling.
 set -uo pipefail  # deliberately not -e: probe/timeout exit codes are inspected explicitly below

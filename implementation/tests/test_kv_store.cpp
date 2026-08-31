@@ -383,7 +383,7 @@ TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);
   store->insert("b", 2);
-  store->defragment();
+  store->reorganize();
   CHECK(test_util::get_sync(store, "a") == 1U);
   CHECK(test_util::get_sync(store, "b") == 2U);
   CHECK(store->insert("c", 3));
@@ -443,8 +443,8 @@ TEST_CASE("VMemKV: update after reorganize redirects out-of-place, Scan sees fre
 }
 
 // Stress/regression test: update() (base-region redirect decision) races scan() (base_mmap_scan
-// read path) races repeated checkpoint() (moves base_boundary, swaps T2Memory generations, remaps
-// base_mmap_scan) -- the three-way race the base/tail split's correctness depends on. Run under
+// read path) races repeated checkpoint() (moves base_boundary in place, no remap) -- the
+// three-way race the base/tail split's correctness depends on. Run under
 // ThreadSanitizer for direct race detection; also self-checks independent of TSan, since every
 // value written here is `kStressValueBytes` copies of one repeated character, so a torn read shows
 // up directly as a non-uniform byte value.
@@ -541,7 +541,7 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
   CHECK(store->impl().t2().get_memory()->base_mmap_scan_seq != nullptr);
   CHECK(store->impl().t2().get_memory()->read_fd >= 0);
 
-  // Insert more, then checkpoint again -- a fresh T2Memory generation every cycle.
+  // Insert more, then checkpoint again -- base_boundary advances further in place.
   for (int i = 10; i < 20; ++i) {
     REQUIRE(store->insert(padded_key(i), value));
   }
@@ -564,10 +564,10 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
   }
 }
 
-// Stress/regression test: update()'s in-place path racing repeated checkpoint() cycles, entered
-// via the checkpoint() API specifically (as opposed to the "...repeated reorganize (stress)"
-// test above, which uses defragment()) -- this exercises checkpoint_internal()'s own
-// append-quiescence/msync machinery through a second public entry point.
+// Stress/regression test: update()'s in-place path racing repeated checkpoint() cycles -- a
+// narrower companion to the "concurrent update+scan survive repeated checkpoint (stress)" test
+// above, isolating checkpoint_internal()'s append-quiescence/msync machinery from that test's
+// added scan-path race.
 //
 // Deliberately bounded (kOpsPerCycle updates/scans per cycle, spawned and joined once per
 // checkpoint() call) rather than free-spinning update/scan threads for the whole test duration:
@@ -650,17 +650,16 @@ TEST_CASE(
 }
 
 // Edge case: checkpoint() called on a store that has never had a single insert (append_size()==0,
-// bytes_used()==0 at rebuild time). Per checkpoint()'s no_t2_checkpoint_yet fallback this still
-// forces a full rebuild -- mmap_t2_memory() must establish a real (non-null) base_mmap_scan and
-// a real (>=0) read_fd even though bytes_used==0 at that moment, or the incremental-promotion
-// mechanism above would never have anything to extend for a store built this way (see
-// mmap_t2_memory()'s comment for why the earlier `if (bytes_used > 0)` guard was removed).
+// bytes_used()==0 at checkpoint time). T2FlatFile's constructor unconditionally establishes a
+// real (non-null) base_mmap_scan and a real (>=0) read_fd regardless of bytes_used, so those
+// mappings exist even for a store built this way -- the incremental-promotion mechanism above
+// always has something to extend, never a null mapping to special-case.
 TEST_CASE("VMemKV: checkpoint() on an empty store still establishes base_mmap_scan/read_fd") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
-  store->checkpoint();  // Forced full rebuild via no_t2_checkpoint_yet, with zero live entries.
+  store->checkpoint();  // No-op promotion: zero live entries, base_boundary stays at 0.
   CHECK(store->impl().t2().get_memory()->base_mmap_scan != nullptr);
   CHECK(store->impl().t2().get_memory()->base_mmap_scan_seq != nullptr);
   CHECK(store->impl().t2().get_memory()->read_fd >= 0);
@@ -982,100 +981,6 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
 // property is covered deterministically in test_t1_index.cpp and under load by
 // reorganize_internal()'s stress-harness verification.
 
-// Regression test: scan_impl() used to acquire one T2MemoryHandle up front and hold it for the
-// whole scan, but a concurrent defragment() publishes a fresh T2Memory generation partway
-// through -- later T1 offsets could belong to a newer generation than that handle protects,
-// causing out-of-bounds reads or an infinite seqlock retry loop. Fixed by stamping every T1
-// sorted_snapshot_ with the T2Memory generation it was built against and validating the pair on
-// every read. Reaching the final CHECK without hanging is this test's primary assertion.
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("VMemKV: scan survives a concurrent defragment() call (regression)") {
-  using TestStore = vmemkv::variants::VMemKVStore;
-  auto store = StoreFactory<TestStore>::make();
-
-  constexpr int kKeyCount = 2000;
-  // Large enough that every config (including T1InlineValue) resolves it through a real T2
-  // record rather than an inline payload -- the inline path never touches T2 at all, so it
-  // wouldn't exercise the race this test targets.
-  const std::string big_value(200, 'v');
-  auto key_for = [](int index) {
-    const std::string digits = std::to_string(index);
-    return "k" + std::string(4 - digits.size(), '0') + digits;
-  };
-  for (int i = 0; i < kKeyCount; ++i) {
-    REQUIRE(store->insert(key_for(i), big_value));
-  }
-
-  std::atomic<bool> stop{false};
-  std::thread reorganizer([&] {
-    while (!stop.load(std::memory_order_relaxed)) {
-      store->defragment();
-    }
-  });
-
-  constexpr int kScannerThreadCount = 4;
-  constexpr int kScansPerThread = 30;
-  std::atomic<bool> count_mismatch{false};
-  std::vector<std::thread> scanners;
-  scanners.reserve(kScannerThreadCount);
-  for (int t = 0; t < kScannerThreadCount; ++t) {
-    scanners.emplace_back([&] {
-      for (int i = 0; i < kScansPerThread; ++i) {
-        const size_t count =
-            store->scan("k0000", "k9999", [](std::span<const std::byte>, std::span<const std::byte>) {});
-        // checkpoint() never adds or removes a key, so every scan should see exactly kKeyCount
-        // entries throughout, regardless of how many checkpoints raced it.
-        if (count != static_cast<size_t>(kKeyCount)) {
-          count_mismatch.store(true, std::memory_order_relaxed);
-        }
-      }
-    });
-  }
-  for (auto &scanner : scanners) {
-    scanner.join();
-  }
-  stop.store(true, std::memory_order_relaxed);
-  reorganizer.join();
-
-  CHECK_FALSE(count_mismatch.load());
-}
-
-// Stress/regression test: repeated concurrent defragment() calls racing an in-place update must
-// never corrupt data or grow T2 capacity. Best run under ThreadSanitizer, which detects a data
-// race directly; the capacity check below is a coarser signal for plain builds.
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("VMemKV: concurrent defragment() calls survive a racing in-place update (regression)") {
-  using TestStore = vmemkv::variants::VMemKVStore;
-  constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
-  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
-
-  // 200B: forces a real (non-inline) T2 record; same-size updates stay in the in-place path.
-  const std::string value(200, 'v');
-  REQUIRE(store->insert("hot", value));
-
-  std::atomic<bool> stop{false};
-  std::thread updater([&] {
-    uint64_t i = 0;
-    while (!stop.load(std::memory_order_relaxed)) {
-      std::string next_value(200, static_cast<char>('a' + (i++ % 26)));
-      CHECK(store->update("hot", next_value));
-    }
-  });
-
-  constexpr int kReorgCycles = 300;
-  for (int i = 0; i < kReorgCycles; ++i) {
-    store->defragment();
-  }
-  stop.store(true, std::memory_order_relaxed);
-  updater.join();
-
-  CHECK(store->t2().bytes_capacity() <= kStoreCapacityBytes);
-
-  const auto final_value = test_util::get_bytes_sync(store, "hot");
-  REQUIRE(final_value.has_value());
-  CHECK(final_value->size() == value.size());
-}
-
 // Regression tests for the formerly-open "torn read via user callback" bug:
 // get_impl()/scan_impl() used to invoke the caller-supplied callback directly from inside
 // read_t2_record_seqlock()'s copy_func, handing it a std::span into T2Memory::base -- live,
@@ -1085,7 +990,7 @@ TEST_CASE("VMemKV: concurrent defragment() calls survive a racing in-place updat
 // discarded attempt. Fixed by having copy_func only copy into an owned buffer and invoking the
 // callback after read_t2_record_seqlock() returns (see get_impl()/scan_impl()'s own comments).
 //
-// Deliberately no reorganize()/checkpoint()/defragment() anywhere in either test below: unlike
+// Deliberately no reorganize()/checkpoint() anywhere in either test below: unlike
 // the writer-stop-barrier/residual-window tests elsewhere in this file, this race needed nothing but
 // plain concurrent update()+scan() (or update()+get()) on a single key -- proving the fix holds
 // even in that minimal case is the point.
@@ -1232,43 +1137,35 @@ TEST_CASE(
   CHECK_FALSE(torn_read_found.load());
 }
 
-// Regression test for reorganize_internal()'s formerly-open "residual window" race: even with
-// its pre/post-stop scan passes and final pre-swap_memory() gate, a writer used to be able to
-// land a fresh entry into T1's active region during the truncate()/open()/mmap()/swap_memory()
-// syscalls. That entry would surface one cycle later, when the *next* reorganize() examined it:
-// its stamped generation still named the T2Memory the previous cycle's swap_memory() had just
-// retired, but offset_mapper resolved it against whatever T2Memory was live at that point --
-// either a crash, a hang (read_t2_record_seqlock spinning on a version field that never
-// settles), or silently wrong data.
+// Regression test for checkpoint_internal()'s "residual window" race: a writer must never be
+// able to land a fresh T2 append past the frontier a concurrently-running checkpoint is about to
+// capture as `target`/`base_boundary`.
 //
-// Fixed in t2_flat_file.hpp by pairing acquire_write_handle() (write_entry_lockfree()'s only way
+// Closed in t2_flat_file.hpp by pairing acquire_write_handle() (write_entry_lockfree()'s only way
 // to get a T2 write handle, held across both the T2 append and the T1 publish attempt) with
-// stop_writers_and_wait() (called here right before the post-stop scan pass): it marks the
-// still-live generation stopped-for-writers, so acquire_write_handle() stops handing it to *new*
-// callers, then blocks until every writer that already held a handle -- i.e. started before the
-// flag went up -- has released it, which only happens after that writer's T1 publish attempt has
-// returned.
+// stop_writers_and_wait() (called here right before the target is captured): it marks writes
+// stopped, so acquire_write_handle() stops handing out new handles, then blocks until every
+// writer that already held a handle -- i.e. started before the flag went up -- has released it,
+// which only happens after that writer's T1 publish attempt has returned.
 //
 // This test proves exactly that handshake, deterministically, using a real writer thread (not a
-// synchronous hook simulating the old race, which would now just deadlock: by the time
-// pre_finish_hook fires, writer_stop_ is already true, and nothing but this same call's own later
-// swap_memory()/resume_writers() would ever clear it -- a hook-spawned writer would spin forever
-// waiting for a flag its own spawning call is blocking on). Instead, pre_stop_hook fires *before*
-// the stop flag goes up, spawning a thread that registers a real T2MemoryHandle to the
-// about-to-be-retired generation and pauses briefly before publishing -- exercising the "writer
-// already in flight when the stop starts" case that used to be lost. stop_writers_and_wait() must
-// block until this thread finishes, and this *same* cycle's post-stop scan pass must then pick
-// its entry up -- unlike the old design, there is no separate "next cycle" where a stale
-// generation could ever surface.
+// synchronous hook simulating the race, which would deadlock: by the time pre_finish_hook fires,
+// writer_stop_ is already true, and nothing but this same call's own later resume_writers() would
+// ever clear it -- a hook-spawned writer would spin forever waiting for a flag its own spawning
+// call is blocking on). Instead, pre_stop_hook fires *before* the stop flag goes up, spawning a
+// thread that registers a real T2MemoryHandle and pauses briefly before publishing -- exercising
+// the "writer already in flight when the stop starts" case. stop_writers_and_wait() must block
+// until this thread finishes, and this *same* cycle's captured target must then already cover its
+// entry -- reading it back must work immediately, no second cycle needed.
 TEST_CASE(
-    "VMemKV: rebuild's writer-stop barrier waits for an in-flight writer instead of retiring "
-    "its generation underneath it (regression)") {
+    "VMemKV: checkpoint's writer-stop barrier waits for an in-flight writer instead of "
+    "capturing a frontier underneath it (regression)") {
   using TestStore = vmemkv::variants::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
   // 200B: forces a real T2 record even under T1InlineValue (an inline payload never touches T2,
-  // so wouldn't reach the generation comparison this test targets).
+  // so wouldn't reach the write-handle registration this test targets).
   const std::string baseline_value(200, 'v');
   REQUIRE(store->insert("baseline", baseline_value));
 
@@ -1276,8 +1173,7 @@ TEST_CASE(
   std::thread straggler_writer;
 
   // pre_stop_hook fires strictly before the stop flag goes up, so the spawned thread's
-  // acquire_write_handle() call is guaranteed to land against the still-current
-  // (about-to-be-retired) generation, registering it with the reference tracker before
+  // acquire_write_handle() call is guaranteed to register with the reference tracker before
   // stop_writers_and_wait() ever scans it.
   using ImplT_1287 = std::decay_t<decltype(store->impl())>;
   store->impl().reorganize_internal(
@@ -1287,9 +1183,9 @@ TEST_CASE(
         using ImplT = ImplT_1287;
         straggler_writer = std::thread([&] {
           vmemkv::T2FlatFile::T2MemoryHandle mem = store->impl().t2().acquire_write_handle();
-          // Simulates being "mid-write": long enough that, absent the stop-and-wait, the rebuild
-          // would very likely have already retired this generation by the time this thread
-          // publishes.
+          // Simulates being "mid-write": long enough that, absent the stop-and-wait, the
+          // checkpoint would very likely have already captured its target by the time this
+          // thread publishes.
           std::this_thread::sleep_for(std::chrono::milliseconds(20));
           kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
             kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
@@ -1297,13 +1193,8 @@ TEST_CASE(
               uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_bytes.size() + val_bytes.size());
               uint64_t block_count = aligned_len / ImplT::kBlockAlignment;
               uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
-              REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0, mem->generation) ==
+              REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0) ==
                       ImplT::T1IndexT::PutResult::Applied);
-              // write_entry_lockfree() would also record this into tail_entries_ -- do the same
-              // here since this injection bypasses that function to construct the scenario
-              // directly. Must land before `mem` releases below, same as write_entry_lockfree()'s
-              // own ordering requirement.
-              store->impl().record_tail_entry_for_test(key_bytes);
             });
           });
           // mem released here -- only now can stop_writers_and_wait() (blocked on this exact
@@ -1312,8 +1203,8 @@ TEST_CASE(
       });
   straggler_writer.join();
 
-  // This same rebuild cycle's post-stop scan pass must have picked up "straggler" and relocated
-  // it with the new generation -- reading it back must work immediately, no second cycle needed.
+  // This same checkpoint cycle's captured target must already cover "straggler" -- reading it
+  // back must work immediately, no second cycle needed.
   const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
   REQUIRE(straggler_readback.has_value());
   CHECK(straggler_readback->size() == straggler_value.size());
@@ -1325,9 +1216,9 @@ TEST_CASE(
 // ThreadReferenceTracker::wait_until_retired()'s single index-ordered scan (it never re-examines
 // a slot once past it) could race -- a writer whose check saw the flag false, but who hadn't
 // registered yet, could still be missed by an already-in-progress scan, so the stop-and-wait
-// could complete and the writer would go on to write into a generation this same cycle no longer
-// recognizes. Fixed by registering first and only then checking the flag, retrying if it turns
-// out to already be true.
+// could complete and the writer would go on to append past the frontier this same cycle just
+// captured. Fixed by registering first and only then checking the flag, retrying if it turns out
+// to already be true.
 //
 // Reproduces the adversarial timing deterministically via acquire_write_handle()'s hook seam
 // (fires once, right after registering and before the writer_stop_ check): the writer thread
@@ -1335,9 +1226,9 @@ TEST_CASE(
 // stop_writers_and_wait() (called on the main thread right after pre_stop_hook returns) sets
 // writer_stop_=true and starts scanning while this thread is still paused, already registered but
 // not yet having checked the flag. Under the fix, the writer's own check must then see
-// writer_stop_==true and back out/retry rather than proceed with a handle that might be to an
-// about-to-retire generation -- exactly the guarantee the old check-then-register order could not
-// make.
+// writer_stop_==true and back out/retry rather than proceed with a handle that might land past
+// the frontier this same cycle already captured -- exactly the guarantee the old check-then-register
+// order could not make.
 TEST_CASE(
     "VMemKV: acquire_write_handle()'s register-then-check-retry survives a writer racing the "
     "writer-stop scan (regression)") {
@@ -1385,13 +1276,8 @@ TEST_CASE(
               uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_bytes.size() + val_bytes.size());
               uint64_t block_count = aligned_len / ImplT::kBlockAlignment;
               uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
-              REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0, mem->generation) ==
+              REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0) ==
                       ImplT::T1IndexT::PutResult::Applied);
-              // write_entry_lockfree() would also record this into tail_entries_ -- do the same
-              // here since this injection bypasses that function to construct the scenario
-              // directly. Must land before `mem` releases below, same as write_entry_lockfree()'s
-              // own ordering requirement.
-              store->impl().record_tail_entry_for_test(key_bytes);
             });
           });
         });
@@ -1410,17 +1296,11 @@ TEST_CASE(
   CHECK(straggler_readback->size() == straggler_value.size());
 }
 
-// Regression test for a design this codebase used to have: an earlier version of
-// checkpoint_internal() published T1's new generation incrementally, mid-rebuild,
-// before T2 was ready. An exception there (e.g. from truncate()/mmap() under real
-// ENOSPC/EMFILE/ENOMEM pressure) could leave a T1 entry permanently naming a T2 generation that
-// would never be published, hanging get()/update() on that key forever inside
-// try_in_place_update()'s/get_impl()'s `mem->generation < res.generation` retry loop --
-// reproduced via fault injection during that redesign, which is what motivated moving T1's
-// publish to a single, I/O-free call at the very end (see checkpoint_internal()'s own
-// comment). This test proves the current design instead: injecting a fault at the last possible
-// moment before T1 could ever be touched (NoOpPreFinishHook's seam) still leaves the store fully
-// functional afterward -- no hang, correct data, and a subsequent checkpoint() succeeds normally.
+// Regression test: checkpoint_internal() publishes T1 via a single, I/O-free call at the very
+// end (see checkpoint_internal()'s own comment). This test injects a fault at the last possible
+// moment before T1 could ever be touched (NoOpPreFinishHook's seam) and confirms the store is
+// still fully functional afterward -- no hang, correct data, and a subsequent checkpoint()
+// succeeds normally.
 TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the store fully usable") {
   using TestStore = vmemkv::variants::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;

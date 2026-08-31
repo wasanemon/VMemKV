@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -1028,8 +1029,8 @@ static auto make_bench_fresh_corpus(const std::string &filename, std::size_t val
 // once per (variant, val_size), no matter which scenario happens to trigger it first. For rival
 // backends, this is exactly make_bench_fresh_corpus() above (already clone-based for them
 // regardless of which reorganize-state concept applies, since they have none). base_mmap is
-// (re-)established by mmap_t2_memory() on every full T2 rebuild *and* on every fresh construction
-// from an existing checkpoint (see load_checkpoint_if_present()), so this one shared,
+// established unconditionally by T2FlatFile's constructor on every fresh construction, including
+// one that adopts an existing checkpoint (see load_checkpoint_if_present()), so this one shared,
 // checkpoint-cloned master already carries it for every VMemKV variant.
 template <typename Store>
 static auto make_bench_fresh_corpus_checkpoint(const std::string &filename,
@@ -1831,7 +1832,7 @@ namespace reorg_probe {
 
 constexpr int kReorgTimeoutSecondsDefault = 60;
 
-// Overridable so a single-call reorganize()/checkpoint()/defragment() timeout can be tightened for
+// Overridable so a single-call reorganize()/checkpoint() timeout can be tightened for
 // a specific experiment (e.g. a 30s checkpoint_contention comparison) without changing the default
 // used everywhere else this timeout applies.
 static inline int reorg_timeout_seconds() {
@@ -1849,8 +1850,6 @@ enum class ProbeMode {
   kT1Only,
   kT1T2,
   kT1T2Steady,
-  kDefrag,
-  kDefragContention,
   kCheckpointContention,
   kReorgContention,
 };
@@ -1862,9 +1861,6 @@ struct ProbeArgs {
   double ratio = 1.0;
   double churn_ratio = 0.0;
   std::string sweep_tag = "default";
-  // 0 = auto (min(hardware_concurrency(), 32), the historical default); lets
-  // run_contention_probe()'s writer thread count be pinned explicitly instead.
-  std::size_t writer_threads = 0;
 };
 
 [[noreturn]] void fail(const std::string &msg) {
@@ -1915,10 +1911,6 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
         args.mode = ProbeMode::kT1T2;
       } else if (value == "t1t2_steady") {
         args.mode = ProbeMode::kT1T2Steady;
-      } else if (value == "defrag") {
-        args.mode = ProbeMode::kDefrag;
-      } else if (value == "defrag_contention") {
-        args.mode = ProbeMode::kDefragContention;
       } else if (value == "checkpoint_contention") {
         args.mode = ProbeMode::kCheckpointContention;
       } else if (value == "reorg_contention") {
@@ -1933,16 +1925,13 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
       args.churn_ratio = std::stod(std::string(value));
     } else if (key == "--sweep-tag") {
       args.sweep_tag = std::string(value);
-    } else if (key == "--writer-threads") {
-      args.writer_threads = static_cast<std::size_t>(std::stoul(std::string(value)));
     }
   }
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
-        "--mode=<t1only|t1t2|t1t2_steady|defrag|defrag_contention|checkpoint_contention|"
-        "reorg_contention> "
-        "--ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>] [--writer-threads=<N>]");
+        "--mode=<t1only|t1t2|t1t2_steady|checkpoint_contention|reorg_contention> "
+        "--ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>]");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
     fail("--ratio must be in (0.0, 1.0]");
@@ -1994,12 +1983,6 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     case ProbeMode::kT1T2Steady:
       mode_name = "t1t2_steady";
       break;
-    case ProbeMode::kDefrag:
-      mode_name = "defrag";
-      break;
-    case ProbeMode::kDefragContention:
-      mode_name = "defrag_contention";  // Unreachable: this mode reports via its own print, below.
-      break;
     case ProbeMode::kCheckpointContention:
       mode_name = "checkpoint_contention";  // Unreachable: this mode reports via its own print, below.
       break;
@@ -2020,14 +2003,13 @@ static std::string reorg_probe_path(const ProbeArgs &args, const std::string &su
          suffix;
 }
 
-static std::size_t resolve_writer_threads(std::size_t override_threads) {
-  return override_threads != 0 ? override_threads
-                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+static std::size_t resolve_writer_threads() {
+  return std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 }
 
 // Samples `churn_count` random indices in [0, key_count) and update()s each, sharded across up
-// to 16 threads. Shared setup shape for run_steady()/run_defrag()/run_checkpoint_contention()'s
-// kUpdateCold pre-churn.
+// to 16 threads. Shared setup shape for run_steady()/run_checkpoint_contention()'s kUpdateCold
+// pre-churn.
 static void apply_random_churn(vmemkv::variants::VMemKVStore &store,
                                std::size_t key_count,
                                std::size_t churn_count,
@@ -2160,46 +2142,7 @@ static void apply_random_churn(vmemkv::variants::VMemKVStore &store,
   report_and_exit(args, key_count, elapsed_sec, timed_out);
 }
 
-// Defrag mode: a single fresh populate, one checkpoint() to establish a realistic pre-defragment
-// state, optional churn (--churn-ratio, same multi-threaded application as run_steady() above),
-// then exactly one timed defragment() call. Two sweeps share this same mode: fixed churn_ratio=0,
-// varying --ratio ("corpus-size scaling") and fixed --ratio=1.0, varying --churn-ratio
-// ("churn-ratio invariance") -- see run_defrag_scaling_probe.sh.
-//
-// defragment_internal() is currently a bookkeeping-only no-op (see its own comment in
-// vmemkv_impl.hpp): it completes in ~O(1) regardless of corpus/churn, so this mode's
-// corpus-size-scaling and churn-ratio-invariance signals are currently degenerate (a flat,
-// near-zero elapsed_sec at every point). Kept as-is for when relocation logic returns.
-[[noreturn]] void run_defrag(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-
-  const std::string path = reorg_probe_path(args,
-                                            "defrag_" + std::to_string(static_cast<int>(args.ratio * 100)) + "_" +
-                                                std::to_string(static_cast<int>(args.churn_ratio * 100)));
-
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  populate_random_order(*store, {key_count, args.val_size});
-  store->checkpoint();
-
-  if (args.churn_ratio > 0.0) {
-    const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * args.churn_ratio));
-    apply_random_churn(
-        *store,
-        key_count,
-        churn_count,
-        kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000) + static_cast<uint64_t>(args.churn_ratio * 1000000),
-        args.val_size);
-  }
-
-  auto [elapsed_sec, timed_out] = timed_run([&store]() { store->defragment(); });
-  report_and_exit(args, key_count, elapsed_sec, timed_out);
-}
-
-// Shared by run_checkpoint_contention()/run_defrag_contention()/run_reorg_contention(): measures
+// Shared by run_checkpoint_contention()/run_reorg_contention(): measures
 // how much concurrent write throughput degrades while `run_operation` executes, and the
 // operation's own duration under that contention. Two phases: an isolated write-TPS baseline
 // (fixed op count per thread, no concurrent maintenance operation), and a concurrent phase where
@@ -2209,7 +2152,7 @@ static void apply_random_churn(vmemkv::variants::VMemKVStore &store,
 // own JSON field name for the timed duration) already did whatever corpus setup (populate/
 // checkpoint/churn) is appropriate for that operation before calling this.
 //
-// `min_wall_seconds` (default 0: exactly one call, unchanged for checkpoint()/defragment()):
+// `min_wall_seconds` (default 0: exactly one call, unchanged for checkpoint()):
 // for an operation fast enough that one call's wall-clock window is comparable to writer-thread
 // scheduling jitter (T1-only reorganize(), sub-10ms even at full corpus), a single-call
 // concurrent_write_tps sample is dominated by that jitter rather than any real effect. Passing a
@@ -2236,12 +2179,10 @@ auto run_contention_probe(Store &store,
                           uint32_t val_size,
                           OperationFn &&run_operation,
                           double min_wall_seconds = 0.0,
-                          std::size_t writer_threads_override = 0,
+                          std::size_t writer_threads = 0,
                           WriteWorkload workload = WriteWorkload::kUpdateExisting)
     -> std::tuple<double, double, double, bool> {
-  const std::size_t writer_threads =
-      writer_threads_override != 0 ? writer_threads_override
-                                   : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+  assert(writer_threads != 0 && "callers must pass an already-resolved thread count (see resolve_writer_threads())");
 
   // Shared across every writer thread and both phases (A then B) so kInsertFresh never reuses a
   // key within one run_contention_probe() call, regardless of how many total ops end up issued.
@@ -2347,44 +2288,6 @@ static void print_contention_result(const ProbeArgs &args,
             << "\":" << op_elapsed_sec << "," << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
 }
 
-// Defrag-contention mode: same populate+checkpoint setup as run_defrag(). --ratio scales corpus
-// size; --churn-ratio is unused here.
-//
-// defragment_internal() is currently a bookkeeping-only no-op (see run_defrag()'s identical
-// note): the concurrent phase's writer-blocking window is now near-zero, so this mode's
-// write-throughput-degradation signal is currently degenerate. Kept as-is for when relocation
-// logic returns.
-[[noreturn]] void run_defrag_contention(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-
-  const std::string path =
-      reorg_probe_path(args, "defragcontention_" + std::to_string(static_cast<int>(args.ratio * 100)));
-
-  const std::size_t resolved_writer_threads = resolve_writer_threads(args.writer_threads);
-
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  populate_random_order(*store, {key_count, args.val_size});
-  store->checkpoint();
-
-  auto [isolated_write_tps, concurrent_write_tps, defrag_elapsed_sec, timed_out] = run_contention_probe(
-      store, key_count, args.val_size, [&store]() { store->defragment(); }, 0.0, resolved_writer_threads);
-
-  print_contention_result(args,
-                          "defrag_contention",
-                          key_count,
-                          resolved_writer_threads,
-                          isolated_write_tps,
-                          concurrent_write_tps,
-                          "defrag_elapsed_sec",
-                          defrag_elapsed_sec,
-                          timed_out);
-  std::_Exit(timed_out ? 124 : 0);
-}
-
 // Checkpoint-contention mode: same populate+checkpoint+pre-churn setup as run_steady()'s
 // t1t2_steady mode (a fixed 0.25 churn ratio -- isolates checkpoint()'s marginal per-record cost
 // from its fixed per-call setup overhead, same reasoning as run_checkpoint_throughput_probe.sh).
@@ -2439,7 +2342,7 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
                                             std::string("checkpointcontention_") + contention_workload_name(workload) +
                                                 "_" + std::to_string(static_cast<int>(args.ratio * 100)));
 
-  const std::size_t resolved_writer_threads = resolve_writer_threads(args.writer_threads);
+  const std::size_t resolved_writer_threads = resolve_writer_threads();
 
   // Suppressed for the whole setup phase below (population + initial checkpoint + optional
   // pre-churn/warm-up), not just population: an auto-triggered checkpoint mid-warm-up would hit
@@ -2511,9 +2414,9 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
   std::_Exit(timed_out ? 124 : 0);
 }
 
-// Reorg-contention mode: same populate+checkpoint setup as run_defrag_contention(). reorganize()
-// is T1-only (never touches T2); its cost tracks live key count, same character as
-// defragment()'s corpus-size dependence. --ratio scales corpus size.
+// Reorg-contention mode: same populate+checkpoint setup as run_checkpoint_contention(), minus its
+// pre-churn/workload options. reorganize() is T1-only (never touches T2); its cost tracks live key
+// count. --ratio scales corpus size.
 //
 // Passes min_wall_seconds=1.0 to run_contention_probe(): a single reorganize() call is sub-10ms
 // even at full corpus, too short a window for concurrent_write_tps to reflect anything but writer
@@ -2529,7 +2432,7 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
   const std::string path =
       reorg_probe_path(args, "reorgcontention_" + std::to_string(static_cast<int>(args.ratio * 100)));
 
-  const std::size_t resolved_writer_threads = resolve_writer_threads(args.writer_threads);
+  const std::size_t resolved_writer_threads = resolve_writer_threads();
 
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
@@ -2569,10 +2472,6 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
   }
   if (args.mode == ProbeMode::kT1T2Steady) {
     run_steady(args);
-  } else if (args.mode == ProbeMode::kDefrag) {
-    run_defrag(args);
-  } else if (args.mode == ProbeMode::kDefragContention) {
-    run_defrag_contention(args);
   } else if (args.mode == ProbeMode::kCheckpointContention) {
     run_checkpoint_contention(args);
   } else if (args.mode == ProbeMode::kReorgContention) {

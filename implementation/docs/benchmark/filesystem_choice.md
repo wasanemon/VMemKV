@@ -12,6 +12,10 @@ VMemKVのT2ストレージは`pwrite()`/`fsync()`/`ftruncate()`/`mmap()`/`rename
 
 この結果を受けて`checkpoint_and_defragment()`は廃止し、`checkpoint_internal()`(既存offsetへのin-place `pwrite()`)と`defragment_internal()`(生存データ全件を新規ファイルへ再配置し`rename()`で丸ごと差し替え)に分離した。どちらもreflinkやpunch_holeを一切必要としない。ファイル丸ごとの置き換え(`rename()`)は、パンチのようなブロック粒度の制約を受けずに100%の空間回収ができる。
 
+> **追記**: `defragment_internal()`とその公開API `defragment()`はその後round 3でコードベースから
+> 完全に削除された。現在は`checkpoint_internal()`のみが稼働している。reflink/punch-holeを不要と
+> する本ドキュメントの結論(ext4で十分)自体は変わらない。
+
 ## 現在の方針
 
 - AWSベンチマーク用NVMeフォーマット: `ext4`(`run_bench_aws_c6id.sh`)

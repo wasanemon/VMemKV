@@ -134,24 +134,28 @@ VMemKV が解消したい断片化は 2 種類ある。
 
 - T1の reorganize:
   - `append_region` と `sorted_region` をマージし，ソートすることで Ordering Fragmentation を解消する．このとき，offset が tombstone のエントリ（Delete済みのもの）はスキップする．
-- T2の reorganize(Defragment):
+- T2の reorganize(Defragment、**設計されたが現在はコードベースから削除済み -- 6.3節参照**):
   - T1 の live entry 順に T2 からデータをコピーし，新しい単一 byte array を構築する．
   - コピー先 offset を T1 に書き戻す．
   - これらの処理において，tombstone 化されたエントリは新しい T1 に含まれず，また，参照offsetが切れているT2のrecordはコピーされないため，Storage Fragmentation が解消される．
 
-T1 の reorganize はT2とは独立して実行できる．すなわち，T1の `reorganize()` を高頻度で実施してもよい．Defragment はオフセット（位置）の変更を伴うため，T1の `reorganize` とセットで実行する．この時の並行処理については，6.3節で詳しく述べる．
+T1 の reorganize はT2とは独立して実行でき，高頻度で実施してもよい。
 
 ![reorganize](../images/reorganization.png)
 
 Tier 1 は単独 `reorganize` により ordering fragmentation を軽く抑えられる。
-Tier 2 は Defragment による再配置により storage fragmentation をまとめて解消する。
-また、Tier 1 の順序に従って Tier 2 を並べ直すことで、scan 性能も向上する。
+Tier 2 の storage fragmentation を解消する仕組みは現在存在しない(Defragment、6.3節参照)。
 
 ### 6.2 checkpoint
 
 Tier 2 の稼働中 mmap は `MAP_SHARED` である。書き込みはページキャッシュへ直接反映されるため、checkpoint は tail 領域を `msync()` して物理ディスクへの反映を確定させるだけの、短時間の操作である。新規 append を短く止める以外に停止は発生しない。詳細な手順と正しさの根拠は low_level_design.md 4.3 節・5.3 節を参照。
 
-### 6.3 Defragment
+### 6.3 Defragment [削除済み]
+
+> **現在の状態**: 本節は過去に設計・実装・測定された挙動の記録である。Defragment(`defragment()`/
+> `defragment_internal()`)は round 1 で no-op 化された後、round 3 で API ごとコードベースから
+> 完全に削除された(`defragment_redesign_proposal.md` §8参照)。Tier 2 の storage fragmentation を
+> 解消する仕組みは現在存在しない。以下は将来 Tier 2 再配置が必要になった際の設計参照として残す。
 
 Defragment は Tier 2 の生存データ全件を、T1 の key 順のまま新しい単一 byte array へ再配置し、旧ファイルを置き換える。これを現在使用中のものと差し替えるにあたって、二つの要件がある。
 

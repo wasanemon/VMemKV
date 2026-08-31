@@ -31,20 +31,15 @@ show_help() {
   echo "                   checkpoint()'s steady-state throughput (records/sec, one point per"
   echo "                   combo) on the same instance via run_checkpoint_throughput_probe.sh"
   echo "                   and download its JSONL output."
-  echo "  --defrag-scaling-probe  After the normal matrix, additionally sweep defragment()"
-  echo "                   duration vs. corpus size and churn ratio, plus a concurrent-write"
-  echo "                   contention spot check, on the same instance via"
-  echo "                   run_defrag_scaling_probe.sh and download its JSONL output."
   echo "  --maintenance-contention-probe  After the normal matrix, additionally measure"
   echo "                   concurrent-write contention spot checks for checkpoint() and"
-  echo "                   reorganize() (T1-only) -- defragment()'s own spot check already lives"
-  echo "                   in --defrag-scaling-probe -- on the same instance via"
+  echo "                   reorganize() (T1-only) on the same instance via"
   echo "                   run_maintenance_contention_probe.sh and download its JSONL output."
   echo "  --skip-matrix    Skip the main Google Benchmark-registered CRUD/Scan/YCSB-E matrix"
   echo "                   entirely (and its results download) -- provision/build the instance"
   echo "                   and run only the *-scaling-probe flags passed alongside this one."
   echo "                   For a standalone probe-only run when the matrix has already been"
-  echo "                   measured separately and only a probe (e.g. --defrag-scaling-probe)"
+  echo "                   measured separately and only a probe (e.g. --reorg-scaling-probe)"
   echo "                   is still needed."
   echo "  --without-rivals  Drop RocksDB/RocksDB-BlobDB/LMDB from the benchmark filter, running"
   echo "                   VMemKV variants only. Use for regression-check runs after a"
@@ -58,7 +53,6 @@ SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
 REORG_SCALING_PROBE=false
 CHECKPOINT_THROUGHPUT_PROBE=false
-DEFRAG_SCALING_PROBE=false
 MAINTENANCE_CONTENTION_PROBE=false
 SKIP_MATRIX=false
 WITHOUT_RIVALS=false
@@ -95,10 +89,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --checkpoint-throughput-probe)
       CHECKPOINT_THROUGHPUT_PROBE=true
-      shift
-      ;;
-    --defrag-scaling-probe)
-      DEFRAG_SCALING_PROBE=true
       shift
       ;;
     --maintenance-contention-probe)
@@ -971,7 +961,7 @@ fi
 if [[ "$CHECKPOINT_THROUGHPUT_PROBE" == "true" ]]; then
   # Additive extra measurement (checkpoint()'s steady-state throughput, records/sec, one point
   # per combo) on top of the normal matrix -- same in_memory/ltm split and combo-filter interface
-  # as REORG_SCALING_PROBE/DEFRAG_SCALING_PROBE above (run_checkpoint_throughput_probe.sh takes
+  # as REORG_SCALING_PROBE above (run_checkpoint_throughput_probe.sh takes
   # the same <bin> <output> <db_dir> [combo_filter] interface).
   checkpoint_throughput_dst_name="checkpoint_throughput_in_memory.jsonl"
   ltm_checkpoint_throughput_dst_name="checkpoint_throughput_ltm.jsonl"
@@ -1049,91 +1039,10 @@ VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
   fi
 fi
 
-if [[ "$DEFRAG_SCALING_PROBE" == "true" ]]; then
-  # Additive extra measurement (defragment() duration vs. corpus size and churn ratio, plus a
-  # concurrent-write contention spot check) on top of the normal matrix -- same reasoning and
-  # in_memory/ltm split as REORG_SCALING_PROBE above (run_defrag_scaling_probe.sh takes the same
-  # <bin> <output> <db_dir> [combo_filter] interface as run_reorg_scaling_probe.sh).
-  defrag_dst_name="defrag_scaling_in_memory.jsonl"
-  ltm_defrag_dst_name="defrag_scaling_ltm.jsonl"
-  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    defrag_dst_name="defrag_scaling_in_memory_${VALUE_SIZE_LIMIT}.jsonl"
-    ltm_defrag_dst_name="defrag_scaling_ltm_${VALUE_SIZE_LIMIT}.jsonl"
-  fi
-
-  defrag_probe_failed=0
-
-  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
-    inmem_defrag_combo_filter="in_memory"
-    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-      inmem_defrag_combo_filter="in_memory:${VALUE_SIZE_LIMIT}"
-    fi
-    inmem_defrag_probe_stdout_log="/tmp/vmemkv_defrag_probe_inmem_${KEY_NAME}.stdout.log"
-    inmem_defrag_probe_stderr_log="/tmp/vmemkv_defrag_probe_inmem_${KEY_NAME}.stderr.log"
-    : >"$inmem_defrag_probe_stdout_log"
-    : >"$inmem_defrag_probe_stderr_log"
-    inmem_defrag_probe_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-./benchmark/run_defrag_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/defrag_scaling_in_memory.jsonl' '/mnt/nvme' '$inmem_defrag_combo_filter'
-    "
-    printf -v inmem_defrag_probe_remote_cmd_quoted '%q' "$inmem_defrag_probe_remote_cmd"
-    echo "[runner] start defrag-scaling-probe scenario=in_memory combo_filter=$inmem_defrag_combo_filter"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${inmem_defrag_probe_remote_cmd_quoted}" \
-        2> >(tee -a "$inmem_defrag_probe_stderr_log" >&2); } | tee -a "$inmem_defrag_probe_stdout_log"
-    inmem_defrag_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end defrag-scaling-probe scenario=in_memory status=$inmem_defrag_probe_status"
-    if [[ "$inmem_defrag_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
-      echo "[WARN] defrag-scaling-probe (in_memory) failed with exit code $inmem_defrag_probe_status -- logs: $inmem_defrag_probe_stdout_log $inmem_defrag_probe_stderr_log" >&2
-      defrag_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/defrag_scaling_in_memory.jsonl" "${RESULTS_DIR}/${defrag_dst_name}" || true
-  fi
-
-  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
-    ltm_defrag_combo_filter="ltm"
-    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-      ltm_defrag_combo_filter="ltm:${VALUE_SIZE_LIMIT}"
-    fi
-    ltm_defrag_probe_stdout_log="/tmp/vmemkv_defrag_probe_ltm_${KEY_NAME}.stdout.log"
-    ltm_defrag_probe_stderr_log="/tmp/vmemkv_defrag_probe_ltm_${KEY_NAME}.stderr.log"
-    : >"$ltm_defrag_probe_stdout_log"
-    : >"$ltm_defrag_probe_stderr_log"
-    # VMEMKV_CONTEXT_memory_budget_bytes explicit here for the same reason as the ltm
-    # reorg-scaling-probe branch above.
-    ltm_defrag_probe_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
-./benchmark/run_defrag_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/defrag_scaling_ltm.jsonl' '/mnt/nvme' '$ltm_defrag_combo_filter'
-    "
-    printf -v ltm_defrag_probe_remote_cmd_quoted '%q' "$ltm_defrag_probe_remote_cmd"
-    echo "[runner] start defrag-scaling-probe scenario=ltm combo_filter=$ltm_defrag_combo_filter"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
-        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${ltm_defrag_probe_remote_cmd_quoted}" \
-        2> >(tee -a "$ltm_defrag_probe_stderr_log" >&2); } | tee -a "$ltm_defrag_probe_stdout_log"
-    ltm_defrag_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end defrag-scaling-probe scenario=ltm status=$ltm_defrag_probe_status"
-    if [[ "$ltm_defrag_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as the in_memory branch above.
-      echo "[WARN] defrag-scaling-probe (ltm) failed with exit code $ltm_defrag_probe_status -- logs: $ltm_defrag_probe_stdout_log $ltm_defrag_probe_stderr_log" >&2
-      defrag_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/defrag_scaling_ltm.jsonl" "${RESULTS_DIR}/${ltm_defrag_dst_name}" || true
-  fi
-
-  if [[ "$defrag_probe_failed" -ne 0 ]]; then
-    echo "[WARN] defrag-scaling-probe had failures -- main benchmark matrix results above are still valid" >&2
-  fi
-fi
-
 if [[ "$MAINTENANCE_CONTENTION_PROBE" == "true" ]]; then
   # Additive extra measurement (concurrent-write contention spot checks for checkpoint() and
   # reorganize(), one point per combo per mode) on top of the normal matrix -- same reasoning and
-  # in_memory/ltm split as DEFRAG_SCALING_PROBE above (run_maintenance_contention_probe.sh takes
+  # in_memory/ltm split as REORG_SCALING_PROBE above (run_maintenance_contention_probe.sh takes
   # the same <bin> <output> <db_dir> [combo_filter] interface).
   maint_dst_name="maintenance_contention_in_memory.jsonl"
   ltm_maint_dst_name="maintenance_contention_ltm.jsonl"
@@ -1166,7 +1075,7 @@ cd /home/ubuntu/faultkv/implementation &&
     set -e
     echo "[runner] end maintenance-contention-probe scenario=in_memory status=$inmem_maint_probe_status"
     if [[ "$inmem_maint_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as defrag-scaling-probe's branches above.
+      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
       echo "[WARN] maintenance-contention-probe (in_memory) failed with exit code $inmem_maint_probe_status -- logs: $inmem_maint_probe_stdout_log $inmem_maint_probe_stderr_log" >&2
       maint_probe_failed=1
     fi
@@ -1183,7 +1092,7 @@ cd /home/ubuntu/faultkv/implementation &&
     : >"$ltm_maint_probe_stdout_log"
     : >"$ltm_maint_probe_stderr_log"
     # VMEMKV_CONTEXT_memory_budget_bytes explicit here for the same reason as the ltm
-    # defrag-scaling-probe branch above.
+    # reorg-scaling-probe branch above.
     ltm_maint_probe_remote_cmd="
 cd /home/ubuntu/faultkv/implementation &&
 VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \

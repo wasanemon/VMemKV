@@ -41,11 +41,11 @@ for task in "${TASKS[@]}"; do
   echo "Launching Instance for: Scenario=$scenario, ValueSize=$val_size (Log: $log_file)"
   
   # Run the orchestrator script in the background. --reorg-scaling-probe,
-  # --checkpoint-throughput-probe, --defrag-scaling-probe and --maintenance-contention-probe are
-  # all additive: they run after this instance's normal (scenario, value_size) matrix, on the
-  # same already-provisioned instance -- no 5th instance needed. All four are scoped to this
-  # instance's own combo (these 4 tasks already partition the 4 combos each measures).
-  extra_flags=(--reorg-scaling-probe --checkpoint-throughput-probe --defrag-scaling-probe --maintenance-contention-probe)
+  # --checkpoint-throughput-probe and --maintenance-contention-probe are all additive: they run
+  # after this instance's normal (scenario, value_size) matrix, on the same already-provisioned
+  # instance -- no extra instance needed. All three are scoped to this instance's own combo (these
+  # 4 tasks already partition the 4 combos each measures).
+  extra_flags=(--reorg-scaling-probe --checkpoint-throughput-probe --maintenance-contention-probe)
   if [[ -n "$WITHOUT_RIVALS_FLAG" ]]; then
     extra_flags+=("$WITHOUT_RIVALS_FLAG")
   fi

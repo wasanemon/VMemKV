@@ -126,15 +126,12 @@ class T1Index {
   // RAII handle for Epoch-based Reclamation (EBR) of AppendRegion to prevent atomic shared_ptr load overhead.
   using T1ReadHandle = typename ThreadReferenceTracker<uint64_t>::Guard;
 
-  // `initial_generation`: tag published on the initial sorted_snapshot_, matching whatever the
-  // caller stamps on the paired T2Memory (see its declaration). Defaults to 0 for standalone
-  // T1Index callers with no such pairing.
-  explicit T1Index(uint64_t initial_generation = 0) {
+  T1Index() {
     auto *active_region = new AppendRegion();
     note_append_region_created();
     auto *active_index = new AppendIndex();
     append_active_.store(new AppendGeneration{active_region, active_index}, std::memory_order_release);
-    sorted_snapshot_.store(new SortedSnapshot{new SortedRegion(), initial_generation}, std::memory_order_release);
+    sorted_snapshot_.store(new SortedRegion(), std::memory_order_release);
   }
 
   ~T1Index() noexcept {
@@ -146,7 +143,7 @@ class T1Index {
     }
     delete_generation(append_active_.load(std::memory_order_relaxed));
     delete_generation(append_immutable_.get());
-    delete_snapshot(sorted_snapshot_.load(std::memory_order_relaxed));
+    delete sorted_snapshot_.load(std::memory_order_relaxed);
   }
 
   T1Index(const T1Index &) = delete;
@@ -157,10 +154,6 @@ class T1Index {
   struct LookupResult {
     Payload payload_bits;
     uint64_t raw_hash;
-    // T2 generation payload_bits was resolved against (see SortedSlot::generation). Meaningless
-    // for inline values/tombstones. Caller must compare against its own T2 mem's generation and
-    // retry on mismatch -- this class doesn't know about T2.
-    uint64_t generation = 0;
   };
 
   enum class PutResult : uint8_t {
@@ -175,8 +168,6 @@ class T1Index {
     Key key{};
     Payload payload_bits{STORE_NOT_FOUND};
     uint64_t hash{0};
-    // See SortedSlot::generation's declaration.
-    uint64_t generation{0};
   };
 
   // No-op default for reorganize()'s chk_writer parameter.
@@ -189,50 +180,41 @@ class T1Index {
     void operator()() const noexcept {}
   };
 
-  // Retrieves the payload and raw hash for a key prefix. See LookupResult::generation for how
-  // callers pairing this against T2Memory must validate the result themselves.
+  // Retrieves the payload and raw hash for a key prefix.
   auto get_with_hash(std::span<const std::byte> key) const -> LookupResult {
     const auto [prefix, hash] = prepare_key_and_hash(key);
     return with_epoch_guard([&]() -> LookupResult { return lookup_by_prefix_hash(prefix, hash); });
   }
 
-  // Same lookup as get_with_hash(), for a caller that already has (prefix, hash) from elsewhere
-  // (e.g. a write-time tracker keyed on the same pair T1 itself uses internally) rather than the
-  // original raw key bytes.
-  auto get_by_prefix_hash(const StoreKey &prefix, uint64_t hash) const -> LookupResult {
-    return with_epoch_guard([&]() -> LookupResult { return lookup_by_prefix_hash(prefix, hash); });
-  }
-
  private:
-  // Shared 3-region lookup body for get_with_hash()/get_by_prefix_hash() -- must be called from
-  // inside with_epoch_guard(). load_slot_consistent() reads (hash, payload, generation) as a
-  // consistent triple via the slot's seqlock -- independent loads here could feed update_impl() a
-  // torn pair and corrupt a live T2 write (see SortedSlot::version's declaration).
+  // Lookup body for get_with_hash() -- must be called from inside with_epoch_guard().
+  // load_slot_consistent() reads (hash, payload) as a consistent pair via the slot's seqlock --
+  // independent loads here could feed update_impl() a torn pair and corrupt a live T2 write (see
+  // SortedSlot::version's declaration).
   auto lookup_by_prefix_hash(const StoreKey &prefix, uint64_t hash) const -> LookupResult {
-    const auto snapshot = sorted_snapshot_.load(std::memory_order_acquire);
-    const SortedRegion *sorted = snapshot->region;
+    const SortedRegion *sorted = sorted_snapshot_.load(std::memory_order_acquire);
     const AppendGeneration *active_gen = append_active_.load(std::memory_order_acquire);
     const AppendRegion *active = active_gen->region;
 
     // 1. check active append region
     if (const AppendSlot *slot = active->find_with_index(*active_gen->index, prefix, hash)) {
-      const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
-      return LookupResult{slot_payload, slot_hash, slot_generation};
+      const auto [slot_hash, slot_payload] = load_slot_consistent(*slot);
+      return LookupResult{slot_payload, slot_hash};
     }
 
     // 2. check immutable append region if exists
     if (const AppendGeneration *imm_gen = append_immutable_.get()) {
       const AppendRegion *imm = imm_gen->region;
       if (const AppendSlot *slot = imm->find_with_index(*imm_gen->index, prefix, hash)) {
-        const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
-        return LookupResult{slot_payload, slot_hash, slot_generation};
+        const auto [slot_hash, slot_payload] = load_slot_consistent(*slot);
+        return LookupResult{slot_payload, slot_hash};
       }
     }
 
     // 3. check sorted region
     if (const SortedSlot *slot = find_sorted(*sorted, prefix, hash)) {
-      const auto [slot_hash, slot_payload, slot_generation] = load_slot_consistent(*slot);
-      return LookupResult{slot_payload, slot_hash, slot_generation};
+      const auto [slot_hash, slot_payload] = load_slot_consistent(*slot);
+      return LookupResult{slot_payload, slot_hash};
     }
 
     return LookupResult{STORE_NOT_FOUND, 0};
@@ -263,14 +245,12 @@ class T1Index {
 
   [[nodiscard]] auto live_bytes() const noexcept -> uint64_t {
     return with_epoch_guard([&]() noexcept -> uint64_t {
-      // Paired reads via load_slot_consistent() -- this result decides (via
-      // should_upgrade_to_t2()) whether reorganize() touches T2, so a torn hash/val pair could
-      // misjudge inline vs. offset and skew that decision.
+      // Paired reads via load_slot_consistent() -- an unpaired hash/val read could misjudge
+      // inline vs. offset.
       uint64_t total_blocks = 0;
-      const auto sorted = sorted_snapshot_.load(std::memory_order_acquire)->region;
+      const auto sorted = sorted_snapshot_.load(std::memory_order_acquire);
       for (size_t i = 0; i < sorted->size; ++i) {
-        const auto [slot_hash, val, slot_generation] = load_slot_consistent(sorted->slots[i]);
-        (void)slot_generation;
+        const auto [slot_hash, val] = load_slot_consistent(sorted->slots[i]);
         if (is_live(val)) {
           if constexpr (Config::UseT1InlineValue) {
             if (t1_detail::is_inline(slot_hash)) {
@@ -283,8 +263,7 @@ class T1Index {
       const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
       size_t active_n = active->size();
       for (size_t i = 0; i < active_n; ++i) {
-        const auto [slot_hash, val, slot_generation] = load_slot_consistent(active->data()[i]);
-        (void)slot_generation;
+        const auto [slot_hash, val] = load_slot_consistent(active->data()[i]);
         if (is_live(val)) {
           if constexpr (Config::UseT1InlineValue) {
             if (t1_detail::is_inline(slot_hash)) {
@@ -303,14 +282,10 @@ class T1Index {
   // Inserts or updates the 64-bit payload for a given key prefix.
   // - Thread-safety: Safe for concurrent writers (guarded internally by slot-level atomic operations or table locks).
   // - Guarantees: Writes to the append region if the key does not exist; updates the slot in-place if it does.
-  // `t2_generation`: T2 generation `value` was resolved against (see SortedSlot::generation).
-  // Ignored for inline/tombstone writes. Stamped atomically with hash so resolve()'s
-  // FreezableRegion bypass can safely insert-as-new instead of blocking on reorganize().
   auto put(std::span<const std::byte> key,
            Payload value,
            bool is_inline = false,
-           uint8_t inline_size = 0,
-           uint64_t t2_generation = 0) -> PutResult {
+           uint8_t inline_size = 0) -> PutResult {
     return with_epoch_guard([&]() -> PutResult {
       const auto [prefix, hash] = prepare_key_and_hash(key);
 
@@ -326,8 +301,8 @@ class T1Index {
         ResolvedSlot slot = resolve(prefix, hash);
         if (slot.found()) {
           // begin_write()/end_write() bracket this store with the slot's seqlock so a reader
-          // can't observe a payload from after try_store() paired with a stale hash/generation
-          // from before store_hash_and_generation() (see ResolvedSlot::begin_write()).
+          // can't observe a payload from after try_store() paired with a stale hash from before
+          // store_hash() (see ResolvedSlot::begin_write()).
           slot.begin_write();
           Payload current = slot.load();
           if (!slot.try_store(current, value)) {
@@ -335,7 +310,7 @@ class T1Index {
             continue;  // Stale snapshot (a benign concurrent update raced us) -- re-resolve.
           }
           if (resolve(prefix, hash).same_slot_as(slot)) {
-            slot.store_hash_and_generation(stored_hash, t2_generation);
+            slot.store_hash(stored_hash);
             slot.end_write();
             return PutResult::Applied;
           }
@@ -354,7 +329,7 @@ class T1Index {
           return PutResult::AppendRegionFull;
         }
 
-        active->publish(index, prefix, stored_hash, value, t2_generation);
+        active->publish(index, prefix, stored_hash, value);
         publish_append_index(*active_gen->index, *active, index, prefix, hash);
         return PutResult::Applied;
       }
@@ -363,10 +338,7 @@ class T1Index {
 
   // Range scan over [lo_bytes, hi_bytes]. Lock-free; collects a consistent snapshot of both
   // regions, dedups, and invokes callback per match.
-  // `Callback`: `(key, payload, hash, t2_generation) -> void`. t2_generation is the T2
-  // generation payload was resolved against (see SortedSlot::generation); meaningless for
-  // inline/tombstone payloads. Caller must validate it against their own T2 mem, same contract
-  // as LookupResult::generation.
+  // `Callback`: `(key, payload, hash) -> void`.
   template <typename Callback>
   auto scan(std::span<const std::byte> lo_bytes,
             std::span<const std::byte> hi_bytes,
@@ -375,8 +347,7 @@ class T1Index {
     const StoreKey upper_bound = t1_detail::prefix_from_bytes(hi_bytes);
 
     return with_epoch_guard([&]() -> size_t {
-      const auto snapshot = sorted_snapshot_.load(std::memory_order_acquire);
-      const SortedRegion *sorted = snapshot->region;
+      const SortedRegion *sorted = sorted_snapshot_.load(std::memory_order_acquire);
       const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
       const AppendGeneration *imm_gen = append_immutable_.get();
       const AppendRegion *imm = imm_gen != nullptr ? imm_gen->region : nullptr;
@@ -393,13 +364,11 @@ class T1Index {
       };
       if (region_disjoint(active) && region_disjoint(imm)) {
         size_t match_count = 0;
-        walk_sorted_region(sorted,
-                           lower_bound,
-                           upper_bound,
-                           [&](const SortedSlot &slot, uint64_t hash, Payload payload, uint64_t generation) {
-                             callback(std::span<const std::byte>(slot.key), payload, hash, generation);
-                             ++match_count;
-                           });
+        walk_sorted_region(
+            sorted, lower_bound, upper_bound, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
+              callback(std::span<const std::byte>(slot.key), payload, hash);
+              ++match_count;
+            });
         return match_count;
       }
 
@@ -407,8 +376,7 @@ class T1Index {
         Key key;
         Payload payload_bits;
         uint64_t hash;
-        int gen;                 // 0: sorted, 1: imm, 2: active (newest)
-        uint64_t t2_generation;  // See SortedSlot::generation's declaration. Not `gen` above.
+        int gen;  // 0: sorted, 1: imm, 2: active (newest)
       };
 
       // Use a stack buffer of 16KB to hold up to ~500 scan candidates without any heap allocations
@@ -417,12 +385,9 @@ class T1Index {
       std::pmr::vector<ScanCandidate> candidates(&mem_res);
 
       // 1. Extract from sorted_region using binary search (O(log S))
-      walk_sorted_region(sorted,
-                         lower_bound,
-                         upper_bound,
-                         [&](const SortedSlot &slot, uint64_t hash, Payload payload, uint64_t generation) {
-                           candidates.push_back({slot.key, payload, hash, 0, generation});
-                         });
+      walk_sorted_region(sorted, lower_bound, upper_bound, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
+        candidates.push_back({slot.key, payload, hash, 0});
+      });
 
       // 2. Extract from append active/immutable regions (manual scan to access slot.hash directly)
       auto extract_append = [&](const AppendRegion *region, int gen) {
@@ -446,12 +411,12 @@ class T1Index {
             continue;
           }
           // Paired read -- see the sorted-region loop above and SortedSlot::version's declaration.
-          const auto [slot_hash, value, slot_generation] = load_slot_consistent(slot);
+          const auto [slot_hash, value] = load_slot_consistent(slot);
           if (value == vmemkv::STORE_NOT_FOUND) {
             continue;
           }
           if (!(slot.key < lower_bound) && !(upper_bound < slot.key)) {
-            candidates.push_back({slot.key, value, slot_hash, gen, slot_generation});
+            candidates.push_back({slot.key, value, slot_hash, gen});
           }
         }
       };
@@ -507,7 +472,7 @@ class T1Index {
           first = false;
           prev_key = cand.key;
           if (cand.payload_bits != vmemkv::STORE_NOT_FOUND) {
-            callback(std::span<const std::byte>(cand.key), cand.payload_bits, cand.hash, cand.t2_generation);
+            callback(std::span<const std::byte>(cand.key), cand.payload_bits, cand.hash);
             ++match_count;
           }
         }
@@ -520,17 +485,14 @@ class T1Index {
   // Reorganizes T1 by merging append_region_ into sorted_region_. Thread-safe; lock-free
   // readers (get/scan) can run concurrently.
   // - OffsetMapper: `void(std::span<EntrySnapshot> merged)`, called exactly once with the full,
-  //   already-deduped, key-ordered live set. May rewrite any entry's `.payload_bits`/`.generation`
-  //   in place (e.g. to relocate a T2 offset), in any order it likes, but must NOT reorder or
-  //   resize `merged` itself -- chk_writer and the SortedRegion built from it right after both
-  //   require key order to survive unchanged. `merged` is not published/visible to any other
-  //   thread at the point this is called, so free in-place mutation of the fields above is safe.
-  //   Entries this mapper doesn't need to touch (inline, T1-only reorg) must be left untouched.
+  //   already-deduped, key-ordered live set. May rewrite any entry's `.payload_bits` in place
+  //   (e.g. to relocate a T2 offset), in any order it likes, but must NOT reorder or resize
+  //   `merged` itself -- chk_writer and the SortedRegion built from it right after both require
+  //   key order to survive unchanged. `merged` is not published/visible to any other thread at
+  //   the point this is called, so free in-place mutation of the field above is safe. Entries
+  //   this mapper doesn't need to touch (inline, T1-only reorg) must be left untouched.
   // - ChkWriter: optional, called once with the finalized sorted entries right before publish,
   //   so a caller can serialize a checkpoint without T1Index knowing about files. No-op default.
-  // `generation`: tag published on the new sorted_snapshot_. Callers pairing T1 against another
-  // generation-tagged resource (T2Memory) must pass the same value stamped there. Defaults to 0
-  // for standalone callers.
   // `post_freeze_hook`: TEST-ONLY seam, called right after step 2 publishes
   // append_immutable_/append_active_, before collect_live_entries() (step 3) snapshots them --
   // lets a test deterministically land a concurrent put() in that window. Defaults to a no-op;
@@ -538,7 +500,6 @@ class T1Index {
   template <typename OffsetMapper, typename ChkWriter = NoOpChkWriter, typename PostFreezeHook = NoOpPostFreezeHook>
   void reorganize(OffsetMapper offset_mapper,
                   ChkWriter chk_writer = ChkWriter{},
-                  uint64_t generation = 0,
                   PostFreezeHook post_freeze_hook = PostFreezeHook{}) {
     bool expected = false;
     if (!reorg_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -569,7 +530,7 @@ class T1Index {
     active_epochs_.wait_until_epoch(freeze_epoch);
 
     // 3. Rebuild sorted region from sorted_region and append_immutable
-    const auto sorted = sorted_snapshot_.load(std::memory_order_acquire)->region;
+    const auto sorted = sorted_snapshot_.load(std::memory_order_acquire);
     // Freeze *before* the merge loop below reads a single slot: from here until the new
     // sorted_snapshot_ publishes, `sorted`'s contents are frozen for writers -- see
     // FreezableRegion's own comment for why put()'s in-place path must bypass instead of
@@ -618,7 +579,7 @@ class T1Index {
       while (si < sorted->size && ii < imm_entries.size()) {
         const SortedSlot &s = sorted->slots[si];
         const EntrySnapshot &m = imm_entries[ii];
-        const auto [s_hash, s_payload, s_generation] = load_slot_consistent(s);
+        const auto [s_hash, s_payload] = load_slot_consistent(s);
         const uint64_t s_clean_hash = s_hash & t1_detail::kCleanHashMask;
         const uint64_t m_clean_hash = m.hash & t1_detail::kCleanHashMask;
         if (s.key == m.key && s_clean_hash == m_clean_hash) {
@@ -633,7 +594,7 @@ class T1Index {
           ++ii;
           skip_dead();
         } else if (s.key != m.key ? s.key < m.key : s_clean_hash < m_clean_hash) {
-          merged.push_back(EntrySnapshot{s.key, s_payload, s_hash, s_generation});
+          merged.push_back(EntrySnapshot{s.key, s_payload, s_hash});
           ++si;
           skip_dead();
         } else {
@@ -643,8 +604,8 @@ class T1Index {
       }
       while (si < sorted->size) {
         const SortedSlot &s = sorted->slots[si];
-        const auto [s_hash, s_payload, s_generation] = load_slot_consistent(s);
-        merged.push_back(EntrySnapshot{s.key, s_payload, s_hash, s_generation});
+        const auto [s_hash, s_payload] = load_slot_consistent(s);
+        merged.push_back(EntrySnapshot{s.key, s_payload, s_hash});
         ++si;
         skip_dead();
       }
@@ -661,15 +622,14 @@ class T1Index {
 
     chk_writer(std::span<const EntrySnapshot>(merged));
 
-    const SortedSnapshot *old_snapshot = sorted_snapshot_.load(std::memory_order_relaxed);
+    const SortedRegion *old_sorted = sorted_snapshot_.load(std::memory_order_relaxed);
 
     auto *next_sorted = new SortedRegion(merged);
 
-    // Bundled with `generation` behind one atomic store so a reader can never see next_sorted
-    // paired with the wrong generation tag (same reasoning as AppendGeneration). Unfreezes both
-    // guarded regions right after: from this point, resolve() sees the new (complete, unfrozen)
-    // sorted region directly, so the bypass is no longer needed for either one.
-    sorted_snapshot_.store(new SortedSnapshot{next_sorted, generation}, std::memory_order_release);
+    // Unfreezes both guarded regions right after: from this point, resolve() sees the new
+    // (complete, unfrozen) sorted region directly, so the bypass is no longer needed for either
+    // one.
+    sorted_snapshot_.store(next_sorted, std::memory_order_release);
     sorted_write_frozen_.unfreeze();
 
     // 4. Safely retire the old buffers
@@ -683,7 +643,7 @@ class T1Index {
     note_append_region_destroyed();
     delete old_active_gen->index;
     delete old_active_gen;
-    delete_snapshot(old_snapshot);
+    delete old_sorted;
 
     reorg_in_progress_.store(false, std::memory_order_release);
   }
@@ -692,14 +652,13 @@ class T1Index {
   // state. Unlike reorganize(), no synchronization or old-region retirement -- only valid
   // before any concurrent access begins (VMemKVImpl construction). `entries` must already be
   // sorted by key ascending.
-  // `generation`: same contract as reorganize()'s. Defaults to 0 for standalone tests.
-  void load_sorted_region_from_checkpoint(std::span<const EntrySnapshot> entries, uint64_t generation = 0) {
+  void load_sorted_region_from_checkpoint(std::span<const EntrySnapshot> entries) {
     // Built before the old snapshot is torn down (matching reorganize()'s own ordering) so a
     // throw from SortedRegion's constructor (e.g. bad_alloc) leaves sorted_snapshot_ pointing at
     // its original, still-valid value instead of a dangling already-deleted pointer.
     auto *next_sorted = new SortedRegion(entries);
-    delete_snapshot(sorted_snapshot_.load(std::memory_order_relaxed));
-    sorted_snapshot_.store(new SortedSnapshot{next_sorted, generation}, std::memory_order_relaxed);
+    delete sorted_snapshot_.load(std::memory_order_relaxed);
+    sorted_snapshot_.store(next_sorted, std::memory_order_relaxed);
   }
 
  private:
@@ -748,15 +707,10 @@ class T1Index {
     // `const SortedSlot*`.
     mutable std::atomic<uint64_t> hash{0};
     mutable std::atomic<Payload> payload_bits{STORE_NOT_FOUND};
-    // The T2 generation `payload_bits` was resolved against, when non-inline/non-tombstone (see
-    // T2Memory::generation). A published entry can survive multiple T2 rebuilds before being
-    // re-examined, so each entry must carry its own tag rather than trusting whatever T2 mem is
-    // currently live. Meaningless for inline values and tombstones.
-    mutable std::atomic<uint64_t> generation{0};
-    // Seqlock guarding the (hash, payload_bits, generation) triple -- individually-atomic fields
-    // rule out a torn *value* in any one field, but not a reader observing them at different
-    // points in time across put()'s multi-step update (see ResolvedSlot::begin_write()). Starts
-    // at 0 (even); only put()'s in-place path touches it, always odd->even bracketed.
+    // Seqlock guarding the (hash, payload_bits) pair -- individually-atomic fields rule out a
+    // torn *value* in either one, but not a reader observing them at different points in time
+    // across put()'s multi-step update (see ResolvedSlot::begin_write()). Starts at 0 (even);
+    // only put()'s in-place path touches it, always odd->even bracketed.
     mutable std::atomic<uint64_t> version{0};
 
     auto clean_hash() const noexcept -> uint64_t {
@@ -773,11 +727,9 @@ class T1Index {
     // SortedSlot::payload_bits above).
     mutable std::atomic<Payload> payload_bits{STORE_NOT_FOUND};
     std::atomic<bool> published{false};
-    // Same contract and reasoning as SortedSlot::generation above.
-    mutable std::atomic<uint64_t> generation{0};
     // Same reasoning as SortedSlot::version above. Not needed for the initial publish()
-    // (published's acquire/release already makes all three visible together); only for later
-    // in-place updates.
+    // (published's acquire/release already makes hash/payload_bits visible together); only for
+    // later in-place updates.
     mutable std::atomic<uint64_t> version{0};
 
     [[nodiscard]] auto clean_hash() const noexcept -> uint64_t {
@@ -806,7 +758,6 @@ class T1Index {
         slots[i].key = entries[i].key;
         slots[i].hash.store(entries[i].hash, std::memory_order_relaxed);
         slots[i].payload_bits.store(entries[i].payload_bits, std::memory_order_relaxed);
-        slots[i].generation.store(entries[i].generation, std::memory_order_relaxed);
         if constexpr (Config::UseBloomFilter) {
           bloom.add(entries[i].hash & t1_detail::kCleanHashMask);
         }
@@ -814,27 +765,11 @@ class T1Index {
     }
   };
 
-  // Bundles a SortedRegion with its generation tag as a single atomically-swappable unit (same
-  // reasoning as AppendGeneration below): two independent atomics could be read as a torn pair
-  // (fresh region + stale tag), so both are published behind one pointer store.
-  struct SortedSnapshot {
-    const SortedRegion *region;
-    uint64_t generation;
-  };
-
-  static void delete_snapshot(const SortedSnapshot *snapshot) noexcept {
-    if (snapshot == nullptr) {
-      return;
-    }
-    delete snapshot->region;
-    delete snapshot;
-  }
-
-  // Walks the sorted region within [lower_bound, upper_bound], calling
-  // sink(slot, hash, payload, t2_generation) for each live match. Shared by scan()'s fast
-  // (direct-delivery) and slow (candidate-buffering) paths so the sorted-region walk has exactly
-  // one implementation; the sink decides what happens per match. Templated rather than a
-  // std::function so each call site's sink is fully inlined.
+  // Walks the sorted region within [lower_bound, upper_bound], calling sink(slot, hash, payload)
+  // for each live match. Shared by scan()'s fast (direct-delivery) and slow
+  // (candidate-buffering) paths so the sorted-region walk has exactly one implementation; the
+  // sink decides what happens per match. Templated rather than a std::function so each call
+  // site's sink is fully inlined.
   template <typename Sink>
   static void walk_sorted_region(const SortedRegion *sorted, Key lower_bound, Key upper_bound, Sink &&sink) {
     if (sorted == nullptr || sorted->size == 0) {
@@ -852,9 +787,9 @@ class T1Index {
       }
       // Paired read via load_slot_consistent() -- feeds scan_impl()'s T2 dereference, same
       // reasoning as get_with_hash() (see SortedSlot::version).
-      const auto [hash, payload, generation] = load_slot_consistent(*it);
+      const auto [hash, payload] = load_slot_consistent(*it);
       if (payload != vmemkv::STORE_NOT_FOUND) {
-        sink(*it, hash, payload, generation);
+        sink(*it, hash, payload);
       }
     }
   }
@@ -895,14 +830,12 @@ class T1Index {
           expected_current, value, std::memory_order_release, std::memory_order_acquire);
     }
 
-    // No const_cast needed: hash/generation are `mutable std::atomic`, same as payload_bits above.
-    void store_hash_and_generation(uint64_t hash, uint64_t generation) const noexcept {
+    // No const_cast needed: hash is `mutable std::atomic`, same as payload_bits above.
+    void store_hash(uint64_t hash) const noexcept {
       if (append != nullptr) {
         append->hash.store(hash, std::memory_order_release);
-        append->generation.store(generation, std::memory_order_release);
       } else {
         sorted->hash.store(hash, std::memory_order_release);
-        sorted->generation.store(generation, std::memory_order_release);
       }
     }
 
@@ -920,11 +853,10 @@ class T1Index {
 
   // Slot-type-generic seqlock reader for callers with a raw `const SortedSlot&`/`const
   // AppendSlot&` (reorganize()'s merge loop, AppendRegion::collect_live_entries()). Reads
-  // (hash, payload_bits, generation) as a consistent triple, immune to a racing
-  // begin_write()/end_write() bracket (see SortedSlot::version).
+  // (hash, payload_bits) as a consistent pair, immune to a racing begin_write()/end_write()
+  // bracket (see SortedSlot::version).
   template <typename SlotT>
-  [[nodiscard]] static auto load_slot_consistent(const SlotT &slot) noexcept
-      -> std::tuple<uint64_t, Payload, uint64_t> {
+  [[nodiscard]] static auto load_slot_consistent(const SlotT &slot) noexcept -> std::pair<uint64_t, Payload> {
     while (true) {
       const uint64_t v1 = slot.version.load(std::memory_order_acquire);
       if (v1 % 2 != 0) {
@@ -933,11 +865,10 @@ class T1Index {
       }
       const uint64_t hash = slot.hash.load(std::memory_order_acquire);
       const Payload payload = slot.payload_bits.load(std::memory_order_acquire);
-      const uint64_t generation = slot.generation.load(std::memory_order_acquire);
       std::atomic_thread_fence(std::memory_order_acquire);
       const uint64_t v2 = slot.version.load(std::memory_order_acquire);
       if (v1 == v2) {
-        return {hash, payload, generation};
+        return {hash, payload};
       }
     }
   }
@@ -982,11 +913,10 @@ class T1Index {
     }
 
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-    void publish(size_t index, Key key, uint64_t hash, Payload value, uint64_t generation) noexcept {
+    void publish(size_t index, Key key, uint64_t hash, Payload value) noexcept {
       slots_[index].key = key;
       slots_[index].hash.store(hash, std::memory_order_relaxed);
       slots_[index].payload_bits.store(value, std::memory_order_relaxed);
-      slots_[index].generation.store(generation, std::memory_order_relaxed);
       // update_bounds() before the published flag, not after: scan()'s extract_append() checks
       // bounds() up front to decide whether to skip this region entirely. Reversing the order
       // could let bounds() say "out of range" for a key already visible via published==true.
@@ -1057,11 +987,11 @@ class T1Index {
         // Reads (hash, payload_bits) as a consistent pair via load_slot_consistent() -- every
         // entry here feeds reorganize()'s offset_mapper, so a torn pair could misdirect a T2
         // read (see SortedSlot::version's declaration).
-        const auto [hash, value, entry_generation] = load_slot_consistent(slot);
+        const auto [hash, value] = load_slot_consistent(slot);
         if (!is_live(value)) {
           continue;
         }
-        out.push_back(EntrySnapshot{slot.key, value, hash, entry_generation});
+        out.push_back(EntrySnapshot{slot.key, value, hash});
       }
     }
 
@@ -1160,8 +1090,9 @@ class T1Index {
 
     // Found in either frozen region means an in-place update would be a Lost Update this cycle
     // (see FreezableRegion's own comment) -- bypass to a new entry in the fresh active region
-    // instead. Safe because every entry carries its own T2 generation stamp (see
-    // SortedSlot::generation), so it can sit unmerged for any number of future cycles.
+    // instead. Safe because T2 never relocates a record, so a bypass entry's offset stays valid
+    // indefinitely; a later reorganize() dedups it against the frozen copy by key + clean hash
+    // regardless of how many cycles pass before that happens.
     if (AppendGeneration *imm_gen = append_immutable_.get()) {
       if (imm_gen->region->find_with_index(*imm_gen->index, key, hash) != nullptr) {
         return ResolvedSlot{};
@@ -1176,7 +1107,7 @@ class T1Index {
         return ResolvedSlot{};
       }
     } else {
-      const auto sorted = sorted_snapshot_.load(std::memory_order_acquire)->region;
+      const auto sorted = sorted_snapshot_.load(std::memory_order_acquire);
       if (const SortedSlot *slot = find_sorted(*sorted, key, hash)) {
         return ResolvedSlot{nullptr, slot};
       }
@@ -1218,7 +1149,7 @@ class T1Index {
   mutable std::atomic<bool> reorg_in_progress_{false};
   std::atomic<uint64_t> reorg_epoch_{1};
 
-  std::atomic<const SortedSnapshot *> sorted_snapshot_{nullptr};
+  std::atomic<const SortedRegion *> sorted_snapshot_{nullptr};
   std::atomic<AppendGeneration *> append_active_{nullptr};
   FreezableRegion<AppendGeneration *> append_immutable_;
   std::atomic<int64_t> append_region_live_count_{0};

@@ -48,20 +48,11 @@ namespace vmemkv {
 struct T2Memory {
   std::byte *base = nullptr;
   uint64_t capacity = 0;
-  // Unique across every T2Memory this process ever constructs -- the pairing tag between a
-  // T2Memory and the T1Index::SortedSnapshot built against it:
-  // VMemKVImpl::reorganize_internal() stamps the same generation onto both, so a reader can tell
-  // whether the pair it holds is self-consistent.
-  uint64_t generation;
 
-  // Bytes of `capacity` allocated so far, for *this* generation. Lives per-T2Memory rather than as
-  // one T2FlatFile-level counter: a shared counter read separately from `mem` (base/capacity) lets
-  // a concurrent swap_memory() reset it to a new generation's value between a writer capturing
-  // `mem` and its fetch_add(), producing an offset valid for the new generation but written
-  // through the old, stale `base` -- silently clobbering a live record. Keeping bytes_used inside
-  // T2Memory makes base/capacity/bytes_used one atomically-consistent triple via a single
-  // get_memory_handle() call. `mutable`: fetch_add()/store() must work through the `const
-  // T2Memory *` get_memory_handle() hands back.
+  // Bytes of `capacity` allocated so far. Lives inside T2Memory (rather than as a separate
+  // T2FlatFile-level counter) so base/capacity/bytes_used form one atomically-consistent triple
+  // via a single get_memory_handle() call. `mutable`: fetch_add()/store() must work through the
+  // `const T2Memory *` get_memory_handle() hands back.
   mutable std::atomic<uint64_t> bytes_used{0};
 
   // The offset below which every byte is (a) durably on disk and (b) guaranteed never to be
@@ -74,8 +65,8 @@ struct T2Memory {
   // the advancing writer share one T2Memory instance rather than transitioning to a new one.
   mutable std::atomic<uint64_t> base_boundary{0};
 
-  // A second, read-only mmap covering [0, capacity) of this exact generation's file -- distinct
-  // from `base`'s MADV_RANDOM mapping used everywhere else, left at the kernel's default readahead
+  // A second, read-only mmap covering [0, capacity) of this file -- distinct from `base`'s
+  // MADV_RANDOM mapping used everywhere else, left at the kernel's default readahead
   // policy (no madvise call). Read by scan_impl() (and get_impl()'s large-record path, via
   // try_read_resident_base_record()) for records whose embedded size hint is larger than one page
   // -- see `base_mmap_scan_seq` below for the small-record counterpart and the "T2 base-region
@@ -98,7 +89,7 @@ struct T2Memory {
   // instead (see the "T2 base-region reads" comment in vmemkv_impl.hpp for why). madvise is a property
   // of the whole mapping, not of an individual read, so Scan's own two size classes need
   // separately-advised mappings rather than one shared policy; which one a given record uses is
-  // decided per record (try_read_base_record() in vmemkv_impl.hpp), not once per generation, so
+  // decided per record (try_read_base_record() in vmemkv_impl.hpp), so
   // a corpus with genuinely mixed record sizes is still handled correctly (just a
   // readahead-policy choice, never a correctness one -- both mappings cover identical bytes).
   // Same lifetime/retirement/best-effort/nullptr-by-default story as base_mmap_scan.
@@ -116,24 +107,11 @@ struct T2Memory {
   // same reason as base_mmap_scan.
   mutable int read_fd = -1;
 
-  // Auto-assigns a fresh, process-global-unique generation. Used where no caller needs to know
-  // the value in advance (e.g. tests exercising the ABA-detection field directly).
-  T2Memory(std::byte *base_ptr, uint64_t capacity_bytes) noexcept
-      : base(base_ptr), capacity(capacity_bytes), generation(allocate_generation()) {}
+  // `initial_bytes_used`: for a rebuilt/adopted mapping with live records already at construction
+  // time; 0 for a brand-new empty file.
+  T2Memory(std::byte *base_ptr, uint64_t capacity_bytes, uint64_t initial_bytes_used = 0) noexcept
+      : base(base_ptr), capacity(capacity_bytes), bytes_used(initial_bytes_used), base_boundary(initial_bytes_used) {}
 
-  // Uses a caller-supplied generation -- e.g. to tag a paired T1Index::SortedSnapshot with an
-  // identical id before this T2Memory exists. `initial_bytes_used`: for a rebuilt/adopted mapping
-  // with live records already at construction time; 0 for a brand-new empty file.
-  T2Memory(std::byte *base_ptr,
-           // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-           uint64_t capacity_bytes,
-           uint64_t explicit_generation,
-           uint64_t initial_bytes_used = 0) noexcept
-      : base(base_ptr),
-        capacity(capacity_bytes),
-        generation(explicit_generation),
-        bytes_used(initial_bytes_used),
-        base_boundary(initial_bytes_used) {}
   ~T2Memory() noexcept {
     if ((base != nullptr) && capacity > 0) {
       ::munmap(base, static_cast<size_t>(capacity));
@@ -152,14 +130,6 @@ struct T2Memory {
 
   T2Memory(const T2Memory &) = delete;
   auto operator=(const T2Memory &) -> T2Memory & = delete;
-
-  // Every T2Memory this process ever constructs must draw from this one process-global counter,
-  // never a fixed/arbitrary value -- see `generation`'s declaration above for why uniqueness
-  // matters (the T1Index::SortedSnapshot pairing check).
-  static auto allocate_generation() noexcept -> uint64_t {
-    static std::atomic<uint64_t> counter{1};
-    return counter.fetch_add(1, std::memory_order_relaxed);
-  }
 };
 
 // Test-only seam for T2FlatFile::acquire_write_handle(); fires once, right after registering the
@@ -192,9 +162,6 @@ class T2FlatFile {
   // persistent T2 data file for this store's whole lifetime; `path` itself is never opened
   // directly, only kept (see path()) as the base other sibling paths (manifest/t1chk/wal) derive
   // from.
-  // `initial_generation`: stamped on the first T2Memory this instance maps. Must come from
-  // T2Memory::allocate_generation(), not an arbitrary value -- see T2Memory::generation's
-  // declaration for why a fixed value is unsafe.
   // `initial_bytes_used`: nullopt (default) starts from a fresh, empty data file, discarding
   // whatever untrusted, unpublished bytes might already be at derive_t2_chk_path(path) -- see
   // low_level_design.md 5.1 for why those bytes carry no authority without a manifest vouching for
@@ -203,7 +170,6 @@ class T2FlatFile {
   // VMemKVImpl::adopted_t2_bytes_used()).
   T2FlatFile(const std::filesystem::path &path,
              uint64_t bytes_capacity,
-             uint64_t initial_generation,
              std::optional<uint64_t> initial_bytes_used = std::nullopt);
   ~T2FlatFile() noexcept;
 
@@ -218,21 +184,21 @@ class T2FlatFile {
 
   auto get_memory_handle() const noexcept -> T2MemoryHandle { return {active_readers_, get_memory()}; }
 
-  // Write-side half of the residual-window fix (see stop_writers_and_wait() for the reorganize
-  // side): acquires a handle for appending a brand-new T2 record, deferring while a reorganize()
-  // has new writers stopped for its final pre-swap window so no writer ever starts writing into a
-  // generation that's about to be retired. Callers appending a new record must hold the returned
-  // handle until their T1 publish (T1Index::put()) attempt has returned -- releasing it earlier
-  // would let this same generation look "stopped" to stop_writers_and_wait() before the T1 entry
+  // Write-side half of the residual-window fix (see stop_writers_and_wait() for the checkpoint
+  // side): acquires a handle for appending a brand-new T2 record, deferring while
+  // checkpoint_internal() has new writers stopped for its target-capture window so no append can
+  // land past the frontier it's about to durabilize. Callers appending a new record must hold the
+  // returned handle until their T1 publish (T1Index::put()) attempt has returned -- releasing it
+  // earlier would let this write look "stopped" to stop_writers_and_wait() before the T1 entry
   // naming it actually exists, reopening the exact race this pairing closes.
   //
   // Registers first, then checks `writer_stop_` -- checking first would leave a gap: a writer
   // whose check saw writer_stop_==false, but who hadn't registered yet, could still be missed by
   // wait_until_retired()'s single index-ordered pass (it never revisits a slot once past it), so
-  // the stop could complete while the writer went on to write into a generation about to be
-  // retired. Registering first closes this: if writer_stop_ turns out to already be true, this
-  // handle is dropped and retried, so no caller ever receives a handle to a generation the stop
-  // might have already (or might be about to) declare fully quiesced. `hook` is a test-only seam,
+  // the stop could complete while the writer went on to write past the frontier being captured.
+  // Registering first closes this: if writer_stop_ turns out to already be true, this handle is
+  // dropped and retried, so no caller ever receives a handle for a write the stop might have
+  // already (or might be about to) declare fully quiesced past. `hook` is a test-only seam,
   // firing once right after registering and before the writer_stop_ check -- lets a test pause a
   // writer in exactly that window to reproduce the race deterministically; no-op in production.
   //
@@ -268,14 +234,14 @@ class T2FlatFile {
     }
   }
 
-  // Reorganize-side half: marks `mem` (the still-live generation about to be retired) as
-  // stopped-for-writers, so acquire_write_handle() stops handing it to new callers, then blocks
-  // until every writer that already holds a handle to it -- i.e. started before the flag went
-  // up -- has released it. Per acquire_write_handle()'s contract that only happens after that
-  // writer's T1 publish attempt returns, so once this call returns, T1's append_region cannot
-  // receive another entry naming `mem`'s generation. Must be paired with resume_writers(),
-  // including on the exception path (the caller's try/catch already covers this; see
-  // reorganize_internal()).
+  // Checkpoint-side half: marks `mem` (the live T2Memory checkpoint_internal() is about to capture
+  // a frontier from) as stopped-for-writers, so acquire_write_handle() stops handing it to new
+  // callers, then blocks until every writer that already holds a handle to it -- i.e. started
+  // before the flag went up -- has released it. Per acquire_write_handle()'s contract that only
+  // happens after that writer's T1 publish attempt returns, so once this call returns, T1's
+  // append_region cannot receive another entry naming a T2 offset past the frontier about to be
+  // captured. Must be paired with resume_writers(), including on the exception path (the caller's
+  // try/catch already covers this; see checkpoint_internal()).
   void stop_writers_and_wait(const T2Memory *mem) const noexcept;
   // Un-pairs stop_writers_and_wait(); safe to call even if writers aren't currently stopped.
   void resume_writers() const noexcept { writer_stop_.store(false, std::memory_order_release); }
@@ -287,9 +253,7 @@ class T2FlatFile {
 
   // ─── Storage Operations ───
   // `mem` must come from acquire_write_handle() (not a plain get_memory_handle()), so the
-  // writer_stop_ check above actually gates new writes -- see that method's contract. The generation
-  // to stamp on a T1 entry (see SortedSlot::generation) is simply `mem->generation`, since the
-  // caller already holds the exact handle the write lands in.
+  // writer_stop_ check above actually gates new writes -- see that method's contract.
   //
   // Appends a new key-value record to the end of the flat file using atomic offset allocation.
   static auto append_default(const T2Memory *mem,
@@ -300,23 +264,17 @@ class T2FlatFile {
   // - Guarantees: Returns true on success; false if new value exceeds alloc_len.
   auto update_value_at(uint64_t payload, std::span<const std::byte> value) const noexcept -> bool;
   // Same as above, but resolves against a caller-supplied `mem` rather than self-acquiring the
-  // current one, so a caller that already validated `payload` against a specific generation writes
-  // through that exact mapping instead of a possibly-newer one a concurrent reorganize() swapped in.
+  // current one, so a write that already validated `payload` against that exact handle goes
+  // through it directly.
   static auto update_value_at(uint64_t payload, std::span<const std::byte> value, const T2Memory *mem) noexcept -> bool;
-  // Swaps the active memory-mapped region with a newly mapped file/capacity.
-  // - Guarantees: thread-safely replaces the atomic pointer; readers transition without blocking.
-  // - Contract: `new_mem->bytes_used` must already hold its correct initial value before this call
-  //   (set via the T2Memory constructor's `initial_bytes_used`) -- see T2Memory::bytes_used's
-  //   declaration for the race this avoids.
-  void swap_memory(std::unique_ptr<T2Memory> new_mem);
 
   // ─── Properties ───
-  // Bytes used in the T2 file (current generation) -- via get_memory_handle(), not a separate
-  // counter; see T2Memory::bytes_used's declaration.
+  // Bytes used in the T2 file -- via get_memory_handle(), not a separate counter; see
+  // T2Memory::bytes_used's declaration.
   auto bytes_used() const noexcept -> uint64_t {
     return get_memory_handle()->bytes_used.load(std::memory_order_acquire);
   }
-  // Total virtual memory capacity mapped for the T2 file (current generation).
+  // Total virtual memory capacity mapped for the T2 file.
   auto bytes_capacity() const noexcept -> uint64_t { return get_memory_handle()->capacity; }
   auto path() const noexcept -> const std::filesystem::path & { return path_; }
 
@@ -331,10 +289,7 @@ class T2FlatFile {
   // Helper to create and pre-allocate an empty binary file on disk.
   static void create_empty_file(const std::filesystem::path &path, uint64_t bytes_capacity);
 
-  void map_file(const std::filesystem::path &path,
-                uint64_t bytes_capacity,
-                uint64_t initial_generation,
-                uint64_t initial_bytes_used);
+  void map_file(const std::filesystem::path &path, uint64_t bytes_capacity, uint64_t initial_bytes_used);
 
   void retire_memory(const T2Memory *old_mem);
 
@@ -349,7 +304,7 @@ class T2FlatFile {
   mutable ThreadReferenceTracker<const T2Memory *> active_readers_;
 
   // Set by stop_writers_and_wait(), cleared by resume_writers(); gates acquire_write_handle() so
-  // no new writer starts against a generation reorganize_internal() is about to retire. See
+  // no new writer appends past the frontier checkpoint_internal() is about to capture. See
   // acquire_write_handle()'s declaration for the full contract.
   mutable std::atomic<bool> writer_stop_{false};
 };

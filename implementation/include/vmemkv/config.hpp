@@ -75,29 +75,14 @@ struct Config {
   static constexpr size_t T1AppendCapacityLog2 = 21;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
-  // Threshold basis for the tail-entry counter (TailEntryTracker, vmemkv_impl.hpp): once the
-  // count of T2-tail writes since the last drain reaches TailEntryHardThresholdPercent of this,
-  // writers block (see maybe_reorganize_if_needed()) until a cycle drains it.
-  static constexpr size_t TailEntryCapacityLog2 = 20;
-  static constexpr size_t TailEntryCapacityEntries = size_t{1} << TailEntryCapacityLog2;
-  static constexpr size_t TailEntrySoftThresholdPercent = 50;
-  static constexpr size_t TailEntryHardThresholdPercent = 90;
-
   // Default Tier 2 (T2) file storage capacity: 1 TiB.
   static constexpr size_t DefaultT2CapacityBytes = 1ULL << 40;
 
-  // Checkpoint trigger independent of tail-tracker pressure: once this many WAL bytes accumulate
-  // since the last checkpoint, a checkpoint fires regardless of tail occupancy, bounding replay
-  // time for workloads that never trip the tail-capacity trigger. See
-  // docs/specification/low_level_design.md 4.4.
+  // Checkpoint trigger: once this many WAL bytes accumulate since the last checkpoint, a
+  // checkpoint fires regardless of T1 append-region occupancy, bounding replay time for workloads
+  // that never trip the append-region-capacity trigger. See docs/specification/low_level_design.md
+  // 4.4.
   static constexpr size_t WalMaxBytesSinceCheckpoint = 64ULL << 20;  // 64 MiB.
-
-  // defragment() auto-trigger (reorg_worker_loop()): fires once T2's total footprint has grown to
-  // DefragGrowthThresholdPercent of its size as of the last defragment cycle (200 = doubled), and
-  // only once that footprint has also passed DefragMinBytesBeforeTrigger. defragment_internal()
-  // is currently a no-op, so this only gates how often that no-op's own bookkeeping runs.
-  static constexpr size_t DefragGrowthThresholdPercent = 200;
-  static constexpr size_t DefragMinBytesBeforeTrigger = 64ULL << 20;  // 64 MiB.
 
   static_assert(T1ReorganizeSoftThresholdPercent > 0 && T1ReorganizeSoftThresholdPercent < kPercentBase,
                 "T1ReorganizeSoftThresholdPercent must be in (0, 100)");

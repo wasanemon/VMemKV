@@ -51,7 +51,6 @@ void write_record(std::byte *record_base, std::span<const std::byte> key, std::s
 
 T2FlatFile::T2FlatFile(const std::filesystem::path &path,
                        uint64_t bytes_capacity,
-                       uint64_t initial_generation,
                        std::optional<uint64_t> initial_bytes_used)
     : path_(path) {
   const std::filesystem::path data_path = vmemkv::derive_t2_chk_path(path);
@@ -60,7 +59,7 @@ T2FlatFile::T2FlatFile(const std::filesystem::path &path,
     std::filesystem::remove(data_path, ignored);
     create_empty_file(data_path, bytes_capacity);
   }
-  map_file(data_path, bytes_capacity, initial_generation, initial_bytes_used.value_or(0));
+  map_file(data_path, bytes_capacity, initial_bytes_used.value_or(0));
 }
 
 T2FlatFile::~T2FlatFile() noexcept {
@@ -147,23 +146,12 @@ auto T2FlatFile::update_value_at(uint64_t payload,
   return true;
 }
 
-void T2FlatFile::swap_memory(std::unique_ptr<T2Memory> new_mem) {
-  const T2Memory *raw_new = new_mem.release();
-  const T2Memory *old_mem = t2_mem_.exchange(raw_new, std::memory_order_acq_rel);
-  if (old_mem != nullptr) {
-    retire_memory(old_mem);
-  }
-}
-
 void T2FlatFile::retire_memory(const T2Memory *old_mem) {
   active_readers_.wait_until_retired(old_mem);
   delete old_mem;
 }
 
-void T2FlatFile::map_file(const std::filesystem::path &path,
-                          uint64_t bytes_capacity,
-                          uint64_t initial_generation,
-                          uint64_t initial_bytes_used) {
+void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capacity, uint64_t initial_bytes_used) {
   const int file_descriptor = ::open(path.c_str(), O_RDWR);
   if (file_descriptor < 0) {
     throw std::system_error(errno, std::generic_category(), "open");
@@ -240,7 +228,7 @@ void T2FlatFile::map_file(const std::filesystem::path &path,
   }
 
   ::close(file_descriptor);
-  auto *mem = new T2Memory(static_cast<std::byte *>(mapped), bytes_capacity, initial_generation, initial_bytes_used);
+  auto *mem = new T2Memory(static_cast<std::byte *>(mapped), bytes_capacity, initial_bytes_used);
   mem->base_mmap_scan = base_mmap_scan_ptr;
   mem->base_mmap_scan_seq = base_mmap_scan_seq_ptr;
   mem->read_fd = read_fd_dup;

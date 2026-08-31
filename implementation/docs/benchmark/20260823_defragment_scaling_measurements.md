@@ -3,8 +3,9 @@
 AWS i4i.8xlarge、LTM は cgroup メモリ制約下(`MemoryHigh=1GiB`/`MemoryMax=2GiB`/`MemorySwapMax=1TiB`、
 `target_ratio=8.0`)。`defragment_internal()`(逐次書き換え方式、単一スレッド版)の実測値。
 
-> この計測当時の`defragment_internal()`は実際にT2レコードを再配置する実装だった。現在は
-> no-op(`docs/specification/defragment_redesign_proposal.md`参照)。
+> この計測当時の`defragment_internal()`は実際にT2レコードを再配置する実装だった。round 1で
+> no-opに戻され、round 3で公開API `defragment()` ごとコードベースから完全に削除された
+> (`docs/specification/defragment_redesign_proposal.md`参照)。
 
 ## コーパスサイズスイープ(churn=0、単独実行、フルコーパス=ratio 100%)
 

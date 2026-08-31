@@ -1,4 +1,5 @@
-// vmemkv_impl.hpp - Checkpoint-free VMemKV coordinator implementation.
+// vmemkv_impl.hpp - VMemKV coordinator implementation: routes reads/writes across T1Index and
+// T2FlatFile, and owns checkpoint/reorganize orchestration.
 //
 // ─── CONCURRENCY SPECIFICATION & MATRIX ──────────────────────────────────────
 //
@@ -60,7 +61,6 @@
 
 #include "checkpoint/checkpoint.hpp"
 #include "core/reference_tracker.hpp"
-#include "core/spin_backoff.hpp"
 #include "t1_index/t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
 #include "wal/wal.hpp"
@@ -111,12 +111,12 @@ inline auto read_t2_record_seqlock(AtFunc &&at_func, CopyFunc &&copy_func) {
 }
 
 // Test-only seam: fires once inside checkpoint_internal(), right before
-// T2FlatFile::stop_writers_and_wait() is called (i.e. while the about-to-be-retired generation is
-// still handed out normally by acquire_write_handle()). Lets a test deterministically get a
-// writer's T2MemoryHandle registered *before* the stop flag goes up, so the subsequent
-// stop-and-wait has a real, still-in-flight writer to wait for -- exercising the exact handshake
-// that closes the residual-window race (see T2FlatFile::stop_writers_and_wait()'s declaration).
-// No-op in production.
+// T2FlatFile::stop_writers_and_wait() is called (i.e. while writes are still handed out normally
+// by acquire_write_handle()). Lets a test deterministically get a writer's T2MemoryHandle
+// registered *before* the stop flag goes up, so the subsequent stop-and-wait has a real,
+// still-in-flight writer to wait for -- exercising the exact handshake that closes the
+// residual-window race (see T2FlatFile::stop_writers_and_wait()'s declaration). No-op in
+// production.
 struct NoOpPreStopHook {
   void operator()() const noexcept {}
 };
@@ -169,10 +169,11 @@ class InPlaceUpdateBarrier {
 //         Stores Key -> Payload (offset/val)  Stores actual Variable-length Value
 //
 // ─── Operation Routing ────────────────────────────────────────────────────────
-// * get(key)    : Look up Payload in T1. If inline, decode. If offset, resolve T2.
-// * insert(key) : Write value to T2 -> Get Offset -> Insert (Key, Offset) into T1.
-// * reorganize(): Rebuild T2 to a temp file containing only live records,
-//                 remap T2, and republish T1 sorted_region (Bypassing concurrent runs).
+// * get(key)     : Look up Payload in T1. If inline, decode. If offset, resolve T2.
+// * insert(key)  : Write value to T2 -> Get Offset -> Insert (Key, Offset) into T1.
+// * reorganize() : Merges T1's append region into its sorted region. Zero I/O, T2 untouched.
+// * checkpoint() : Durabilizes T2's live tail in place (msync, no relocation) and persists a
+//                  manifest-committed checkpoint.
 //
 template <typename ConfigT = vmemkv::Config<>>
 class VMemKVImpl {
@@ -215,10 +216,7 @@ class VMemKVImpl {
   // found, in which case T2FlatFile adopts its data file directly and T1 is fast-loaded from the
   // paired T1 checkpoint file, leaving only the rotated-down WAL tail to replay.
   VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity)
-      : initial_generation_(vmemkv::T2Memory::allocate_generation()),
-        t1_(initial_generation_),
-        t2_(t2_path, t2_bytes_capacity, initial_generation_, adopted_t2_bytes_used(t2_path)),
-        wal_(vmemkv::derive_wal_path(t2_path)) {
+      : t2_(t2_path, t2_bytes_capacity, adopted_t2_bytes_used(t2_path)), wal_(vmemkv::derive_wal_path(t2_path)) {
     recovering_ = true;
     load_checkpoint_if_present(t2_path);
     recover_from_wal();
@@ -239,46 +237,40 @@ class VMemKVImpl {
   static constexpr uint64_t kBlockAlignment = 16;
 
   // T1Only: in-memory merge, zero I/O, T2 untouched. Checkpoint: durabilizes T2's live tail
-  // in-place (checkpoint_internal()) -- no record ever moves. Defragment: currently a bookkeeping
-  // no-op (defragment_internal()) -- does the same T1 merge as T1Only, never touches T2.
-  enum class ReorgMode { T1Only, Checkpoint, Defragment };
+  // in-place (checkpoint_internal()) -- no record ever moves.
+  enum class ReorgMode { T1Only, Checkpoint };
 
   VMemKVImpl(const VMemKVImpl &) = delete;
   auto operator=(const VMemKVImpl &) -> VMemKVImpl & = delete;
   VMemKVImpl(VMemKVImpl &&) = delete;
   auto operator=(VMemKVImpl &&) -> VMemKVImpl & = delete;
 
-  // Merges T1's sorted+append regions and, depending on `mode`, also durabilizes or relocates T2's
-  // live data and persists the result as a manifest-committed checkpoint (low_level_design.md 5.2,
+  // Merges T1's sorted+append regions and, if `mode` is Checkpoint, also durabilizes T2's live
+  // data and persists the result as a manifest-committed checkpoint (low_level_design.md 5.2,
   // 5.6). Called under reorg_running_'s CAS guard (see reorganize()).
   template <typename PreStopHook = NoOpPreStopHook, typename PreFinishHook = NoOpPreFinishHook>
   void reorganize_internal(ReorgMode mode,
                            PreStopHook pre_stop_hook = PreStopHook{},
                            PreFinishHook pre_finish_hook = PreFinishHook{}) {
-    // Checkpointing/defragmenting during WAL replay is unsafe: recover_from_wal() runs inside
-    // wal_.replay()'s callback, and a checkpoint/defragment cycle expects to be the sole writer of
-    // T1/T2/manifest/WAL state for its duration -- recursing into one mid-replay would let it
-    // observe a T1/T2 still being reconstructed and publish a manifest against that incomplete
-    // state. recover_from_wal() is the only caller that can run while recovering_ is true, and it
-    // always passes ReorgMode::T1Only explicitly -- assert rather than silently override, so a
-    // future caller bug surfaces instead of being papered over.
+    // Checkpointing during WAL replay is unsafe: recover_from_wal() runs inside wal_.replay()'s
+    // callback, and a checkpoint cycle expects to be the sole writer of T1/T2/manifest/WAL state
+    // for its duration -- recursing into one mid-replay would let it observe a T1/T2 still being
+    // reconstructed and publish a manifest against that incomplete state. recover_from_wal() is
+    // the only caller that can run while recovering_ is true, and it always passes
+    // ReorgMode::T1Only explicitly -- assert rather than silently override, so a future caller bug
+    // surfaces instead of being papered over.
     assert((!recovering_ || mode == ReorgMode::T1Only) &&
-           "must not request a checkpoint/defragment while recovering_ -- see recover_from_wal()'s call site");
+           "must not request a checkpoint while recovering_ -- see recover_from_wal()'s call site");
 
     switch (mode) {
       case ReorgMode::Checkpoint:
         checkpoint_internal(pre_stop_hook, pre_finish_hook);
         break;
-      case ReorgMode::Defragment:
-        defragment_internal(pre_stop_hook, pre_finish_hook);
-        break;
       case ReorgMode::T1Only:
         // T1-only reorganize (zero I/O): T2 isn't touched, so the mapper leaves every entry's
-        // payload/generation untouched. Overwriting every generation to "current T2" here would
-        // silently erase a stale generation left by a past race, with no way to detect it later.
+        // payload untouched.
         t1_.reorganize([](std::span<typename T1IndexT::EntrySnapshot> /*merged*/) {},
-                       typename T1IndexT::NoOpChkWriter{},
-                       t2_.get_memory()->generation);
+                       typename T1IndexT::NoOpChkWriter{});
         reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
         reset_tombstone_counters();
         break;
@@ -388,16 +380,16 @@ class VMemKVImpl {
       // production -- see NoOpPreFinishHook.
       pre_finish_hook();
 
-      // The only place T1 gets published this cycle. No record's payload_bits or generation ever
-      // changes here -- checkpoint never relocates a record and never swaps to a new T2Memory, so
-      // there is nothing for the offset_mapper to restamp; T1's own reorganize() still merges
-      // append_region into sorted_region and writes the T1 checkpoint file (5.4 節) regardless.
+      // The only place T1 gets published this cycle. No record's payload_bits ever changes here --
+      // checkpoint never relocates a record, so there is nothing for the offset_mapper to
+      // restamp; T1's own reorganize() still merges append_region into sorted_region and writes
+      // the T1 checkpoint file (5.4 節) regardless.
       auto offset_mapper_fn = [](std::span<EntrySnapshot> /*merged*/) {};
       auto chk_writer_fn = [&](std::span<const EntrySnapshot> merged) {
         vmemkv::write_t1_checkpoint(vmemkv::derive_t1_chk_path(t2_path()), merged);
       };
       const auto t1_reorganize_start = std::chrono::steady_clock::now();
-      t1_.reorganize(offset_mapper_fn, chk_writer_fn, t2_.get_memory()->generation);
+      t1_.reorganize(offset_mapper_fn, chk_writer_fn);
       t1_reorganize_duration = std::chrono::steady_clock::now() - t1_reorganize_start;
 
       vmemkv::write_manifest(vmemkv::derive_manifest_path(t2_path()), checkpoint_lsn, target);
@@ -450,26 +442,6 @@ class VMemKVImpl {
     }
   }
 
-  // No-op on T2: never relocates records or reclaims dead space. Still does the same T1
-  // append-region drain as ReorgMode::T1Only (see that case's comment for why the mapper is a
-  // no-op) -- every reorg_worker_loop() wakeup exists because of append-region/tombstone
-  // pressure, so every ReorgMode branch must relieve it. Also advances
-  // bytes_used_at_last_defragment_/drains tail_entries_'s count so the auto-trigger doesn't
-  // busy-retrigger on stale growth/capacity signals.
-  template <typename PreStopHook = NoOpPreStopHook, typename PreFinishHook = NoOpPreFinishHook>
-  void defragment_internal(PreStopHook pre_stop_hook = PreStopHook{}, PreFinishHook pre_finish_hook = PreFinishHook{}) {
-    (void)pre_stop_hook;
-    (void)pre_finish_hook;
-    t1_.reorganize([](std::span<typename T1IndexT::EntrySnapshot> /*merged*/) {},
-                   typename T1IndexT::NoOpChkWriter{},
-                   t2_.get_memory()->generation);
-    reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
-    reset_tombstone_counters();
-    bytes_used_at_last_defragment_.store(t2_.get_memory()->bytes_used.load(std::memory_order_acquire),
-                                         std::memory_order_relaxed);
-    tail_entries_.drain_and_clear([](const StoreKey &, uint64_t) {});
-  }
-
   // update_impl()'s three possible outcomes for a non-inline entry: Aborted means update_impl()
   // itself must return false immediately (the key vanished, or T2FlatFile::update_value_at()
   // failed); FellThrough means the caller must fall back to write_entry_lockfree() (append-region
@@ -481,89 +453,71 @@ class VMemKVImpl {
     Wal::PendingRecord *pending = nullptr;
   };
 
-  // update_impl()'s in-place-update decision for a non-inline entry: retries under the same
-  // generation-pairing dance as get_impl() -- see get_impl()'s comment for the full "why" -- until
-  // it can either apply the update in place or conclusively decide it must fall through to
-  // write_entry_lockfree(). Reads T1 (`res`) once per attempt, outside the T2-matching loop: the
-  // inner loop re-fetches a real T2MemoryHandle every iteration and compares its generation
-  // directly, with no separate peek-then-fetch step reorganize could advance across in between.
-  // Re-reading T1 happens only on a directly-observed overshoot.
+  // update_impl()'s in-place-update decision for a non-inline entry: either applies the update in
+  // place or conclusively decides it must fall through to write_entry_lockfree().
   auto try_in_place_update(std::span<const std::byte> full_key,
                            std::span<const std::byte> value) -> InPlaceUpdateResult {
-    auto res = t1_.get_with_hash(full_key);
-    SpinBackoff backoff;
-    while (true) {
-      if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
+    const auto res = t1_.get_with_hash(full_key);
+    if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
+      return {InPlaceOutcome::Aborted};
+    }
+    if (t1_detail::is_inline(res.raw_hash)) {
+      return {InPlaceOutcome::FellThrough};  // Inline entry -- fall through to write_entry_lockfree().
+    }
+
+    T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+
+    // Read key/alloc_len fresh under the seqlock -- see read_t2_record_seqlock()'s comment for
+    // why an unprotected t2_.at() call isn't safe here.
+    bool key_matches = false;
+    uint32_t alloc_len = 0;
+    read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(res.payload_bits & kOffsetMask, mem); },
+                           [&](const T2RecordView &record) -> bool {
+                             key_matches = byte_span_equal(record.key, full_key);
+                             alloc_len = record.header->alloc_len;
+                             return true;
+                           });
+    const uint64_t offset = res.payload_bits & kOffsetMask;
+    // Registered *before* reading capture_watermark_/base_boundary below, and held through the
+    // write: whichever of this registration or checkpoint_internal()'s claim+wait happens
+    // first, the other side sees it. If the claim lands first, allow_in_place below already
+    // observes the raised capture_watermark_ and refuses to write. If this registration lands
+    // first, checkpoint_internal()'s in_place_update_barrier_.wait_until_retired() call blocks
+    // until this guard releases -- so base_boundary can never publish past an offset this write
+    // is still touching. See InPlaceUpdateBarrier's own contract.
+    const auto write_guard = in_place_update_barrier_.enter(offset);
+
+    // T2's base region is read through its own seqlock-free mmaps (see
+    // T2Memory::base_boundary's comment), which is only safe if base offsets never change after
+    // being written -- so an in-place update targeting the base is redirected out-of-place
+    // (falls through to write_entry_lockfree()) instead. checkpoint_internal() advances
+    // base_boundary in place on this same T2Memory instance (see that field's own declaration),
+    // so this read is against a value that only ever grows, never regresses.
+    //
+    // capture_watermark_ extends the same redirect to a range checkpoint_internal() has already
+    // claimed *this cycle*, before base_boundary itself has advanced to cover it (see that
+    // member's own comment) -- without this, an in-place update landing between the claim and
+    // the cycle's actual durabilizing read of this offset could mutate bytes it's about to (or
+    // already did) capture: torn on disk if msync() catches it mid-write, or silently reverted
+    // live once base_boundary publishes past it. seq_cst: paired with checkpoint_internal()'s
+    // seq_cst store to this same field and with in_place_update_barrier_'s own seq_cst
+    // registration/scan -- see that store's comment for the independent-atomics race this closes.
+    const bool allow_in_place = offset >= mem->base_boundary.load(std::memory_order_acquire) &&
+                                offset >= capture_watermark_.load(std::memory_order_seq_cst);
+    if (key_matches && value.size() <= alloc_len && allow_in_place) {
+      if (!t2_.update_value_at(offset, value, mem)) {
         return {InPlaceOutcome::Aborted};
       }
-      if (t1_detail::is_inline(res.raw_hash)) {
-        return {InPlaceOutcome::FellThrough};  // Inline entry -- fall through to write_entry_lockfree().
-      }
-
-      T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-      if (mem->generation < res.generation) {
-        backoff.wait();  // T2 hasn't caught up to what T1 already reflects -- retry (no T1 re-read).
-        continue;
-      }
-      backoff.reset();
-      if (mem->generation > res.generation) {
-        res = t1_.get_with_hash(full_key);  // Overshot -- res is stale, take a fresh T1 read.
-        continue;
-      }
-
-      // Read key/alloc_len fresh under the seqlock -- see read_t2_record_seqlock()'s comment for
-      // why an unprotected t2_.at() call isn't safe here.
-      bool key_matches = false;
-      uint32_t alloc_len = 0;
-      read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(res.payload_bits & kOffsetMask, mem); },
-                             [&](const T2RecordView &record) -> bool {
-                               key_matches = byte_span_equal(record.key, full_key);
-                               alloc_len = record.header->alloc_len;
-                               return true;
-                             });
-      const uint64_t offset = res.payload_bits & kOffsetMask;
-      // Registered *before* reading capture_watermark_/base_boundary below, and held through the
-      // write: whichever of this registration or checkpoint_internal()'s claim+wait happens
-      // first, the other side sees it. If the claim lands first, allow_in_place below already
-      // observes the raised capture_watermark_ and refuses to write. If this registration lands
-      // first, checkpoint_internal()'s in_place_update_barrier_.wait_until_retired() call blocks
-      // until this guard releases -- so base_boundary can never publish past an offset this write
-      // is still touching. See InPlaceUpdateBarrier's own contract.
-      const auto write_guard = in_place_update_barrier_.enter(offset);
-
-      // T2's base region is read through its own seqlock-free mmaps (see
-      // T2Memory::base_boundary's comment), which is only safe if base offsets never change after
-      // being written -- so an in-place update targeting the base is redirected out-of-place
-      // (falls through to write_entry_lockfree()) instead. checkpoint_internal() advances
-      // base_boundary in place on this same T2Memory instance (see that field's own declaration),
-      // so this read is against a value that only ever grows, never regresses.
-      //
-      // capture_watermark_ extends the same redirect to a range checkpoint_internal()/
-      // defragment_internal() has already claimed *this cycle*, before base_boundary itself has
-      // advanced to cover it (see that member's own comment) -- without this, an in-place update
-      // landing between the claim and the cycle's actual durabilizing/relocating read of this
-      // offset could mutate bytes it's about to (or already did) capture: torn on disk if msync()
-      // catches it mid-write, or silently reverted live once base_boundary publishes past it.
-      // seq_cst: paired with checkpoint_internal()'s seq_cst store to this same field and with
-      // in_place_update_barrier_'s own seq_cst registration/scan -- see that store's comment for
-      // the independent-atomics race this closes.
-      const bool allow_in_place = offset >= mem->base_boundary.load(std::memory_order_acquire) &&
-                                  offset >= capture_watermark_.load(std::memory_order_seq_cst);
-      if (key_matches && value.size() <= alloc_len && allow_in_place) {
-        if (!t2_.update_value_at(offset, value, mem)) {
-          return {InPlaceOutcome::Aborted};
-        }
-        return {InPlaceOutcome::Applied, wal_.reserve_update(full_key, value)};
-      }
-      return {InPlaceOutcome::FellThrough};  // Base-resident, doesn't fit alloc_len, or key mismatch.
+      return {InPlaceOutcome::Applied, wal_.reserve_update(full_key, value)};
     }
+    return {InPlaceOutcome::FellThrough};  // Base-resident, doesn't fit alloc_len, or key mismatch.
   }
 
   // Bounded poll, not an unconditional atomic::wait(): same rationale as reorg_worker_loop()'s
   // idle wait (see its comment) -- std::atomic<bool>::wait/notify's real-world guarantee doesn't
   // rule out a missed wakeup, and this has no timed overload to bound it directly. Both call
   // sites below only reach this while an actual reorganize is already in flight (either a manual
-  // reorganize()/checkpoint()/defragment() call found one running, or insert/update/delete hit
+  // reorganize()/checkpoint() call found one running, or insert/update/delete hit
   // the hard backpressure limit), so the wait is inherently on the order of a reorganize's own
   // duration (milliseconds to seconds) already -- kIdlePollInterval's latency is not perceptible
   // against that, unlike a genuinely hot per-call path.
@@ -583,12 +537,12 @@ class VMemKVImpl {
     total_hard_stall_duration_us_.fetch_add(static_cast<uint64_t>(waited_us), std::memory_order_relaxed);
   }
 
-  // Shared wait/CAS/run/retry loop for the three public methods below. `decide` is invoked fresh
+  // Shared wait/CAS/run/retry loop for the two public methods below. `decide` is invoked fresh
   // on every successful CAS (i.e. strictly after acquiring reorg_running_'s single-flight
-  // guarantee, never before). `force_run` mirrors the old force_t2_gc=true contract: guarantees at
-  // least one reorganize_internal() call actually completes even if T1's append region is already
-  // empty (e.g. bulk_load()'s periodic internal reorganizes already drained it), rather than
-  // skipping because there was "nothing to do" by the T1-emptiness measure alone.
+  // guarantee, never before). `force_run` guarantees at least one reorganize_internal() call
+  // actually completes even if T1's append region is already empty (e.g. bulk_load()'s periodic
+  // internal reorganizes already drained it), rather than skipping because there was "nothing to
+  // do" by the T1-emptiness measure alone.
   //
   // Performs (or waits for a concurrently-running) exactly one reorganize_internal() cycle, then
   // returns -- never loops back to check whether T1's append region has become fully empty. Under
@@ -635,12 +589,6 @@ class VMemKVImpl {
     run_reorganize([] { return ReorgMode::T1Only; }, /*force_run=*/false);
   }
 
-  // Forces a defragment_internal() cycle -- currently a bookkeeping-only no-op (see that
-  // function's own comment): does not relocate T2 records or reclaim space.
-  void defragment() {
-    run_reorganize([] { return ReorgMode::Defragment; }, /*force_run=*/true);
-  }
-
   // Forces a checkpoint_internal() cycle: durabilizes T2's live tail in place and persists the
   // result as a manifest-committed checkpoint.
   void checkpoint() {
@@ -652,13 +600,6 @@ class VMemKVImpl {
   auto t1() const noexcept -> const T1IndexT & { return t1_; }
   auto t2() noexcept -> vmemkv::T2FlatFile & { return t2_; }
   auto t2() const noexcept -> const vmemkv::T2FlatFile & { return t2_; }
-
-  // TEST-ONLY: records `full_key` into tail_entries_ as write_entry_lockfree() would, for a test
-  // that injects a T2 tail write via the low-level acquire_write_handle()/append_default()
-  // primitives directly (bypassing write_entry_lockfree()) to simulate a specific outcome.
-  void record_tail_entry_for_test(std::span<const std::byte> full_key) {
-    tail_entries_.record(t1_detail::prefix_from_bytes(full_key), t1_detail::hash_full_key(full_key));
-  }
 
   auto get_statistics() const noexcept -> vmemkv::VMemKVStatistics {
     return vmemkv::VMemKVStatistics{
@@ -699,31 +640,23 @@ class VMemKVImpl {
         continue;
       }
 
-      // acquire_write_handle() (not a plain get_memory_handle()) defers while a reorganize() has
-      // new writers stopped for its final pre-swap window, and -- critically -- `mem` is held
+      // acquire_write_handle() (not a plain get_memory_handle()) defers while checkpoint_internal()
+      // has new writers stopped for its target-capture window, and -- critically -- `mem` is held
       // alive across both the T2 append below and the T1 publish attempt, not released in
-      // between. That pairing is what closes reorganize_internal()'s residual-window race: as
-      // long as this handle is live, stop_writers_and_wait() can't conclude that `mem`'s
-      // generation is safe to retire, so a straggler entry naming it can never survive past the
-      // reorg that's currently running. write_generation is simply `mem->generation` -- the exact
-      // generation this write landed in, since we never let go of `mem` between writing and
-      // publishing.
+      // between. That pairing is what closes checkpoint_internal()'s residual-window race: as
+      // long as this handle is live, stop_writers_and_wait() can't conclude this write is
+      // quiesced, so a straggler entry can never land past the frontier the currently-running
+      // checkpoint captures.
       typename T1IndexT::PutResult put_result;
       {
         T2FlatFile::T2MemoryHandle mem = t2_.acquire_write_handle();
         uint64_t offset = vmemkv::T2FlatFile::append_default(mem, full_key, value);
-        uint64_t write_generation = mem->generation;
 
         uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + full_key.size() + value.size());
         uint64_t block_count = aligned_len / kBlockAlignment;
         assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
         uint64_t encoded_payload = offset | (block_count << kSizeEmbeddingShift);
-        put_result = t1_.put(full_key, encoded_payload, false, 0, write_generation);
-        if (put_result == T1IndexT::PutResult::Applied) {
-          // Counts this write toward tail_entries_'s near_capacity()/growth-threshold gate (see
-          // TailEntryTracker's own comment).
-          tail_entries_.record(t1_detail::prefix_from_bytes(full_key), t1_detail::hash_full_key(full_key));
-        }
+        put_result = t1_.put(full_key, encoded_payload, false, 0);
       }
       // `mem` is released here, strictly before maybe_reorganize_if_needed() below: that call can
       // block this thread waiting for a concurrent reorganize() to finish (hard-threshold
@@ -787,9 +720,9 @@ class VMemKVImpl {
   // want *different* readahead policies for that read though (madvise is a property of the
   // whole mapping, not of one read), so three distinct mappings/handles of the identical bytes
   // exist (`base_mmap_scan_seq`, `base_mmap_scan`, `read_fd` -- see T2FlatFile's constructor for
-  // how each is set up) -- which one a given call should use is decided per record (never once per
-  // generation: a real corpus isn't guaranteed uniform record sizes even though this project's
-  // benchmarks happen to use one size per run) by try_read_base_record()'s switch below. That
+  // how each is set up) -- which one a given call should use is decided per record (a real corpus
+  // isn't guaranteed uniform record sizes even though this project's benchmarks happen to use one
+  // size per run) by try_read_base_record()'s switch below. That
   // switch is the single place this decision is made, and callers never choose a mapping
   // themselves.
   // -------------------------------------------------------------------------------------------
@@ -967,110 +900,93 @@ class VMemKVImpl {
 
   // Retrieves a value and invokes callback with its raw bytes.
   // - Thread-safety: lock-free, concurrently readable during reorganization.
-  // - Concurrency note (canonical explanation; other methods below point here): looks up T1 once,
-  //   then loops constructing a real T2MemoryHandle and comparing its generation directly against
-  //   the T1 read, with no separate peek-then-fetch step in between for reorganize to advance
-  //   across. If T2 hasn't caught up yet, retry cheaply without touching T1 again; only take a
-  //   fresh T1 read on a directly-observed overshoot. This matters because
-  //   checkpoint_internal() always calls t1_.reorganize() (re-stamping every entry to
-  //   the new generation) strictly before t2_.swap_memory() (the point get_memory_handle() starts
-  //   returning that generation): for the span between those two calls, T1 already reports
-  //   generation N+1 for an entry while T2's live handle still reports N. A T1 offset resolved
-  //   against the wrong T2 generation is not just wrong data -- the rebuilt T2 file can be a
-  //   different size, so the offset can be out of bounds, and read_t2_record_seqlock() can spin
-  //   forever on bytes that never settle into a valid record.
+  // - Concurrency note (canonical explanation; other methods below point here): a T1 lookup names
+  //   a T2 offset; that offset's bytes are protected by whichever of two independent mechanisms
+  //   applies. Below base_boundary, the offset is immutable forever (see
+  //   T2Memory::base_boundary's comment) and try_read_base_record() reads it seqlock-free. At or
+  //   above it, the offset can be concurrently in-place-updated, so read_t2_record_seqlock()
+  //   below re-checks a version counter around the read and retries on a torn observation.
+  //   get_memory_handle() keeps whichever T2Memory is currently live alive for the call's
+  //   duration; T2 never remaps to a different T2Memory instance while any handle to it survives.
   template <typename Callback>
   auto get_impl(std::span<const std::byte> full_key, Callback callback) const -> bool {
-    auto res = t1_.get_with_hash(full_key);
-    SpinBackoff backoff;
-    while (true) {
-      if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
-        return false;
-      }
-
-      if constexpr (ConfigT::UseT1InlineValue) {
-        if (t1_detail::is_inline(res.raw_hash)) {
-          size_t size = t1_detail::decode_size(res.raw_hash);
-          std::array<std::byte, kInlineScalarValueBytes> stack_buf;
-          std::memcpy(stack_buf.data(), &res.payload_bits, size);
-          callback(std::span<const std::byte>(stack_buf.data(), size));
-          return true;
-        }
-      }
-
-      T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-      if (mem->generation < res.generation) {
-        backoff.wait();  // T2 hasn't caught up to what T1 already reflects -- retry (no T1 re-read).
-        continue;
-      }
-      backoff.reset();
-      if (mem->generation > res.generation) {
-        res = t1_.get_with_hash(full_key);  // Overshot -- res is stale, take a fresh T1 read.
-        continue;
-      }
-
-      const uint64_t offset = res.payload_bits & kOffsetMask;
-
-      // Base-region fast path: see try_read_base_record()'s doc comment. Bytes are immutable
-      // once written, so callback can safely receive a span straight into the pread'd buffer --
-      // no torn-read risk, no extra copy beyond what pread() itself did. thread_local/static for
-      // the same reason as tl_get_value_buf below (per-thread reuse, no per-call heap
-      // allocation).
-      thread_local static std::vector<std::byte> tl_get_base_buf;
-      if (const auto base_record = try_read_base_record(mem, res.payload_bits, BaseReader::kGet, &tl_get_base_buf);
-          base_record.has_value()) {
-        if (byte_span_equal(base_record->key, full_key)) {
-          callback(base_record->value);
-          return true;
-        }
-        // Defensive mismatch (should not happen -- try_read_base_record()'s own bounds check
-        // already guards against reading garbage): fall through to the always-correct seqlock
-        // path below instead of trusting this read.
-      }
-
-      // Torn-read fix: copy_func below must only *copy* the record's bytes into an owned buffer
-      // and return -- never invoke `callback` from inside it. `record.value` points live into
-      // T2Memory::base (MAP_SHARED, concurrently update_value_at()-writable); the seqlock's
-      // before/after version check only bounds what happens *around* copy_func's call, not what
-      // callback itself might do or how long it might run if invoked from inside that window --
-      // calling back from inside would let a concurrent in-place update tear the bytes the
-      // caller sees mid-read. thread_local (not a plain local, unlike reorganize_internal()'s
-      // offset_mapper which runs single-threaded) since concurrent callers on different threads
-      // must not share one buffer; static so repeated calls on the same thread reuse
-      // already-grown capacity instead of reallocating.
-      thread_local static std::vector<std::byte> tl_get_value_buf;
-      bool key_matches = read_t2_record_seqlock(
-          [&]() -> T2RecordView { return t2_.at(offset, mem); },
-          [&](const T2RecordView &record) -> bool {
-            if (!byte_span_equal(record.key, full_key)) {
-              return false;
-            }
-            if constexpr (ConfigT::UseGetPopulateRead) {
-              // Prototype: batch-fault the value's full page range with one
-              // syscall instead of letting each page fault in one at a time
-              // as the copy below touches it -- see GetPopulateRead's doc
-              // comment in config.hpp. Below one page this is a no-op
-              // (the implicit fault from the copy already covers it in one
-              // shot), so only values spanning more than one page pay for it.
-              constexpr uintptr_t kPageSize = 4096;
-              constexpr uintptr_t kPageMask = kPageSize - 1;
-              if (record.value.size() > kPageSize) {
-                const auto start = reinterpret_cast<uintptr_t>(record.value.data());
-                const auto end = start + record.value.size();
-                const auto aligned_start = start & ~kPageMask;
-                const auto aligned_len = ((end + kPageMask) & ~kPageMask) - aligned_start;
-                ::madvise(reinterpret_cast<void *>(aligned_start), aligned_len, MADV_POPULATE_READ);
-              }
-            }
-            tl_get_value_buf.assign(record.value.begin(), record.value.end());
-            return true;
-          });
-
-      if (key_matches) {
-        callback(std::span<const std::byte>(tl_get_value_buf));
-      }
-      return key_matches;
+    const auto res = t1_.get_with_hash(full_key);
+    if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
+      return false;
     }
+
+    if constexpr (ConfigT::UseT1InlineValue) {
+      if (t1_detail::is_inline(res.raw_hash)) {
+        size_t size = t1_detail::decode_size(res.raw_hash);
+        std::array<std::byte, kInlineScalarValueBytes> stack_buf;
+        std::memcpy(stack_buf.data(), &res.payload_bits, size);
+        callback(std::span<const std::byte>(stack_buf.data(), size));
+        return true;
+      }
+    }
+
+    T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
+    const uint64_t offset = res.payload_bits & kOffsetMask;
+
+    // Base-region fast path: see try_read_base_record()'s doc comment. Bytes are immutable
+    // once written, so callback can safely receive a span straight into the pread'd buffer --
+    // no torn-read risk, no extra copy beyond what pread() itself did. thread_local/static for
+    // the same reason as tl_get_value_buf below (per-thread reuse, no per-call heap
+    // allocation).
+    thread_local static std::vector<std::byte> tl_get_base_buf;
+    if (const auto base_record = try_read_base_record(mem, res.payload_bits, BaseReader::kGet, &tl_get_base_buf);
+        base_record.has_value()) {
+      if (byte_span_equal(base_record->key, full_key)) {
+        callback(base_record->value);
+        return true;
+      }
+      // Defensive mismatch (should not happen -- try_read_base_record()'s own bounds check
+      // already guards against reading garbage): fall through to the always-correct seqlock
+      // path below instead of trusting this read.
+    }
+
+    // Torn-read fix: copy_func below must only *copy* the record's bytes into an owned buffer
+    // and return -- never invoke `callback` from inside it. `record.value` points live into
+    // T2Memory::base (MAP_SHARED, concurrently update_value_at()-writable); the seqlock's
+    // before/after version check only bounds what happens *around* copy_func's call, not what
+    // callback itself might do or how long it might run if invoked from inside that window --
+    // calling back from inside would let a concurrent in-place update tear the bytes the
+    // caller sees mid-read. thread_local (not a plain local, unlike reorganize_internal()'s
+    // offset_mapper which runs single-threaded) since concurrent callers on different threads
+    // must not share one buffer; static so repeated calls on the same thread reuse
+    // already-grown capacity instead of reallocating.
+    thread_local static std::vector<std::byte> tl_get_value_buf;
+    bool key_matches = read_t2_record_seqlock(
+        [&]() -> T2RecordView { return t2_.at(offset, mem); },
+        [&](const T2RecordView &record) -> bool {
+          if (!byte_span_equal(record.key, full_key)) {
+            return false;
+          }
+          if constexpr (ConfigT::UseGetPopulateRead) {
+            // Prototype: batch-fault the value's full page range with one
+            // syscall instead of letting each page fault in one at a time
+            // as the copy below touches it -- see GetPopulateRead's doc
+            // comment in config.hpp. Below one page this is a no-op
+            // (the implicit fault from the copy already covers it in one
+            // shot), so only values spanning more than one page pay for it.
+            constexpr uintptr_t kPageSize = 4096;
+            constexpr uintptr_t kPageMask = kPageSize - 1;
+            if (record.value.size() > kPageSize) {
+              const auto start = reinterpret_cast<uintptr_t>(record.value.data());
+              const auto end = start + record.value.size();
+              const auto aligned_start = start & ~kPageMask;
+              const auto aligned_len = ((end + kPageMask) & ~kPageMask) - aligned_start;
+              ::madvise(reinterpret_cast<void *>(aligned_start), aligned_len, MADV_POPULATE_READ);
+            }
+          }
+          tl_get_value_buf.assign(record.value.begin(), record.value.end());
+          return true;
+        });
+
+    if (key_matches) {
+      callback(std::span<const std::byte>(tl_get_value_buf));
+    }
+    return key_matches;
   }
 
   // Updates the value of an existing key.
@@ -1091,7 +1007,7 @@ class VMemKVImpl {
 
       // Fast path: an ungated lookup to see whether the *current* value is inline -- if so, this
       // call never touches T2 (write_entry_lockfree() re-decides inline-ness for the new value
-      // fresh), so the generation-pairing dance below has nothing to protect here.
+      // fresh), so try_in_place_update() below has nothing to protect here.
       const auto quick = t1_.get_with_hash(full_key);
       if (quick.payload_bits == vmemkv::STORE_NOT_FOUND) {
         return false;
@@ -1161,7 +1077,7 @@ class VMemKVImpl {
   // Bulk-loads `count` entries via write_entry_lockfree(), bypassing the WAL for higher
   // throughput than individual insert_impl() calls. No durability guarantee: skipping the WAL
   // means a crash after this returns can lose everything loaded, unless the caller separately
-  // commits a checkpoint (defragment() or checkpoint()) afterward. Still triggers ordinary T1-only
+  // commits a checkpoint() afterward. Still triggers ordinary T1-only
   // reorganizes via maybe_reorganize_if_needed() once the append region crosses its soft
   // threshold. Not safe to call concurrently with other writers.
   template <typename KeyFn, typename ValueFn>
@@ -1176,25 +1092,9 @@ class VMemKVImpl {
   }
 
   // Performs a range scan, invoking callback(key, val) for each matching live entry.
-  // - Thread-safety: concurrently readable.
-  // - Same generation-pairing concern as get_impl(), but a whole-scan retry-from-scratch isn't
-  //   viable the way get_impl()'s retry is: t1_.scan() may have already delivered earlier entries
-  //   to the callback before a later one mismatches, and restarting from `lower_bound` would
-  //   double-deliver them. A single freshly-fetched handle (grabbed once before calling
-  //   t1_.scan()) isn't enough either -- t1_.scan() takes its own T1 snapshot internally, after
-  //   this function is entered, so that handle can already be one or more reorganize() cycles
-  //   stale by the time t1_.scan() captures the entries it hands to the callback below (no writers
-  //   needed; back-to-back reorganize() calls alone are enough), and even a handle re-fetched
-  //   per-entry can't help once a *later* reorganize() lands mid-callback-loop, since
-  //   get_memory_handle() only ever returns whatever's live *now* -- never a specific older
-  //   generation an entry happens to be stamped for.
-  // - So on a mismatch: abort the rest of this pass (t1_.scan()'s own loop still runs to
-  //   completion, but harmlessly, since every subsequent candidate short-circuits below), remember
-  //   the last key this pass actually finished examining, and re-invoke t1_.scan() from there
-  //   (inclusive) under a freshly-paired T1 snapshot/T2 handle -- skipping re-delivery of that one
-  //   already-delivered key. Keys arrive from t1_.scan() in strictly ascending order (see its
-  //   dedup/sort step), so "resume from the last delivered key" can never re-visit or skip a live
-  //   entry, only retry examining the ones a stale pass didn't get to yet.
+  // - Thread-safety: concurrently readable. t1_.scan() takes its own consistent T1 snapshot
+  //   internally (epoch-guarded for its whole duration, including this callback), so every key it
+  //   hands to the callback below is resolved against a single, self-consistent T1 state.
   template <typename Callback>
   auto scan_impl(std::span<const std::byte> lower_bound,
                  std::span<const std::byte> upper_bound,
@@ -1204,138 +1104,86 @@ class VMemKVImpl {
     }
 
     size_t total_count = 0;
-    std::array<std::byte, kStoreKeyBytes> resume_key{};
-    bool have_resume_key = false;
-    // Same SpinBackoff as get_impl()/try_in_place_update()'s retry loops -- a bare immediate
-    // retry here (no backoff) is the identical anti-pattern already found, twice, to cause
-    // genuine sustained CI-runner starvation: a concurrent defragment() cycling generations
-    // faster than one t1_.scan() pass can complete under real contention could otherwise retry
-    // this loop indefinitely without ever yielding real CPU time to whichever thread is actually
-    // advancing T2's generation. See SpinBackoff's doc comment.
-    SpinBackoff backoff;
 
-    while (true) {
-      std::span<const std::byte> current_lower =
-          have_resume_key ? std::span<const std::byte>(resume_key.data(), kStoreKeyBytes) : lower_bound;
+    t1_.scan(lower_bound,
+             upper_bound,
+             // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+             [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash) {
+               if (payload == vmemkv::STORE_NOT_FOUND) {
+                 return;
+               }
 
-      bool mismatch = false;
-      std::array<std::byte, kStoreKeyBytes> last_key{};
-      bool advanced = false;
-      size_t pass_count = 0;
+               if constexpr (ConfigT::UseT1InlineValue) {
+                 if (t1_detail::is_inline(hash)) {
+                   size_t size = t1_detail::decode_size(hash);
+                   std::array<std::byte, kInlineScalarValueBytes> stack_value;
+                   std::memcpy(stack_value.data(), &payload, size);
 
-      t1_.scan(current_lower,
-               upper_bound,
-               // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-               [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash, uint64_t t2_generation) {
-                 if (mismatch) {
-                   return;
-                 }
-                 if (payload == vmemkv::STORE_NOT_FOUND) {
-                   return;
-                 }
-                 // Resuming re-scans from the last delivered key inclusively -- skip re-delivering it.
-                 if (have_resume_key &&
-                     byte_span_equal(index_key, std::span<const std::byte>(resume_key.data(), kStoreKeyBytes))) {
-                   return;
-                 }
+                   // Trailing-zero-byte trim via bit_width instead of a byte-by-byte loop: index_key
+                   // is exactly two uint64_t's worth of bytes, so the last non-zero byte's position
+                   // comes directly from whichever half is nonzero, no per-byte branching needed.
+                   // Requires little-endian (memcpy'd byte 0 must land in the least-significant
+                   // position) -- true for every platform this codebase targets, but asserted here
+                   // since it's not obvious from the arithmetic alone.
+                   static_assert(kStoreKeyBytes == 2 * sizeof(uint64_t));
+                   static_assert(std::endian::native == std::endian::little);
+                   uint64_t lo_word;
+                   uint64_t hi_word;
+                   std::memcpy(&lo_word, index_key.data(), sizeof(lo_word));
+                   std::memcpy(&hi_word, index_key.data() + sizeof(lo_word), sizeof(hi_word));
+                   const size_t len = hi_word != 0 ? sizeof(lo_word) + (std::bit_width(hi_word) + 7) / 8
+                                                   : (std::bit_width(lo_word) + 7) / 8;
 
-                 if constexpr (ConfigT::UseT1InlineValue) {
-                   if (t1_detail::is_inline(hash)) {
-                     size_t size = t1_detail::decode_size(hash);
-                     std::array<std::byte, kInlineScalarValueBytes> stack_value;
-                     std::memcpy(stack_value.data(), &payload, size);
-
-                     // Trailing-zero-byte trim via bit_width instead of a byte-by-byte loop: index_key
-                     // is exactly two uint64_t's worth of bytes, so the last non-zero byte's position
-                     // comes directly from whichever half is nonzero, no per-byte branching needed.
-                     // Requires little-endian (memcpy'd byte 0 must land in the least-significant
-                     // position) -- true for every platform this codebase targets, but asserted here
-                     // since it's not obvious from the arithmetic alone.
-                     static_assert(kStoreKeyBytes == 2 * sizeof(uint64_t));
-                     static_assert(std::endian::native == std::endian::little);
-                     uint64_t lo_word;
-                     uint64_t hi_word;
-                     std::memcpy(&lo_word, index_key.data(), sizeof(lo_word));
-                     std::memcpy(&hi_word, index_key.data() + sizeof(lo_word), sizeof(hi_word));
-                     const size_t len = hi_word != 0 ? sizeof(lo_word) + (std::bit_width(hi_word) + 7) / 8
-                                                     : (std::bit_width(lo_word) + 7) / 8;
-
-                     // Inline values never reference T2, so they can never generation-mismatch.
-                     // last_key needs the full, untrimmed bytes regardless (a later record's mismatch
-                     // can resume from here); key_view reuses that copy instead of a second one.
-                     std::memcpy(last_key.data(), index_key.data(), kStoreKeyBytes);
-                     std::span<const std::byte> key_view(last_key.data(), len);
-                     advanced = true;
-                     if (!key_in_range(key_view, lower_bound, upper_bound)) {
-                       return;
-                     }
-                     callback(key_view, std::span<const std::byte>(stack_value.data(), size));
-                     ++pass_count;
+                   const std::span<const std::byte> key_view(index_key.data(), len);
+                   if (!key_in_range(key_view, lower_bound, upper_bound)) {
                      return;
                    }
-                 }
-
-                 // Generation mismatch -- see scan_impl()'s doc comment above.
-                 T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
-                 if (t2_generation != mem->generation) {
-                   mismatch = true;
+                   callback(key_view, std::span<const std::byte>(stack_value.data(), size));
+                   ++total_count;
                    return;
                  }
+               }
 
-                 std::memcpy(last_key.data(), index_key.data(), kStoreKeyBytes);
-                 advanced = true;
+               T2FlatFile::T2MemoryHandle mem = t2_.get_memory_handle();
 
-                 // Base-region fast path: see try_read_base_record()'s doc comment. No seqlock
-                 // needed -- the base mappings' bytes are immutable once written, so callback can
-                 // safely receive live spans straight into them.
-                 if (const auto base_record = try_read_base_record(mem, payload, BaseReader::kScan, nullptr);
-                     base_record.has_value()) {
-                   if (key_in_range(base_record->key, lower_bound, upper_bound)) {
-                     callback(base_record->key, base_record->value);
-                   }
-                   ++pass_count;
-                   return;
+               // Base-region fast path: see try_read_base_record()'s doc comment. No seqlock
+               // needed -- the base mappings' bytes are immutable once written, so callback can
+               // safely receive live spans straight into them.
+               if (const auto base_record = try_read_base_record(mem, payload, BaseReader::kScan, nullptr);
+                   base_record.has_value()) {
+                 if (key_in_range(base_record->key, lower_bound, upper_bound)) {
+                   callback(base_record->key, base_record->value);
                  }
+                 ++total_count;
+                 return;
+               }
 
-                 // t2_.at() called inside read_t2_record_seqlock() (as AtFunc), matching get_impl() --
-                 // see read_t2_record_seqlock()'s comment.
-                 //
-                 // Torn-read fix: copy_func below must only *copy* into an owned buffer and
-                 // return, never invoke `callback` from inside it -- see get_impl()'s identical
-                 // fix and comment for the full rationale. thread_local since this is called
-                 // concurrently from many threads; static so repeated calls (once per matching
-                 // record, possibly many per scan()) reuse already-grown capacity instead of
-                 // reallocating.
-                 thread_local static std::vector<std::byte> tl_scan_key_buf;
-                 thread_local static std::vector<std::byte> tl_scan_value_buf;
-                 bool in_range =
-                     read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(payload & kOffsetMask, mem); },
-                                            [&](const T2RecordView &record) -> bool {
-                                              if (!key_in_range(record.key, lower_bound, upper_bound)) {
-                                                return false;
-                                              }
-                                              tl_scan_key_buf.assign(record.key.begin(), record.key.end());
-                                              tl_scan_value_buf.assign(record.value.begin(), record.value.end());
-                                              return true;
-                                            });
-                 if (in_range) {
-                   callback(std::span<const std::byte>(tl_scan_key_buf), std::span<const std::byte>(tl_scan_value_buf));
-                 }
-                 ++pass_count;
-               });
-
-      total_count += pass_count;
-      if (!mismatch) {
-        break;
-      }
-      if (advanced) {
-        resume_key = last_key;
-        have_resume_key = true;
-      }
-      // else: the mismatch fired on the very first (non-skipped) candidate this pass -- retry the
-      // exact same range under a fresh handle/snapshot pairing.
-      backoff.wait();
-    }
+               // t2_.at() called inside read_t2_record_seqlock() (as AtFunc), matching get_impl() --
+               // see read_t2_record_seqlock()'s comment.
+               //
+               // Torn-read fix: copy_func below must only *copy* into an owned buffer and
+               // return, never invoke `callback` from inside it -- see get_impl()'s identical
+               // fix and comment for the full rationale. thread_local since this is called
+               // concurrently from many threads; static so repeated calls (once per matching
+               // record, possibly many per scan()) reuse already-grown capacity instead of
+               // reallocating.
+               thread_local static std::vector<std::byte> tl_scan_key_buf;
+               thread_local static std::vector<std::byte> tl_scan_value_buf;
+               bool in_range =
+                   read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(payload & kOffsetMask, mem); },
+                                          [&](const T2RecordView &record) -> bool {
+                                            if (!key_in_range(record.key, lower_bound, upper_bound)) {
+                                              return false;
+                                            }
+                                            tl_scan_key_buf.assign(record.key.begin(), record.key.end());
+                                            tl_scan_value_buf.assign(record.value.begin(), record.value.end());
+                                            return true;
+                                          });
+               if (in_range) {
+                 callback(std::span<const std::byte>(tl_scan_key_buf), std::span<const std::byte>(tl_scan_value_buf));
+               }
+               ++total_count;
+             });
 
     return total_count;
   }
@@ -1360,21 +1208,6 @@ class VMemKVImpl {
   // reorg_worker_loop() to decide whether to call checkpoint()-equivalent behavior.
   auto wal_over_threshold() const -> bool { return wal_.size_bytes() >= ConfigT::WalMaxBytesSinceCheckpoint; }
 
-  // Whether T2's total footprint has grown enough since the last defragment_internal() cycle (or
-  // since startup, if none has ever run) to warrant another one. Used only by reorg_worker_loop().
-  // bytes_used, not base_boundary: bytes_used also counts whatever's currently in the tail, so
-  // growth here reflects total space consumed regardless of how recently checkpoint() last ran.
-  // Gated by DefragMinBytesBeforeTrigger so a store that hasn't reached a meaningful size yet
-  // doesn't pay for a cycle before there's anything worth reclaiming.
-  auto defrag_growth_over_threshold() const -> bool {
-    const uint64_t current = t2_.get_memory()->bytes_used.load(std::memory_order_acquire);
-    if (current < ConfigT::DefragMinBytesBeforeTrigger) {
-      return false;
-    }
-    const uint64_t baseline = bytes_used_at_last_defragment_.load(std::memory_order_acquire);
-    return current >= (baseline * ConfigT::DefragGrowthThresholdPercent) / 100;
-  }
-
   // Fast-boot path (low_level_design.md 5.3): if a checkpoint was ever committed, adopts its T1
   // sorted_region to match the T2 data T2FlatFile's constructor already adopted (see
   // adopted_t2_bytes_used(), consulted from the constructor's initializer list before t1_/t2_
@@ -1395,18 +1228,15 @@ class VMemKVImpl {
     vmemkv::T1CheckpointFile t1_chk(vmemkv::derive_t1_chk_path(t2_path));
 
     // O(N) memcpy-shaped conversion (on-disk order -> EntrySnapshot order), no hashing or
-    // per-key insertion -- what makes fast boot fast (low_level_design.md 5.4). Every entry in
-    // one checkpoint was written against the same T2 generation it rebuilt, and t2_ was
-    // constructed against that identical generation (initial_generation_), so all loaded entries
-    // are uniformly stamped with it.
+    // per-key insertion -- what makes fast boot fast (low_level_design.md 5.4).
     using EntrySnapshot = typename T1IndexT::EntrySnapshot;
     std::vector<EntrySnapshot> entries;
     entries.reserve(t1_chk.entries().size());
     for (const auto &on_disk : t1_chk.entries()) {
-      entries.push_back(EntrySnapshot{on_disk.key_prefix, on_disk.payload_bits, on_disk.hash, initial_generation_});
+      entries.push_back(EntrySnapshot{on_disk.key_prefix, on_disk.payload_bits, on_disk.hash});
     }
 
-    t1_.load_sorted_region_from_checkpoint(entries, initial_generation_);
+    t1_.load_sorted_region_from_checkpoint(entries);
   }
 
   // Replays the current contents of wal_ into T1 (and, via write_entry_lockfree, T2) -- whether
@@ -1477,9 +1307,8 @@ class VMemKVImpl {
   }
 
   // Lets a caller (via setenv/unsetenv) suppress reorg_worker_loop()'s auto-triggered Checkpoint
-  // for a bounded window, without affecting a manually requested reorganize()/checkpoint()/
-  // defragment() call or T1Only/Defragment auto-triggering. Checked fresh every wakeup, not
-  // cached.
+  // for a bounded window, without affecting a manually requested reorganize()/checkpoint() call or
+  // T1Only auto-triggering. Checked fresh every wakeup, not cached.
   static auto auto_reorg_suppressed() noexcept -> bool { return std::getenv("VMEMKV_SUPPRESS_AUTO_REORG") != nullptr; }
 
   void reorg_worker_loop(std::stop_token stop_token) {
@@ -1509,20 +1338,16 @@ class VMemKVImpl {
         continue;
       }
       try {
-        // Explicit priority: checkpoint pressure (WAL size) wins over defragment pressure
-        // (tail-tracker or T2 footprint growth), which wins over a plain T1-only reorganize. Note
-        // reorg_requested_ (this wakeup's trigger) only ever fires on append-region/delete
-        // pressure (see maybe_reorganize_if_needed()) -- tail_entries_/WAL-size/T2-footprint
-        // changes never themselves cause a wakeup, so this only checks them "while already awake
-        // anyway."
+        // Explicit priority: checkpoint pressure (WAL size) wins over a plain T1-only reorganize.
+        // Note reorg_requested_ (this wakeup's trigger) only ever fires on append-region/delete
+        // pressure (see maybe_reorganize_if_needed()) -- WAL-size changes never themselves cause a
+        // wakeup, so this only checks it "while already awake anyway."
         //
-        // auto_reorg_suppressed() gates only this Checkpoint branch, never T1Only/Defragment: T1's
-        // append region has a hard capacity, so some reorg must keep draining it or
+        // auto_reorg_suppressed() gates only this Checkpoint branch, never T1Only: T1's append
+        // region has a hard capacity, so some reorg must keep draining it or
         // write_entry_lockfree()'s AppendRegionFull retry loop spins forever.
         if (wal_over_threshold() && !auto_reorg_suppressed()) {
           reorganize_internal(ReorgMode::Checkpoint);
-        } else if (tail_entries_.near_capacity() || defrag_growth_over_threshold()) {
-          reorganize_internal(ReorgMode::Defragment);
         } else {
           reorganize_internal(ReorgMode::T1Only);
         }
@@ -1574,27 +1399,6 @@ class VMemKVImpl {
     }
 
     if (append_size >= hard_limit || append_size >= append_capacity) {
-      if (reorg_running_.load(std::memory_order_acquire)) {
-        hard_stall_count_.fetch_add(1, std::memory_order_relaxed);
-      }
-      wait_until_reorg_not_running();
-    }
-
-    // Same soft/hard split as above, for tail_entries_ instead of the T1 append region. Unlike
-    // the append region (drained by *any* reorganize_internal() call), only a defragment cycle
-    // drains tail_entries_ -- see reorg_worker_loop()'s priority check, which fires a defragment
-    // whenever tail_entries_.near_capacity() so the wakeup this triggers actually picks that kind
-    // of cycle.
-    const size_t tail_size = tail_entries_.size();
-    const size_t tail_capacity = ConfigT::TailEntryCapacityEntries;
-    const size_t tail_soft_limit = (tail_capacity * ConfigT::TailEntrySoftThresholdPercent) / 100;
-    const size_t tail_hard_limit = (tail_capacity * ConfigT::TailEntryHardThresholdPercent) / 100;
-
-    if (tail_size >= tail_soft_limit) {
-      reorg_requested_.store(true, std::memory_order_release);
-    }
-
-    if (tail_size >= tail_hard_limit) {
       if (reorg_running_.load(std::memory_order_acquire)) {
         hard_stall_count_.fetch_add(1, std::memory_order_relaxed);
       }
@@ -1652,9 +1456,6 @@ class VMemKVImpl {
     }
   }
 
-  // Reserved once, before t1_/t2_ construct, and stamped on both t1_'s initial sorted_snapshot_
-  // and t2_'s initial T2Memory so the two agree on a matching pair from construction.
-  const uint64_t initial_generation_;
   T1IndexT t1_;
   vmemkv::T2FlatFile t2_;
   vmemkv::Wal wal_;
@@ -1700,41 +1501,6 @@ class VMemKVImpl {
   mutable std::atomic<uint64_t> last_checkpoint_wal_rotate_leader_wait_us_{0};
   mutable std::atomic<uint64_t> last_checkpoint_bytes_synced_{0};
   mutable std::atomic<uint64_t> last_checkpoint_corpus_bytes_{0};
-
-  // reorg_worker_loop()'s auto-trigger baseline for defragment(): T2's total footprint
-  // (bytes_used) as of the end of the most recent successful defragment_internal() cycle, updated
-  // by that function itself regardless of trigger source. 0 until the first cycle ever completes.
-  std::atomic<uint64_t> bytes_used_at_last_defragment_{0};
-
-  // Counts entries written into T2's tail region (offset >= old_base_boundary) since the last
-  // cycle that drained it, so reorg_worker_loop() knows when tail growth alone should force a
-  // cycle even if T1's append-region thresholds haven't. No longer carries entry content
-  // (prefix/hash): defragment_internal() (its only content consumer) discards them, and
-  // checkpoint_internal() durabilizes the tail via a single msync() over an offset range rather
-  // than per-entry enumeration.
-  class TailEntryTracker {
-   public:
-    void record(const StoreKey & /*prefix*/, uint64_t /*hash*/) noexcept {
-      tail_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] auto size() const noexcept -> size_t { return tail_.load(std::memory_order_relaxed); }
-
-    // Forces a cycle (which drains this tracker) before it could otherwise grow unbounded purely
-    // from soft-threshold-triggered T1-only cycles, which don't touch this at all.
-    [[nodiscard]] auto near_capacity() const noexcept -> bool {
-      return size() >= (ConfigT::TailEntryCapacityEntries * ConfigT::TailEntrySoftThresholdPercent) / 100;
-    }
-
-    template <typename Fn>
-    void drain_and_clear(Fn && /*fn*/) {
-      tail_.store(0, std::memory_order_relaxed);
-    }
-
-   private:
-    std::atomic<size_t> tail_{0};
-  };
-  mutable TailEntryTracker tail_entries_;
 };
 
 using VMemKV = VMemKVImpl<vmemkv::Config<>>;

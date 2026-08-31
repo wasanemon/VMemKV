@@ -12,7 +12,7 @@
 # I/O, which risks the outer/internal timeouts on the largest combos (in_memory/8B's 20M-key
 # corpus, ltm's memory-constrained scenarios, and large-value ltm/64KB records).
 #
-# No sweep, no escalation -- unlike run_reorg_scaling_probe.sh/run_defrag_scaling_probe.sh, this
+# No sweep, no escalation -- unlike run_reorg_scaling_probe.sh, this
 # is exactly one data point per combo. Reuses run_probe_point()'s two-tier timeout handling (see
 # common/reorg_probe_common.sh).
 set -uo pipefail  # deliberately not -e: probe/timeout exit codes are inspected explicitly below
@@ -25,9 +25,9 @@ DB_DIR="${3:-/tmp}"
 # ("in_memory"/"ltm" or "in_memory:8B"/"ltm:64KB"). Empty (the default) means "all 4 combos".
 COMBO_FILTER="${4:-}"
 
-# Larger than run_reorg_scaling_probe.sh/run_defrag_scaling_probe.sh's 300s: applying churn to a
-# large corpus is itself setup work independent of checkpoint()'s own cost, and needs more
-# headroom than a single reorganize()/defragment() call does.
+# Larger than run_reorg_scaling_probe.sh's 300s: applying churn to a large corpus is itself setup
+# work independent of checkpoint()'s own cost, and needs more headroom than a single
+# reorganize() call does.
 OUTER_TIMEOUT_SECONDS=600
 ALL_COMBOS=("in_memory:8B" "in_memory:1KB" "ltm:1KB" "ltm:64KB")
 COMBOS=()

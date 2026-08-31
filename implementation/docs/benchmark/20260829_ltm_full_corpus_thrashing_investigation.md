@@ -6,8 +6,8 @@
 
 ## 症状と初期調査
 
-`run_defrag_scaling_probe.sh`のLTMスイープと`run_checkpoint_throughput_probe.sh`の`ltm/1KB`/
-`ltm/64KB`地点も同じパターン(フル〜ほぼフルコーパスで発生)。`benchmark_results/2026082101`
+当時存在した`run_defrag_scaling_probe.sh`(round 3で`defragment()`削除に伴い廃止済み)のLTMスイープと
+`run_checkpoint_throughput_probe.sh`の`ltm/1KB`/`ltm/64KB`地点も同じパターン(フル〜ほぼフルコーパスで発生)。`benchmark_results/2026082101`
 (commit `4a7084c`)ではこれらの地点が5.2-5.68秒で完走していた記録がある。
 
 2026-08-28のcheckpoint自動トリガー修正(`6aec324`/`db31a6b`/`a3bb115`)が原因ではないことをAWS A/Bで
