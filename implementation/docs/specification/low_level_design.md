@@ -215,7 +215,7 @@ struct VMemKV {
 
 `reorganize` は Ordering Fragmentation を解消する: Tier 1 `append_region` の肥大化により候補探索・確認コストが増え、Get / Scan が遅くなる問題である。
 
-Tier 2 側にも delete や append-update の結果として生じる Storage Fragmentation(Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ)が存在する。`checkpoint_internal()`(4.3 節)はこれを解消しない。`defragment_internal()`(4.6 節)が Tier 2 全体を再配置してこれを解消する。
+Tier 2 側にも delete や append-update の結果として生じる Storage Fragmentation(Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ)が存在する。`checkpoint_internal()`(4.3 節)はこれを解消しない。設計上は`defragment_internal()`(4.6 節)が Tier 2 全体を再配置してこれを解消するが、現在は no-op で稼働していない。
 
 ### 4.2 T1 Reorganize
 
@@ -250,7 +250,7 @@ T1 `reorganize` は T2 と独立に実行できる。
 
 entry 単位でインライン化されている entry(2.1.1 節、7.3 節)は Tier 2 に一切アクセスしないため、この処理の対象から外れる。
 
-`checkpoint_internal()` は Tier 2 の**単一の永続ファイル**の tail 領域(`[old_base_boundary, bytes_used)`)を `msync()` で永続化する。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- Storage Fragmentation の解消(GC)はこの処理の対象外であり、4.6 節の `defragment_internal()` が担う。
+`checkpoint_internal()` は Tier 2 の**単一の永続ファイル**の tail 領域(`[old_base_boundary, bytes_used)`)を `msync()` で永続化する。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- Storage Fragmentation の解消(GC)はこの処理の対象外であり、設計上は 4.6 節の `defragment_internal()` が担うが、現在は no-op で稼働していない。
 
 **Input**
 
@@ -297,7 +297,7 @@ $$\text{Defragment\_Trigger} = \left(\text{T2\_Bytes\_Used} \ge \text{DefragGrow
 |---|---|
 | `reorganize()` | T1 の Append→Sorted マージのみ。T2/ディスク非関与 |
 | `checkpoint()` | Tier 2 の tail を in-place で永続化し、manifest を commit して WAL を rotate する |
-| `defragment()` | Tier 2 の生存データ全件を新しい offset へ再配置し、manifest を commit して WAL を rotate する(4.6 節) |
+| `defragment()` | 設計上はTier 2の生存データ全件を再配置(4.6節)。現在はno-op(T1のAppend→Sortedマージのみ) |
 
 ### 4.5 T1 Reorganize Auto-Trigger (ワークロード適応型 L2 キャッシュサイズ制限と Soft/Hard しきい値)
 
@@ -328,6 +328,9 @@ T1 `reorganize` は、`append_region` のサイズに応じて自動的にバッ
 2. `reorganize()` のマージ完了時に、`scan_active_` を `false` にリセットする。
 
 ### 4.6 T2 Defragment (`defragment_internal()`)
+
+> **現在の状態**: 本節は設計された挙動を記述する。`defragment_internal()`は現在no-opであり、
+> T2レコードの再配置・空間回収は行わない(`defragment_redesign_proposal.md` §8参照)。
 
 `checkpoint_internal()`(4.3 節)が解消しない Storage Fragmentation ―― Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ ―― を、`defragment_internal()` が解消する。生存中の Tier 2 record 全件を、T1 の key 順のまま新規ファイルへ連続した offset で再配置し、旧ファイルを丸ごと置き換える。
 

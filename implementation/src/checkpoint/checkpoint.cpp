@@ -21,9 +21,8 @@ constexpr mode_t kCheckpointFilePermissions = 0600;
 // Writes in kSyncIntervalBytes chunks, periodically fdatasync()-ing and
 // posix_fadvise(DONTNEED)-ing what's been written, rather than one write()+fsync() at the end.
 // This bounds how much of the T1 checkpoint accumulates as page cache, competing with the live T2
-// mmap's resident pages for RAM (see maybe_sync_and_drop_checkpoint_cache() in vmemkv_impl.hpp for
-// the equivalent on T2). Best-effort for the periodic calls -- only the final fsync is a hard
-// durability requirement.
+// mmap's resident pages for RAM. Best-effort for the periodic calls -- only the final fsync is a
+// hard durability requirement.
 void write_fsync_close(int file_descriptor, const void *data, size_t size, const char *what) {
   constexpr size_t kSyncIntervalBytes = 512ULL * 1024 * 1024;  // 512MiB
   const auto *bytes = static_cast<const std::byte *>(data);

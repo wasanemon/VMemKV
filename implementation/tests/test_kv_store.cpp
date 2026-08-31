@@ -989,7 +989,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
 // sorted_snapshot_ with the T2Memory generation it was built against and validating the pair on
 // every read. Reaching the final CHECK without hanging is this test's primary assertion.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("VMemKV: scan survives a T2-generation-swapping defragment running concurrently (regression)") {
+TEST_CASE("VMemKV: scan survives a concurrent defragment() call (regression)") {
   using TestStore = vmemkv::variants::VMemKVStore;
   auto store = StoreFactory<TestStore>::make();
 
@@ -1009,7 +1009,7 @@ TEST_CASE("VMemKV: scan survives a T2-generation-swapping defragment running con
   std::atomic<bool> stop{false};
   std::thread reorganizer([&] {
     while (!stop.load(std::memory_order_relaxed)) {
-      store->defragment();  // Forces a fresh T2Memory (new mmap, new generation) every call.
+      store->defragment();
     }
   });
 
@@ -1040,13 +1040,11 @@ TEST_CASE("VMemKV: scan survives a T2-generation-swapping defragment running con
   CHECK_FALSE(count_mismatch.load());
 }
 
-// Stress/regression test: concurrent in-place updates racing repeated defragment() cycles must
-// never corrupt data or inflate T2 capacity (capacity only ever grows, so any torn read that
-// oversizes a relocated record's footprint would be permanent and visible here). Best run under
-// ThreadSanitizer, which detects a data race directly; the capacity check below is a coarser
-// signal for plain builds.
+// Stress/regression test: repeated concurrent defragment() calls racing an in-place update must
+// never corrupt data or grow T2 capacity. Best run under ThreadSanitizer, which detects a data
+// race directly; the capacity check below is a coarser signal for plain builds.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("VMemKV: defragment survives a concurrent in-place update (regression)") {
+TEST_CASE("VMemKV: concurrent defragment() calls survive a racing in-place update (regression)") {
   using TestStore = vmemkv::variants::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
@@ -1066,13 +1064,11 @@ TEST_CASE("VMemKV: defragment survives a concurrent in-place update (regression)
 
   constexpr int kReorgCycles = 300;
   for (int i = 0; i < kReorgCycles; ++i) {
-    store->defragment();  // Forces a fresh T2Memory generation every call, maximizing race opportunities.
+    store->defragment();
   }
   stop.store(true, std::memory_order_relaxed);
   updater.join();
 
-  // A torn read would write an oversized "value" and, since T2 capacity only ever grows, that
-  // inflation would be permanent and visible here.
   CHECK(store->t2().bytes_capacity() <= kStoreCapacityBytes);
 
   const auto final_value = test_util::get_bytes_sync(store, "hot");

@@ -2015,6 +2015,47 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   std::_Exit(timed_out ? 124 : 0);
 }
 
+static std::string reorg_probe_path(const ProbeArgs &args, const std::string &suffix) {
+  return get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" + std::to_string(args.val_size) + "_" +
+         suffix;
+}
+
+static std::size_t resolve_writer_threads(std::size_t override_threads) {
+  return override_threads != 0 ? override_threads
+                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+}
+
+// Samples `churn_count` random indices in [0, key_count) and update()s each, sharded across up
+// to 16 threads. Shared setup shape for run_steady()/run_defrag()/run_checkpoint_contention()'s
+// kUpdateCold pre-churn.
+static void apply_random_churn(vmemkv::variants::VMemKVStore &store,
+                               std::size_t key_count,
+                               std::size_t churn_count,
+                               uint64_t seed,
+                               std::size_t val_size) {
+  std::mt19937_64 churn_rng(seed);
+  std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
+  std::vector<std::size_t> churn_indices(churn_count);
+  for (auto &idx : churn_indices) {
+    idx = churn_index_dist(churn_rng);
+  }
+  const std::size_t churn_threads =
+      std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
+  std::vector<std::thread> workers;
+  workers.reserve(churn_threads);
+  for (std::size_t t = 0; t < churn_threads; ++t) {
+    workers.emplace_back([&store, &churn_indices, val_size, t, churn_threads]() {
+      for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
+        const std::size_t idx = churn_indices[i];
+        store.update(make_key(idx), make_value_for_key(idx, val_size));
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+}
+
 // T1-only / T1+T2 bootstrap modes: a single fresh populate (scattered insert order, see
 // populate_random_order()'s comment) followed by exactly one timed reorganize()/checkpoint()
 // call, against a corpus with no prior checkpoint.
@@ -2025,9 +2066,9 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
   const bool force_checkpoint = args.mode == ProbeMode::kT1T2;
 
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_" + (force_checkpoint ? "t1t2" : "t1only") + "_" +
-                           std::to_string(static_cast<int>(args.ratio * 100));
+  const std::string path = reorg_probe_path(
+      args,
+      (force_checkpoint ? "t1t2" : "t1only") + std::string("_") + std::to_string(static_cast<int>(args.ratio * 100)));
 
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
@@ -2102,31 +2143,12 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   // concurrent WAL appends benefit from group commit (see wal.cpp) the same way a real concurrent
   // write workload would.
   const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * args.churn_ratio));
-  std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000) +
-                            static_cast<uint64_t>(args.churn_ratio * 1000000));
-  std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
-  std::vector<std::size_t> churn_indices(churn_count);
-  for (auto &idx : churn_indices) {
-    idx = churn_index_dist(churn_rng);
-  }
-  const std::size_t churn_threads =
-      std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
-
-  {
-    std::vector<std::thread> workers;
-    workers.reserve(churn_threads);
-    for (std::size_t t = 0; t < churn_threads; ++t) {
-      workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
-        for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
-          const std::size_t idx = churn_indices[i];
-          store->update(make_key(idx), make_value_for_key(idx, val_size));
-        }
-      });
-    }
-    for (auto &worker : workers) {
-      worker.join();
-    }
-  }
+  apply_random_churn(
+      *store,
+      key_count,
+      churn_count,
+      kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000) + static_cast<uint64_t>(args.churn_ratio * 1000000),
+      args.val_size);
 
   auto [elapsed_sec, timed_out] = timed_run([&store]() { store->checkpoint(); });
 
@@ -2143,16 +2165,20 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 // then exactly one timed defragment() call. Two sweeps share this same mode: fixed churn_ratio=0,
 // varying --ratio ("corpus-size scaling") and fixed --ratio=1.0, varying --churn-ratio
 // ("churn-ratio invariance") -- see run_defrag_scaling_probe.sh.
+//
+// defragment_internal() is currently a bookkeeping-only no-op (see its own comment in
+// vmemkv_impl.hpp): it completes in ~O(1) regardless of corpus/churn, so this mode's
+// corpus-size-scaling and churn-ratio-invariance signals are currently degenerate (a flat,
+// near-zero elapsed_sec at every point). Kept as-is for when relocation logic returns.
 [[noreturn]] void run_defrag(const ProbeArgs &args) {
   using Store = vmemkv::variants::VMemKVStore;
 
   const std::size_t full_key_count = corpus_size_for_value(args.val_size);
   const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
 
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_defrag_" +
-                           std::to_string(static_cast<int>(args.ratio * 100)) + "_" +
-                           std::to_string(static_cast<int>(args.churn_ratio * 100));
+  const std::string path = reorg_probe_path(args,
+                                            "defrag_" + std::to_string(static_cast<int>(args.ratio * 100)) + "_" +
+                                                std::to_string(static_cast<int>(args.churn_ratio * 100)));
 
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
@@ -2161,28 +2187,12 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
 
   if (args.churn_ratio > 0.0) {
     const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * args.churn_ratio));
-    std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000) +
-                              static_cast<uint64_t>(args.churn_ratio * 1000000));
-    std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
-    std::vector<std::size_t> churn_indices(churn_count);
-    for (auto &idx : churn_indices) {
-      idx = churn_index_dist(churn_rng);
-    }
-    const std::size_t churn_threads =
-        std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
-    std::vector<std::thread> workers;
-    workers.reserve(churn_threads);
-    for (std::size_t t = 0; t < churn_threads; ++t) {
-      workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
-        for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
-          const std::size_t idx = churn_indices[i];
-          store->update(make_key(idx), make_value_for_key(idx, val_size));
-        }
-      });
-    }
-    for (auto &worker : workers) {
-      worker.join();
-    }
+    apply_random_churn(
+        *store,
+        key_count,
+        churn_count,
+        kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000) + static_cast<uint64_t>(args.churn_ratio * 1000000),
+        args.val_size);
   }
 
   auto [elapsed_sec, timed_out] = timed_run([&store]() { store->defragment(); });
@@ -2316,21 +2326,44 @@ auto run_contention_probe(Store &store,
   return {isolated_write_tps, concurrent_write_tps, avg_op_elapsed_sec, timed_out};
 }
 
+// scenario/value_size/mode/ratio/key_count/writer_threads/isolated_write_tps/concurrent_write_tps
+// plus a caller-named op-duration field and timed_out -- the common shape of every contention
+// mode's result. checkpoint_contention prints its own (it also carries a workload field and
+// trailing checkpoint-phase stats no other mode has).
+static void print_contention_result(const ProbeArgs &args,
+                                    const char *mode_name,
+                                    std::size_t key_count,
+                                    std::size_t writer_threads,
+                                    double isolated_write_tps,
+                                    double concurrent_write_tps,
+                                    const char *op_field_name,
+                                    double op_elapsed_sec,
+                                    bool timed_out) {
+  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
+            << "," << "\"mode\":\"" << mode_name << "\"," << "\"ratio\":" << args.ratio << ","
+            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << writer_threads << ","
+            << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"concurrent_write_tps\":" << concurrent_write_tps << "," << "\"" << op_field_name
+            << "\":" << op_elapsed_sec << "," << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
+}
+
 // Defrag-contention mode: same populate+checkpoint setup as run_defrag(). --ratio scales corpus
 // size; --churn-ratio is unused here.
+//
+// defragment_internal() is currently a bookkeeping-only no-op (see run_defrag()'s identical
+// note): the concurrent phase's writer-blocking window is now near-zero, so this mode's
+// write-throughput-degradation signal is currently degenerate. Kept as-is for when relocation
+// logic returns.
 [[noreturn]] void run_defrag_contention(const ProbeArgs &args) {
   using Store = vmemkv::variants::VMemKVStore;
 
   const std::size_t full_key_count = corpus_size_for_value(args.val_size);
   const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
 
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_defragcontention_" +
-                           std::to_string(static_cast<int>(args.ratio * 100));
+  const std::string path =
+      reorg_probe_path(args, "defragcontention_" + std::to_string(static_cast<int>(args.ratio * 100)));
 
-  const std::size_t resolved_writer_threads =
-      args.writer_threads != 0 ? args.writer_threads
-                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+  const std::size_t resolved_writer_threads = resolve_writer_threads(args.writer_threads);
 
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
@@ -2340,13 +2373,15 @@ auto run_contention_probe(Store &store,
   auto [isolated_write_tps, concurrent_write_tps, defrag_elapsed_sec, timed_out] = run_contention_probe(
       store, key_count, args.val_size, [&store]() { store->defragment(); }, 0.0, resolved_writer_threads);
 
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"defrag_contention\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
-            << "\"isolated_write_tps\":" << isolated_write_tps << ","
-            << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
-            << "\"defrag_elapsed_sec\":" << defrag_elapsed_sec << ","
-            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
+  print_contention_result(args,
+                          "defrag_contention",
+                          key_count,
+                          resolved_writer_threads,
+                          isolated_write_tps,
+                          concurrent_write_tps,
+                          "defrag_elapsed_sec",
+                          defrag_elapsed_sec,
+                          timed_out);
   std::_Exit(timed_out ? 124 : 0);
 }
 
@@ -2400,103 +2435,51 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
   const std::size_t full_key_count = corpus_size_for_value(args.val_size);
   const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
 
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_checkpointcontention_" +
-                           contention_workload_name(workload) + "_" +
-                           std::to_string(static_cast<int>(args.ratio * 100));
+  const std::string path = reorg_probe_path(args,
+                                            std::string("checkpointcontention_") + contention_workload_name(workload) +
+                                                "_" + std::to_string(static_cast<int>(args.ratio * 100)));
 
-  const std::size_t resolved_writer_threads =
-      args.writer_threads != 0 ? args.writer_threads
-                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+  const std::size_t resolved_writer_threads = resolve_writer_threads(args.writer_threads);
 
-  // Reuse-if-present: population + baseline checkpoint() + pre-churn/warm-up are setup, not what
-  // this mode measures, and can themselves dominate wall time under real LTM memory pressure.
-  // VMEMKV_BENCH_REUSE_PREBUILT=1 skips straight to recovery-from-manifest (fast: mmap + WAL
-  // replay, no data movement) when `path` already has one, matching run_steady()'s own reuse
-  // pattern -- build `path` unconstrained first, then point cgroup-constrained trials at copies
-  // of it to keep the measured phase free of setup-phase contamination.
-  const bool reuse_prebuilt = std::getenv("VMEMKV_BENCH_REUSE_PREBUILT") != nullptr;
-  const bool manifest_exists = reuse_prebuilt && std::filesystem::exists(vmemkv::derive_manifest_path(path));
+  // Suppressed for the whole setup phase below (population + initial checkpoint + optional
+  // pre-churn/warm-up), not just population: an auto-triggered checkpoint mid-warm-up would hit
+  // the exact same "concurrent with an active writer" cost this mode exists to isolate. Lifted
+  // again right before run_contention_probe() -- see its own explicit checkpoint() lambda, which
+  // this never touches (that's a manually requested call, not the auto-trigger this gates).
+  setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
+  auto store = make_vmemkv_fresh(
+      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+  populate_random_order(*store, {key_count, args.val_size});
+  store->checkpoint();
 
-  std::unique_ptr<Store> store;
-  if (manifest_exists) {
-    store = std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes);
-  } else {
-    // Suppressed for the whole setup phase below (population + initial checkpoint + optional
-    // pre-churn/warm-up), not just population: an auto-triggered checkpoint mid-warm-up would hit
-    // the exact same "concurrent with an active writer" cost this mode exists to isolate. Lifted
-    // again right before run_contention_probe() -- see its own explicit checkpoint() lambda, which
-    // this never touches (that's a manually requested call, not the auto-trigger this gates).
-    setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
-    store = make_vmemkv_fresh(
-        path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-    populate_random_order(*store, {key_count, args.val_size});
-    store->checkpoint();
-
-    if (workload == ContentionWorkload::kUpdateWarm) {
-      // Every key, once, via the real update() API (WAL-durable, same call the measurement phase
-      // itself makes) -- moves every key to tail. Deliberately *not* followed by a checkpoint()
-      // here: base_boundary must stay put so every key is still tail-resident (offset >=
-      // base_boundary) once this is durable and (if reused) recovered via WAL replay elsewhere.
-      const std::size_t warm_threads =
-          std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}});
-      std::vector<std::thread> workers;
-      workers.reserve(warm_threads);
-      for (std::size_t t = 0; t < warm_threads; ++t) {
-        workers.emplace_back([&store, key_count, val_size = args.val_size, t, warm_threads]() {
-          for (std::size_t idx = t; idx < key_count; idx += warm_threads) {
-            store->update(make_key(idx), make_value_for_key(idx, val_size));
-          }
-        });
-      }
-      for (auto &worker : workers) {
-        worker.join();
-      }
-    } else if (workload == ContentionWorkload::kUpdateCold) {
-      constexpr double kPreChurnRatio = 0.25;
-      const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
-      std::mt19937_64 churn_rng(kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000));
-      std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
-      std::vector<std::size_t> churn_indices(churn_count);
-      for (auto &idx : churn_indices) {
-        idx = churn_index_dist(churn_rng);
-      }
-      const std::size_t churn_threads =
-          std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
-      std::vector<std::thread> workers;
-      workers.reserve(churn_threads);
-      for (std::size_t t = 0; t < churn_threads; ++t) {
-        workers.emplace_back([&store, &churn_indices, val_size = args.val_size, t, churn_threads]() {
-          for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
-            const std::size_t idx = churn_indices[i];
-            store->update(make_key(idx), make_value_for_key(idx, val_size));
-          }
-        });
-      }
-      for (auto &worker : workers) {
-        worker.join();
-      }
-      // Reused by a later invocation (VMEMKV_BENCH_REUSE_PREBUILT=1) only if this prebuild step
-      // itself set that same env var -- otherwise make_vmemkv_fresh() wipes it again next time,
-      // same as every other non-reuse caller. Re-bases the pre-churned keys back to base -- see
-      // this branch's own doc comment above for why kUpdateWarm deliberately skips this.
-      if (reuse_prebuilt) {
-        store->checkpoint();
-      }
+  if (workload == ContentionWorkload::kUpdateWarm) {
+    // Every key, once, via the real update() API (WAL-durable, same call the measurement phase
+    // itself makes) -- moves every key to tail. Deliberately *not* followed by a checkpoint()
+    // here: base_boundary must stay put so every key is still tail-resident (offset >=
+    // base_boundary) once this is durable.
+    const std::size_t warm_threads =
+        std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}});
+    std::vector<std::thread> workers;
+    workers.reserve(warm_threads);
+    for (std::size_t t = 0; t < warm_threads; ++t) {
+      workers.emplace_back([&store, key_count, val_size = args.val_size, t, warm_threads]() {
+        for (std::size_t idx = t; idx < key_count; idx += warm_threads) {
+          store->update(make_key(idx), make_value_for_key(idx, val_size));
+        }
+      });
     }
-    // kInsert: no pre-churn/warm-up at all -- the populated+checkpointed corpus is exactly what
-    // the measurement phase's fresh-key inserts will be appended after.
-    unsetenv("VMEMKV_SUPPRESS_AUTO_REORG");
+    for (auto &worker : workers) {
+      worker.join();
+    }
+  } else if (workload == ContentionWorkload::kUpdateCold) {
+    constexpr double kPreChurnRatio = 0.25;
+    const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
+    apply_random_churn(
+        *store, key_count, churn_count, kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000), args.val_size);
   }
-
-  // Setup-only invocation (meant to run unconstrained, ahead of a separate cgroup-constrained
-  // measurement run pointed at a copy of `path`): stop here, before run_contention_probe()'s own
-  // isolated-baseline writes and checkpoint() would otherwise measure (and mutate) this exact
-  // process's run instead of the later, real one.
-  if (std::getenv("VMEMKV_BENCH_PREBUILD_ONLY") != nullptr) {
-    std::cout << "{\"prebuild_only\":true,\"key_count\":" << key_count << "}" << std::endl;
-    std::_Exit(0);
-  }
+  // kInsert: no pre-churn/warm-up at all -- the populated+checkpointed corpus is exactly what
+  // the measurement phase's fresh-key inserts will be appended after.
+  unsetenv("VMEMKV_SUPPRESS_AUTO_REORG");
 
   const WriteWorkload write_workload =
       workload == ContentionWorkload::kInsert ? WriteWorkload::kInsertFresh : WriteWorkload::kUpdateExisting;
@@ -2543,13 +2526,10 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
   const std::size_t full_key_count = corpus_size_for_value(args.val_size);
   const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
 
-  const std::string path = get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" +
-                           std::to_string(args.val_size) + "_reorgcontention_" +
-                           std::to_string(static_cast<int>(args.ratio * 100));
+  const std::string path =
+      reorg_probe_path(args, "reorgcontention_" + std::to_string(static_cast<int>(args.ratio * 100)));
 
-  const std::size_t resolved_writer_threads =
-      args.writer_threads != 0 ? args.writer_threads
-                               : std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
+  const std::size_t resolved_writer_threads = resolve_writer_threads(args.writer_threads);
 
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
@@ -2564,13 +2544,15 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
       kReorgContentionMinWallSeconds,
       resolved_writer_threads);
 
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"reorg_contention\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
-            << "\"isolated_write_tps\":" << isolated_write_tps << ","
-            << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
-            << "\"reorg_elapsed_sec\":" << reorg_elapsed_sec << ","
-            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
+  print_contention_result(args,
+                          "reorg_contention",
+                          key_count,
+                          resolved_writer_threads,
+                          isolated_write_tps,
+                          concurrent_write_tps,
+                          "reorg_elapsed_sec",
+                          reorg_elapsed_sec,
+                          timed_out);
   std::_Exit(timed_out ? 124 : 0);
 }
 

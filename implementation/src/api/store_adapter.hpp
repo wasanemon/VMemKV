@@ -147,8 +147,8 @@ class StoreAdapter {
   // unconditionally rather than needing an is_rival_store_v branch.
   void reorganize() { impl_.reorganize(); }
 
-  // Always fully rebuilds T2 (GC) and persists a checkpoint. Rival backends self-compact/
-  // self-manage storage and have no such distinction -- no-op for them.
+  // Currently a bookkeeping-only placeholder: does not relocate T2 records, reclaim space, or
+  // persist a checkpoint. Rival backends self-compact/self-manage storage -- no-op for them too.
   void defragment() {
     if constexpr (detail::is_rival_store_v<KVSImpl>) {
       // no-op: rivals self-manage compaction, same rationale as reorganize()'s rival no-op.

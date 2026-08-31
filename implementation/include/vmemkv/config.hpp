@@ -75,13 +75,9 @@ struct Config {
   static constexpr size_t T1AppendCapacityLog2 = 21;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
-  // Capacity of the tail-entry tracker that feeds checkpoint_internal()'s copy_live_entries()
-  // -- one entry per key written into T2's tail region since the last cycle, so that pass can
-  // enumerate exactly what needs copying into the new generation instead of scanning the entire
-  // live keyspace. Unlike DeadRangeCapacityEntries above, an entry lost here is a correctness bug,
-  // not a benign leak (its bytes only exist in the old generation's tail, which the cycle
-  // discards) -- TailEntryHardThresholdPercent leaves generous headroom below 100% so writers
-  // block (see maybe_reorganize_if_needed()) well before this tracker could ever actually fill.
+  // Threshold basis for the tail-entry counter (TailEntryTracker, vmemkv_impl.hpp): once the
+  // count of T2-tail writes since the last drain reaches TailEntryHardThresholdPercent of this,
+  // writers block (see maybe_reorganize_if_needed()) until a cycle drains it.
   static constexpr size_t TailEntryCapacityLog2 = 20;
   static constexpr size_t TailEntryCapacityEntries = size_t{1} << TailEntryCapacityLog2;
   static constexpr size_t TailEntrySoftThresholdPercent = 50;
@@ -98,8 +94,8 @@ struct Config {
 
   // defragment() auto-trigger (reorg_worker_loop()): fires once T2's total footprint has grown to
   // DefragGrowthThresholdPercent of its size as of the last defragment cycle (200 = doubled), and
-  // only once that footprint has also passed DefragMinBytesBeforeTrigger -- avoids paying for a
-  // cycle before a store has grown large enough for accumulated dead space to matter.
+  // only once that footprint has also passed DefragMinBytesBeforeTrigger. defragment_internal()
+  // is currently a no-op, so this only gates how often that no-op's own bookkeeping runs.
   static constexpr size_t DefragGrowthThresholdPercent = 200;
   static constexpr size_t DefragMinBytesBeforeTrigger = 64ULL << 20;  // 64 MiB.
 
@@ -115,7 +111,6 @@ struct Config {
 
 namespace detail {
 using T1_AllOff = Config<>;
-using T1_AllOn = Config<BloomFilter>;
 using System_AllOn = Config<BloomFilter, T1InlineValue>;
 }  // namespace detail
 

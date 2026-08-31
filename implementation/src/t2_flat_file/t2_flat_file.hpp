@@ -84,11 +84,9 @@ struct T2Memory {
   // file, they always transparently agree -- reads are only ever gated by the `offset <
   // base_boundary` check (scan_impl()), never by whether this specific mapping has "seen" a write.
   // Its lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based retirement
-  // scheme that already protects `base`/`capacity`. nullptr unless explicitly set by the caller
-  // (mmap_t2_memory() in vmemkv_impl.hpp -- best-effort -- a failure to create it just means the
-  // reader falls back to the always-correct `base` + seqlock path) -- the plain T2FlatFile-owned
-  // initial mapping never sets this, since a fresh store has base_boundary == 0 and thus nothing to
-  // map yet.
+  // scheme that already protects `base`/`capacity`. Set unconditionally by T2FlatFile's
+  // constructor; nullptr only if that best-effort mapping failed, in which case the reader falls
+  // back to the always-correct `base` + seqlock path.
   // `mutable` only so the destructor (a const-safe operation) can unmap it through the same
   // `const T2Memory *` pattern bytes_used already uses; never mutated after construction
   // otherwise.
@@ -111,12 +109,11 @@ struct T2Memory {
   // larger-than-one-page record instead of a page-fault-driven mmap read -- see the "T2
   // base-region reads" comment in vmemkv_impl.hpp for why Get's large-record path and Scan want
   // different read mechanisms on the same immutable bytes. `dup()`'d (not the original fd, which
-  // mmap_t2_memory() always closes right after mapping) so this handle's lifetime is self-
-  // contained and tied to this T2Memory, matching the two mappings' own retirement story. -1
-  // unless explicitly set by the caller (mmap_t2_memory() -- best-effort -- a dup() failure
-  // just means get_impl() falls back to the always-correct
-  // `base` + seqlock path) -- the plain T2FlatFile-owned initial mapping never sets this, for the
-  // same reason it never sets base_mmap_scan. `mutable` for the same reason as base_mmap_scan.
+  // T2FlatFile's constructor closes right after mapping) so this handle's lifetime is
+  // self-contained and tied to this T2Memory, matching the two mappings' own retirement story.
+  // Set unconditionally by that constructor; -1 only if the best-effort dup() failed, in which
+  // case get_impl() falls back to the always-correct `base` + seqlock path. `mutable` for the
+  // same reason as base_mmap_scan.
   mutable int read_fd = -1;
 
   // Auto-assigns a fresh, process-global-unique generation. Used where no caller needs to know

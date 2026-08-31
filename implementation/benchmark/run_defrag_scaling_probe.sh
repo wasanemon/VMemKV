@@ -2,6 +2,11 @@
 # run_defrag_scaling_probe.sh - Sweeps defragment()'s wall-clock duration, via bench_kv's
 # standalone `--reorg-probe` CLI mode (see bench_kv.cpp's run_defrag()/run_defrag_contention()).
 #
+# defragment_internal() is currently a bookkeeping-only no-op (see its own comment in
+# vmemkv_impl.hpp): it completes in ~O(1) regardless of corpus size or churn ratio, so both
+# sweeps below currently produce a flat, near-zero-duration line rather than the scaling signal
+# they were built to measure. Kept as-is for when relocation logic returns.
+#
 # Two sweeps, both against a corpus that's already been checkpoint()ed once (a realistic
 # pre-defragment state):
 #   corpus-size sweep (--mode=defrag): churn_ratio fixed at 0, --ratio swept 25%/50%/75%/100%,
