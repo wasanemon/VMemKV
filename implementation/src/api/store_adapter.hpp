@@ -2,7 +2,6 @@
 #pragma once
 
 #include <algorithm>
-#include <cstring>
 #include <optional>
 #include <span>
 #include <tuple>
@@ -76,22 +75,19 @@ class StoreAdapter {
     });
   }
 
-  // Shared body for insert()/update() below: both serialize key/value the same way and reject the
-  // same inline-value sentinel collision (an 8-byte value that's all-1-bits would otherwise be
-  // indistinguishable from T1's own STORE_NOT_FOUND sentinel if inlined) before dispatching to
-  // whichever KVSImpl method the caller names via `ImplMethod`.
+  // Shared body for insert()/update() below: both serialize key/value the same way before
+  // dispatching to whichever KVSImpl method the caller names via `ImplMethod`. An 8-byte value
+  // that's all-1-bits used to be rejected here (it's bit-for-bit identical to T1's own
+  // STORE_NOT_FOUND sentinel, which would have made it permanently unreadable if inlined) --
+  // that's now handled once, for every write path (including bulk_load(), which this
+  // per-call guard never covered), by VMemKVImpl::try_make_inline_payload() declining to inline
+  // such a value and routing it through the ordinary T2-record path instead. No guard needed here
+  // any more, for VMemKV or any other KVSImpl.
   template <auto ImplMethod, typename Key, typename Value>
   auto insert_or_update(const Key &key, Value &&value) -> bool {
     return kvs_detail::with_key_serialized(key, [this, &value](std::span<const std::byte> key_bytes) -> bool {
       return kvs_detail::with_val_serialized(std::forward<Value>(value),
                                              [this, key_bytes](std::span<const std::byte> val_bytes) -> bool {
-                                               if (val_bytes.size() == kInlineScalarValueBytes) {
-                                                 uint64_t val_u64 = 0;
-                                                 std::memcpy(&val_u64, val_bytes.data(), kInlineScalarValueBytes);
-                                                 if (val_u64 == ~0ULL) {
-                                                   return false;
-                                                 }
-                                               }
                                                return (impl_.*ImplMethod)(key_bytes, val_bytes);
                                              });
     });

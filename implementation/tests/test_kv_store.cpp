@@ -296,9 +296,18 @@ TEST_CASE_TEMPLATE("custom serializers (ADL) for user-defined types", Store, STO
   CHECK(results[1] == kLargeValue);
 }
 
-TEST_CASE_TEMPLATE("insert rejects STORE_NOT_FOUND payload in T1", Store, STORE_TYPES) {
+// Regression test: a value that's bit-for-bit identical to T1's STORE_NOT_FOUND sentinel
+// (~0ULL) used to be rejected outright by StoreAdapter::insert()/update() -- necessary at the
+// time because inlining it would have made the entry indistinguishable from "not found" on every
+// read path, but that rejection never covered bulk_load() (a real bug, fixed separately). Now
+// that VMemKVImpl::try_make_inline_payload() itself declines to inline this exact value (routing
+// it through the ordinary T2-record path instead, whose payload is an offset, never the raw value
+// bytes), the value is fully storable and retrievable like any other -- verifies that here.
+TEST_CASE_TEMPLATE("insert accepts a value equal to STORE_NOT_FOUND and it round-trips", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
-  CHECK_FALSE(store->insert("a", vmemkv::STORE_NOT_FOUND));
+  CHECK(store->insert("a", vmemkv::STORE_NOT_FOUND));
+  bool found = store->get("a", [](std::span<const std::byte> /*val*/) {});
+  CHECK(found);
   CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
 }
 
@@ -314,11 +323,40 @@ TEST_CASE_TEMPLATE("update missing key returns false", Store, STORE_TYPES) {
   CHECK_FALSE(store->update("z", 1));
 }
 
-TEST_CASE_TEMPLATE("update rejects STORE_NOT_FOUND payload in T1", Store, STORE_TYPES) {
+// Same as the insert case above, for update().
+TEST_CASE_TEMPLATE("update accepts a value equal to STORE_NOT_FOUND and it round-trips", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);
-  CHECK_FALSE(store->update("a", vmemkv::STORE_NOT_FOUND));
-  CHECK(test_util::get_sync(store, "a") == 1U);
+  CHECK(store->update("a", vmemkv::STORE_NOT_FOUND));
+  CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
+}
+
+// Regression test for the actual bug: unlike insert()/update(), StoreAdapter::bulk_load() never
+// went through the sentinel-rejection guard above (it calls impl_.bulk_load_impl() directly), and
+// VMemKVImpl::try_make_inline_payload()/T1Index::put() had no equivalent check of their own --
+// so a bulk-loaded entry whose 8-byte value happened to equal STORE_NOT_FOUND was silently
+// inlined and became permanently invisible to both get() and scan() (indistinguishable from a
+// tombstone). Exercises the fix directly through bulk_load(), on the one variant where inlining
+// is actually possible.
+TEST_CASE("bulk_load: an entry whose value equals STORE_NOT_FOUND round-trips via get() and scan()") {
+  auto store = StoreFactory<vmemkv::variants::VMemKV_Var2_Inline>::make();
+  const std::string all_ff_value(8, '\xFF');
+  store->bulk_load(
+      1, [](std::size_t /*index*/) { return std::string("a"); }, [&](std::size_t /*index*/) { return all_ff_value; });
+
+  bool found = store->get("a", [](std::span<const std::byte> /*val*/) {});
+  CHECK(found);
+  CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
+
+  size_t scan_hits = 0;
+  std::ignore = store->scan("a", "a~", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
+    REQUIRE(value.size() == sizeof(uint64_t));
+    uint64_t val_u64 = 0;
+    std::memcpy(&val_u64, value.data(), sizeof(uint64_t));
+    CHECK(val_u64 == vmemkv::STORE_NOT_FOUND);
+    ++scan_hits;
+  });
+  CHECK(scan_hits == 1U);
 }
 
 TEST_CASE_TEMPLATE("remove existing key", Store, STORE_TYPES) {
@@ -970,6 +1008,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
       FAIL("missing key_odd inline payload");
     }
     const auto &res_odd_value = *res_odd;  // NOLINT(bugprone-unchecked-optional-access)
+    REQUIRE(res_odd_value.size() == kInlineValueBytes);
     uint64_t read_odd = 0;
     std::memcpy(&read_odd, res_odd_value.data(), kInlineValueBytes);
     CHECK(read_odd == val_odd);
@@ -987,6 +1026,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
       FAIL("missing key_even inline payload");
     }
     const auto &res_even_value = *res_even;  // NOLINT(bugprone-unchecked-optional-access)
+    REQUIRE(res_even_value.size() == kInlineValueBytes);
     uint64_t read_even = 0;
     std::memcpy(&read_even, res_even_value.data(), kInlineValueBytes);
     CHECK(read_even == val_even);

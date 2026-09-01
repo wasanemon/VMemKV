@@ -73,8 +73,7 @@ T2FlatFile::~T2FlatFile() noexcept {
   }
 }
 
-// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-auto T2FlatFile::at(uint64_t payload, const T2Memory *mem) const noexcept -> T2RecordView {
+auto T2FlatFile::at(uint64_t payload, const T2Memory *mem) noexcept -> T2RecordView {
   const std::byte *record_base = resolve_record(payload, mem);
   const auto *header = reinterpret_cast<const ValueRecordHeader *>(record_base);
   const auto *key_begin = reinterpret_cast<const std::byte *>(header + 1);

@@ -1315,9 +1315,20 @@ class VMemKVImpl {
     if constexpr (ConfigT::UseT1InlineValue) {
       if (full_key.size() <= t1_detail::kPrefixBytes && (full_key.empty() || full_key.back() != std::byte{0})) {
         if (!value.empty() && value.size() <= t1_detail::kInlineValueByteCount) {
-          out_size = static_cast<uint8_t>(value.size());
           uint64_t payload = 0;
           std::memcpy(&payload, value.data(), value.size());
+          // A full-width (8-byte) value that happens to be all-1-bits is bit-for-bit identical to
+          // T1's STORE_NOT_FOUND sentinel (t1_index.hpp) -- inlining it would make every read path
+          // (get_impl()/scan_impl(), which both short-circuit to "not found" purely from seeing
+          // that bit pattern in payload_bits) treat this live entry as permanently absent. Only
+          // possible when value.size() == kInlineValueByteCount: shorter values leave payload's
+          // upper bytes zeroed by the initializer above, so they can never reach ~0ULL. Falling
+          // through to the normal T2-record path instead is safe: that path's payload is an
+          // offset into T2, not the raw value bytes, so this exact collision cannot recur there.
+          if (payload == vmemkv::STORE_NOT_FOUND) {
+            return std::nullopt;
+          }
+          out_size = static_cast<uint8_t>(value.size());
           return payload;
         }
       }

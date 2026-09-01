@@ -255,7 +255,7 @@ class T2FlatFile {
   // Resolves a record at the given payload offset into a structured view.
   // - Contract: The offset must be within bounds. The returned view references the memory base,
   //   and remains valid as long as the 'mem' instance is kept alive.
-  auto at(uint64_t payload, const T2Memory *mem) const noexcept -> T2RecordView;
+  static auto at(uint64_t payload, const T2Memory *mem) noexcept -> T2RecordView;
 
   // ─── Storage Operations ───
   // `mem` must come from acquire_write_handle() (not a plain get_memory_handle()), so the

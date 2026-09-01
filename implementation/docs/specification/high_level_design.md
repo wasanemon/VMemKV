@@ -161,7 +161,7 @@ Tier 2 の稼働中 mmap は `MAP_SHARED` である。書き込みはページ�
 詳細は [low_level_design.md](./low_level_design.md) を参照。
 
 - Tier 1 `mlock` / `MADV_HUGEPAGE` / 一時的 `MADV_SEQUENTIAL`（未実装・将来検討）
-- Tier 1 `madvise(MADV_RANDOM)`（常時有効。In-Memory 読出で約5%の性能向上に貢献する）
+- Tier 2 `madvise(MADV_RANDOM)`（常時有効。In-Memory 読出で約5%の性能向上に貢献する）
 - WAL Group Commit（実装済み。ロックフリー固定長リングバッファ方式。詳細は low_level_design.md 7.1 節）
 - Early Lock Release / Flush Pipelining（未実装・将来検討）
 - SIMD による Tier 1 scan 高速化

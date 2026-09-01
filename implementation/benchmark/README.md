@@ -34,7 +34,7 @@ This directory contains the benchmark executable, the local runner, the AWS runn
 
 Benchmark rows are encoded as flat `key=value` segments so the raw Google Benchmark JSON stays unchanged while reporting and plotting can split fields deterministically.
 
-The current benchmark matrix uses `8B` for in-memory runs and `1KB`/`64KB` for LTM runs.
+The current benchmark matrix uses `8B`/`1KB` for in-memory runs and `1KB`/`64KB` for LTM runs.
 `bench_kv` derives the baseline from the effective machine memory limit (`cgroup` when present, otherwise `/proc/meminfo`). The AWS runner places LTM benchmark runs in a 1GiB cgroup so the corpus is scaled from that budget.
 
 ## How to Extend

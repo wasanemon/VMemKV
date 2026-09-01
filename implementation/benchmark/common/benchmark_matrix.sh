@@ -162,12 +162,6 @@ vmemkv_matrix::ltm_priming_filter() {
   printf '(%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$\n' "$scenario_regex"
 }
 
-vmemkv_matrix::local_quick_filter() {
-  # Smoke-test a single unique benchmark to keep `--quick` fast and
-  # avoid name collisions across VMemKV variants.
-  printf '%s\n' '^Store=VMemKV/Variant=Baseline/Op=Get/Mode=Hit/Dist=Zipf/Value=8B/real_time/threads:1$'
-}
-
 vmemkv_matrix::scenario_quick_filter() {
   local scenario_key="$1"
 

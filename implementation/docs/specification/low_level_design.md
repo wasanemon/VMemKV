@@ -314,8 +314,8 @@ T1 `reorganize` は、`append_region` のサイズに応じて自動的にバッ
     $$T_{\text{soft}} = \min \left( \frac{\text{L2\_Cache\_Bytes}}{\text{sizeof(AppendSlot)}}, \; \text{APPEND\_CAP} \times \frac{\text{SoftThresholdPercent}}{100} \right)$$
     
     *   $\text{L2\_Cache\_Bytes} = 1 \text{ MB}$ （現代の一般的なコアあたり L2 キャッシュ容量）
-    *   $\text{sizeof(AppendSlot)} = 56 \text{ バイト}$
-    *   スキャンアクティブ時の絶対上限件数: **18,724 件**
+    *   $\text{sizeof(AppendSlot)} = 48 \text{ バイト}$（2.1節参照）
+    *   スキャンアクティブ時の絶対上限件数: **21,845 件**
 
 #### 3. スキャンアクティブ状態の検出 (Read-only Fast Path)
 マルチスレッド並行スキャンにおいてフラグ書き込みによるキャッシュラインの奪い合い（Cache Bouncing）を回避するため、**Read-Check-Write (TEST and SET) パターン**による軽量なアトミックフラグ `scan_active_` を用いる。
@@ -547,9 +547,9 @@ THP はスワップアウト時に 2MB 単位を保たず、512 個の 4KB ペ�
 
 5.5 節の WAL Rotation はレコードコピー方式(移植性重視)を基本とするが、対応ファイルシステム(ext4, xfs 等。tmpfs 等では非対応)では `fallocate(FALLOC_FL_COLLAPSE_RANGE)` によりファイル先頭のバイト範囲をコピー無しで直接除去できる。コピーを伴わないためローテーションの停止時間をさらに縮小できるが、Linux カーネル・ファイルシステム依存の機能であるため opt-in とする。
 
-### 7.7 Tier 1 madvise(MADV_RANDOM) Optimization
+### 7.7 Tier 2 madvise(MADV_RANDOM) Optimization
 
-T1インデックスに対して、仮想メモリマップ時のReadahead（カーネル先読み）を抑止しランダムアクセス性能を最適化する。
+Tier 2 の主 mmap(`base`、2.2節)に対して、仮想メモリマップ時のReadahead（カーネル先読み）を抑止しランダムアクセス性能を最適化する。
 - **最適化の内容**: mmap領域のマップ直後に `madvise(..., MADV_RANDOM)` を呼び出し、OSカーネルの不要なページ先読み・カーネル空間メモリバス帯域の浪費を防ぐ。in-memory Get_Hit において約5%の性能向上をもたらす。常時有効であり、無効化する経路は存在しない。
 
 ### 7.8 Scan の io_uring 並列プリフェッチは不採用
