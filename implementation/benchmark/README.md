@@ -15,9 +15,6 @@ This directory contains the benchmark executable, the local runner, the AWS runn
   - Keeps build/run plumbing out of the runners.
 - `common/benchmark_progress.awk`
   - Shared output prefixer for time and progress counters.
-- `common/benchmark_dimensions.json`
-  - Static ID/name table for frontend consumers.
-  - Keep this in sync with the raw benchmark names emitted by `bench_kv.cpp`.
 - `run_bench.sh`
   - Local-only runner.
   - Builds locally, executes locally, and saves raw Google Benchmark JSON.
@@ -37,7 +34,6 @@ This directory contains the benchmark executable, the local runner, the AWS runn
 
 Benchmark rows are encoded as flat `key=value` segments so the raw Google Benchmark JSON stays unchanged while reporting and plotting can split fields deterministically.
 
-Frontend code that wants stable labels without parsing benchmark names should read `common/benchmark_dimensions.json` alongside the raw Google Benchmark JSON. The raw JSON carries the human-readable benchmark name, and the counters expose numeric IDs plus corpus sizes.
 The current benchmark matrix uses `8B` for in-memory runs and `1KB`/`64KB` for LTM runs.
 `bench_kv` derives the baseline from the effective machine memory limit (`cgroup` when present, otherwise `/proc/meminfo`). The AWS runner places LTM benchmark runs in a 1GiB cgroup so the corpus is scaled from that budget.
 

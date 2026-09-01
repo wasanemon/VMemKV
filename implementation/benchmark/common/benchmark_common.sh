@@ -14,12 +14,6 @@ vmemkv_repo_root() {
   cd "$script_dir/../../.." && pwd
 }
 
-vmemkv_impl_root() {
-  local repo_root
-  repo_root="$(vmemkv_repo_root)"
-  printf '%s\n' "$repo_root/implementation"
-}
-
 vmemkv_git_revision() {
   local repo_root
   repo_root="$(vmemkv_repo_root)"

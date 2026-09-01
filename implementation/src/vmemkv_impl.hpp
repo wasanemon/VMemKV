@@ -3,7 +3,7 @@
 //
 // ─── CONCURRENCY SPECIFICATION & MATRIX ──────────────────────────────────────
 //
-// The VMemKV architecture enforces thread-safety at the StoreImpl level,
+// The VMemKV architecture enforces thread-safety at the VMemKVImpl level,
 // coordinating and routing operations across two underlying structural layers:
 // 1. T1Index (In-memory Index)
 // 2. T2FlatFile (Binary Disk Log File)
@@ -11,8 +11,8 @@
 // +--------------------+-------------------+---------------------------------------------------+
 // | Component          | Read Operations   | Write Operations (Insert/Update/Delete)           |
 // +--------------------+-------------------+---------------------------------------------------+
-// | vmemkv::T1Index    | Thread-Safe       | Thread-Unsafe (relies on StoreImpl serialization) |
-// | vmemkv::T2FlatFile  | Thread-Safe       | Thread-Unsafe (relies on StoreImpl serialization) |
+// | vmemkv::T1Index    | Thread-Safe       | Thread-Unsafe (relies on VMemKVImpl serialization)|
+// | vmemkv::T2FlatFile  | Thread-Safe       | Thread-Unsafe (relies on VMemKVImpl serialization)|
 // | vmemkv::VMemKVStore | Thread-Safe       | Thread-Safe (fully serialized/coordinated)        |
 // +--------------------+-------------------+---------------------------------------------------+
 //
@@ -50,6 +50,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -633,6 +634,20 @@ class VMemKVImpl {
         continue;
       }
 
+      // Checked before touching T2 at all (not just asserted post-append): block_count must fit
+      // the 16 bits kSizeEmbeddingShift reserves for it in the payload, or it would silently wrap,
+      // corrupting the embedded size hint try_read_base_record() uses for its fast-path reads (see
+      // that function's own comment) -- release builds have no assert to catch this, and a
+      // wrapped hint degrades to the always-correct-but-slower seqlock/pread fallback rather than
+      // returning wrong data, but that's not a contract worth leaving unenforced when
+      // T2FlatFile::append_default() already throws on capacity overrun for the same class of
+      // "this write cannot be represented" failure.
+      uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + full_key.size() + value.size());
+      uint64_t block_count = aligned_len / kBlockAlignment;
+      if (block_count >= 65536) {
+        throw std::runtime_error("Record size exceeds 1.04MB limit");
+      }
+
       // acquire_write_handle() (not a plain get_memory_handle()) defers while checkpoint_internal()
       // has new writers stopped for its target-capture window, and -- critically -- `mem` is held
       // alive across both the T2 append below and the T1 publish attempt, not released in
@@ -644,10 +659,6 @@ class VMemKVImpl {
       {
         T2FlatFile::T2MemoryHandle mem = t2_.acquire_write_handle();
         uint64_t offset = vmemkv::T2FlatFile::append_default(mem, full_key, value);
-
-        uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + full_key.size() + value.size());
-        uint64_t block_count = aligned_len / kBlockAlignment;
-        assert(block_count < 65536 && "Record size exceeds 1.04MB limit");
         uint64_t encoded_payload = offset | (block_count << kSizeEmbeddingShift);
         put_result = t1_.put(full_key, encoded_payload, false, 0);
       }
@@ -1121,7 +1132,10 @@ class VMemKVImpl {
                    // comes directly from whichever half is nonzero, no per-byte branching needed.
                    // Requires little-endian (memcpy'd byte 0 must land in the least-significant
                    // position) -- true for every platform this codebase targets, but asserted here
-                   // since it's not obvious from the arithmetic alone.
+                   // since it's not obvious from the arithmetic alone. Only unambiguous because
+                   // try_make_inline_payload() refuses to inline a key whose own last byte is 0x00
+                   // -- see that function's comment for why trimming would otherwise silently
+                   // truncate such a key's trailing zero byte(s) along with the real padding.
                    static_assert(kStoreKeyBytes == 2 * sizeof(uint64_t));
                    static_assert(std::endian::native == std::endian::little);
                    uint64_t lo_word;
@@ -1275,11 +1289,31 @@ class VMemKVImpl {
   // Restricted to keys <= 16 bytes: T1 only stores a 16-byte prefix (StoreKey), so for longer
   // keys the full key must live in T2 to resolve conflicts. For keys <= 16 bytes the prefix is
   // the entire key, so T2 can safely be bypassed.
+  //
+  // Also restricted to keys that don't end in a 0x00 byte: an inline entry has no T2 record, so
+  // scan_impl() must recover the original key length from the zero-padded 16-byte prefix alone,
+  // by trimming trailing zero bytes (see its own comment). That trim is only unambiguous when
+  // every trailing zero byte in the stored prefix is padding -- a key whose own last byte is 0x00
+  // (e.g. any multiple of 256 encoded as a big-endian integer key, or a key entirely of zero
+  // bytes) would have a genuine zero trimmed away as if it were padding, silently truncating the
+  // key scan_impl() hands back (and, via key_in_range()'s use of that truncated key, potentially
+  // excluding the entry from scan results entirely). Excluding such keys from inlining here routes
+  // them through the normal T2-record path instead, where the full key is stored verbatim and
+  // scan_impl() reads it directly -- no recovery, no ambiguity. get_impl()/insert_impl()/
+  // try_in_place_update() never need this recovery (the caller already supplies the full key), so
+  // they're unaffected either way.
+  // kInlineScalarValueBytes (this class's own stack-buffer size, used by get_impl()/scan_impl() to
+  // hold a decoded inline value) and t1_detail::kInlineValueByteCount (T1Index's own inline-value
+  // byte cap, checked below) encode the same invariant in two separate files with nothing else
+  // tying them together -- if they ever drifted apart, T1Index could accept a payload wider than
+  // this class's buffer, silently corrupting whatever memory follows it.
+  static_assert(kInlineScalarValueBytes == t1_detail::kInlineValueByteCount);
+
   auto try_make_inline_payload(std::span<const std::byte> full_key,
                                std::span<const std::byte> value,
                                uint8_t &out_size) const noexcept -> std::optional<uint64_t> {
     if constexpr (ConfigT::UseT1InlineValue) {
-      if (full_key.size() <= t1_detail::kPrefixBytes) {
+      if (full_key.size() <= t1_detail::kPrefixBytes && (full_key.empty() || full_key.back() != std::byte{0})) {
         if (!value.empty() && value.size() <= t1_detail::kInlineValueByteCount) {
           out_size = static_cast<uint8_t>(value.size());
           uint64_t payload = 0;

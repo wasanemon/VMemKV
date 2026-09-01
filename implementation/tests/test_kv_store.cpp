@@ -896,6 +896,37 @@ TEST_CASE_TEMPLATE("scan with integral keys verifies lexicographical ordering", 
   CHECK(keys[3] == kScanHundred);
 }
 
+// Regression test: scan_impl()'s inline-value fast path used to recover a key's original length
+// from T1's 16-byte zero-padded prefix by trimming trailing zero bytes -- ambiguous whenever the
+// key's own last byte is 0x00 (indistinguishable from padding), which silently truncated the key
+// handed to scan()'s callback. A big-endian-encoded integer key that's a multiple of 256 hits this
+// directly (e.g. 256 encodes as {0x00,0x00,0x01,0x00}). Fixed by excluding such keys from
+// inlining (try_make_inline_payload()) so they take the normal T2-record path instead, where the
+// full key is stored verbatim. This test only makes sense for a store with UseT1InlineValue on
+// (Var2_Inline) -- the bug is specific to that fast path.
+TEST_CASE("Value Inlining: scan() returns the untruncated key for a key ending in a zero byte") {
+  auto store = StoreFactory<vmemkv::variants::VMemKV_Var2_Inline>::make();
+  store->insert(256U, 256U);  // big-endian encode(256) = {0x00,0x00,0x01,0x00} -- ends in 0x00.
+  store->reorganize();
+
+  std::vector<std::byte> observed_key;
+  const size_t scan_count =
+      store->scan(0U, 1000U, [&](std::span<const std::byte> key_bytes, std::span<const std::byte> /*value*/) {
+        observed_key.assign(key_bytes.begin(), key_bytes.end());
+      });
+  REQUIRE(scan_count == 1U);
+  REQUIRE(observed_key.size() == 4U);
+  CHECK(static_cast<uint8_t>(observed_key[0]) == 0x00U);
+  CHECK(static_cast<uint8_t>(observed_key[1]) == 0x00U);
+  CHECK(static_cast<uint8_t>(observed_key[2]) == 0x01U);
+  CHECK(static_cast<uint8_t>(observed_key[3]) == 0x00U);
+
+  // get() must still find it via the exact key the caller already knows (unaffected by this fix
+  // either way, since it never needed to recover the key from T1's prefix).
+  const auto got = test_util::get_bytes_sync(store, 256U);
+  REQUIRE(got.has_value());
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write paths") {
   const std::string path = reserve_temp_path().string();

@@ -1,8 +1,7 @@
 # Prefix Google Benchmark output with wall clock time, elapsed time, and
 # progress counters.
 #
-# Expected state file format:
-# - "run_label run_total global_total"
+# Expected state file format: a single bare number (global_total).
 
 function color_enabled() {
   return ("VMEMKV_COLOR" in ENVIRON) && ENVIRON["VMEMKV_COLOR"] != "" && ENVIRON["VMEMKV_COLOR"] != "0" && tolower(ENVIRON["VMEMKV_COLOR"]) != "false";

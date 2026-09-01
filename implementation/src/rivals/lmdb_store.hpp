@@ -43,39 +43,11 @@ class LMDBStore {
     std::filesystem::remove(path_);
     std::filesystem::remove(path_ + "-lock");
 
-    if (mdb_env_create(&env_) != 0) {
-      throw std::runtime_error("LMDB env_create failed");
-    }
-    mdb_env_set_mapsize(env_, kMapSizeBytes);
-    mdb_env_set_maxreaders(env_, kMaxReaders);
-
     // MDB_WRITEMAP without MDB_MAPASYNC means every commit synchronously msyncs, matching
     // VMemKV's own per-write fsync contract (wal.hpp) and RocksDB's WriteOptions.sync=true (see
     // RocksDBStore::make_durable_write_options()). bulk_load_impl() below toggles MDB_MAPASYNC
     // on for its own duration instead, like the other two engines' bulk loaders.
-    constexpr unsigned int kEnvFlags = MDB_NOSUBDIR | MDB_WRITEMAP;
-    int rc = mdb_env_open(env_, path_.c_str(), kEnvFlags, 0664);
-    if (rc != 0) {
-      mdb_env_close(env_);
-      env_ = nullptr;
-      throw std::runtime_error("LMDB env_open failed: " + std::string(mdb_strerror(rc)));
-    }
-
-    MDB_txn *txn = nullptr;
-    rc = mdb_txn_begin(env_, nullptr, 0, &txn);
-    if (rc != 0) {
-      mdb_env_close(env_);
-      env_ = nullptr;
-      throw std::runtime_error("LMDB txn_begin failed: " + std::string(mdb_strerror(rc)));
-    }
-    rc = mdb_dbi_open(txn, nullptr, 0, &dbi_);
-    if (rc != 0) {
-      mdb_txn_abort(txn);
-      mdb_env_close(env_);
-      env_ = nullptr;
-      throw std::runtime_error("LMDB dbi_open failed: " + std::string(mdb_strerror(rc)));
-    }
-    mdb_txn_commit(txn);
+    open_env_and_dbi(path_, MDB_NOSUBDIR | MDB_WRITEMAP, "", env_, dbi_);
   }
 
   // Closes the environment (cleans up temp files in bench/test usage).
@@ -113,33 +85,7 @@ class LMDBStore {
     path_ = master_path + "_clone.lmdb";
     clone_from(master_path, path_);
 
-    if (mdb_env_create(&env_) != 0) {
-      throw std::runtime_error("LMDB env_create failed (clone)");
-    }
-    mdb_env_set_mapsize(env_, kMapSizeBytes);
-    mdb_env_set_maxreaders(env_, kMaxReaders);
-    constexpr unsigned int kEnvFlags = MDB_NOSUBDIR | MDB_WRITEMAP;
-    int rc = mdb_env_open(env_, path_.c_str(), kEnvFlags, 0664);
-    if (rc != 0) {
-      mdb_env_close(env_);
-      env_ = nullptr;
-      throw std::runtime_error("LMDB env_open failed (clone): " + std::string(mdb_strerror(rc)));
-    }
-    MDB_txn *txn = nullptr;
-    rc = mdb_txn_begin(env_, nullptr, 0, &txn);
-    if (rc != 0) {
-      mdb_env_close(env_);
-      env_ = nullptr;
-      throw std::runtime_error("LMDB txn_begin failed (clone): " + std::string(mdb_strerror(rc)));
-    }
-    rc = mdb_dbi_open(txn, nullptr, 0, &dbi_);
-    if (rc != 0) {
-      mdb_txn_abort(txn);
-      mdb_env_close(env_);
-      env_ = nullptr;
-      throw std::runtime_error("LMDB dbi_open failed (clone): " + std::string(mdb_strerror(rc)));
-    }
-    mdb_txn_commit(txn);
+    open_env_and_dbi(path_, MDB_NOSUBDIR | MDB_WRITEMAP, " (clone)", env_, dbi_);
   }
 
   // No-op: LMDB reclaims freed B+Tree pages automatically via its freelist; there is
@@ -308,6 +254,42 @@ class LMDBStore {
   static constexpr size_t kMapSizeBytes = 1ULL << 40;
   static constexpr unsigned int kMaxReaders = 512;
 
+  // Opens an LMDB environment at `path` with `flags` and its single (unnamed) DBI -- the
+  // create/set-mapsize/set-maxreaders/open/txn-begin/dbi-open/commit sequence shared by the main
+  // constructor, the CloneFromMasterTag constructor, and ensure_master_built(). On any failure,
+  // closes whatever partial env it already created (leaving `env_out` null) and throws, with
+  // `label_suffix` (e.g. " (clone)", " (master build)", or "" for the main constructor) appended
+  // so the error identifies which call site failed.
+  static void open_env_and_dbi(
+      const std::string &path, unsigned int flags, const char *label_suffix, MDB_env *&env_out, MDB_dbi &dbi_out) {
+    if (mdb_env_create(&env_out) != 0) {
+      throw std::runtime_error(std::string("LMDB env_create failed") + label_suffix);
+    }
+    mdb_env_set_mapsize(env_out, kMapSizeBytes);
+    mdb_env_set_maxreaders(env_out, kMaxReaders);
+    int rc = mdb_env_open(env_out, path.c_str(), flags, 0664);
+    if (rc != 0) {
+      mdb_env_close(env_out);
+      env_out = nullptr;
+      throw std::runtime_error(std::string("LMDB env_open failed") + label_suffix + ": " + mdb_strerror(rc));
+    }
+    MDB_txn *txn = nullptr;
+    rc = mdb_txn_begin(env_out, nullptr, 0, &txn);
+    if (rc != 0) {
+      mdb_env_close(env_out);
+      env_out = nullptr;
+      throw std::runtime_error(std::string("LMDB txn_begin failed") + label_suffix + ": " + mdb_strerror(rc));
+    }
+    rc = mdb_dbi_open(txn, nullptr, 0, &dbi_out);
+    if (rc != 0) {
+      mdb_txn_abort(txn);
+      mdb_env_close(env_out);
+      env_out = nullptr;
+      throw std::runtime_error(std::string("LMDB dbi_open failed") + label_suffix + ": " + mdb_strerror(rc));
+    }
+    mdb_txn_commit(txn);
+  }
+
   // Builds a fresh master at a ".building" sibling path, renamed into place only once fully
   // populated and closed, so a crash mid-build never leaves a partial master for a later call
   // to trust. The build env is closed before the rename: LMDB forbids the same file being open
@@ -326,30 +308,8 @@ class LMDBStore {
     std::filesystem::remove(building_path + "-lock", ignored);
 
     MDB_env *build_env = nullptr;
-    if (mdb_env_create(&build_env) != 0) {
-      throw std::runtime_error("LMDB env_create failed (master build)");
-    }
-    mdb_env_set_mapsize(build_env, kMapSizeBytes);
-    mdb_env_set_maxreaders(build_env, kMaxReaders);
-    int rc = mdb_env_open(build_env, building_path.c_str(), MDB_NOSUBDIR | MDB_WRITEMAP, 0664);
-    if (rc != 0) {
-      mdb_env_close(build_env);
-      throw std::runtime_error("LMDB env_open failed (master build): " + std::string(mdb_strerror(rc)));
-    }
     MDB_dbi build_dbi = 0;
-    MDB_txn *txn = nullptr;
-    rc = mdb_txn_begin(build_env, nullptr, 0, &txn);
-    if (rc != 0) {
-      mdb_env_close(build_env);
-      throw std::runtime_error("LMDB txn_begin failed (master build): " + std::string(mdb_strerror(rc)));
-    }
-    rc = mdb_dbi_open(txn, nullptr, 0, &build_dbi);
-    if (rc != 0) {
-      mdb_txn_abort(txn);
-      mdb_env_close(build_env);
-      throw std::runtime_error("LMDB dbi_open failed (master build): " + std::string(mdb_strerror(rc)));
-    }
-    mdb_txn_commit(txn);
+    open_env_and_dbi(building_path, MDB_NOSUBDIR | MDB_WRITEMAP, " (master build)", build_env, build_dbi);
 
     bulk_load_into(build_env, build_dbi, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
     mdb_env_close(build_env);

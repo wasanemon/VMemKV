@@ -70,18 +70,18 @@ class YCSBTimelineCollector {
 
   std::vector<ThreadCounter> counters;
   std::array<std::atomic<uint64_t>, kDurationSeconds> t1_reorg_counts{};
-  std::array<std::atomic<uint64_t>, kDurationSeconds> t2_reorg_counts{};
-  // Separate from t1_reorg_counts/t2_reorg_counts: counts reorgs the benchmark itself
+  std::array<std::atomic<uint64_t>, kDurationSeconds> t2_checkpoint_counts{};
+  // Separate from t1_reorg_counts/t2_checkpoint_counts: counts reorgs the benchmark itself
   // forced (see kForcedTriggers below), as opposed to ones VMemKV triggered organically. Kept
   // apart so a future report pass can render these as differently-colored vertical lines. Exact
   // per-call timing lives in forced_events instead -- these per-second buckets exist only to keep
-  // the same "reorg activity per second" chart t1_reorg_counts/t2_reorg_counts already draw.
+  // the same "reorg activity per second" chart t1_reorg_counts/t2_checkpoint_counts already draw.
   std::array<std::atomic<uint64_t>, kDurationSeconds> t1_forced_reorg_counts{};
-  std::array<std::atomic<uint64_t>, kDurationSeconds> t2_forced_reorg_counts{};
+  std::array<std::atomic<uint64_t>, kDurationSeconds> t2_forced_checkpoint_counts{};
   // Only ever touched by thread_idx==0 (see the trigger site below), so no locking needed.
   std::vector<ForcedEvent> forced_events;
   std::atomic<uint64_t> last_recorded_t1{0};
-  std::atomic<uint64_t> last_recorded_t2{0};
+  std::atomic<uint64_t> last_recorded_checkpoint_t2{0};
   std::atomic<uint64_t> next_key_index;
   std::chrono::steady_clock::time_point start_time;
 
@@ -89,9 +89,9 @@ class YCSBTimelineCollector {
       : counters(num_threads), next_key_index(initial_keys) {
     for (int i = 0; i < kDurationSeconds; ++i) {
       t1_reorg_counts[i].store(0, std::memory_order_relaxed);
-      t2_reorg_counts[i].store(0, std::memory_order_relaxed);
+      t2_checkpoint_counts[i].store(0, std::memory_order_relaxed);
       t1_forced_reorg_counts[i].store(0, std::memory_order_relaxed);
-      t2_forced_reorg_counts[i].store(0, std::memory_order_relaxed);
+      t2_forced_checkpoint_counts[i].store(0, std::memory_order_relaxed);
     }
   }
 
@@ -120,9 +120,9 @@ class YCSBTimelineCollector {
     std::vector<uint64_t> total_scan(kDurationSeconds, 0);
     std::vector<uint64_t> total_insert(kDurationSeconds, 0);
     std::vector<uint64_t> total_reorg_t1(kDurationSeconds, 0);
-    std::vector<uint64_t> total_reorg_t2(kDurationSeconds, 0);
+    std::vector<uint64_t> total_checkpoint_t2(kDurationSeconds, 0);
     std::vector<uint64_t> total_forced_reorg_t1(kDurationSeconds, 0);
-    std::vector<uint64_t> total_forced_reorg_t2(kDurationSeconds, 0);
+    std::vector<uint64_t> total_forced_checkpoint_t2(kDurationSeconds, 0);
 
     for (const auto &tc : counters) {
       for (int i = 0; i < kDurationSeconds; ++i) {
@@ -132,9 +132,9 @@ class YCSBTimelineCollector {
     }
     for (int i = 0; i < kDurationSeconds; ++i) {
       total_reorg_t1[i] = t1_reorg_counts[i].load(std::memory_order_relaxed);
-      total_reorg_t2[i] = t2_reorg_counts[i].load(std::memory_order_relaxed);
+      total_checkpoint_t2[i] = t2_checkpoint_counts[i].load(std::memory_order_relaxed);
       total_forced_reorg_t1[i] = t1_forced_reorg_counts[i].load(std::memory_order_relaxed);
-      total_forced_reorg_t2[i] = t2_forced_reorg_counts[i].load(std::memory_order_relaxed);
+      total_forced_checkpoint_t2[i] = t2_forced_checkpoint_counts[i].load(std::memory_order_relaxed);
     }
 
     // Sanitize parameters to prevent slash / from breaking folder path
@@ -158,8 +158,9 @@ class YCSBTimelineCollector {
       for (int i = 0; i < kDurationSeconds; ++i) {
         out << "    {\"sec\": " << (i + 1) << ", \"scan_ops\": " << total_scan[i]
             << ", \"insert_ops\": " << total_insert[i] << ", \"t1_reorg_ops\": " << total_reorg_t1[i]
-            << ", \"t2_reorg_ops\": " << total_reorg_t2[i] << ", \"t1_forced_reorg_ops\": " << total_forced_reorg_t1[i]
-            << ", \"t2_forced_reorg_ops\": " << total_forced_reorg_t2[i] << "}";
+            << ", \"t2_checkpoint_ops\": " << total_checkpoint_t2[i]
+            << ", \"t1_forced_reorg_ops\": " << total_forced_reorg_t1[i]
+            << ", \"t2_forced_checkpoint_ops\": " << total_forced_checkpoint_t2[i] << "}";
         if (i < kDurationSeconds - 1) out << ",";
         out << "\n";
       }
@@ -1158,6 +1159,12 @@ static void record_store_statistics(benchmark::State &state, StoreHolder<StorePt
       benchmark::Counter(static_cast<double>(stats.checkpoint_count), benchmark::Counter::kDefaults);
   state.counters["Hard_Stalls"] =
       benchmark::Counter(static_cast<double>(stats.hard_stall_count), benchmark::Counter::kDefaults);
+  state.counters["Hard_Stall_Duration_us"] =
+      benchmark::Counter(static_cast<double>(stats.total_hard_stall_duration_us), benchmark::Counter::kDefaults);
+  state.counters["Append_Region_Live"] =
+      benchmark::Counter(static_cast<double>(stats.append_region_live_count), benchmark::Counter::kDefaults);
+  state.counters["Append_Region_Peak"] =
+      benchmark::Counter(static_cast<double>(stats.append_region_peak_count), benchmark::Counter::kDefaults);
 }
 
 template <typename StorePtr>
@@ -1371,7 +1378,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
               col->start();
               auto stats = store.get_statistics();
               col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
-              col->last_recorded_t2.store(stats.checkpoint_count, std::memory_order_relaxed);
+              col->last_recorded_checkpoint_t2.store(stats.checkpoint_count, std::memory_order_relaxed);
               ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
             }
           } else {
@@ -1400,13 +1407,13 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                 col->last_recorded_t1.store(current_t1, std::memory_order_relaxed);
               }
 
-              // Track T2 Reorg
-              uint64_t current_t2 = stats.checkpoint_count;
-              uint64_t prev_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
-              if (current_t2 > prev_t2) {
-                uint64_t diff = current_t2 - prev_t2;
-                col->t2_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
-                col->last_recorded_t2.store(current_t2, std::memory_order_relaxed);
+              // Track T2 Checkpoint
+              uint64_t current_checkpoint_t2 = stats.checkpoint_count;
+              uint64_t prev_t2 = col->last_recorded_checkpoint_t2.load(std::memory_order_relaxed);
+              if (current_checkpoint_t2 > prev_t2) {
+                uint64_t diff = current_checkpoint_t2 - prev_t2;
+                col->t2_checkpoint_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
+                col->last_recorded_checkpoint_t2.store(current_checkpoint_t2, std::memory_order_relaxed);
               }
 
               // Fire the next scheduled forced reorganize()/checkpoint() call once elapsed
@@ -1444,10 +1451,10 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                   col->last_recorded_t1.store(post_t1, std::memory_order_relaxed);
                 }
                 uint64_t post_t2 = post_stats.checkpoint_count;
-                uint64_t pre_force_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
+                uint64_t pre_force_t2 = col->last_recorded_checkpoint_t2.load(std::memory_order_relaxed);
                 if (post_t2 > pre_force_t2) {
-                  col->t2_forced_reorg_counts[bucket].fetch_add(post_t2 - pre_force_t2, std::memory_order_relaxed);
-                  col->last_recorded_t2.store(post_t2, std::memory_order_relaxed);
+                  col->t2_forced_checkpoint_counts[bucket].fetch_add(post_t2 - pre_force_t2, std::memory_order_relaxed);
+                  col->last_recorded_checkpoint_t2.store(post_t2, std::memory_order_relaxed);
                 }
 
                 col->forced_events.push_back({trigger.second_mark,
@@ -2390,12 +2397,14 @@ auto contention_workload_name(ContentionWorkload workload) -> const char * {
             << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
             << "\"checkpoint_elapsed_sec\":" << checkpoint_elapsed_sec << ","
             << "\"timed_out\":" << (timed_out ? "true" : "false") << ","
+            << "\"last_checkpoint_us\":" << final_stats.last_checkpoint_duration_us << ","
             << "\"last_checkpoint_msync_us\":" << final_stats.last_checkpoint_msync_duration_us << ","
             << "\"last_checkpoint_t1_reorganize_us\":" << final_stats.last_checkpoint_t1_reorganize_duration_us << ","
             << "\"last_checkpoint_stop_writers_us\":" << final_stats.last_checkpoint_stop_writers_duration_us << ","
             << "\"last_checkpoint_barrier_drain_us\":" << final_stats.last_checkpoint_barrier_drain_duration_us << ","
             << "\"last_checkpoint_wal_rotate_us\":" << final_stats.last_checkpoint_wal_rotate_duration_us << ","
-            << "\"last_checkpoint_bytes_synced\":" << final_stats.last_checkpoint_bytes_synced << ","
+            << "\"last_checkpoint_wal_rotate_leader_wait_us\":" << final_stats.last_checkpoint_wal_rotate_leader_wait_us
+            << "," << "\"last_checkpoint_bytes_synced\":" << final_stats.last_checkpoint_bytes_synced << ","
             << "\"last_checkpoint_corpus_bytes\":" << final_stats.last_checkpoint_corpus_bytes << "}" << std::endl;
   std::_Exit(timed_out ? 124 : 0);
 }

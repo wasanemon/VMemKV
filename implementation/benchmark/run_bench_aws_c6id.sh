@@ -24,6 +24,9 @@ show_help() {
   echo "  --ltm-first      Run Scenario B (Larger-than-Memory) before Scenario A (In-Memory)"
   echo "  --large-value-first  Run larger-value benchmarks before smaller-value benchmarks"
   echo "  --quick          Run one workload per scenario with a short min_time"
+  echo "  --scenario in_memory|ltm|all  Limit which scenario(s) run (default: all)"
+  echo "  --value-size SIZE  Limit to one value-size combo within the active scenario(s)"
+  echo "                   (e.g. 8B, 1KB, 64KB -- see common/benchmark_matrix.sh)"
   echo "  --reorg-scaling-probe  After the normal matrix, additionally sweep reorganize()"
   echo "                   duration vs. corpus size (T1-only) on the same instance via"
   echo "                   run_reorg_scaling_probe.sh and download its JSONL output"
@@ -354,7 +357,7 @@ prepare_remote_storage() {
     sudo mkdir -p /mnt/nvme
     MOUNT_TARGET=\$(findmnt -rn -S \"\$DEV\" -o TARGET 2>/dev/null | head -n 1 || true)
     if [ -z \"\$MOUNT_TARGET\" ]; then
-      MOUNT_TARGET=\$(grep -E "^[^ ]*nvme[1-9]n1" /proc/mounts | awk '{print \$2}' | head -n 1 || true)
+      MOUNT_TARGET=\$(grep -E \"^[^ ]*nvme[1-9]n1\" /proc/mounts | awk '{print \$2}' | head -n 1 || true)
     fi
 
     if [ -n \"\$MOUNT_TARGET\" ]; then

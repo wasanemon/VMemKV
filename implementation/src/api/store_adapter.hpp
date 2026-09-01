@@ -76,8 +76,12 @@ class StoreAdapter {
     });
   }
 
-  template <typename Key, typename Value>
-  auto insert(const Key &key, Value &&value) -> bool {
+  // Shared body for insert()/update() below: both serialize key/value the same way and reject the
+  // same inline-value sentinel collision (an 8-byte value that's all-1-bits would otherwise be
+  // indistinguishable from T1's own STORE_NOT_FOUND sentinel if inlined) before dispatching to
+  // whichever KVSImpl method the caller names via `ImplMethod`.
+  template <auto ImplMethod, typename Key, typename Value>
+  auto insert_or_update(const Key &key, Value &&value) -> bool {
     return kvs_detail::with_key_serialized(key, [this, &value](std::span<const std::byte> key_bytes) -> bool {
       return kvs_detail::with_val_serialized(std::forward<Value>(value),
                                              [this, key_bytes](std::span<const std::byte> val_bytes) -> bool {
@@ -88,26 +92,19 @@ class StoreAdapter {
                                                    return false;
                                                  }
                                                }
-                                               return impl_.insert_impl(key_bytes, val_bytes);
+                                               return (impl_.*ImplMethod)(key_bytes, val_bytes);
                                              });
     });
   }
 
   template <typename Key, typename Value>
+  auto insert(const Key &key, Value &&value) -> bool {
+    return insert_or_update<&KVSImpl::insert_impl>(key, std::forward<Value>(value));
+  }
+
+  template <typename Key, typename Value>
   auto update(const Key &key, Value &&value) -> bool {
-    return kvs_detail::with_key_serialized(key, [this, &value](std::span<const std::byte> key_bytes) -> bool {
-      return kvs_detail::with_val_serialized(std::forward<Value>(value),
-                                             [this, key_bytes](std::span<const std::byte> val_bytes) -> bool {
-                                               if (val_bytes.size() == kInlineScalarValueBytes) {
-                                                 uint64_t val_u64 = 0;
-                                                 std::memcpy(&val_u64, val_bytes.data(), kInlineScalarValueBytes);
-                                                 if (val_u64 == ~0ULL) {
-                                                   return false;
-                                                 }
-                                               }
-                                               return impl_.update_impl(key_bytes, val_bytes);
-                                             });
-    });
+    return insert_or_update<&KVSImpl::update_impl>(key, std::forward<Value>(value));
   }
 
   template <typename Key>

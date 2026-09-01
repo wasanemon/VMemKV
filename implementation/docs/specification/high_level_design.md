@@ -121,7 +121,7 @@ entry がインライン化されている場合は，3. は不要であり，Ti
 
 payload が offset の index については，Update と Delete における古いデータの削除は T1 の offset を書き換えるだけで行われるのが重要なポイントである．T1 の offset がポインタ/参照だとみなしたとき，これらの T2 の削除されたデータは参照カウントがゼロになったものといえる．ただし，これらの Tier 2 データが物理削除される仕組みは現状存在しない（6.1 節参照）．
 
-## 6. Reorganize, Checkpoint, Live Reload
+## 6. Reorganize, Checkpoint
 
 ### 6.1 reorganize と断片化
 
@@ -162,7 +162,8 @@ Tier 2 の稼働中 mmap は `MAP_SHARED` である。書き込みはページ�
 
 - Tier 1 `mlock` / `MADV_HUGEPAGE` / 一時的 `MADV_SEQUENTIAL`（未実装・将来検討）
 - Tier 1 `madvise(MADV_RANDOM)`（常時有効。In-Memory 読出で約5%の性能向上に貢献する）
-- Group Commit / Early Lock Release / Flush Pipelining（未実装・将来検討）
+- WAL Group Commit（実装済み。ロックフリー固定長リングバッファ方式。詳細は low_level_design.md 7.1 節）
+- Early Lock Release / Flush Pipelining（未実装・将来検討）
 - SIMD による Tier 1 scan 高速化
 - entry-level adaptive covering
 - `sorted_region` ネガティブルックアップ用 Bloom filter による miss時の O(1)化

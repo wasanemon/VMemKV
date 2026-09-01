@@ -82,14 +82,6 @@ vmemkv_matrix::scenario_value_order_keys_from_flag() {
   esac
 }
 
-vmemkv_matrix::scenario_json_filename() {
-  case "$1" in
-    in_memory) printf '%s\n' "results_in_memory.json" ;;
-    ltm) printf '%s\n' "results_ltm.json" ;;
-    *) return 1 ;;
-  esac
-}
-
 vmemkv_matrix::value_filter_fragment() {
   case "$1" in
     8b) printf '%s\n' "Value=8B" ;;
@@ -188,8 +180,10 @@ vmemkv_matrix::scenario_quick_filter() {
       ;;
     ltm)
       # One representative LTM workload, chosen to reach the scenario boundary quickly.
-      # Value labels carry a "(20% 8B)" suffix for non-8B sizes, hence the ".*".
-      printf '%s\n' '^Store=VMemKV/Variant=Bloom-T1InlineValue-Prefaulting/Op=Get/Mode=Hit/Dist=Zipf/Value=64KB.*threads:1$'
+      # Value labels carry a "(20% 8B)" suffix for non-8B sizes, hence the ".*". The variant
+      # here must match one VMemKVImpl::name() (vmemkv_impl.hpp) can actually produce, or this
+      # filter silently matches zero benchmarks.
+      printf '%s\n' '^Store=VMemKV/Variant=Bloom-T1InlineValue/Op=Get/Mode=Hit/Dist=Zipf/Value=64KB.*threads:1$'
       ;;
     *)
       return 1
