@@ -20,41 +20,24 @@
 set -uo pipefail  # deliberately not -e: probe/timeout exit codes are inspected explicitly below
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BENCH_KV_BIN="${1:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [combo_filter]}"
-OUTPUT_PATH="${2:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [combo_filter]}"
-DB_DIR="${3:-/tmp}"
-# Optional 4th arg: restrict which combos run (same two forms as run_reorg_scaling_probe.sh's
-# COMBO_FILTER). Empty (the default) means "all 4 combos".
-COMBO_FILTER="${4:-}"
-
-OUTER_TIMEOUT_SECONDS=300
-ALL_COMBOS=("in_memory:8B" "in_memory:1KB" "ltm:1KB" "ltm:64KB")
-COMBOS=()
-for combo in "${ALL_COMBOS[@]}"; do
-  if [[ -z "$COMBO_FILTER" || "$combo" == "$COMBO_FILTER" || "$combo" == "${COMBO_FILTER}:"* ]]; then
-    COMBOS+=("$combo")
-  fi
-done
-
-: > "$OUTPUT_PATH"
-
-log() { echo "[maintenance-contention-probe] $*" >&2; }
-
 # shellcheck source=common/reorg_probe_common.sh
 source "$SCRIPT_DIR/common/reorg_probe_common.sh"
+init_probe_driver "maintenance-contention-probe" "$@"
+
+OUTER_TIMEOUT_SECONDS=300
 
 for combo in "${COMBOS[@]}"; do
   scenario="${combo%%:*}"
   value_size="${combo##*:}"
   log "=== ${scenario}/${value_size}/checkpoint_contention spot check ==="
-  run_probe_point "$scenario" "$value_size" "checkpoint_contention" "1.0" "checkpoint" --sweep-tag=contention
+  run_probe_point "$scenario" "$value_size" "checkpoint_contention" "1.0" "checkpoint"
 done
 
 for combo in "${COMBOS[@]}"; do
   scenario="${combo%%:*}"
   value_size="${combo##*:}"
   log "=== ${scenario}/${value_size}/reorg_contention spot check ==="
-  run_probe_point "$scenario" "$value_size" "reorg_contention" "1.0" "reorg" --sweep-tag=contention
+  run_probe_point "$scenario" "$value_size" "reorg_contention" "1.0" "reorg"
 done
 
 log "done. Results written to $OUTPUT_PATH"

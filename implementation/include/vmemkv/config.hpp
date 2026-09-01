@@ -101,7 +101,7 @@ using System_AllOn = Config<BloomFilter, T1InlineValue>;
 
 struct VMemKVStatistics {
   uint64_t t1_reorg_count = 0;
-  uint64_t t2_reorg_count = 0;
+  uint64_t checkpoint_count = 0;
   uint64_t hard_stall_count = 0;
 
   // Phase breakdown for the most recently completed checkpoint_internal() cycle (auto-triggered

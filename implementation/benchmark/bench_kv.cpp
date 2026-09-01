@@ -1155,7 +1155,7 @@ static void record_store_statistics(benchmark::State &state, StoreHolder<StorePt
   state.counters["Reorgs_T1"] =
       benchmark::Counter(static_cast<double>(stats.t1_reorg_count), benchmark::Counter::kDefaults);
   state.counters["Reorgs_T2"] =
-      benchmark::Counter(static_cast<double>(stats.t2_reorg_count), benchmark::Counter::kDefaults);
+      benchmark::Counter(static_cast<double>(stats.checkpoint_count), benchmark::Counter::kDefaults);
   state.counters["Hard_Stalls"] =
       benchmark::Counter(static_cast<double>(stats.hard_stall_count), benchmark::Counter::kDefaults);
 }
@@ -1371,7 +1371,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
               col->start();
               auto stats = store.get_statistics();
               col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
-              col->last_recorded_t2.store(stats.t2_reorg_count, std::memory_order_relaxed);
+              col->last_recorded_t2.store(stats.checkpoint_count, std::memory_order_relaxed);
               ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
             }
           } else {
@@ -1401,7 +1401,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
               }
 
               // Track T2 Reorg
-              uint64_t current_t2 = stats.t2_reorg_count;
+              uint64_t current_t2 = stats.checkpoint_count;
               uint64_t prev_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
               if (current_t2 > prev_t2) {
                 uint64_t diff = current_t2 - prev_t2;
@@ -1443,7 +1443,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                   // doesn't also attribute this same delta to the natural t1_reorg_counts.
                   col->last_recorded_t1.store(post_t1, std::memory_order_relaxed);
                 }
-                uint64_t post_t2 = post_stats.t2_reorg_count;
+                uint64_t post_t2 = post_stats.checkpoint_count;
                 uint64_t pre_force_t2 = col->last_recorded_t2.load(std::memory_order_relaxed);
                 if (post_t2 > pre_force_t2) {
                   col->t2_forced_reorg_counts[bucket].fetch_add(post_t2 - pre_force_t2, std::memory_order_relaxed);
@@ -1821,13 +1821,15 @@ void register_all_benchmarks() {
 // time against the same budget (conflating the two would make a timeout ambiguous: slow setup, or
 // slow reorganize/checkpoint?).
 //
-// Three modes, selected via --mode:
+// Five modes, selected via --mode:
 //   t1only / t1t2 (run_bootstrap(), below): a single fresh populate followed by exactly one timed
 //     reorganize()/checkpoint() call.
 //   t1t2_steady (run_steady(), below): measures a *second* (or later) checkpoint() call against a
-//     corpus that already has one checkpointed generation. Used by two experiments that only
-//     differ in which axis (--ratio or --churn-ratio) they sweep -- see run_churn_scaling_probe.sh
-//     and run_reorg_scaling_probe.sh's t1t2_steady sweep, respectively.
+//     corpus that already has one checkpointed generation -- see
+//     run_checkpoint_throughput_probe.sh's t1t2_steady sweep.
+//   checkpoint_contention / reorg_contention (run_checkpoint_contention()/run_reorg_contention(),
+//     below): measures reorganize()/checkpoint() latency under concurrent writer contention -- see
+//     run_maintenance_contention_probe.sh.
 namespace reorg_probe {
 
 constexpr int kReorgTimeoutSecondsDefault = 60;
@@ -1924,6 +1926,7 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
     } else if (key == "--churn-ratio") {
       args.churn_ratio = std::stod(std::string(value));
     } else if (key == "--sweep-tag") {
+      // Only read by run_steady() (t1t2_steady mode) -- every other mode ignores this value.
       args.sweep_tag = std::string(value);
     }
   }
@@ -1990,11 +1993,15 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
       mode_name = "reorg_contention";  // Unreachable: this mode reports via its own print, below.
       break;
   }
+  // churn_ratio only means anything for t1t2_steady (run_steady() is the only mode that applies
+  // it) -- every other mode never touches args.churn_ratio, so emitting its default 0.0 there
+  // would misleadingly read as "measured with zero churn" rather than "not applicable."
+  const bool churn_ratio_applicable = args.mode == ProbeMode::kT1T2Steady;
   std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
             << "," << "\"mode\":\"" << mode_name << "\"," << "\"ratio\":" << args.ratio << ","
-            << "\"churn_ratio\":" << args.churn_ratio << "," << "\"key_count\":" << key_count << ","
-            << "\"elapsed_sec\":" << elapsed_sec << "," << "\"timed_out\":" << (timed_out ? "true" : "false") << "}"
-            << std::endl;
+            << "\"churn_ratio\":" << (churn_ratio_applicable ? std::to_string(args.churn_ratio) : "null") << ","
+            << "\"key_count\":" << key_count << "," << "\"elapsed_sec\":" << elapsed_sec << ","
+            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
   std::_Exit(timed_out ? 124 : 0);
 }
 
@@ -2178,8 +2185,8 @@ auto run_contention_probe(Store &store,
                           std::size_t key_count,
                           uint32_t val_size,
                           OperationFn &&run_operation,
-                          double min_wall_seconds = 0.0,
-                          std::size_t writer_threads = 0,
+                          double min_wall_seconds,
+                          std::size_t writer_threads,
                           WriteWorkload workload = WriteWorkload::kUpdateExisting)
     -> std::tuple<double, double, double, bool> {
   assert(writer_threads != 0 && "callers must pass an already-resolved thread count (see resolve_writer_threads())");
@@ -2265,27 +2272,6 @@ auto run_contention_probe(Store &store,
   const double avg_op_elapsed_sec = reps > 0 ? op_elapsed_sec / static_cast<double>(reps) : op_elapsed_sec;
 
   return {isolated_write_tps, concurrent_write_tps, avg_op_elapsed_sec, timed_out};
-}
-
-// scenario/value_size/mode/ratio/key_count/writer_threads/isolated_write_tps/concurrent_write_tps
-// plus a caller-named op-duration field and timed_out -- the common shape of every contention
-// mode's result. checkpoint_contention prints its own (it also carries a workload field and
-// trailing checkpoint-phase stats no other mode has).
-static void print_contention_result(const ProbeArgs &args,
-                                    const char *mode_name,
-                                    std::size_t key_count,
-                                    std::size_t writer_threads,
-                                    double isolated_write_tps,
-                                    double concurrent_write_tps,
-                                    const char *op_field_name,
-                                    double op_elapsed_sec,
-                                    bool timed_out) {
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"" << mode_name << "\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << writer_threads << ","
-            << "\"isolated_write_tps\":" << isolated_write_tps << ","
-            << "\"concurrent_write_tps\":" << concurrent_write_tps << "," << "\"" << op_field_name
-            << "\":" << op_elapsed_sec << "," << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
 }
 
 // Checkpoint-contention mode: same populate+checkpoint+pre-churn setup as run_steady()'s
@@ -2447,15 +2433,16 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
       kReorgContentionMinWallSeconds,
       resolved_writer_threads);
 
-  print_contention_result(args,
-                          "reorg_contention",
-                          key_count,
-                          resolved_writer_threads,
-                          isolated_write_tps,
-                          concurrent_write_tps,
-                          "reorg_elapsed_sec",
-                          reorg_elapsed_sec,
-                          timed_out);
+  // Inlined (not shared with run_checkpoint_contention()'s print below): that mode's result
+  // carries a workload field and trailing checkpoint-phase stats this mode doesn't have, so a
+  // shared helper would need as many optional fields as it saves lines.
+  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
+            << "," << "\"mode\":\"reorg_contention\"," << "\"ratio\":" << args.ratio << ","
+            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
+            << "\"isolated_write_tps\":" << isolated_write_tps << ","
+            << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
+            << "\"reorg_elapsed_sec\":" << reorg_elapsed_sec << ","
+            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
   std::_Exit(timed_out ? 124 : 0);
 }
 

@@ -4,12 +4,8 @@
 // append_default record round-tripping and in-place update_value_at.
 
 #include <doctest/doctest.h>
-#include <fcntl.h>
-#include <unistd.h>
 
-#include <api/store_adapter.hpp>  // pulled in transitively by vmemkv_impl.hpp; kInlineScalarValueBytes lives here
-#include <atomic>
-#include <cstring>
+#include <api/store_adapter.hpp>  // kInlineScalarValueBytes, needed by vmemkv_impl.hpp below (get_impl()'s inline-value path)
 #include <filesystem>
 #include <span>
 #include <string>
@@ -56,7 +52,7 @@ TEST_CASE("T2FlatFile: update_value_at overwrites in place when the new value fi
   auto mem = t2.file.get_memory_handle();
   const uint64_t offset = t2.file.append_default(mem, as_span(bytes_of("k")), as_span(bytes_of("0123456789")));
 
-  CHECK(t2.file.update_value_at(offset, as_span(bytes_of("abc"))));
+  CHECK(vmemkv::T2FlatFile::update_value_at(offset, as_span(bytes_of("abc")), mem));
 
   CHECK(span_to_string(t2.file.at(offset, mem).value) == "abc");
 }
@@ -66,7 +62,7 @@ TEST_CASE("T2FlatFile: update_value_at fails when the new value exceeds alloc_le
   auto mem = t2.file.get_memory_handle();
   const uint64_t offset = t2.file.append_default(mem, as_span(bytes_of("k")), as_span(bytes_of("abc")));
 
-  CHECK_FALSE(t2.file.update_value_at(offset, as_span(bytes_of("0123456789"))));
+  CHECK_FALSE(vmemkv::T2FlatFile::update_value_at(offset, as_span(bytes_of("0123456789")), mem));
 }
 
 // Regression test: read_t2_record_seqlock() used to take an already-built T2RecordView and only
@@ -86,7 +82,7 @@ TEST_CASE(
   const uint64_t offset = t2.file.append_default(mem, as_span(bytes_of("k")), as_span(bytes_of(original_value)));
 
   const std::string shrunk_value = "new";  // Fits within alloc_len=64; update_value_at() succeeds.
-  REQUIRE(t2.file.update_value_at(offset, as_span(bytes_of(shrunk_value))));
+  REQUIRE(vmemkv::T2FlatFile::update_value_at(offset, as_span(bytes_of(shrunk_value)), mem));
 
   // read_t2_record_seqlock() calls at_func() itself, fresh, so it always sees the record as it
   // is *right now* -- there is no way for a caller to hand it a stale, pre-built view anymore.

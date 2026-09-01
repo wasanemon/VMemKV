@@ -543,9 +543,9 @@ void Wal::rotate_segment() {
   }
 
   // Become leader ourselves rather than "wait until flushing_ is false" -- the latter has a TOCTOU
-  // where another thread could grab leadership between this call waking and acting on fd_. Unlike
-  // the old file-copy design, no drain_pending() first: a record that reserved its lsn just before
-  // this swap may still end up physically written to either the old or the new segment depending
+  // where another thread could grab leadership between this call waking and acting on fd_. No
+  // drain_pending() first: a record that reserved its lsn just before this swap may still end up
+  // physically written to either the old or the new segment depending
   // on exactly when its own group-commit round runs (write_and_fsync_batch() reads fd_ fresh) --
   // both are correct, since replay() reads every segment currently on disk regardless of which one
   // a given record landed in (see this file's own comment above and low_level_design.md 5.5).

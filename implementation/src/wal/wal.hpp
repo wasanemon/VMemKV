@@ -149,8 +149,8 @@ class Wal {
   // Rolls over to a fresh segment (low_level_design.md 5.5): opens
   // derive_wal_segment_path(path_, generation+1), publishes it as the new active fd, and deletes
   // the segment two generations back (safe by construction -- see the doc comment on the .cpp
-  // definition for the argument). Takes no LSN: unlike the old single-file design, this needs no
-  // knowledge of checkpoint_lsn at all, and thus no per-record scan to find where it falls.
+  // definition for the argument). Takes no LSN: needs no knowledge of checkpoint_lsn at all, and
+  // thus no per-record scan to find where it falls.
   // Briefly becomes group-commit leader only to swap fd_ without racing an in-flight
   // write_and_fsync_batch() against the old fd -- does not drain first (a record landing in
   // either the old or new segment is equally correct, see that same comment).

@@ -109,7 +109,7 @@ struct T2Memory {
 
   // `initial_bytes_used`: for a rebuilt/adopted mapping with live records already at construction
   // time; 0 for a brand-new empty file.
-  T2Memory(std::byte *base_ptr, uint64_t capacity_bytes, uint64_t initial_bytes_used = 0) noexcept
+  T2Memory(std::byte *base_ptr, uint64_t capacity_bytes, uint64_t initial_bytes_used) noexcept
       : base(base_ptr), capacity(capacity_bytes), bytes_used(initial_bytes_used), base_boundary(initial_bytes_used) {}
 
   ~T2Memory() noexcept {
@@ -155,7 +155,10 @@ struct NoOpAcquireWriteHandleHook {
 class T2FlatFile {
  public:
   // ─── Types and Constructors ───
-  // RAII handle for lock-free reader thread safety without shared_ptr copy overhead.
+  // RAII handle produced by acquire_write_handle(): registers the calling writer in
+  // active_writers_ so stop_writers_and_wait() can quiesce in-flight appenders before
+  // checkpoint_internal() captures a frontier. Not used by plain readers -- see
+  // get_memory_handle()'s comment.
   using T2MemoryHandle = typename ThreadReferenceTracker<const T2Memory *>::Guard;
 
   // Constructor. Always creates or adopts vmemkv::derive_t2_chk_path(path) -- the single,
@@ -177,12 +180,15 @@ class T2FlatFile {
   auto operator=(const T2FlatFile &) -> T2FlatFile & = delete;
 
   // ─── Memory and Record Access ───
-  // Acquires a shared reference to the current mapped memory region.
-  // - Thread-safety: Thread-safe; returned pointer guards against concurrent file munmap.
-  // - Contract: Callers must hold the returned pointer (via T2MemoryHandle) for the duration of record accesses.
+  // Returns the current T2Memory instance. There is exactly one T2Memory for a store's whole
+  // process lifetime (no relocating rebuild ever replaces it), so a plain pointer is already
+  // stable for as long as this T2FlatFile itself is alive -- readers need no reference-counted
+  // handle to keep it alive across the call. `get_memory_handle()` is a same-named alias kept for
+  // call sites that read via `mem->...`; it does not register with `active_writers_`, which is
+  // reserved for acquire_write_handle()'s writer-quiesce contract (see stop_writers_and_wait()).
   auto get_memory() const noexcept -> const T2Memory * { return t2_mem_.load(std::memory_order_acquire); }
 
-  auto get_memory_handle() const noexcept -> T2MemoryHandle { return {active_readers_, get_memory()}; }
+  auto get_memory_handle() const noexcept -> const T2Memory * { return get_memory(); }
 
   // Write-side half of the residual-window fix (see stop_writers_and_wait() for the checkpoint
   // side): acquires a handle for appending a brand-new T2 record, deferring while
@@ -202,17 +208,17 @@ class T2FlatFile {
   // firing once right after registering and before the writer_stop_ check -- lets a test pause a
   // writer in exactly that window to reproduce the race deterministically; no-op in production.
   //
-  // The outer while(writer_stop_) loop below deliberately does NOT touch active_readers_ at all:
+  // The outer while(writer_stop_) loop below deliberately does NOT touch active_writers_ at all:
   // retrying the register-then-check dance immediately on rejection would let a rejected writer's
   // slot toggle between the retired value and cleared rapidly enough that
   // stop_writers_and_wait()'s drain check could lose that race indefinitely under sustained write
-  // load. Waiting out here first means a writer only touches active_readers_ once per genuine
+  // load. Waiting out here first means a writer only touches active_writers_ once per genuine
   // writer_stop_ transition, so once past that transition the tracked count can only drain, never
-  // bounce back up. This doesn't reopen the gap the ordering above protects against: the actual
-  // register-then-check pair is unchanged, just no longer attempted in a tight loop while already
-  // known to be rejected.
+  // bounce back up. This doesn't reopen the gap the ordering above protects against: the
+  // register-then-check pair itself still runs exactly once per genuine transition, just never
+  // retried in a tight loop while already known to be rejected.
   //
-  // Registers/releases through active_readers_ directly (rather than a named T2MemoryHandle
+  // Registers/releases through active_writers_ directly (rather than a named T2MemoryHandle
   // local) on the retry path: T2MemoryHandle's Guard has a deleted copy constructor and no
   // implicit move constructor, so `return handle;` for a named local isn't guaranteed elided
   // (NRVO is optional, unlike a prvalue return) -- only the success path constructs one, as a
@@ -225,12 +231,12 @@ class T2FlatFile {
         backoff.wait();
       }
       const T2Memory *mem = get_memory();
-      active_readers_.acquire(mem);
+      active_writers_.acquire(mem);
       hook();
       if (!writer_stop_.load(std::memory_order_seq_cst)) {
-        return {active_readers_, mem};  // re-acquire()s the same value; harmless.
+        return {active_writers_, mem};  // re-acquire()s the same value; harmless.
       }
-      active_readers_.release();
+      active_writers_.release();
     }
   }
 
@@ -262,10 +268,6 @@ class T2FlatFile {
   // Updates the value of an existing record in-place if the new value fits within alloc_len.
   // - Thread-safety: Thread-safe for distinct keys (callers hold per-key stripe lock).
   // - Guarantees: Returns true on success; false if new value exceeds alloc_len.
-  auto update_value_at(uint64_t payload, std::span<const std::byte> value) const noexcept -> bool;
-  // Same as above, but resolves against a caller-supplied `mem` rather than self-acquiring the
-  // current one, so a write that already validated `payload` against that exact handle goes
-  // through it directly.
   static auto update_value_at(uint64_t payload, std::span<const std::byte> value, const T2Memory *mem) noexcept -> bool;
 
   // ─── Properties ───
@@ -274,8 +276,6 @@ class T2FlatFile {
   auto bytes_used() const noexcept -> uint64_t {
     return get_memory_handle()->bytes_used.load(std::memory_order_acquire);
   }
-  // Total virtual memory capacity mapped for the T2 file.
-  auto bytes_capacity() const noexcept -> uint64_t { return get_memory_handle()->capacity; }
   auto path() const noexcept -> const std::filesystem::path & { return path_; }
 
  private:
@@ -291,8 +291,6 @@ class T2FlatFile {
 
   void map_file(const std::filesystem::path &path, uint64_t bytes_capacity, uint64_t initial_bytes_used);
 
-  void retire_memory(const T2Memory *old_mem);
-
   // ─── Member Variables ───
   // The identity path passed to the constructor -- NOT the file actually opened/mapped (that's
   // always vmemkv::derive_t2_chk_path(path_), see the constructor's doc comment). Sibling paths
@@ -301,7 +299,13 @@ class T2FlatFile {
 
   std::atomic<const T2Memory *> t2_mem_{nullptr};
 
-  mutable ThreadReferenceTracker<const T2Memory *> active_readers_;
+  // Tracks only in-flight writers (acquire_write_handle() registrants) -- plain readers
+  // (get_impl()/scan_impl()/try_in_place_update(), via get_memory_handle()) never register here.
+  // The sole purpose is stop_writers_and_wait()'s quiesce: closing the residual-window race where
+  // an append could land past the frontier checkpoint_internal() is about to durabilize. That race
+  // is about appenders publishing new T2 offsets, not readers, so excluding readers only shortens
+  // the wait -- it does not weaken the guarantee.
+  mutable ThreadReferenceTracker<const T2Memory *> active_writers_;
 
   // Set by stop_writers_and_wait(), cleared by resume_writers(); gates acquire_write_handle() so
   // no new writer appends past the frontier checkpoint_internal() is about to capture. See

@@ -60,4 +60,18 @@ inline auto span_to_string(std::span<const std::byte> value) -> std::string {
   return {reinterpret_cast<const char *>(value.data()), value.size()};
 }
 
+// Shared core of test_kv_store.cpp's get_bytes_sync() and test_crash_recovery.cpp's get_bytes():
+// both do the same store->get()-with-callback dance and only differ in the collection type they
+// hand back, so each is a thin wrapper around this.
+template <typename StorePtr, typename Key>
+auto get_optional_bytes(const StorePtr &store, const Key &key) -> std::optional<std::vector<std::byte>> {
+  std::optional<std::vector<std::byte>> result;
+  const bool found =
+      store->get(key, [&](std::span<const std::byte> val) { result = std::vector<std::byte>(val.begin(), val.end()); });
+  if (found) {
+    return result;
+  }
+  return std::nullopt;
+}
+
 }  // namespace vmemkv_test

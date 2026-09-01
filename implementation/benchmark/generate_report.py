@@ -181,15 +181,10 @@ def build_reorg_scaling_data(report_dir):
     return reorg_data
 
 
-def build_checkpoint_throughput_data(report_dir):
-    """Reads checkpoint_throughput_in_memory.jsonl / checkpoint_throughput_ltm.jsonl
-    (run_checkpoint_throughput_probe.sh, via bench_kv --reorg-probe --mode=t1t2_steady
-    --ratio=1.0 --churn-ratio=0.25 -- full corpus size, a high-but-not-maximal churn ratio that
-    isolates the marginal per-record durabilization cost from checkpoint()'s fixed per-call setup
-    overhead while keeping setup work and checkpoint() I/O proportionally bounded) into
-    {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per combo."""
-    data = {}
-    for fname in ["checkpoint_throughput_in_memory.jsonl", "checkpoint_throughput_ltm.jsonl"]:
+def _iter_fixed_files_by_scenario_field(report_dir, filenames):
+    """Yields (scenario_key, rec) for every JSONL line in `filenames` (relative to report_dir)
+    whose own "scenario"/"value_size" fields resolve to a known SCENARIO_LABELS entry."""
+    for fname in filenames:
         path = report_dir / fname
         if not path.exists():
             continue
@@ -198,14 +193,52 @@ def build_checkpoint_throughput_data(report_dir):
                 continue
             rec = json.loads(line)
             scenario_key = SCENARIO_LABELS.get((rec["scenario"], _value_size_label(rec.get("value_size"))))
-            if scenario_key is None or rec.get("timed_out"):
+            if scenario_key is not None:
+                yield scenario_key, rec
+
+
+def _iter_per_scenario_files(report_dir, filename_fmt):
+    """Yields (scenario_key, rec) for every JSONL line in report_dir / filename_fmt.format(scenario=,
+    val_size=), one file per SCENARIO_LABELS entry."""
+    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
+        path = report_dir / filename_fmt.format(scenario=scenario, val_size=val_size)
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            if not line.strip():
                 continue
-            data[scenario_key] = {
-                "key_count": rec["key_count"],
-                "elapsed_sec": rec["elapsed_sec"],
-                "records_per_sec": rec["key_count"] / rec["elapsed_sec"],
-            }
+            yield scenario_key, json.loads(line)
+
+
+def _build_throughput_data(records, accept):
+    """Reduces a (scenario_key, rec) stream to {scenario_key: {"key_count", "elapsed_sec",
+    "records_per_sec"}}, keeping the last accepted record per scenario_key. `accept(rec)` decides
+    which records count."""
+    data = {}
+    for scenario_key, rec in records:
+        if not accept(rec):
+            continue
+        data[scenario_key] = {
+            "key_count": rec["key_count"],
+            "elapsed_sec": rec["elapsed_sec"],
+            "records_per_sec": rec["key_count"] / rec["elapsed_sec"],
+        }
     return data
+
+
+def build_checkpoint_throughput_data(report_dir):
+    """Reads checkpoint_throughput_in_memory.jsonl / checkpoint_throughput_ltm.jsonl
+    (run_checkpoint_throughput_probe.sh, via bench_kv --reorg-probe --mode=t1t2_steady
+    --ratio=1.0 --churn-ratio=0.25 -- full corpus size, a high-but-not-maximal churn ratio that
+    isolates the marginal per-record durabilization cost from checkpoint()'s fixed per-call setup
+    overhead while keeping setup work and checkpoint() I/O proportionally bounded) into
+    {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per combo."""
+    return _build_throughput_data(
+        _iter_fixed_files_by_scenario_field(
+            report_dir, ["checkpoint_throughput_in_memory.jsonl", "checkpoint_throughput_ltm.jsonl"]
+        ),
+        accept=lambda rec: not rec.get("timed_out"),
+    )
 
 
 def build_reorg_throughput_data(report_dir):
@@ -215,23 +248,10 @@ def build_reorg_throughput_data(report_dir):
     reorganize() is T1-only (never touches T2) and rebuilds the whole structure every call --
     cost tracks corpus size, not churn, so this reuses the sweep's own ratio=1.0 point rather
     than a separate probe."""
-    data = {}
-    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
-        path = report_dir / f"reorg_scaling_{scenario}_{val_size}.jsonl"
-        if not path.exists():
-            continue
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            if rec.get("mode") != "t1only" or (rec.get("ratio") or 0) != 1 or rec.get("timed_out"):
-                continue
-            data[scenario_key] = {
-                "key_count": rec["key_count"],
-                "elapsed_sec": rec["elapsed_sec"],
-                "records_per_sec": rec["key_count"] / rec["elapsed_sec"],
-            }
-    return data
+    return _build_throughput_data(
+        _iter_per_scenario_files(report_dir, "reorg_scaling_{scenario}_{val_size}.jsonl"),
+        accept=lambda rec: rec.get("mode") == "t1only" and (rec.get("ratio") or 0) == 1 and not rec.get("timed_out"),
+    )
 
 
 def build_maintenance_contention_data(report_dir):
@@ -370,60 +390,40 @@ def _badge_for_checkpoint_headroom(ratio):
     return ("✅ Keeps up", "bg-emerald-50 text-emerald-700 border-emerald-200")
 
 
-def render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data):
-    if not checkpoint_throughput_data:
+def _render_vs_insert_table_html(throughput_data, raw_data, op_column_header):
+    if not throughput_data:
         return ""
     idx32 = THREADS.index(32)
     out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
            '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
            '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>',
            '<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">checkpoint() steady-state</th>',
+           f'<th class="py-2 px-3 font-bold text-slate-700">{op_column_header}</th>',
            '<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>',
            "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
     for scenario_key in ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"]:
-        cp = checkpoint_throughput_data.get(scenario_key)
+        entry = throughput_data.get(scenario_key)
         insert_series = raw_data.get(scenario_key, {}).get("Insert", {}).get("+Inline")
-        if not cp or not insert_series or insert_series[idx32] is None:
+        if not entry or not insert_series or insert_series[idx32] is None:
             continue
         insert_rate = insert_series[idx32]
-        cp_rate = cp["records_per_sec"]
-        ratio = insert_rate / cp_rate if cp_rate else float("inf")
+        op_rate = entry["records_per_sec"]
+        ratio = insert_rate / op_rate if op_rate else float("inf")
         label_text, badge_class = _badge_for_checkpoint_headroom(ratio)
         out.append(f'<tr><td class="py-2 px-3">{scenario_key}</td>'
                     f'<td class="py-2 px-3">{insert_rate:,.0f}/s</td>'
-                    f'<td class="py-2 px-3">{cp_rate:,.0f}/s</td>'
+                    f'<td class="py-2 px-3">{op_rate:,.0f}/s</td>'
                     f'<td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border {badge_class} font-bold w-fit">{label_text} ({ratio:.2f}x)</span></td></tr>')
     out.append("</tbody></table></div>")
     return "\n".join(out)
+
+
+def render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data):
+    return _render_vs_insert_table_html(checkpoint_throughput_data, raw_data, "checkpoint() steady-state")
 
 
 def render_reorg_vs_insert_table_html(reorg_throughput_data, raw_data):
-    if not reorg_throughput_data:
-        return ""
-    idx32 = THREADS.index(32)
-    out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
-           '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
-           '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">reorganize() full-corpus</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>',
-           "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
-    for scenario_key in ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"]:
-        rg = reorg_throughput_data.get(scenario_key)
-        insert_series = raw_data.get(scenario_key, {}).get("Insert", {}).get("+Inline")
-        if not rg or not insert_series or insert_series[idx32] is None:
-            continue
-        insert_rate = insert_series[idx32]
-        rg_rate = rg["records_per_sec"]
-        ratio = insert_rate / rg_rate if rg_rate else float("inf")
-        label_text, badge_class = _badge_for_checkpoint_headroom(ratio)
-        out.append(f'<tr><td class="py-2 px-3">{scenario_key}</td>'
-                    f'<td class="py-2 px-3">{insert_rate:,.0f}/s</td>'
-                    f'<td class="py-2 px-3">{rg_rate:,.0f}/s</td>'
-                    f'<td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border {badge_class} font-bold w-fit">{label_text} ({ratio:.2f}x)</span></td></tr>')
-    out.append("</tbody></table></div>")
-    return "\n".join(out)
+    return _render_vs_insert_table_html(reorg_throughput_data, raw_data, "reorganize() full-corpus")
 
 
 def _badge_for_slowdown(pct):
@@ -533,58 +533,6 @@ def main():
         "const reorgThroughputData = " + json.dumps(reorg_throughput_data, indent=2) + ";\n    "
     )
 
-    # checkpoint()/defragment() mislabeling: churn-scaling, reorg-scaling and YCSB-E's forced
-    # triggers only ever call checkpoint(), never defragment() -- but older report rounds
-    # (predating that split) still describe them as defragment()/reflink+punch/O(N)/O(diff). Best
-    # effort (not asserted) since exact wording has drifted across rounds; a no-op once fixed.
-    html = html.replace(
-        "t=10秒・t=25秒予定の<code class=\"bg-slate-100 px-1 rounded text-xs\">defragment()</code>(粗い点線)",
-        "t=10秒・t=25秒予定の<code class=\"bg-slate-100 px-1 rounded text-xs\">checkpoint()</code>(粗い点線)",
-    )
-    html = html.replace("後続のdefragment()トリガー", "後続のcheckpoint()トリガー")
-    html = html.replace("t=10s & t=25s (defragment())", "t=10s & t=25s (checkpoint())")
-    old_reorg_caption_variants = [
-        """<strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、ただし<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">defragment()</code>。reflink元が無いのでO(N)。現行のreflink+punch実装そのものを、コールド状態で計測した数値であって別実装ではない)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既存世代からのreflink clone + hole punch、O(diff)の本来の定常状態。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。""",
-        """<strong class="text-indigo-600">藍色</strong> = T1-only、<strong class="text-rose-600">赤色</strong> = T1+T2。""",
-    ]
-    new_reorg_caption = """<strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。"""
-    for old_variant in old_reorg_caption_variants:
-        html = html.replace(old_variant, new_reorg_caption)
-
-    # checkpoint()'s bootstrap/steady cost no longer has its own chart series -- it only durabilizes
-    # the tail since the last cycle (proportional to churn, not corpus size), so a corpus-size sweep
-    # was never the right axis for it; see the new Insert-vs-checkpoint-throughput chart/table
-    # instead (run_checkpoint_throughput_probe.sh). This chart goes back to being reorganize()-only,
-    # T1-only, the same operation it always measured. Best effort (not asserted), a no-op once fixed.
-    html = html.replace(
-        "Reorganize / Checkpoint Duration vs. Corpus Size (T1-only reorganize() vs T1+T2 checkpoint())",
-        "reorganize() Duration vs. Corpus Size (T1-only)",
-    )
-    html = html.replace(
-        """const modeStyle = {
-        t1only: { label: 'Reorganize (T1-only)', color: '#6366f1' },
-        t1t2:   { label: 'Checkpoint, bootstrap (T1+T2)', color: '#e11d48' },
-        t1t2_steady: { label: 'Checkpoint, steady (T1+T2)', color: '#059669' },
-      };
-      const datasets = ['t1only', 't1t2', 't1t2_steady'].filter(m => rs[m] && rs[m].length).map(m => {""",
-        """const modeStyle = {
-        t1only: { label: 'Reorganize (T1-only)', color: '#6366f1' },
-      };
-      const datasets = ['t1only'].filter(m => rs[m] && rs[m].length).map(m => {""",
-    )
-    old_reorg_caption_simplified_variants = [
-        """<strong class="text-indigo-600">藍色</strong> = T1-only(T2は一切触らない)。<strong class="text-rose-600">赤色</strong> = T1+T2、<strong>ブートストラップ</strong>(直前チェックポイントが存在しない新規コーパスへの初回<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>)。<strong class="text-emerald-600">緑色</strong> = T1+T2 steady(既にチェックポイント済みのコーパスへの2回目以降の<code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code>。churn_ratio=0.01でのコーパスサイズ不変性実験、1KB LTMタブのみ)。""",
-    ]
-    new_reorg_caption_simplified = """reorganize() は T1(インメモリインデックス)のみを対象とし、T2には一切触れない。"""
-    for old_variant in old_reorg_caption_simplified_variants:
-        html = html.replace(old_variant, new_reorg_caption_simplified)
-
-    # Older report rounds' already-generated HTML says churn_ratio=1.0 in this caption; the probe
-    # measures at churn_ratio=0.25 (see run_checkpoint_throughput_probe.sh). Best effort (not
-    # asserted), a no-op once fixed.
-    html = html.replace("checkpoint()</code> の定常状態スループット(churn_ratio=1.0での記録数/所要時間",
-                         "checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間")
-
     # Header title / links / description.
     old_title = f'<title>VMemKV Performance Charts ({args.template_id})</title>'
     new_title = f'<title>{args.title}</title>'
@@ -655,8 +603,7 @@ def main():
     # otherwise insert a fresh section right after the Workload Winners section closes.
     section_open_marker = '<section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">'
 
-    def upsert_section(html, heading, icon_bg, icon_text, icon_name, title, description_html, table_html,
-                       old_headings=()):
+    def upsert_section(html, heading, icon_bg, icon_text, icon_name, title, description_html, table_html):
         if not table_html:
             return html
         section_html = f'''
@@ -673,16 +620,7 @@ def main():
         {table_html}
       </section>
 '''
-        # A prior report round may have used a different heading for what is now the same
-        # logical section (e.g. a rename, or dropping a "(new experiment)" suffix) -- check those
-        # first so the update-in-place path (below) still fires and the section's existing
-        # position is preserved, instead of appearing "not present" and being re-inserted
-        # elsewhere.
-        heading_idx = -1
-        for candidate in (heading, *old_headings):
-            heading_idx = html.find(candidate)
-            if heading_idx != -1:
-                break
+        heading_idx = html.find(heading)
         if heading_idx == -1:
             # Not present yet: insert right after the Workload Winners section closes.
             winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
@@ -697,71 +635,6 @@ def main():
             ws_start -= 1
         section_end = html.index("</section>", heading_idx) + len("</section>")
         return html[:ws_start] + "\n" + section_html.strip("\n") + html[section_end:]
-
-    def remove_section(html, heading):
-        heading_idx = html.find(heading)
-        if heading_idx == -1:
-            return html
-        section_start = html.rindex(section_open_marker, 0, heading_idx)
-        section_end = html.index("</section>", heading_idx) + len("</section>")
-        return html[:section_start] + html[section_end:]
-
-    # Per-tab chart blocks (inserted by the checkpoint/reorg/defrag-throughput migration loops
-    # below) aren't wrapped in a <section>, so remove_section() can't reach them. Each block ends
-    # with exactly one <textarea>...</textarea> immediately followed by its own two closing divs
-    # (space-y-1.5 wrapper, then the block itself) -- unlike the tab-container's own close, this
-    # pair immediately follows every block regardless of how many siblings come after it, so it's
-    # a safe per-block boundary to search for starting from the anchor (searching for the next
-    # "double close" from the anchor alone would overshoot into a later sibling block instead).
-    def remove_mt12_block(html, anchor_text):
-        anchor_idx = html.find(anchor_text)
-        if anchor_idx == -1:
-            return html
-        block_marker = '<div class="mt-12 border-t border-slate-200 pt-8 space-y-6">'
-        block_start = html.rindex(block_marker, 0, anchor_idx)
-        ws_start = block_start
-        while ws_start > 0 and html[ws_start - 1] in " \t\n":
-            ws_start -= 1
-        close_marker = "</textarea>\n        </div>\n      </div>\n"
-        block_end = html.index(close_marker, anchor_idx) + len(close_marker)
-        return html[:ws_start] + html[block_end:]
-
-    # Both superseded by the Insert-vs-checkpoint-throughput chart/table below: checkpoint()'s
-    # cost tracks churn, not corpus size, so a corpus-size sweep (bootstrap-only, or steady-state
-    # scoped to ltm/1KB) was never the right measurement for "does checkpoint keep up".
-    html = remove_section(html, "Corpus-Size Invariance across Generations (new experiment)")
-    html = remove_section(html, "Churn-Ratio Scaling (new experiment)")
-    # defragment() has been removed entirely (round 3) -- strip these sections from any older
-    # template being regenerated. Older heading names are tried only as a fallback (never both):
-    # "Defragment Scaling & Contention" is also a substring of unrelated body text elsewhere in
-    # older templates, so it must not be searched once the current heading has already matched.
-    html = remove_section(html, "Insert vs. Defragment() Throughput")
-    if "Defragment Corpus-Size Scaling" in html:
-        html = remove_section(html, "Defragment Corpus-Size Scaling")
-    elif "Defragment Scaling & Contention (new experiment)" in html:
-        html = remove_section(html, "Defragment Scaling & Contention (new experiment)")
-    elif "<h3 class=\"text-base font-bold text-slate-900\">Defragment Scaling & Contention</h3>" in html:
-        html = remove_section(html, "<h3 class=\"text-base font-bold text-slate-900\">Defragment Scaling & Contention</h3>")
-    # Per-tab defrag-throughput blocks, one per scenario/value combo -- not <section>s, so the
-    # remove_section() calls above don't reach them.
-    while True:
-        html = remove_mt12_block(html, "Insert Throughput vs. Defragment() Full-Corpus Throughput")
-        if "Insert Throughput vs. Defragment() Full-Corpus Throughput" not in html:
-            break
-    # Orphaned JS an older template's already-migrated initCharts() wiring still calls -- must go
-    # together, in either order, or the surviving half is a dangling reference/definition.
-    orphaned_wiring = """        const dfEid = valSize.toLowerCase().replace(/-/g,'_') + '-defrag-throughput';
-        const dfCanvas = document.getElementById('chart-' + dfEid);
-        if (dfCanvas) {
-          const cfg3 = makeDefragVsInsertConfig(valSize);
-          if (cfg3) new Chart(dfCanvas, cfg3);
-        }
-"""
-    html = html.replace(orphaned_wiring, "")
-    if "function makeDefragVsInsertConfig(" in html:
-        func_start = html.index("    function makeDefragVsInsertConfig(")
-        func_end = html.index("\n\n    ", func_start) + len("\n\n")
-        html = html[:func_start] + html[func_end:]
 
     html = upsert_section(
         html,
@@ -788,15 +661,13 @@ def main():
         table_html=render_maintenance_contention_html(maintenance_contention_data),
     )
 
-    # Per-tab "Insert vs. Checkpoint() Throughput" chart: one new canvas + section per tab,
-    # inserted right after the existing Reorg Scaling Probe section (same sibling-block style),
-    # plus the JS chart-config function and its initCharts() wiring. All three insertions are
-    # guarded so a re-run against an already-migrated template is a no-op.
-    if "function makeCheckpointVsInsertConfig(" not in html:
-        checkpoint_config_js = """    function makeCheckpointVsInsertConfig(valSizeKey) {
-      const cp = checkpointThroughputData[valSizeKey];
+    # Per-tab "Insert vs. X() Throughput" chart configs: one new canvas + section per tab, plus
+    # the JS chart-config function and its initCharts() wiring. Both insertions below are guarded
+    # so a re-run against an already-migrated template is a no-op.
+    _VS_INSERT_CONFIG_JS = """    function %(func_name)s(valSizeKey) {
+      const %(var)s = %(data_var)s[valSizeKey];
       const insertSeries = rawData[valSizeKey] && rawData[valSizeKey]['Insert'] && rawData[valSizeKey]['Insert']['+Inline'];
-      if (!cp || !insertSeries) return null;
+      if (!%(var)s || !insertSeries) return null;
       const threadLabels = [1, 4, 16, 32];
       return {
         type: 'line',
@@ -813,9 +684,9 @@ def main():
               pointRadius: 3.5,
             },
             {
-              label: 'checkpoint() steady-state',
-              data: threadLabels.map(() => cp.records_per_sec),
-              borderColor: '#059669',
+              label: '%(series_label)s',
+              data: threadLabels.map(() => %(var)s.records_per_sec),
+              borderColor: '%(color)s',
               backgroundColor: 'transparent',
               borderWidth: 2,
               borderDash: [6, 4],
@@ -859,77 +730,21 @@ def main():
     }
 
     """
+
+    if "function makeCheckpointVsInsertConfig(" not in html:
+        checkpoint_config_js = _VS_INSERT_CONFIG_JS % {
+            "func_name": "makeCheckpointVsInsertConfig", "var": "cp", "data_var": "checkpointThroughputData",
+            "series_label": "checkpoint() steady-state", "color": "#059669",
+        }
         html = html.replace("    function initCharts() {", checkpoint_config_js + "function initCharts() {")
 
     if "function makeReorgVsInsertConfig(" not in html:
-        reorg_config_js = """    function makeReorgVsInsertConfig(valSizeKey) {
-      const rg = reorgThroughputData[valSizeKey];
-      const insertSeries = rawData[valSizeKey] && rawData[valSizeKey]['Insert'] && rawData[valSizeKey]['Insert']['+Inline'];
-      if (!rg || !insertSeries) return null;
-      const threadLabels = [1, 4, 16, 32];
-      return {
-        type: 'line',
-        data: {
-          labels: threadLabels,
-          datasets: [
-            {
-              label: 'Insert (+Inline)',
-              data: insertSeries,
-              borderColor: '#6366f1',
-              backgroundColor: 'transparent',
-              borderWidth: 2,
-              tension: 0.2, fill: false,
-              pointRadius: 3.5,
-            },
-            {
-              label: 'reorganize() full-corpus',
-              data: threadLabels.map(() => rg.records_per_sec),
-              borderColor: '#7c3aed',
-              backgroundColor: 'transparent',
-              borderWidth: 2,
-              borderDash: [6, 4],
-              pointRadius: 0,
-              fill: false,
-            },
-          ],
-        },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          animation: { duration: 900, easing: 'easeInOutQuart' },
-          plugins: {
-            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
-            tooltip: {
-              mode: 'index', intersect: false,
-              backgroundColor: 'rgba(15,23,42,0.95)',
-              titleFont: {size:12,family:'Inter',weight:'bold'},
-              bodyFont: {size:11,family:'Inter'},
-              padding:10, cornerRadius:8,
-              callbacks: {
-                title: items => `${items[0].label} threads`,
-                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw)}/s`
-              }
-            }
-          },
-          scales: {
-            x: {
-              title: { display:true, text:'Threads', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8' }
-            },
-            y: {
-              type: 'logarithmic',
-              title: { display:true, text:'Throughput (records/sec, log scale)', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
-            }
-          }
-        }
-      };
-    }
-
-    """
         if "    function initCharts() {" not in html:
             raise RuntimeError("initCharts() anchor not found for reorg chart config insertion -- template drifted")
+        reorg_config_js = _VS_INSERT_CONFIG_JS % {
+            "func_name": "makeReorgVsInsertConfig", "var": "rg", "data_var": "reorgThroughputData",
+            "series_label": "reorganize() full-corpus", "color": "#7c3aed",
+        }
         html = html.replace("    function initCharts() {", reorg_config_js + "function initCharts() {")
 
     if "-checkpoint-throughput'" not in html:

@@ -53,9 +53,8 @@ using VMemKVLMDB = StoreAdapter<::LMDBStore>;
 
 // ─── 1. Core Stacked Ablation Variants ───
 // Isolated (non-cumulative) prototype variant for one-off measurement of GetPopulateRead alone --
-// see docs/benchmark/20260809_ltm_64kb_get_hit_profiling.md. Deliberately not in
-// AllPossibleTypes below: it served its purpose as an isolation-sweep diagnostic, and a
-// standalone entry there would just be a redundant benchmark cell.
+// see docs/benchmark/20260809_ltm_64kb_get_hit_profiling.md. Not in AllPossibleTypes below: an
+// isolation-sweep diagnostic, not a cell in the main ablation comparison.
 using VMemKV_GetPopulateRead = StoreAdapter<VMemKVImpl<Config<GetPopulateRead>>>;
 using VMemKV_Var0_Baseline = VMemKV_Baseline;
 using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
@@ -70,10 +69,9 @@ using VMemKV_RocksDBBlobDB = VMemKVRocksDBBlobDB;
 using VMemKV_LMDB = VMemKVLMDB;
 
 // ─── 2. Unified Benchmark Registration Tuple ───
-// SimdScan is intentionally absent from every variant below: measured against real benchmark
-// data it contributed no measurable signal even in its own target scenario (Scan), so it was
-// dropped from the stack to reduce ablation noise. The tag and Config machinery remain in
-// config.hpp for future re-verification.
+// SimdScan is intentionally absent from every variant below: contributes no measurable signal
+// even in its own target scenario (Scan), so excluding it reduces ablation noise. The tag and
+// Config machinery stay in config.hpp for future re-verification.
 using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
                                     VMemKV_Var1_Bloom,
                                     VMemKV_Var2_Inline,

@@ -176,7 +176,7 @@ struct VMemKV {
 **Notes**
 
 - old Tier 2 record はその場では削除しない。
-- old Tier 2 record は Tier 1 から到達不能になり、後続の `reorganize` で物理削除される。
+- old Tier 2 record は Tier 1 から到達不能になるが、Tier 2 側は物理削除されない -- 4.1 節/4.3 節で述べる通り、Storage Fragmentation を解消する仕組みは現状コードベースに存在しない。
 - Failure Rule は 3.2 節と同様: 2.〜4. が失敗した操作を WAL に記録してはならない。
 - 手順3の in-place 判定には `offset >= base_boundary`(2.2節)の条件も含まれる。この境界未満を指す record への更新は、たとえ `new_value_len <= alloc_len` でも in-place にはせず、手順4の追記パスに強制的に回す。base 領域は専用mmapで直接読む読み取り経路(7.9節)の前提として「二度と書き換わらない」ことに依存しているため。`base_boundary` はその `T2Store` インスタンスの生存期間中一定なので、この判定は追加の同期なしに安全である。
 
@@ -191,7 +191,7 @@ struct VMemKV {
 **Notes**
 
 - Tier 2 の record は delete 時には触らない。
-- delete 済み record は Tier 1 から到達不能になり、`reorganize` で物理削除される。
+- delete 済み record は Tier 1 から到達不能になるが、Tier 2 側は物理削除されない -- Update の Notes と同様。
 - Failure Rule は 3.2 節と同様: 2. が失敗した操作を WAL に記録してはならない。
 
 ### 3.5 Scan
@@ -215,7 +215,7 @@ struct VMemKV {
 
 `reorganize` は Ordering Fragmentation を解消する: Tier 1 `append_region` の肥大化により候補探索・確認コストが増え、Get / Scan が遅くなる問題である。
 
-Tier 2 側にも delete や append-update の結果として生じる Storage Fragmentation(Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ)が存在する。`checkpoint_internal()`(4.3 節)はこれを解消しない。Tier 2 全体を再配置してこれを解消する仕組みはコードベースに存在しない -- 過去に設計・実装され、その後 API ごと削除された(`defragment_redesign_proposal.md` §8 参照)。
+Tier 2 側にも delete や append-update の結果として生じる Storage Fragmentation(Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ)が存在する。`checkpoint_internal()`(4.3 節)はこれを解消しない。Tier 2 全体を再配置してこれを解消する仕組みはコードベースに存在しない。
 
 ### 4.2 T1 Reorganize
 
@@ -250,7 +250,7 @@ T1 `reorganize` は T2 と独立に実行できる。
 
 entry 単位でインライン化されている entry(2.1.1 節、7.3 節)は Tier 2 に一切アクセスしないため、この処理の対象から外れる。
 
-`checkpoint_internal()` は Tier 2 の**単一の永続ファイル**の tail 領域(`[old_base_boundary, bytes_used)`)を `msync()` で永続化する。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- Storage Fragmentation の解消(GC)はこの処理の対象外であり、現状コードベースにその機構は存在しない(`defragment_redesign_proposal.md` §8 参照)。
+`checkpoint_internal()` は Tier 2 の**単一の永続ファイル**の tail 領域(`[old_base_boundary, bytes_used)`)を `msync()` で永続化する。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- Storage Fragmentation の解消(GC)はこの処理の対象外であり、現状コードベースにその機構は存在しない。
 
 **Input**
 
@@ -321,45 +321,6 @@ T1 `reorganize` は、`append_region` のサイズに応じて自動的にバッ
 マルチスレッド並行スキャンにおいてフラグ書き込みによるキャッシュラインの奪い合い（Cache Bouncing）を回避するため、**Read-Check-Write (TEST and SET) パターン**による軽量なアトミックフラグ `scan_active_` を用いる。
 1. `scan()` の開始時に `scan_active_` が `false` の場合のみ `true` を書き込む。すでに `true` の場合は読み取り（Read-only）でバイパスし、無駄なキャッシュ無効化を防ぐ。
 2. `reorganize()` のマージ完了時に、`scan_active_` を `false` にリセットする。
-
-### 4.6 T2 Defragment (`defragment_internal()`) [削除済み]
-
-> **現在の状態**: 本節は過去に設計・実装・測定された挙動の記録である。`defragment_internal()`
-> および公開 API `defragment()` は round 1 で no-op 化された後、round 3 で API ごとコードベースから
-> 完全に削除された(`defragment_redesign_proposal.md` §8参照)。以下は将来 Tier 2 再配置が
-> 必要になった際の設計参照として残す。
-
-`checkpoint_internal()`(4.3 節)が解消しない Storage Fragmentation ―― Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ ―― を、当時の `defragment_internal()` は次の設計で解消していた。生存中の Tier 2 record 全件を、T1 の key 順のまま新規ファイルへ連続した offset で再配置し、旧ファイルを丸ごと置き換える。
-
-`checkpoint_internal()` との違いは「record を動かすかどうか」の一点であり、それ以外の同期機構(`tail_entries_`、`T2FlatFile::stop_writers_and_wait()`、`t1_.reorganize()` の単一 publish ポイント、`T2Memory` 世代スワップ、manifest commit、WAL rotate)は共有する。
-
-base 領域は record が隙間なく連続しているとは限らない: 生存中に上書きされ、それ以降 Tier 1 から到達不能になった record の slot も、有効な形式のバイト列を保ったまま残り得る。したがって base 領域のバイト列を無条件でオフセット順にパースする方式は成立しない。Phase 0 が触れる record は例外なく、T1 が今この瞬間に保証する offset(`payload_bits`)経由でのみアドレスされ、直前の record の長さから推測することはない。
-
-**Input**
-
-- T1 の現在の生存 entry 全件(`sorted_region` + `append_region`)
-- Tier 2 の生存中の record 全件(base 領域・tail 領域の両方)
-
-**Output**
-
-- 新しい世代の `T2Memory`(新規ファイルへの `mmap`。offset は生存 record ごとに新規採番され、`base_boundary` はファイル全体を覆う)
-- `payload_bits`(offset + block_count)と世代タグを更新した Tier 1
-
-**Procedure**
-
-1. `capture_watermark_` をサイクル開始時に一度だけ `old_base_boundary` へ固定する(以降このサイクル中は動かさない)。base 領域の record は `try_in_place_update()` の `offset >= mem->base_boundary` チェックによりもともと in-place 更新の対象外のため、この一括固定だけで Phase 0 の全読み取りに対する不変性が保証される。tail 領域の catch-up はすべて手順4以降(writer 停止後)にのみ行うため、`checkpoint_internal()` の pre-stop パスのような record 単位の逐次前進は不要。
-2. `t1_.scan()` を1回走査し、`old_base_boundary` 未満の offset を持つ生存 entry 全件の `payload_bits`(offset + 埋め込み block_count)を `live_payloads` として収集し、offset 昇順にソートする(base 領域は前サイクルの出力自体が key 順で書かれているため、offset 昇順は key 順と一致する ―― 帰納的に次サイクルも同じ前提を維持する)。各 `payload_bits` を `try_read_base_record()`(`BaseReader::kScan`、この昇順アクセスパターン向けに調整された読み取りパス。稀に読み取りが成立しない場合は `t2_.at()` にフォールバックする ―― `offset < old_base_boundary` は手順1の固定によりこのフェーズ中不変なので、どちらの経路も seqlock は不要)で読み、スクラッチファイルへ offset 昇順(= key 順)のまま `pwrite()` する。この走査は writer をブロックしない。
-3. `T2FlatFile::stop_writers_and_wait()` で新規書き込みハンドルの発行を止め、発行済みハンドルが全て解放されるまで待つ。
-4. writer が完全に停止した状態で `tail_entries_` を `drain_and_clear()` により完全に回収する。各エントリの現在値を T1 から再解決して読み取り、key 順にソートする。writer が残っていないため、この回収は1回で生存集合を確定できる。
-5. 手順2のスクラッチファイル(offset 昇順 = key 順)と手順4の tail 候補(key 順)を、key をキーにマージソートの要領で本出力ファイルへマージする。同一 key が両方に存在する場合は tail 側が勝つ(スクラッチ側は base 領域からの読み取りであり、tail に候補があるということは既に上書きされた後の値である)。この merge が「base は常に key 順」という不変条件を次サイクルへ引き継ぐ。
-6. `t1_.reorganize()` を1回呼び、生存 entry 全件の `payload_bits` を手順5で確定した新しい offset/block_count へ、世代タグを新しい `T2Memory` の世代へ書き換える。同じ呼び出しの中で T1 checkpoint の一時ファイルを書き出す(temp + `rename`)。
-7. 新しい `T2Memory` を publish し、writer を再開する。新規ファイルを正式なパスへ `rename()` する(Linux の unlink-while-open の性質により、旧ファイルの実データは既存の読者がいなくなるまで保持される ―― 明示的な `unlink()` は不要)。manifest を書き `fsync` してアトミックに差し替え、WAL をローテーションする。
-
-**Effect**
-
-- Storage Fragmentation を完全に解消する(生存データのみが、隙間なく、key 順で新規ファイルに存在する)。
-- Ordering Fragmentation も副次的に解消する: Scan が読む物理 offset 順が再び T1 の key 順と一致する。
-- コストは生存コーパスサイズに比例する(`checkpoint_internal()` の「前回サイクル以降の tail のみ」より高コスト)。頻繁な呼び出しには向かない。
 
 ## 5. Checkpoint Reload
 

@@ -82,7 +82,7 @@ static constexpr uint64_t STORE_NOT_FOUND = ~0ULL;
 // ─── T1Index Structure Overview ─────────────────────────────────────────────
 //
 //               +-----------------------------+
-//               | sorted_region_ (shared_ptr) |
+//               |  sorted_region_ (raw ptr)   |
 //               +--------------+--------------+
 //                              |
 //                              v
@@ -131,7 +131,7 @@ class T1Index {
     note_append_region_created();
     auto *active_index = new AppendIndex();
     append_active_.store(new AppendGeneration{active_region, active_index}, std::memory_order_release);
-    sorted_snapshot_.store(new SortedRegion(), std::memory_order_release);
+    sorted_region_.store(new SortedRegion(), std::memory_order_release);
   }
 
   ~T1Index() noexcept {
@@ -143,7 +143,7 @@ class T1Index {
     }
     delete_generation(append_active_.load(std::memory_order_relaxed));
     delete_generation(append_immutable_.get());
-    delete sorted_snapshot_.load(std::memory_order_relaxed);
+    delete sorted_region_.load(std::memory_order_relaxed);
   }
 
   T1Index(const T1Index &) = delete;
@@ -192,7 +192,7 @@ class T1Index {
   // independent loads here could feed update_impl() a torn pair and corrupt a live T2 write (see
   // SortedSlot::version's declaration).
   auto lookup_by_prefix_hash(const StoreKey &prefix, uint64_t hash) const -> LookupResult {
-    const SortedRegion *sorted = sorted_snapshot_.load(std::memory_order_acquire);
+    const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
     const AppendGeneration *active_gen = append_active_.load(std::memory_order_acquire);
     const AppendRegion *active = active_gen->region;
 
@@ -248,7 +248,7 @@ class T1Index {
       // Paired reads via load_slot_consistent() -- an unpaired hash/val read could misjudge
       // inline vs. offset.
       uint64_t total_blocks = 0;
-      const auto sorted = sorted_snapshot_.load(std::memory_order_acquire);
+      const auto sorted = sorted_region_.load(std::memory_order_acquire);
       for (size_t i = 0; i < sorted->size; ++i) {
         const auto [slot_hash, val] = load_slot_consistent(sorted->slots[i]);
         if (is_live(val)) {
@@ -276,8 +276,6 @@ class T1Index {
       return total_blocks * 16;
     });
   }
-
-  [[nodiscard]] static constexpr auto append_capacity() noexcept -> size_t { return APPEND_CAP; }
 
   // Inserts or updates the 64-bit payload for a given key prefix.
   // - Thread-safety: Safe for concurrent writers (guarded internally by slot-level atomic operations or table locks).
@@ -347,7 +345,7 @@ class T1Index {
     const StoreKey upper_bound = t1_detail::prefix_from_bytes(hi_bytes);
 
     return with_epoch_guard([&]() -> size_t {
-      const SortedRegion *sorted = sorted_snapshot_.load(std::memory_order_acquire);
+      const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
       const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
       const AppendGeneration *imm_gen = append_immutable_.get();
       const AppendRegion *imm = imm_gen != nullptr ? imm_gen->region : nullptr;
@@ -482,7 +480,7 @@ class T1Index {
     });
   }
 
-  // Reorganizes T1 by merging append_region_ into sorted_region_. Thread-safe; lock-free
+  // Reorganizes T1 by merging append_active_'s region into sorted_region_. Thread-safe; lock-free
   // readers (get/scan) can run concurrently.
   // - OffsetMapper: `void(std::span<EntrySnapshot> merged)`, called exactly once with the full,
   //   already-deduped, key-ordered live set. May rewrite any entry's `.payload_bits` in place
@@ -530,9 +528,9 @@ class T1Index {
     active_epochs_.wait_until_epoch(freeze_epoch);
 
     // 3. Rebuild sorted region from sorted_region and append_immutable
-    const auto sorted = sorted_snapshot_.load(std::memory_order_acquire);
+    const auto sorted = sorted_region_.load(std::memory_order_acquire);
     // Freeze *before* the merge loop below reads a single slot: from here until the new
-    // sorted_snapshot_ publishes, `sorted`'s contents are frozen for writers -- see
+    // sorted_region_ publishes, `sorted`'s contents are frozen for writers -- see
     // FreezableRegion's own comment for why put()'s in-place path must bypass instead of
     // mutating this region once its values start feeding `merged`.
     sorted_write_frozen_.freeze(sorted);
@@ -622,14 +620,12 @@ class T1Index {
 
     chk_writer(std::span<const EntrySnapshot>(merged));
 
-    const SortedRegion *old_sorted = sorted_snapshot_.load(std::memory_order_relaxed);
-
     auto *next_sorted = new SortedRegion(merged);
 
     // Unfreezes both guarded regions right after: from this point, resolve() sees the new
     // (complete, unfrozen) sorted region directly, so the bypass is no longer needed for either
     // one.
-    sorted_snapshot_.store(next_sorted, std::memory_order_release);
+    sorted_region_.store(next_sorted, std::memory_order_release);
     sorted_write_frozen_.unfreeze();
 
     // 4. Safely retire the old buffers
@@ -643,7 +639,10 @@ class T1Index {
     note_append_region_destroyed();
     delete old_active_gen->index;
     delete old_active_gen;
-    delete old_sorted;
+    // `sorted` (loaded above, before the merge) is still the pointer sorted_region_ held until
+    // the store() above just replaced it -- reorg_in_progress_'s single-flight guarantees nothing
+    // else could have written sorted_region_ in between, so no second load is needed here.
+    delete sorted;
 
     reorg_in_progress_.store(false, std::memory_order_release);
   }
@@ -654,11 +653,11 @@ class T1Index {
   // sorted by key ascending.
   void load_sorted_region_from_checkpoint(std::span<const EntrySnapshot> entries) {
     // Built before the old snapshot is torn down (matching reorganize()'s own ordering) so a
-    // throw from SortedRegion's constructor (e.g. bad_alloc) leaves sorted_snapshot_ pointing at
+    // throw from SortedRegion's constructor (e.g. bad_alloc) leaves sorted_region_ pointing at
     // its original, still-valid value instead of a dangling already-deleted pointer.
     auto *next_sorted = new SortedRegion(entries);
-    delete sorted_snapshot_.load(std::memory_order_relaxed);
-    sorted_snapshot_.store(next_sorted, std::memory_order_relaxed);
+    delete sorted_region_.load(std::memory_order_relaxed);
+    sorted_region_.store(next_sorted, std::memory_order_relaxed);
   }
 
  private:
@@ -1069,7 +1068,7 @@ class T1Index {
     return nullptr;
   }
 
-  // Runs `func` registered in active_epochs_. Every method dereferencing sorted_snapshot_/
+  // Runs `func` registered in active_epochs_. Every method dereferencing sorted_region_/
   // append_active_/append_immutable_ must go through this, or reorganize()'s wait_until_epoch()
   // can't know the buffers it's about to delete are still in use, letting a caller like put()
   // dereference a buffer reorganize() has already freed.
@@ -1100,14 +1099,14 @@ class T1Index {
     }
 
     if (const SortedRegion *frozen_sorted = sorted_write_frozen_.get()) {
-      // While frozen, sorted_snapshot_ points at this exact same region (reorganize() pairs the
+      // While frozen, sorted_region_ points at this exact same region (reorganize() pairs the
       // freeze/unfreeze around the merge and publish), so checking it again below would be
       // redundant -- not found here means not found in the live sorted region either.
       if (find_sorted(*frozen_sorted, key, hash) != nullptr) {
         return ResolvedSlot{};
       }
     } else {
-      const auto sorted = sorted_snapshot_.load(std::memory_order_acquire);
+      const auto sorted = sorted_region_.load(std::memory_order_acquire);
       if (const SortedSlot *slot = find_sorted(*sorted, key, hash)) {
         return ResolvedSlot{nullptr, slot};
       }
@@ -1149,13 +1148,13 @@ class T1Index {
   mutable std::atomic<bool> reorg_in_progress_{false};
   std::atomic<uint64_t> reorg_epoch_{1};
 
-  std::atomic<const SortedRegion *> sorted_snapshot_{nullptr};
+  std::atomic<const SortedRegion *> sorted_region_{nullptr};
   std::atomic<AppendGeneration *> append_active_{nullptr};
   FreezableRegion<AppendGeneration *> append_immutable_;
   std::atomic<int64_t> append_region_live_count_{0};
   std::atomic<int64_t> append_region_peak_count_{0};
   // See FreezableRegion's own comment. Frozen for the duration of reorganize()'s merge loop
-  // (the same SortedRegion sorted_snapshot_ currently points at), unfrozen right after the
+  // (the same SortedRegion sorted_region_ currently points at), unfrozen right after the
   // replacement publishes -- closes the sorted-region counterpart of the Lost Update hazard
   // append_immutable_ already guarded against.
   FreezableRegion<const SortedRegion *> sorted_write_frozen_;

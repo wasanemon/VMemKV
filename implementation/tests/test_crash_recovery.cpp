@@ -48,14 +48,11 @@ auto make_value(int index) -> std::string { return "value_" + std::to_string(ind
 
 template <typename StorePtr>
 auto get_bytes(StorePtr &store, const std::string &key) -> std::optional<std::string> {
-  std::optional<std::string> result;
-  const bool found = store->get(key, [&](std::span<const std::byte> val) {
-    result = std::string(reinterpret_cast<const char *>(val.data()), val.size());
-  });
-  if (found) {
-    return result;
+  const auto bytes = vmemkv_test::get_optional_bytes(store, key);
+  if (!bytes.has_value()) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  return vmemkv_test::span_to_string(vmemkv_test::as_span(*bytes));
 }
 
 // Simulates a crash mid-append: raw bytes shorter than a full WAL record header, appended
@@ -679,7 +676,7 @@ TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file
 // before, so checkpoint_internal() must create the T2 checkpoint file (O_CREAT) rather than
 // assume one already exists, even for an insert-only workload that never generates fragmentation
 // on its own. Deliberately the default (large) WalMaxBytesSinceCheckpoint, not a tiny override --
-// this test's exact t2_reorg_count assertions are about the *explicit* checkpoint() call below,
+// this test's exact checkpoint_count assertions are about the *explicit* checkpoint() call below,
 // and a small threshold would let reorg_worker_loop()'s own auto-trigger race that explicit call
 // (both incrementing the same counter), making the exact-count assertion flaky (found the hard
 // way: maybe_reorganize_if_needed() used to never actually evaluate the byte-threshold check for
@@ -696,7 +693,7 @@ TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint f
   const auto stats_after = store->impl().get_statistics();
 
   CHECK(std::filesystem::exists(vmemkv::derive_manifest_path(path)));
-  CHECK(stats_after.t2_reorg_count == stats_before.t2_reorg_count + 1);
+  CHECK(stats_after.checkpoint_count == stats_before.checkpoint_count + 1);
   CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path)));
 
   for (int i = 0; i < 200; ++i) {
@@ -712,7 +709,7 @@ TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint f
 // cycle in place (same T1/T2 checkpoint file paths throughout, checkpoint_lsn still advancing
 // every cycle), and a restart after several cycles correctly adopts the final state. Default
 // (large) WalMaxBytesSinceCheckpoint -- see the previous test case's own comment for why a tiny
-// override would make this test's exact t2_reorg_count assertion race auto-triggered cycles.
+// override would make this test's exact checkpoint_count assertion race auto-triggered cycles.
 TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survive restart") {
   const auto path = reserve_crash_temp_path();
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
@@ -744,8 +741,8 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
   }
 
   const auto stats_after_cycles = store->impl().get_statistics();
-  CHECK(stats_after_cycles.t2_reorg_count ==
-        stats_after_seed.t2_reorg_count + kCycles);  // Every checkpoint() ran a cycle.
+  CHECK(stats_after_cycles.checkpoint_count ==
+        stats_after_seed.checkpoint_count + kCycles);  // Every checkpoint() ran a cycle.
 
   // A genuine restart adopts the final checkpoint correctly.
   store.reset();

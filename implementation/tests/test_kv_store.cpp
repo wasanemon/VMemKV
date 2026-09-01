@@ -56,13 +56,7 @@ inline auto decode_scanned_u64(std::span<const std::byte> val) -> uint64_t {
 
 template <typename StorePtr, typename Key>
 auto get_bytes_sync(const StorePtr &store, const Key &key) -> std::optional<std::vector<std::byte>> {
-  std::optional<std::vector<std::byte>> res;
-  bool found =
-      store->get(key, [&](std::span<const std::byte> val) { res = std::vector<std::byte>(val.begin(), val.end()); });
-  if (found) {
-    return res;
-  }
-  return std::nullopt;
+  return vmemkv_test::get_optional_bytes(store, key);
 }
 }  // namespace test_util
 
@@ -977,10 +971,6 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   }
 }
 
-// A flaky store-level "lost update racing reorganize()" test was removed from here; that
-// property is covered deterministically in test_t1_index.cpp and under load by
-// reorganize_internal()'s stress-harness verification.
-
 // Regression tests for the formerly-open "torn read via user callback" bug:
 // get_impl()/scan_impl() used to invoke the caller-supplied callback directly from inside
 // read_t2_record_seqlock()'s copy_func, handing it a std::span into T2Memory::base -- live,
@@ -1137,6 +1127,37 @@ TEST_CASE(
   CHECK_FALSE(torn_read_found.load());
 }
 
+namespace {
+
+// Shared by the two writer-stop-barrier regression tests below: builds a "straggler" T2 record
+// through an already-acquired write handle and publishes it into T1, exactly as
+// write_entry_lockfree() would for a real append.
+template <typename ImplT, typename StorePtr>
+void publish_straggler_entry(StorePtr &store,
+                             const vmemkv::T2FlatFile::T2MemoryHandle &mem,
+                             const std::string &straggler_value) {
+  kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
+    kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
+      const uint64_t offset = vmemkv::T2FlatFile::append_default(mem, key_bytes, val_bytes);
+      uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_bytes.size() + val_bytes.size());
+      uint64_t block_count = aligned_len / ImplT::kBlockAlignment;
+      uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
+      REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0) == ImplT::T1IndexT::PutResult::Applied);
+    });
+  });
+}
+
+// Shared trailing check: the straggler entry published above must be immediately readable, with
+// no second checkpoint/reorganize cycle needed.
+template <typename StorePtr>
+void verify_straggler_readback(StorePtr &store, const std::string &straggler_value) {
+  const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
+  REQUIRE(straggler_readback.has_value());
+  CHECK(straggler_readback->size() == straggler_value.size());
+}
+
+}  // namespace
+
 // Regression test for checkpoint_internal()'s "residual window" race: a writer must never be
 // able to land a fresh T2 append past the frontier a concurrently-running checkpoint is about to
 // capture as `target`/`base_boundary`.
@@ -1175,39 +1196,27 @@ TEST_CASE(
   // pre_stop_hook fires strictly before the stop flag goes up, so the spawned thread's
   // acquire_write_handle() call is guaranteed to register with the reference tracker before
   // stop_writers_and_wait() ever scans it.
-  using ImplT_1287 = std::decay_t<decltype(store->impl())>;
-  store->impl().reorganize_internal(
-      ImplT_1287::ReorgMode::Checkpoint,
-      /*pre_stop_hook=*/
-      [&] {
-        using ImplT = ImplT_1287;
-        straggler_writer = std::thread([&] {
-          vmemkv::T2FlatFile::T2MemoryHandle mem = store->impl().t2().acquire_write_handle();
-          // Simulates being "mid-write": long enough that, absent the stop-and-wait, the
-          // checkpoint would very likely have already captured its target by the time this
-          // thread publishes.
-          std::this_thread::sleep_for(std::chrono::milliseconds(20));
-          kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
-            kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
-              const uint64_t offset = vmemkv::T2FlatFile::append_default(mem, key_bytes, val_bytes);
-              uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_bytes.size() + val_bytes.size());
-              uint64_t block_count = aligned_len / ImplT::kBlockAlignment;
-              uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
-              REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0) ==
-                      ImplT::T1IndexT::PutResult::Applied);
-            });
-          });
-          // mem released here -- only now can stop_writers_and_wait() (blocked on this exact
-          // handle since before this thread even started sleeping) proceed.
-        });
-      });
+  using ImplT = std::decay_t<decltype(store->impl())>;
+  store->impl().reorganize_internal(ImplT::ReorgMode::Checkpoint,
+                                    /*pre_stop_hook=*/
+                                    [&] {
+                                      straggler_writer = std::thread([&] {
+                                        vmemkv::T2FlatFile::T2MemoryHandle mem =
+                                            store->impl().t2().acquire_write_handle();
+                                        // Simulates being "mid-write": long enough that, absent the stop-and-wait, the
+                                        // checkpoint would very likely have already captured its target by the time
+                                        // this thread publishes.
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                        publish_straggler_entry<ImplT>(store, mem, straggler_value);
+                                        // mem released here -- only now can stop_writers_and_wait() (blocked on this
+                                        // exact handle since before this thread even started sleeping) proceed.
+                                      });
+                                    });
   straggler_writer.join();
 
   // This same checkpoint cycle's captured target must already cover "straggler" -- reading it
   // back must work immediately, no second cycle needed.
-  const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
-  REQUIRE(straggler_readback.has_value());
-  CHECK(straggler_readback->size() == straggler_value.size());
+  verify_straggler_readback(store, straggler_value);
 }
 
 // Regression test for the formerly-open "residual window" race described in
@@ -1243,57 +1252,48 @@ TEST_CASE(
   std::thread straggler_writer;
   std::atomic<bool> writer_registered{false};
 
-  store->impl().reorganize_internal(
-      std::decay_t<decltype(store->impl())>::ReorgMode::Checkpoint,
-      /*pre_stop_hook=*/
-      [&] {
-        using ImplT = std::decay_t<decltype(store->impl())>;
-        straggler_writer = std::thread([&] {
-          // Only the *first* acquire_write_handle() attempt needs to pause here -- that's the one
-          // stop_writers_and_wait() (below) is guaranteed to observe as "already registered,
-          // haven't checked the flag yet" (the exact window this test targets). A production
-          // caller's retries carry no such delay (NoOpAcquireWriteHandleHook is instant), so they
-          // re-check writer_stop_ within nanoseconds of it clearing; re-pausing on every retry
-          // here would be purely a test-harness artifact -- and a bad one: it can stretch the
-          // *net* time this slot spends showing a stale value far past what
-          // ThreadReferenceTracker::wait_until_retired()'s SpinBackoff (yields, then 1ms polls)
-          // is tuned to catch quickly, since each retry reopens only a sub-microsecond release
-          // window against a 30ms-wide observation stride.
-          bool first_attempt = true;
-          vmemkv::T2FlatFile::T2MemoryHandle mem = store->impl().t2().acquire_write_handle([&] {
-            writer_registered.store(true, std::memory_order_release);
-            if (first_attempt) {
-              first_attempt = false;
-              // Long enough that stop_writers_and_wait() below is guaranteed to have set
-              // writer_stop_=true and started its scan (finding this thread's slot registered,
-              // hence blocking on it) before this thread wakes up and checks the flag itself.
-              std::this_thread::sleep_for(std::chrono::milliseconds(30));
-            }
-          });
-          kvs_detail::with_key_serialized(std::string("straggler"), [&](std::span<const std::byte> key_bytes) {
-            kvs_detail::with_val_serialized(straggler_value, [&](std::span<const std::byte> val_bytes) {
-              const uint64_t offset = vmemkv::T2FlatFile::append_default(mem, key_bytes, val_bytes);
-              uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_bytes.size() + val_bytes.size());
-              uint64_t block_count = aligned_len / ImplT::kBlockAlignment;
-              uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
-              REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0) ==
-                      ImplT::T1IndexT::PutResult::Applied);
-            });
-          });
-        });
-        // Don't let pre_stop_hook return until the writer has registered -- otherwise
-        // stop_writers_and_wait() might start scanning before the writer's slot is set at all,
-        // which wouldn't exercise the "scan already saw/blocked on a registered slot, writer only
-        // then wakes up and self-checks" path this test targets.
-        while (!writer_registered.load(std::memory_order_acquire)) {
-          std::this_thread::yield();
-        }
-      });
+  using ImplT = std::decay_t<decltype(store->impl())>;
+  store->impl().reorganize_internal(ImplT::ReorgMode::Checkpoint,
+                                    /*pre_stop_hook=*/
+                                    [&] {
+                                      straggler_writer = std::thread([&] {
+                                        // Only the *first* acquire_write_handle() attempt needs to pause here -- that's
+                                        // the one stop_writers_and_wait() (below) is guaranteed to observe as "already
+                                        // registered, haven't checked the flag yet" (the exact window this test
+                                        // targets). A production caller's retries carry no such delay
+                                        // (NoOpAcquireWriteHandleHook is instant), so they re-check writer_stop_ within
+                                        // nanoseconds of it clearing; re-pausing on every retry here would be purely a
+                                        // test-harness artifact -- and a bad one: it can stretch the *net* time this
+                                        // slot spends showing a stale value far past what
+                                        // ThreadReferenceTracker::wait_until_retired()'s SpinBackoff (yields, then 1ms
+                                        // polls) is tuned to catch quickly, since each retry reopens only a
+                                        // sub-microsecond release window against a 30ms-wide observation stride.
+                                        bool first_attempt = true;
+                                        vmemkv::T2FlatFile::T2MemoryHandle mem =
+                                            store->impl().t2().acquire_write_handle([&] {
+                                              writer_registered.store(true, std::memory_order_release);
+                                              if (first_attempt) {
+                                                first_attempt = false;
+                                                // Long enough that stop_writers_and_wait() below is guaranteed to have
+                                                // set writer_stop_=true and started its scan (finding this thread's
+                                                // slot registered, hence blocking on it) before this thread wakes up
+                                                // and checks the flag itself.
+                                                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                                              }
+                                            });
+                                        publish_straggler_entry<ImplT>(store, mem, straggler_value);
+                                      });
+                                      // Don't let pre_stop_hook return until the writer has registered -- otherwise
+                                      // stop_writers_and_wait() might start scanning before the writer's slot is set at
+                                      // all, which wouldn't exercise the "scan already saw/blocked on a registered
+                                      // slot, writer only then wakes up and self-checks" path this test targets.
+                                      while (!writer_registered.load(std::memory_order_acquire)) {
+                                        std::this_thread::yield();
+                                      }
+                                    });
   straggler_writer.join();
 
-  const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
-  REQUIRE(straggler_readback.has_value());
-  CHECK(straggler_readback->size() == straggler_value.size());
+  verify_straggler_readback(store, straggler_value);
 }
 
 // Regression test: checkpoint_internal() publishes T1 via a single, I/O-free call at the very

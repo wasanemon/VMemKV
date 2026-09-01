@@ -759,6 +759,109 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
   fi
 }
 
+# Runs one "additive extra measurement" probe script against the already-provisioned instance.
+# REORG_SCALING_PROBE, CHECKPOINT_THROUGHPUT_PROBE, and MAINTENANCE_CONTENTION_PROBE below all
+# share this exact orchestration -- up to two invocations (in_memory unconstrained, ltm
+# systemd-run-wrapped with the same MemoryHigh/MemoryMax/MemorySwapMax as run_scenario()'s own ltm
+# wrap), respecting SCENARIO_LIMIT/VALUE_SIZE_LIMIT exactly like the matrix above. Only the probe
+# script, its output basename, the log-file prefix, and a human-readable label differ between the
+# three call sites -- see each call site's own comment for what it measures.
+#
+# Args: $1 = probe script name (e.g. run_reorg_scaling_probe.sh)
+#       $2 = output basename (e.g. reorg_scaling -> reorg_scaling_in_memory.jsonl)
+#       $3 = log-file prefix (e.g. vmemkv_reorg_probe)
+#       $4 = human-readable label for [runner]/[WARN] messages (e.g. reorg-scaling-probe)
+#
+# A failure here is logged as [WARN], not [ERROR], and does not fail the whole run: unlike the
+# matrix above, this is a supplementary measurement, not the main deliverable.
+run_remote_probe() {
+  local probe_script="$1"
+  local output_basename="$2"
+  local log_prefix="$3"
+  local label="$4"
+
+  local inmem_dst_name="${output_basename}_in_memory.jsonl"
+  local ltm_dst_name="${output_basename}_ltm.jsonl"
+  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+    inmem_dst_name="${output_basename}_in_memory_${VALUE_SIZE_LIMIT}.jsonl"
+    ltm_dst_name="${output_basename}_ltm_${VALUE_SIZE_LIMIT}.jsonl"
+  fi
+
+  local probe_failed=0
+
+  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+    local inmem_combo_filter="in_memory"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      inmem_combo_filter="in_memory:${VALUE_SIZE_LIMIT}"
+    fi
+    local inmem_stdout_log="/tmp/${log_prefix}_inmem_${KEY_NAME}.stdout.log"
+    local inmem_stderr_log="/tmp/${log_prefix}_inmem_${KEY_NAME}.stderr.log"
+    : >"$inmem_stdout_log"
+    : >"$inmem_stderr_log"
+    local inmem_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+./benchmark/${probe_script} './build-rel/benchmark/bench_kv' '/mnt/nvme/${output_basename}_in_memory.jsonl' '/mnt/nvme' '$inmem_combo_filter'
+    "
+    local inmem_remote_cmd_quoted
+    printf -v inmem_remote_cmd_quoted '%q' "$inmem_remote_cmd"
+    echo "[runner] start ${label} scenario=in_memory combo_filter=$inmem_combo_filter"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${inmem_remote_cmd_quoted}" \
+        2> >(tee -a "$inmem_stderr_log" >&2); } | tee -a "$inmem_stdout_log"
+    local inmem_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end ${label} scenario=in_memory status=$inmem_status"
+    if [[ "$inmem_status" -ne 0 ]]; then
+      # [WARN], deliberately not [ERROR]: this run's own on-error logging (and any external
+      # watcher pattern-matching "[ERROR]" to decide the whole run failed, see this session's
+      # AWS-monitoring convention) must not treat a supplementary-measurement hiccup as fatal
+      # when the main benchmark matrix already succeeded.
+      echo "[WARN] ${label} (in_memory) failed with exit code $inmem_status -- logs: $inmem_stdout_log $inmem_stderr_log" >&2
+      probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/${output_basename}_in_memory.jsonl" "${RESULTS_DIR}/${inmem_dst_name}" || true
+  fi
+
+  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+    local ltm_combo_filter="ltm"
+    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+      ltm_combo_filter="ltm:${VALUE_SIZE_LIMIT}"
+    fi
+    local ltm_stdout_log="/tmp/${log_prefix}_ltm_${KEY_NAME}.stdout.log"
+    local ltm_stderr_log="/tmp/${log_prefix}_ltm_${KEY_NAME}.stderr.log"
+    : >"$ltm_stdout_log"
+    : >"$ltm_stderr_log"
+    # VMEMKV_CONTEXT_memory_budget_bytes must be set explicitly here, not left to
+    # detect_machine_memory_bytes()'s cgroup-file fallback: that would read this systemd-run scope's
+    # MemoryMax (2x LTM_MEMORY_BUDGET_BYTES, see below), not the declared budget itself, mis-sizing
+    # every corpus by 2x -- same reasoning as run_scenario()'s priming/measurement passes above.
+    local ltm_remote_cmd="
+cd /home/ubuntu/faultkv/implementation &&
+VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
+./benchmark/${probe_script} './build-rel/benchmark/bench_kv' '/mnt/nvme/${output_basename}_ltm.jsonl' '/mnt/nvme' '$ltm_combo_filter'
+    "
+    local ltm_remote_cmd_quoted
+    printf -v ltm_remote_cmd_quoted '%q' "$ltm_remote_cmd"
+    echo "[runner] start ${label} scenario=ltm combo_filter=$ltm_combo_filter"
+    set +e
+    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${ltm_remote_cmd_quoted}" \
+        2> >(tee -a "$ltm_stderr_log" >&2); } | tee -a "$ltm_stdout_log"
+    local ltm_status=${PIPESTATUS[0]}
+    set -e
+    echo "[runner] end ${label} scenario=ltm status=$ltm_status"
+    if [[ "$ltm_status" -ne 0 ]]; then
+      # [WARN], not [ERROR] -- same reasoning as the in_memory branch above.
+      echo "[WARN] ${label} (ltm) failed with exit code $ltm_status -- logs: $ltm_stdout_log $ltm_stderr_log" >&2
+      probe_failed=1
+    fi
+    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/${output_basename}_ltm.jsonl" "${RESULTS_DIR}/${ltm_dst_name}" || true
+  fi
+
+  if [[ "$probe_failed" -ne 0 ]]; then
+    echo "[WARN] ${label} had failures -- main benchmark matrix results above are still valid" >&2
+  fi
+}
 
 
 inmem_filter="${inmem_filter:-}"
@@ -877,85 +980,7 @@ if [[ "$REORG_SCALING_PROBE" == "true" ]]; then
   # so run_4parallel_bench.sh's 4 concurrent instances don't clobber each other's output in this
   # shared local logs/ directory. A failure here is logged but does not fail the whole run --
   # unlike the matrix above, this is a supplementary measurement, not the main deliverable.
-  inmem_dst_name="reorg_scaling_in_memory.jsonl"
-  ltm_dst_name="reorg_scaling_ltm.jsonl"
-  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    inmem_dst_name="reorg_scaling_in_memory_${VALUE_SIZE_LIMIT}.jsonl"
-    ltm_dst_name="reorg_scaling_ltm_${VALUE_SIZE_LIMIT}.jsonl"
-  fi
-
-  reorg_probe_failed=0
-
-  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
-    inmem_combo_filter="in_memory"
-    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-      inmem_combo_filter="in_memory:${VALUE_SIZE_LIMIT}"
-    fi
-    inmem_probe_stdout_log="/tmp/vmemkv_reorg_probe_inmem_${KEY_NAME}.stdout.log"
-    inmem_probe_stderr_log="/tmp/vmemkv_reorg_probe_inmem_${KEY_NAME}.stderr.log"
-    : >"$inmem_probe_stdout_log"
-    : >"$inmem_probe_stderr_log"
-    inmem_probe_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-./benchmark/run_reorg_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/reorg_scaling_in_memory.jsonl' '/mnt/nvme' '$inmem_combo_filter'
-    "
-    printf -v inmem_probe_remote_cmd_quoted '%q' "$inmem_probe_remote_cmd"
-    echo "[runner] start reorg-scaling-probe scenario=in_memory combo_filter=$inmem_combo_filter"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${inmem_probe_remote_cmd_quoted}" \
-        2> >(tee -a "$inmem_probe_stderr_log" >&2); } | tee -a "$inmem_probe_stdout_log"
-    inmem_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end reorg-scaling-probe scenario=in_memory status=$inmem_probe_status"
-    if [[ "$inmem_probe_status" -ne 0 ]]; then
-      # [WARN], deliberately not [ERROR]: this run's own on-error logging (and any external
-      # watcher pattern-matching "[ERROR]" to decide the whole run failed, see this session's
-      # AWS-monitoring convention) must not treat a supplementary-measurement hiccup as fatal
-      # when the main benchmark matrix above already succeeded.
-      echo "[WARN] reorg-scaling-probe (in_memory) failed with exit code $inmem_probe_status -- logs: $inmem_probe_stdout_log $inmem_probe_stderr_log" >&2
-      reorg_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/reorg_scaling_in_memory.jsonl" "${RESULTS_DIR}/${inmem_dst_name}" || true
-  fi
-
-  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
-    ltm_combo_filter="ltm"
-    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-      ltm_combo_filter="ltm:${VALUE_SIZE_LIMIT}"
-    fi
-    ltm_probe_stdout_log="/tmp/vmemkv_reorg_probe_ltm_${KEY_NAME}.stdout.log"
-    ltm_probe_stderr_log="/tmp/vmemkv_reorg_probe_ltm_${KEY_NAME}.stderr.log"
-    : >"$ltm_probe_stdout_log"
-    : >"$ltm_probe_stderr_log"
-    # VMEMKV_CONTEXT_memory_budget_bytes must be set explicitly here, not left to
-    # detect_machine_memory_bytes()'s cgroup-file fallback: that would read this systemd-run scope's
-    # MemoryMax (2x LTM_MEMORY_BUDGET_BYTES, see below), not the declared budget itself, mis-sizing
-    # every corpus by 2x -- same reasoning as run_scenario()'s priming/measurement passes above.
-    ltm_probe_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
-./benchmark/run_reorg_scaling_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/reorg_scaling_ltm.jsonl' '/mnt/nvme' '$ltm_combo_filter'
-    "
-    printf -v ltm_probe_remote_cmd_quoted '%q' "$ltm_probe_remote_cmd"
-    echo "[runner] start reorg-scaling-probe scenario=ltm combo_filter=$ltm_combo_filter"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
-        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${ltm_probe_remote_cmd_quoted}" \
-        2> >(tee -a "$ltm_probe_stderr_log" >&2); } | tee -a "$ltm_probe_stdout_log"
-    ltm_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end reorg-scaling-probe scenario=ltm status=$ltm_probe_status"
-    if [[ "$ltm_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as the in_memory branch above.
-      echo "[WARN] reorg-scaling-probe (ltm) failed with exit code $ltm_probe_status -- logs: $ltm_probe_stdout_log $ltm_probe_stderr_log" >&2
-      reorg_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/reorg_scaling_ltm.jsonl" "${RESULTS_DIR}/${ltm_dst_name}" || true
-  fi
-
-  if [[ "$reorg_probe_failed" -ne 0 ]]; then
-    echo "[WARN] reorg-scaling-probe had failures -- main benchmark matrix results above are still valid" >&2
-  fi
+  run_remote_probe "run_reorg_scaling_probe.sh" "reorg_scaling" "vmemkv_reorg_probe" "reorg-scaling-probe"
 fi
 
 if [[ "$CHECKPOINT_THROUGHPUT_PROBE" == "true" ]]; then
@@ -963,80 +988,7 @@ if [[ "$CHECKPOINT_THROUGHPUT_PROBE" == "true" ]]; then
   # per combo) on top of the normal matrix -- same in_memory/ltm split and combo-filter interface
   # as REORG_SCALING_PROBE above (run_checkpoint_throughput_probe.sh takes
   # the same <bin> <output> <db_dir> [combo_filter] interface).
-  checkpoint_throughput_dst_name="checkpoint_throughput_in_memory.jsonl"
-  ltm_checkpoint_throughput_dst_name="checkpoint_throughput_ltm.jsonl"
-  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    checkpoint_throughput_dst_name="checkpoint_throughput_in_memory_${VALUE_SIZE_LIMIT}.jsonl"
-    ltm_checkpoint_throughput_dst_name="checkpoint_throughput_ltm_${VALUE_SIZE_LIMIT}.jsonl"
-  fi
-
-  checkpoint_throughput_probe_failed=0
-
-  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
-    inmem_checkpoint_throughput_combo_filter="in_memory"
-    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-      inmem_checkpoint_throughput_combo_filter="in_memory:${VALUE_SIZE_LIMIT}"
-    fi
-    inmem_checkpoint_throughput_probe_stdout_log="/tmp/vmemkv_checkpoint_throughput_probe_inmem_${KEY_NAME}.stdout.log"
-    inmem_checkpoint_throughput_probe_stderr_log="/tmp/vmemkv_checkpoint_throughput_probe_inmem_${KEY_NAME}.stderr.log"
-    : >"$inmem_checkpoint_throughput_probe_stdout_log"
-    : >"$inmem_checkpoint_throughput_probe_stderr_log"
-    inmem_checkpoint_throughput_probe_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-./benchmark/run_checkpoint_throughput_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/checkpoint_throughput_in_memory.jsonl' '/mnt/nvme' '$inmem_checkpoint_throughput_combo_filter'
-    "
-    printf -v inmem_checkpoint_throughput_probe_remote_cmd_quoted '%q' "$inmem_checkpoint_throughput_probe_remote_cmd"
-    echo "[runner] start checkpoint-throughput-probe scenario=in_memory combo_filter=$inmem_checkpoint_throughput_combo_filter"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${inmem_checkpoint_throughput_probe_remote_cmd_quoted}" \
-        2> >(tee -a "$inmem_checkpoint_throughput_probe_stderr_log" >&2); } | tee -a "$inmem_checkpoint_throughput_probe_stdout_log"
-    inmem_checkpoint_throughput_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end checkpoint-throughput-probe scenario=in_memory status=$inmem_checkpoint_throughput_probe_status"
-    if [[ "$inmem_checkpoint_throughput_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
-      echo "[WARN] checkpoint-throughput-probe (in_memory) failed with exit code $inmem_checkpoint_throughput_probe_status -- logs: $inmem_checkpoint_throughput_probe_stdout_log $inmem_checkpoint_throughput_probe_stderr_log" >&2
-      checkpoint_throughput_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/checkpoint_throughput_in_memory.jsonl" "${RESULTS_DIR}/${checkpoint_throughput_dst_name}" || true
-  fi
-
-  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
-    ltm_checkpoint_throughput_combo_filter="ltm"
-    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-      ltm_checkpoint_throughput_combo_filter="ltm:${VALUE_SIZE_LIMIT}"
-    fi
-    ltm_checkpoint_throughput_probe_stdout_log="/tmp/vmemkv_checkpoint_throughput_probe_ltm_${KEY_NAME}.stdout.log"
-    ltm_checkpoint_throughput_probe_stderr_log="/tmp/vmemkv_checkpoint_throughput_probe_ltm_${KEY_NAME}.stderr.log"
-    : >"$ltm_checkpoint_throughput_probe_stdout_log"
-    : >"$ltm_checkpoint_throughput_probe_stderr_log"
-    # VMEMKV_CONTEXT_memory_budget_bytes explicit here for the same reason as the ltm
-    # reorg-scaling-probe branch above.
-    ltm_checkpoint_throughput_probe_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
-./benchmark/run_checkpoint_throughput_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/checkpoint_throughput_ltm.jsonl' '/mnt/nvme' '$ltm_checkpoint_throughput_combo_filter'
-    "
-    printf -v ltm_checkpoint_throughput_probe_remote_cmd_quoted '%q' "$ltm_checkpoint_throughput_probe_remote_cmd"
-    echo "[runner] start checkpoint-throughput-probe scenario=ltm combo_filter=$ltm_checkpoint_throughput_combo_filter"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
-        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${ltm_checkpoint_throughput_probe_remote_cmd_quoted}" \
-        2> >(tee -a "$ltm_checkpoint_throughput_probe_stderr_log" >&2); } | tee -a "$ltm_checkpoint_throughput_probe_stdout_log"
-    ltm_checkpoint_throughput_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end checkpoint-throughput-probe scenario=ltm status=$ltm_checkpoint_throughput_probe_status"
-    if [[ "$ltm_checkpoint_throughput_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as the in_memory branch above.
-      echo "[WARN] checkpoint-throughput-probe (ltm) failed with exit code $ltm_checkpoint_throughput_probe_status -- logs: $ltm_checkpoint_throughput_probe_stdout_log $ltm_checkpoint_throughput_probe_stderr_log" >&2
-      checkpoint_throughput_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/checkpoint_throughput_ltm.jsonl" "${RESULTS_DIR}/${ltm_checkpoint_throughput_dst_name}" || true
-  fi
-
-  if [[ "$checkpoint_throughput_probe_failed" -ne 0 ]]; then
-    echo "[WARN] checkpoint-throughput-probe had failures -- main benchmark matrix results above are still valid" >&2
-  fi
+  run_remote_probe "run_checkpoint_throughput_probe.sh" "checkpoint_throughput" "vmemkv_checkpoint_throughput_probe" "checkpoint-throughput-probe"
 fi
 
 if [[ "$MAINTENANCE_CONTENTION_PROBE" == "true" ]]; then
@@ -1044,78 +996,5 @@ if [[ "$MAINTENANCE_CONTENTION_PROBE" == "true" ]]; then
   # reorganize(), one point per combo per mode) on top of the normal matrix -- same reasoning and
   # in_memory/ltm split as REORG_SCALING_PROBE above (run_maintenance_contention_probe.sh takes
   # the same <bin> <output> <db_dir> [combo_filter] interface).
-  maint_dst_name="maintenance_contention_in_memory.jsonl"
-  ltm_maint_dst_name="maintenance_contention_ltm.jsonl"
-  if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-    maint_dst_name="maintenance_contention_in_memory_${VALUE_SIZE_LIMIT}.jsonl"
-    ltm_maint_dst_name="maintenance_contention_ltm_${VALUE_SIZE_LIMIT}.jsonl"
-  fi
-
-  maint_probe_failed=0
-
-  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
-    inmem_maint_combo_filter="in_memory"
-    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-      inmem_maint_combo_filter="in_memory:${VALUE_SIZE_LIMIT}"
-    fi
-    inmem_maint_probe_stdout_log="/tmp/vmemkv_maint_probe_inmem_${KEY_NAME}.stdout.log"
-    inmem_maint_probe_stderr_log="/tmp/vmemkv_maint_probe_inmem_${KEY_NAME}.stderr.log"
-    : >"$inmem_maint_probe_stdout_log"
-    : >"$inmem_maint_probe_stderr_log"
-    inmem_maint_probe_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-./benchmark/run_maintenance_contention_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/maintenance_contention_in_memory.jsonl' '/mnt/nvme' '$inmem_maint_combo_filter'
-    "
-    printf -v inmem_maint_probe_remote_cmd_quoted '%q' "$inmem_maint_probe_remote_cmd"
-    echo "[runner] start maintenance-contention-probe scenario=in_memory combo_filter=$inmem_maint_combo_filter"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc ${inmem_maint_probe_remote_cmd_quoted}" \
-        2> >(tee -a "$inmem_maint_probe_stderr_log" >&2); } | tee -a "$inmem_maint_probe_stdout_log"
-    inmem_maint_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end maintenance-contention-probe scenario=in_memory status=$inmem_maint_probe_status"
-    if [[ "$inmem_maint_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as reorg-scaling-probe's branches above.
-      echo "[WARN] maintenance-contention-probe (in_memory) failed with exit code $inmem_maint_probe_status -- logs: $inmem_maint_probe_stdout_log $inmem_maint_probe_stderr_log" >&2
-      maint_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/maintenance_contention_in_memory.jsonl" "${RESULTS_DIR}/${maint_dst_name}" || true
-  fi
-
-  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
-    ltm_maint_combo_filter="ltm"
-    if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
-      ltm_maint_combo_filter="ltm:${VALUE_SIZE_LIMIT}"
-    fi
-    ltm_maint_probe_stdout_log="/tmp/vmemkv_maint_probe_ltm_${KEY_NAME}.stdout.log"
-    ltm_maint_probe_stderr_log="/tmp/vmemkv_maint_probe_ltm_${KEY_NAME}.stderr.log"
-    : >"$ltm_maint_probe_stdout_log"
-    : >"$ltm_maint_probe_stderr_log"
-    # VMEMKV_CONTEXT_memory_budget_bytes explicit here for the same reason as the ltm
-    # reorg-scaling-probe branch above.
-    ltm_maint_probe_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
-VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
-./benchmark/run_maintenance_contention_probe.sh './build-rel/benchmark/bench_kv' '/mnt/nvme/maintenance_contention_ltm.jsonl' '/mnt/nvme' '$ltm_maint_combo_filter'
-    "
-    printf -v ltm_maint_probe_remote_cmd_quoted '%q' "$ltm_maint_probe_remote_cmd"
-    echo "[runner] start maintenance-contention-probe scenario=ltm combo_filter=$ltm_maint_combo_filter"
-    set +e
-    { ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
-        "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${ltm_maint_probe_remote_cmd_quoted}" \
-        2> >(tee -a "$ltm_maint_probe_stderr_log" >&2); } | tee -a "$ltm_maint_probe_stdout_log"
-    ltm_maint_probe_status=${PIPESTATUS[0]}
-    set -e
-    echo "[runner] end maintenance-contention-probe scenario=ltm status=$ltm_maint_probe_status"
-    if [[ "$ltm_maint_probe_status" -ne 0 ]]; then
-      # [WARN], not [ERROR] -- same reasoning as the in_memory branch above.
-      echo "[WARN] maintenance-contention-probe (ltm) failed with exit code $ltm_maint_probe_status -- logs: $ltm_maint_probe_stdout_log $ltm_maint_probe_stderr_log" >&2
-      maint_probe_failed=1
-    fi
-    scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/mnt/nvme/maintenance_contention_ltm.jsonl" "${RESULTS_DIR}/${ltm_maint_dst_name}" || true
-  fi
-
-  if [[ "$maint_probe_failed" -ne 0 ]]; then
-    echo "[WARN] maintenance-contention-probe had failures -- main benchmark matrix results above are still valid" >&2
-  fi
+  run_remote_probe "run_maintenance_contention_probe.sh" "maintenance_contention" "vmemkv_maint_probe" "maintenance-contention-probe"
 fi

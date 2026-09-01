@@ -129,9 +129,9 @@ struct ManifestHeader {
   uint8_t format_version = kManifestFormatVersion;
   // NOLINTNEXTLINE(modernize-avoid-c-arrays)
   uint8_t reserved[3] = {};
-  // == checkpoint_lsn of the cycle that committed this manifest -- the WAL replay boundary, not
-  // a filename component (derive_t1_chk_path/derive_t2_chk_path name fixed, generation-independent
-  // paths; see their own comments).
+  // == checkpoint_lsn of the cycle that committed this manifest: the WAL replay boundary.
+  // derive_t1_chk_path()/derive_t2_chk_path() name fixed paths independent of this value -- see
+  // their own comments.
   uint64_t generation = 0;
   uint64_t t2_bytes_used = 0;  // Logical bytes durably written to the T2 checkpoint file -- not
                                // recoverable from that file's size alone (it may be truncated to

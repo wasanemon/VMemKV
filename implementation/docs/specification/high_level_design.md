@@ -119,7 +119,7 @@ entry がインライン化されている場合は，3. は不要であり，Ti
 
 インライン化されている entry では，Update / Delete / Scan も Tier 1 payload だけで完結する．
 
-payload が offset の index については，Update と Delete における古いデータの削除は T1 の offset を書き換えるだけで行われるのが重要なポイントである．T1 の offset がポインタ/参照だとみなしたとき，これらの T2 の削除されたデータは参照カウントがゼロになったものといえる．これらは，後述する `reorganize()` で物理削除される．
+payload が offset の index については，Update と Delete における古いデータの削除は T1 の offset を書き換えるだけで行われるのが重要なポイントである．T1 の offset がポインタ/参照だとみなしたとき，これらの T2 の削除されたデータは参照カウントがゼロになったものといえる．ただし，これらの Tier 2 データが物理削除される仕組みは現状存在しない（6.1 節参照）．
 
 ## 6. Reorganize, Checkpoint, Live Reload
 
@@ -134,41 +134,17 @@ VMemKV が解消したい断片化は 2 種類ある。
 
 - T1の reorganize:
   - `append_region` と `sorted_region` をマージし，ソートすることで Ordering Fragmentation を解消する．このとき，offset が tombstone のエントリ（Delete済みのもの）はスキップする．
-- T2の reorganize(Defragment、**設計されたが現在はコードベースから削除済み -- 6.3節参照**):
-  - T1 の live entry 順に T2 からデータをコピーし，新しい単一 byte array を構築する．
-  - コピー先 offset を T1 に書き戻す．
-  - これらの処理において，tombstone 化されたエントリは新しい T1 に含まれず，また，参照offsetが切れているT2のrecordはコピーされないため，Storage Fragmentation が解消される．
 
 T1 の reorganize はT2とは独立して実行でき，高頻度で実施してもよい。
 
 ![reorganize](../images/reorganization.png)
 
 Tier 1 は単独 `reorganize` により ordering fragmentation を軽く抑えられる。
-Tier 2 の storage fragmentation を解消する仕組みは現在存在しない(Defragment、6.3節参照)。
+Tier 2 の storage fragmentation を解消する仕組みは現在存在しない。
 
 ### 6.2 checkpoint
 
 Tier 2 の稼働中 mmap は `MAP_SHARED` である。書き込みはページキャッシュへ直接反映されるため、checkpoint は tail 領域を `msync()` して物理ディスクへの反映を確定させるだけの、短時間の操作である。新規 append を短く止める以外に停止は発生しない。詳細な手順と正しさの根拠は low_level_design.md 4.3 節・5.3 節を参照。
-
-### 6.3 Defragment [削除済み]
-
-> **現在の状態**: 本節は過去に設計・実装・測定された挙動の記録である。Defragment(`defragment()`/
-> `defragment_internal()`)は round 1 で no-op 化された後、round 3 で API ごとコードベースから
-> 完全に削除された(`defragment_redesign_proposal.md` §8参照)。Tier 2 の storage fragmentation を
-> 解消する仕組みは現在存在しない。以下は将来 Tier 2 再配置が必要になった際の設計参照として残す。
-
-Defragment は Tier 2 の生存データ全件を、T1 の key 順のまま新しい単一 byte array へ再配置し、旧ファイルを置き換える。これを現在使用中のものと差し替えるにあたって、二つの要件がある。
-
-1. 停止時間を最小化する。走査中はオンラインで読み取れる必要がある(atomic pointer swap による無停止化)。
-2. メモリ領域を大幅に圧迫しない。フルスキャン・フルコピーを伴うため、キャッシュラインへの影響を抑える設計が要る。
-
-![live reload](../images/live_reload_checkpoint.svg)
-
-概略は次のとおりである。T1 の `reorganize()` 呼び出しの中で checkpoint LSN を確定し、新しい `sorted_region` と新しい T2 ファイルを一時ファイルへ書き出したうえで、manifest の `rename()` を新世代の有効化点として atomic pointer swap で公開し、最後に不要になった WAL レコードと旧世代のファイルを片付ける。詳細な手順と正しさの根拠は low_level_design.md 4.6 節を参照。
-
-このフローにおいて、旧世代バッファへの書き込みがまだ進行中の状態でマージが進まないよう、pointer swapの直後（マージ開始前）に「一段目のエポック同期バリア」を挟み、旧世代のすべての書き込みスレッドの完了を待機する。
-
-このフローに stop-the-world は存在しない。
 
 ## 7. 障害耐性と WAL
 

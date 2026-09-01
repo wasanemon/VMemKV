@@ -97,14 +97,14 @@ TEST_CASE("T1Index: put with STORE_NOT_FOUND tombstones the key") {
 TEST_CASE("T1Index: append region reports AppendRegionFull once capacity is exhausted") {
   auto idx = make_index();
   size_t applied = 0;
-  for (size_t i = 0; i < TestIndex::append_capacity() + 1; ++i) {
+  for (size_t i = 0; i < TestIndex::APPEND_CAP + 1; ++i) {
     const std::string key = "k" + std::to_string(i);
     if (idx->put(to_span(key), static_cast<uint64_t>(i)) == TestIndex::PutResult::AppendRegionFull) {
       break;
     }
     ++applied;
   }
-  CHECK(applied == TestIndex::append_capacity());
+  CHECK(applied == TestIndex::APPEND_CAP);
 }
 
 TEST_CASE("T1Index: reorganize merges append region into sorted region, keeps live entries readable") {

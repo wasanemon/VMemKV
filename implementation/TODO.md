@@ -11,9 +11,8 @@ This document outlines the roadmap to implement the full, robust architecture of
   - If a Swap file is not configured or fails validation under memory-constrained environments, raise an initialization warning/error or exit gracefully.
 
 ## 5. Scan-side offset-order read reordering (no storage compaction)
-* **Status**: 🔴 **Not Implemented** -- higher priority now that `defragment()` has been removed
-  entirely (round 3; see `docs/specification/defragment_redesign_proposal.md`). No mechanism in
-  the codebase mitigates key-order/physical-offset decorrelation at all anymore.
+* **Status**: 🔴 **Not Implemented**. No mechanism in the codebase mitigates key-order/physical-offset
+  decorrelation.
 * **Idea**: Scan already reads in bounded batches. Within one batch, sort the batch's candidates
   by *T2 physical offset* before reading them (instead of T1's key order), then re-sort the
   fetched results back to key order before invoking the caller's callback. No writer-stop, no
@@ -37,8 +36,9 @@ This document outlines the roadmap to implement the full, robust architecture of
 
 ## 7. `T1Index::reorganize()`'s O(corpus) merge cost
 * **Status**: 🔴 **Not Implemented** -- found 2026-08-31.
-* **Problem**: `reorganize()`'s in-memory merge of `sorted_region_`/`append_region_` walks the
-  full existing `sorted_region_` every call, regardless of how small the delta being merged in is.
+* **Problem**: `reorganize()`'s in-memory merge of `sorted_region_` with `append_active_`'s region
+  walks the full existing `sorted_region_` every call, regardless of how small the delta being
+  merged in is.
   `checkpoint_internal()`'s T1-checkpoint-file rewrite inherits this same O(corpus) cost, since it
   depends on this merge to produce a coherent snapshot. This is the structural reason checkpoint
   and T1-only-reorganize auto-triggering can compound under sustained writes: each cycle pays the

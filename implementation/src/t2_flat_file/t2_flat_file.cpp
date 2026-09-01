@@ -65,7 +65,11 @@ T2FlatFile::T2FlatFile(const std::filesystem::path &path,
 T2FlatFile::~T2FlatFile() noexcept {
   const T2Memory *mem = t2_mem_.load(std::memory_order_relaxed);
   if (mem != nullptr) {
-    retire_memory(mem);
+    // wait_until_retired() here only guards against a writer that started before this store began
+    // shutting down still holding a handle -- readers never register in active_writers_ (see its
+    // declaration), so there's nothing else to wait for.
+    active_writers_.wait_until_retired(mem);
+    delete mem;
   }
 }
 
@@ -107,12 +111,7 @@ void T2FlatFile::stop_writers_and_wait(const T2Memory *mem) const noexcept {
   // seq_cst: paired with acquire_write_handle()'s seq_cst writer_stop_ load and
   // ThreadReferenceTracker::acquire()'s seq_cst store -- see acquire_write_handle()'s comment.
   writer_stop_.store(true, std::memory_order_seq_cst);
-  active_readers_.wait_until_retired(mem);
-}
-
-auto T2FlatFile::update_value_at(uint64_t payload, std::span<const std::byte> value) const noexcept -> bool {
-  T2MemoryHandle mem = get_memory_handle();
-  return update_value_at(payload, value, mem);
+  active_writers_.wait_until_retired(mem);
 }
 
 auto T2FlatFile::update_value_at(uint64_t payload,
@@ -144,11 +143,6 @@ auto T2FlatFile::update_value_at(uint64_t payload,
   std::atomic_thread_fence(std::memory_order_release);
   atomic_version.store(ver + 2, std::memory_order_release);
   return true;
-}
-
-void T2FlatFile::retire_memory(const T2Memory *old_mem) {
-  active_readers_.wait_until_retired(old_mem);
-  delete old_mem;
 }
 
 void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capacity, uint64_t initial_bytes_used) {
