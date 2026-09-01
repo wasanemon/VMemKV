@@ -178,7 +178,7 @@ struct VMemKV {
 - old Tier 2 record はその場では削除しない。
 - old Tier 2 record は Tier 1 から到達不能になるが、Tier 2 側は物理削除されない -- 4.1 節/4.3 節で述べる通り、Storage Fragmentation を解消する仕組みは現状コードベースに存在しない。
 - Failure Rule は 3.2 節と同様: 2.〜4. が失敗した操作を WAL に記録してはならない。
-- 手順3の in-place 判定には `offset >= base_boundary`(2.2節)の条件も含まれる。この境界未満を指す record への更新は、たとえ `new_value_len <= alloc_len` でも in-place にはせず、手順4の追記パスに強制的に回す。base 領域は専用mmapで直接読む読み取り経路(7.9節)の前提として「二度と書き換わらない」ことに依存しているため。`base_boundary` はその `T2Store` インスタンスの生存期間中一定なので、この判定は追加の同期なしに安全である。
+- 手順3の in-place 判定には `offset >= base_boundary`(2.2節)の条件も含まれる。この境界未満を指す record への更新は、たとえ `new_value_len <= alloc_len` でも in-place にはせず、手順4の追記パスに強制的に回す。base 領域は専用mmapで直接読む読み取り経路(7.9節)の前提として「二度と書き換わらない」ことに依存しているため。`base_boundary` は `checkpoint_internal()` によってのみ単調に前進するアトミック変数(2.2節)であり、この判定は単一のアトミックロードで読むだけで安全である -- 前進中に古い値を読んでも、判定は常に安全側(tail 領域寄り = 追記パス)に倒れるだけで、base 領域への in-place 書き込みを誤って許可することはない。
 
 ### 3.4 Delete
 
@@ -565,7 +565,6 @@ T2 の「base」領域(2.2節)は書き込み後二度と変更されないた�
   - `base_mmap_scan_seq`(read-only mmap、`MADV_SEQUENTIAL`): 埋め込みサイズヒントが1ページ以下のレコード用。広い先読み窓で多数の小さいレコードのフォルトを少数の major fault にまとめられる。`scan_impl()`・`get_impl()`双方の小レコード読み取りで使う。
   - `base_mmap_scan`(read-only mmap、カーネルのデフォルト(適応的)readahead方針): それより大きいレコード用。`scan_impl()`の大レコード読み取りと、`get_impl()`の大レコード読み取りのうちページキャッシュ常駐が確認できた場合(`mincore()`)に使う。無条件に`MADV_SEQUENTIAL`を付けると、大きいレコードのコーパスをZipfのような偏ったアクセスで読む場合に読み取りバイト数が余分に増えることが測定で判明したため、こちらは意図的に控えめな方針にしてある。
   - `read_fd`(`dup()`したファイルディスクリプタ経由の`pread()`): `get_impl()`の大レコード読み取りで、上記のページキャッシュ常駐確認が取れなかった場合に、そのレコード1つぶんにサイズを絞って読む。
-- **マッピング作成時のウォームアップ**: `base_mmap_scan`・`base_mmap_scan_seq`の両方を、作成時に `MAP_POPULATE` 相当で即座にウォームアップする(reorganize直後の初回アクセスがコールドフォルトの嵐で不安定になるのを防ぐ)。1KB In-Memory Get/Hit/Uniformで約250倍の退行を防ぐ効果があり、常時有効。
 - **測定方法・結果**: `implementation/docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md`(base/tail split と実データ読み取りの元設計)、`implementation/docs/benchmark/20260810_t2_no_madvise_random.md`を参照。`Scan` は他の Op と共通のマスターコーパスを使用する。
 
 ## 8. Parameters

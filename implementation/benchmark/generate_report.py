@@ -747,127 +747,105 @@ def main():
         }
         html = html.replace("    function initCharts() {", reorg_config_js + "function initCharts() {")
 
-    if "-checkpoint-throughput'" not in html:
-        wiring_marker = """        const reorgCanvas = document.getElementById('chart-' + reorgEid);
-        if (reorgCanvas) {
-          const cfg = makeReorgScalingConfig(valSize);
-          if (cfg) new Chart(reorgCanvas, cfg);
-        }
-      }
-    }"""
-        wiring_new = """        const reorgCanvas = document.getElementById('chart-' + reorgEid);
-        if (reorgCanvas) {
-          const cfg = makeReorgScalingConfig(valSize);
-          if (cfg) new Chart(reorgCanvas, cfg);
-        }
-        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
+    # Each entry appends one more `if (fooCanvas) {...}` wiring block to the chain below, right
+    # before its closing "      }\n    }" -- chained because each step's insertion point is the
+    # previous step's own tail (block 2's marker is byte-identical to block 1's inserted content
+    # + close tail). `guard` mirrors the original per-step idempotency check (a re-run against an
+    # already-migrated template no-ops that step); `drift_msg` names which step failed to locate
+    # its marker, matching the original's distinct RuntimeError per step.
+    _CHART_WIRINGS = [
+        ("-checkpoint-throughput'", """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
         const cpCanvas = document.getElementById('chart-' + cpEid);
         if (cpCanvas) {
           const cfg2 = makeCheckpointVsInsertConfig(valSize);
           if (cfg2) new Chart(cpCanvas, cfg2);
         }
-      }
-    }"""
-        if wiring_marker not in html:
-            raise RuntimeError("initCharts() reorg-scaling wiring marker not found -- template drifted")
-        html = html.replace(wiring_marker, wiring_new)
-
-    if "-reorg-throughput'" not in html:
-        reorg_wiring_marker = """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
-        const cpCanvas = document.getElementById('chart-' + cpEid);
-        if (cpCanvas) {
-          const cfg2 = makeCheckpointVsInsertConfig(valSize);
-          if (cfg2) new Chart(cpCanvas, cfg2);
-        }
-      }
-    }"""
-        reorg_wiring_new = """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
-        const cpCanvas = document.getElementById('chart-' + cpEid);
-        if (cpCanvas) {
-          const cfg2 = makeCheckpointVsInsertConfig(valSize);
-          if (cfg2) new Chart(cpCanvas, cfg2);
-        }
-        const rgEid = valSize.toLowerCase().replace(/-/g,'_') + '-reorg-throughput';
+""", "reorg-scaling wiring"),
+        ("-reorg-throughput'", """        const rgEid = valSize.toLowerCase().replace(/-/g,'_') + '-reorg-throughput';
         const rgCanvas = document.getElementById('chart-' + rgEid);
         if (rgCanvas) {
           const cfg4 = makeReorgVsInsertConfig(valSize);
           if (cfg4) new Chart(rgCanvas, cfg4);
         }
-      }
-    }"""
-        if reorg_wiring_marker not in html:
-            raise RuntimeError("initCharts() checkpoint-throughput wiring marker not found -- template drifted")
-        html = html.replace(reorg_wiring_marker, reorg_wiring_new)
+""", "checkpoint-throughput wiring"),
+    ]
+    _WIRING_CLOSE_TAIL = "      }\n    }"
+    wiring_marker = """        const reorgCanvas = document.getElementById('chart-' + reorgEid);
+        if (reorgCanvas) {
+          const cfg = makeReorgScalingConfig(valSize);
+          if (cfg) new Chart(reorgCanvas, cfg);
+        }
+""" + _WIRING_CLOSE_TAIL
+    for guard, snippet, drift_msg in _CHART_WIRINGS:
+        wiring_new = wiring_marker[: -len(_WIRING_CLOSE_TAIL)] + snippet + _WIRING_CLOSE_TAIL
+        if guard not in html:
+            if wiring_marker not in html:
+                raise RuntimeError(f"initCharts() {drift_msg} marker not found -- template drifted")
+            html = html.replace(wiring_marker, wiring_new)
+        wiring_marker = wiring_new
 
-    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
+    # Per-tab "Insert vs. X() Throughput" section, inserted right after `prior_suffix`'s own
+    # section for each scenario tab -- chained the same way as the JS wiring above (the
+    # reorg-throughput section is inserted after the checkpoint-throughput section this same pass
+    # may have just added). `own_suffix` is also this section's idempotency guard (already-present
+    # anchor means an earlier run already inserted it for this scenario).
+    _PER_TAB_THROUGHPUT_SECTIONS = [
+        {
+            "own_suffix": "checkpoint-throughput",
+            "prior_suffix": "reorg-scaling",
+            "bar_color": "bg-emerald-500",
+            "heading": "Insert Throughput vs. Checkpoint() Steady-State Throughput",
+            "description_html": '<strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。',
+            "memo_placeholder": "Checkpoint Throughput 実験データに関するメモを入力...",
+        },
+        {
+            "own_suffix": "reorg-throughput",
+            "prior_suffix": "checkpoint-throughput",
+            "bar_color": "bg-violet-500",
+            "heading": "Insert Throughput vs. Reorganize() Full-Corpus Throughput",
+            "description_html": '<strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-violet-600">紫色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(T1-only)のフルコーパススループット(T1-only コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。単独実行(並行書き込みなし)での比較。',
+            "memo_placeholder": "Reorganize Throughput 実験データに関するメモを入力...",
+        },
+    ]
+
+    def insert_per_tab_throughput_section(html, scenario_key, spec):
         slug = scenario_key.lower().replace("-", "_")
-        anchor = f'id="memo-{slug}-checkpoint-throughput"'
+        anchor = f'id="memo-{slug}-{spec["own_suffix"]}"'
         if anchor in html:
-            continue
-        reorg_memo_anchor = f'id="memo-{slug}-reorg-scaling"'
-        if reorg_memo_anchor not in html:
-            continue
+            return html
+        prior_anchor = f'id="memo-{slug}-{spec["prior_suffix"]}"'
+        if prior_anchor not in html:
+            return html
         section_html = f'''
       <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
         <div class="flex items-center gap-3">
-          <div class="w-2 h-6 bg-emerald-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Checkpoint() Steady-State Throughput</h2>
+          <div class="w-2 h-6 {spec["bar_color"]} rounded-full"></div>
+          <h2 class="text-lg font-bold text-slate-900">{spec["heading"]}</h2>
         </div>
         <p class="text-sm text-slate-500">
-          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。
+          {spec["description_html"]}
         </p>
         <div class="space-y-3">
           <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
             <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
             <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
           </div>
-          <div class="h-80 relative"><canvas id="chart-{slug}-checkpoint-throughput"></canvas></div>
+          <div class="h-80 relative"><canvas id="chart-{slug}-{spec["own_suffix"]}"></canvas></div>
         </div>
         <div class="space-y-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
-          <textarea id="memo-{slug}-checkpoint-throughput" oninput="saveMemo('{slug}-checkpoint-throughput', this.value)" placeholder="Checkpoint Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
+          <textarea id="memo-{slug}-{spec["own_suffix"]}" oninput="saveMemo('{slug}-{spec["own_suffix"]}', this.value)" placeholder="{spec["memo_placeholder"]}" class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
         </div>
       </div>
 '''
-        anchor_idx = html.index(reorg_memo_anchor)
+        anchor_idx = html.index(prior_anchor)
         close_marker = "\n      </div>\n    </div>\n"
         close_idx = html.index(close_marker, anchor_idx) + len("\n      </div>\n")
-        html = html[:close_idx] + section_html.lstrip("\n") + html[close_idx:]
+        return html[:close_idx] + section_html.lstrip("\n") + html[close_idx:]
 
-    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
-        slug = scenario_key.lower().replace("-", "_")
-        anchor = f'id="memo-{slug}-reorg-throughput"'
-        if anchor in html:
-            continue
-        checkpoint_memo_anchor = f'id="memo-{slug}-checkpoint-throughput"'
-        if checkpoint_memo_anchor not in html:
-            continue
-        section_html = f'''
-      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
-        <div class="flex items-center gap-3">
-          <div class="w-2 h-6 bg-violet-500 rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">Insert Throughput vs. Reorganize() Full-Corpus Throughput</h2>
-        </div>
-        <p class="text-sm text-slate-500">
-          <strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-violet-600">紫色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(T1-only)のフルコーパススループット(T1-only コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。単独実行(並行書き込みなし)での比較。
-        </p>
-        <div class="space-y-3">
-          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
-            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
-            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
-          </div>
-          <div class="h-80 relative"><canvas id="chart-{slug}-reorg-throughput"></canvas></div>
-        </div>
-        <div class="space-y-1.5">
-          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
-          <textarea id="memo-{slug}-reorg-throughput" oninput="saveMemo('{slug}-reorg-throughput', this.value)" placeholder="Reorganize Throughput 実験データに関するメモを入力..." class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
-        </div>
-      </div>
-'''
-        anchor_idx = html.index(checkpoint_memo_anchor)
-        close_marker = "\n      </div>\n    </div>\n"
-        close_idx = html.index(close_marker, anchor_idx) + len("\n      </div>\n")
-        html = html[:close_idx] + section_html.lstrip("\n") + html[close_idx:]
+    for spec in _PER_TAB_THROUGHPUT_SECTIONS:
+        for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
+            html = insert_per_tab_throughput_section(html, scenario_key, spec)
 
     args.out.write_text(html)
     print(f"Wrote {args.out} ({len(html)} bytes)")

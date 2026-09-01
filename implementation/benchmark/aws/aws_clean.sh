@@ -4,9 +4,8 @@
 set -euo pipefail
 
 TARGET_KEY="${1:-}"
-# Matches run_bench_aws_c6id.sh's KEY_NAME ("vmemkv-i4i-key-$$") -- stale as "vmemkv-c6id-key-"
-# since the c6id->i4i instance-type switch (see that script's INSTANCE_TYPE comment), which left
-# this fallback (no TARGET_KEY) unable to find or clean up any current run's resources.
+# Must match run_bench_aws_c6id.sh's KEY_NAME prefix ("vmemkv-i4i-key-$$"), or the no-TARGET_KEY
+# fallback below can't find or clean up any current run's resources.
 KEY_PREFIX="vmemkv-i4i-key-"
 
 echo "==========================================================="

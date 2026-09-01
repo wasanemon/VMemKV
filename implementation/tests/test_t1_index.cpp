@@ -3,7 +3,7 @@
 // These tests exercise vmemkv::T1Index directly (no VMemKVImpl/T2FlatFile/WAL involvement):
 // get/put round-trips, reorganize()'s merge + chk_writer snapshot, checkpoint-adopt via
 // load_sorted_region_from_checkpoint(), and a concurrency stress test that regresses the
-// with_epoch_guard() fix (put/get_with_hash/append_size/live_bytes racing reorganize()).
+// with_epoch_guard() fix (put/get_with_hash/append_size racing reorganize()).
 
 #include <doctest/doctest.h>
 
@@ -185,13 +185,13 @@ TEST_CASE("T1Index: load_sorted_region_from_checkpoint replaces any previously l
   CHECK(idx->get(to_span("a")) == 2U);
 }
 
-// Regression test for the epoch-guard fix (with_epoch_guard()): put(), get_with_hash(),
-// append_size(), and live_bytes() must all register in active_epochs_ for their whole duration,
-// or reorganize()'s wait_until_epoch() has no way to know they are still using the buffers it is
-// about to delete -- a TSan-confirmed data race / use-after-free before the fix. Hammering
-// reorganize() concurrently with all four is the most direct way to regress that.
+// Regression test for the epoch-guard fix (with_epoch_guard()): put(), get_with_hash(), and
+// append_size() must all register in active_epochs_ for their whole duration, or reorganize()'s
+// wait_until_epoch() has no way to know they are still using the buffers it is about to delete --
+// a TSan-confirmed data race / use-after-free before the fix. Hammering reorganize() concurrently
+// with all three is the most direct way to regress that.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("T1Index: concurrent put/get_with_hash/append_size/live_bytes survive racing reorganize") {
+TEST_CASE("T1Index: concurrent put/get_with_hash/append_size survive racing reorganize") {
   auto idx = make_index();
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> reorganize_count{0};
@@ -214,7 +214,6 @@ TEST_CASE("T1Index: concurrent put/get_with_hash/append_size/live_bytes survive 
       while (!stop.load(std::memory_order_relaxed)) {
         (void)idx->get_with_hash(to_span(std::string("w0_0")));
         (void)idx->append_size();
-        (void)idx->live_bytes();
       }
     });
   }

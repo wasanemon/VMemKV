@@ -1,4 +1,4 @@
-// test_support.hpp - Shared helpers for the test_kv_store test files.
+// test_support.hpp - Shared helpers for the test_kv_store binary's constituent .cpp files.
 #pragma once
 
 #include <unistd.h>

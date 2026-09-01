@@ -175,11 +175,6 @@ class T1Index {
     void operator()(std::span<const EntrySnapshot> /*merged*/) const noexcept {}
   };
 
-  // No-op default for reorganize()'s post_freeze_hook parameter (see reorganize()'s own comment).
-  struct NoOpPostFreezeHook {
-    void operator()() const noexcept {}
-  };
-
   // Retrieves the payload and raw hash for a key prefix.
   auto get_with_hash(std::span<const std::byte> key) const -> LookupResult {
     const auto [prefix, hash] = prepare_key_and_hash(key);
@@ -241,40 +236,6 @@ class T1Index {
   }
   [[nodiscard]] auto append_region_peak_count() const noexcept -> int64_t {
     return append_region_peak_count_.load(std::memory_order_relaxed);
-  }
-
-  [[nodiscard]] auto live_bytes() const noexcept -> uint64_t {
-    return with_epoch_guard([&]() noexcept -> uint64_t {
-      // Paired reads via load_slot_consistent() -- an unpaired hash/val read could misjudge
-      // inline vs. offset.
-      uint64_t total_blocks = 0;
-      const auto sorted = sorted_region_.load(std::memory_order_acquire);
-      for (size_t i = 0; i < sorted->size; ++i) {
-        const auto [slot_hash, val] = load_slot_consistent(sorted->slots[i]);
-        if (is_live(val)) {
-          if constexpr (Config::UseT1InlineValue) {
-            if (t1_detail::is_inline(slot_hash)) {
-              continue;
-            }
-          }
-          total_blocks += (val >> 48);
-        }
-      }
-      const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
-      size_t active_n = active->size();
-      for (size_t i = 0; i < active_n; ++i) {
-        const auto [slot_hash, val] = load_slot_consistent(active->data()[i]);
-        if (is_live(val)) {
-          if constexpr (Config::UseT1InlineValue) {
-            if (t1_detail::is_inline(slot_hash)) {
-              continue;
-            }
-          }
-          total_blocks += (val >> 48);
-        }
-      }
-      return total_blocks * 16;
-    });
   }
 
   // Inserts or updates the 64-bit payload for a given key prefix.
@@ -491,14 +452,8 @@ class T1Index {
   //   this mapper doesn't need to touch (inline, T1-only reorg) must be left untouched.
   // - ChkWriter: optional, called once with the finalized sorted entries right before publish,
   //   so a caller can serialize a checkpoint without T1Index knowing about files. No-op default.
-  // `post_freeze_hook`: TEST-ONLY seam, called right after step 2 publishes
-  // append_immutable_/append_active_, before collect_live_entries() (step 3) snapshots them --
-  // lets a test deterministically land a concurrent put() in that window. Defaults to a no-op;
-  // production callers never pass one.
-  template <typename OffsetMapper, typename ChkWriter = NoOpChkWriter, typename PostFreezeHook = NoOpPostFreezeHook>
-  void reorganize(OffsetMapper offset_mapper,
-                  ChkWriter chk_writer = ChkWriter{},
-                  PostFreezeHook post_freeze_hook = PostFreezeHook{}) {
+  template <typename OffsetMapper, typename ChkWriter = NoOpChkWriter>
+  void reorganize(OffsetMapper offset_mapper, ChkWriter chk_writer = ChkWriter{}) {
     bool expected = false;
     if (!reorg_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       return;
@@ -516,8 +471,6 @@ class T1Index {
     AppendGeneration *old_active_gen = append_active_.load(std::memory_order_acquire);
     append_immutable_.freeze(old_active_gen);
     append_active_.store(next_active_gen, std::memory_order_release);
-
-    post_freeze_hook();
 
     // Advance epoch and wait for all writers currently accessing the old append region to exit.
     // Once they do, we are guaranteed that:

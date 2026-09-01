@@ -29,8 +29,6 @@ struct SpinBackoff {
       std::this_thread::sleep_for(kBackoffSleep);
     }
   }
-
-  void reset() { spin_count = 0; }
 };
 
 }  // namespace vmemkv
