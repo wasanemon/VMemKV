@@ -1,0 +1,2 @@
+{"job":"reorganize","scenario":"ltm","value_size":1024,"key_count":10000000,"writer_threads":32,"job_elapsed_sec":60,"insert_degradation_pct":51.998572,"update_degradation_pct":null,"scan_degradation_pct":null,"timed_out":true}
+{"job":"checkpoint","scenario":"ltm","value_size":1024,"key_count":10000000,"writer_threads":32,"job_elapsed_sec":60,"insert_degradation_pct":50.811495,"update_degradation_pct":null,"scan_degradation_pct":null,"timed_out":true}

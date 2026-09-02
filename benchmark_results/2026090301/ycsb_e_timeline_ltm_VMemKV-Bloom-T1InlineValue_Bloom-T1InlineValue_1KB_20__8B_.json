@@ -1,0 +1,42 @@
+{
+  "store": "VMemKV-Bloom-T1InlineValue",
+  "variant": "Bloom-T1InlineValue",
+  "value_size": "1KB_20__8B_",
+  "timeline": [
+    {"sec": 1, "scan_ops": 69250, "insert_ops": 3656, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 2, "scan_ops": 11597, "insert_ops": 562, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 3, "scan_ops": 0, "insert_ops": 0, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 4, "scan_ops": 81982, "insert_ops": 4333, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 5, "scan_ops": 70504, "insert_ops": 3783, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 6, "scan_ops": 80747, "insert_ops": 4263, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 7, "scan_ops": 74738, "insert_ops": 4012, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 8, "scan_ops": 69956, "insert_ops": 3656, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 1, "t2_forced_checkpoint_ops": 0},
+    {"sec": 9, "scan_ops": 96190, "insert_ops": 5039, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 10, "scan_ops": 95827, "insert_ops": 5120, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 11, "scan_ops": 74440, "insert_ops": 3851, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 12, "scan_ops": 72732, "insert_ops": 3802, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 13, "scan_ops": 55258, "insert_ops": 2887, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 14, "scan_ops": 80638, "insert_ops": 4252, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 2, "t2_forced_checkpoint_ops": 1},
+    {"sec": 15, "scan_ops": 97149, "insert_ops": 4965, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 16, "scan_ops": 95643, "insert_ops": 5199, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 17, "scan_ops": 89282, "insert_ops": 4621, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 18, "scan_ops": 80538, "insert_ops": 4181, "t1_reorg_ops": 1, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 19, "scan_ops": 95335, "insert_ops": 4963, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 20, "scan_ops": 91732, "insert_ops": 4854, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 21, "scan_ops": 95660, "insert_ops": 5093, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 22, "scan_ops": 75957, "insert_ops": 3875, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 23, "scan_ops": 85531, "insert_ops": 4491, "t1_reorg_ops": 1, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 24, "scan_ops": 95553, "insert_ops": 5061, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 25, "scan_ops": 94966, "insert_ops": 5083, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 26, "scan_ops": 76756, "insert_ops": 4033, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 27, "scan_ops": 36156, "insert_ops": 1970, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 28, "scan_ops": 69320, "insert_ops": 3601, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 29, "scan_ops": 77035, "insert_ops": 4052, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 30, "scan_ops": 71520, "insert_ops": 3765, "t1_reorg_ops": 0, "t2_checkpoint_ops": 0, "t1_forced_reorg_ops": 1, "t2_forced_checkpoint_ops": 1}
+  ],
+  "forced_events": [
+    {"scheduled_sec": 5, "fired_sec": 7, "kind": "reorganize", "elapsed_sec": 2.67764},
+    {"scheduled_sec": 10, "fired_sec": 13, "kind": "checkpoint", "elapsed_sec": 3.46806},
+    {"scheduled_sec": 25, "fired_sec": 29, "kind": "checkpoint", "elapsed_sec": 5.87666}
+  ]
+}
