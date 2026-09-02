@@ -1,1 +1,0 @@
-{"scenario":"in_memory","value_size":1024,"mode":"t1t2_steady","ratio":1,"churn_ratio":0.25,"key_count":8000000,"elapsed_sec":26.9031,"timed_out":false}

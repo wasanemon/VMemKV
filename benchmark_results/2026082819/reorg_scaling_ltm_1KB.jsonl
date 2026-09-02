@@ -1,2 +1,0 @@
-{"scenario":"ltm","value_size":1024,"mode":"t1only","ratio":0.25,"churn_ratio":0,"key_count":2064888,"elapsed_sec":18.1744,"timed_out":false}
-{"scenario":"ltm","value_size":"1KB","mode":"t1only","ratio":0.5,"key_count":null,"elapsed_sec":300,"timed_out":true,"failure_reason":"outer_timeout"}

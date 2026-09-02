@@ -1,1 +1,0 @@
-{"scenario":"ltm","value_size":"1KB","mode":"t1t2_steady","ratio":1.0,"key_count":null,"elapsed_sec":600,"timed_out":true,"failure_reason":"outer_timeout"}

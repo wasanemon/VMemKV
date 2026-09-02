@@ -1,2 +1,0 @@
-{"scenario":"ltm","value_size":65536,"mode":"defrag","ratio":0.25,"churn_ratio":0,"key_count":32760,"elapsed_sec":60,"timed_out":true}
-{"scenario":"ltm","value_size":"64KB","mode":"defrag_contention","ratio":1.0,"key_count":null,"elapsed_sec":300,"timed_out":true,"failure_reason":"outer_timeout"}
