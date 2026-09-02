@@ -154,149 +154,34 @@ def build_forced_events_data(report_dir):
     return forced_events_data
 
 
-def build_reorg_scaling_data(report_dir):
-    reorg_data = {}
-    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
-        fname = report_dir / f"reorg_scaling_{scenario}_{val_size}.jsonl"
-        if not fname.exists():
-            continue
-        modes = {}
-        for line in fname.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            mode = rec["mode"]
-            modes.setdefault(mode, []).append({
-                "key_count": rec["key_count"],
-                "ratio": rec.get("ratio"),
-                "elapsed_sec": rec["elapsed_sec"],
-                "timed_out": rec["timed_out"],
-            })
-        for mode_points in modes.values():
-            # key_count is null for an outer_timeout record (run_probe_point()'s synthesized
-            # failure fallback, reorg_probe_common.sh) -- setup never even reported a corpus size.
-            # Sorts last: it represents "went further than the largest point that did complete."
-            mode_points.sort(key=lambda p: (p["key_count"] is None, p["key_count"]))
-        reorg_data[scenario_key] = modes
-    return reorg_data
-
-
-def _iter_fixed_files_by_scenario_field(report_dir, filenames):
-    """Yields (scenario_key, rec) for every JSONL line in `filenames` (relative to report_dir)
-    whose own "scenario"/"value_size" fields resolve to a known SCENARIO_LABELS entry."""
-    for fname in filenames:
-        path = report_dir / fname
-        if not path.exists():
-            continue
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            scenario_key = SCENARIO_LABELS.get((rec["scenario"], _value_size_label(rec.get("value_size"))))
-            if scenario_key is not None:
-                yield scenario_key, rec
-
-
-def _iter_per_scenario_files(report_dir, filename_fmt):
-    """Yields (scenario_key, rec) for every JSONL line in report_dir / filename_fmt.format(scenario=,
-    val_size=), one file per SCENARIO_LABELS entry."""
-    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
-        path = report_dir / filename_fmt.format(scenario=scenario, val_size=val_size)
-        if not path.exists():
-            continue
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            yield scenario_key, json.loads(line)
-
-
-def _build_throughput_data(records, accept):
-    """Reduces a (scenario_key, rec) stream to {scenario_key: {"key_count", "elapsed_sec",
-    "records_per_sec"}}, keeping the last accepted record per scenario_key. `accept(rec)` decides
-    which records count."""
+def build_background_jobs_data(report_dir):
+    """Reads background_jobs_in_memory.jsonl / background_jobs_ltm.jsonl
+    (run_background_jobs_probe.sh via run_bench_aws_c6id.sh's run_remote_probe(), matching
+    the file-per-scenario convention the retired reorg-scaling/checkpoint-throughput/
+    maintenance-contention probes used) into {(job, scenario): rec}. Each rec carries
+    job_elapsed_sec plus insert/update/scan_degradation_pct, measured against a fixed 1KB x
+    10,000,000-record corpus (in_memory unconstrained, ltm cgroup-constrained to the same
+    LTM_MEMORY_BUDGET_BYTES as the rest of the suite) -- a single reproducible reference point
+    rather than a sweep across the matrix's 4 scenario/value-size combos, see
+    render_background_jobs_summary_html()."""
     data = {}
-    for scenario_key, rec in records:
-        if not accept(rec):
-            continue
-        data[scenario_key] = {
-            "key_count": rec["key_count"],
-            "elapsed_sec": rec["elapsed_sec"],
-            "records_per_sec": rec["key_count"] / rec["elapsed_sec"],
-        }
-    return data
-
-
-def build_checkpoint_throughput_data(report_dir):
-    """Reads checkpoint_throughput_in_memory.jsonl / checkpoint_throughput_ltm.jsonl
-    (run_checkpoint_throughput_probe.sh, via bench_kv --reorg-probe --mode=t1t2_steady
-    --ratio=1.0 --churn-ratio=0.25 -- full corpus size, a high-but-not-maximal churn ratio that
-    isolates the marginal per-record durabilization cost from checkpoint()'s fixed per-call setup
-    overhead while keeping setup work and checkpoint() I/O proportionally bounded) into
-    {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per combo."""
-    return _build_throughput_data(
-        _iter_fixed_files_by_scenario_field(
-            report_dir, ["checkpoint_throughput_in_memory.jsonl", "checkpoint_throughput_ltm.jsonl"]
-        ),
-        accept=lambda rec: not rec.get("timed_out"),
-    )
-
-
-def build_reorg_throughput_data(report_dir):
-    """Reads reorg_scaling_<scenario>_<value_size>.jsonl (run_reorg_scaling_probe.sh, mode=t1only,
-    ratio=1.0 -- the full-corpus point of the existing T1-only corpus-size sweep) into
-    {scenario_key: {"key_count", "elapsed_sec", "records_per_sec"}}, one entry per combo.
-    reorganize() is T1-only (never touches T2) and rebuilds the whole structure every call --
-    cost tracks corpus size, not churn, so this reuses the sweep's own ratio=1.0 point rather
-    than a separate probe."""
-    return _build_throughput_data(
-        _iter_per_scenario_files(report_dir, "reorg_scaling_{scenario}_{val_size}.jsonl"),
-        accept=lambda rec: rec.get("mode") == "t1only" and (rec.get("ratio") or 0) == 1 and not rec.get("timed_out"),
-    )
-
-
-def build_maintenance_contention_data(report_dir):
-    """Reads maintenance_contention_in_memory.jsonl / maintenance_contention_ltm.jsonl
-    (run_maintenance_contention_probe.sh, modes checkpoint_contention/reorg_contention) into
-    {scenario_val: {"checkpoint": {...}, "reorganize": {...}}} (isolated_write_tps/
-    concurrent_write_tps/elapsed_sec/timed_out per op) -- see render_maintenance_contention_html().
-    reorganize()
-    (T1-only) often completes in well under a millisecond even at full corpus size -- its
-    concurrent_write_tps figure is a mean over many repeated reorganize() calls spanning at least
-    a second (bench_kv's run_reorg_contention() passes min_wall_seconds=1.0 to
-    run_contention_probe() for this reason), not a single call's window, so it isn't noise despite
-    the tiny per-call duration -- flagged inline in the rendered table so the duration figure
-    itself isn't mistaken for that window."""
-    data = {}
-    for fname in ["maintenance_contention_in_memory.jsonl", "maintenance_contention_ltm.jsonl"]:
+    lines = []
+    for fname in ["background_jobs_in_memory.jsonl", "background_jobs_ltm.jsonl"]:
         path = report_dir / fname
-        if not path.exists():
+        if path.exists():
+            lines.extend(path.read_text().splitlines())
+    for line in lines:
+        if not line.strip():
             continue
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            scenario_val = f'{rec["scenario"]}_{_value_size_label(rec.get("value_size"))}'
-            mode = rec.get("mode")
-            if mode == "checkpoint_contention":
-                op, elapsed_key = "checkpoint", "checkpoint_elapsed_sec"
-            elif mode == "reorg_contention":
-                op, elapsed_key = "reorganize", "reorg_elapsed_sec"
-            else:
-                continue
-            data.setdefault(scenario_val, {})[op] = {
-                "isolated_write_tps": rec.get("isolated_write_tps"),
-                "concurrent_write_tps": rec.get("concurrent_write_tps"),
-                "elapsed_sec": rec.get(elapsed_key, rec.get("elapsed_sec")),
-                "timed_out": rec.get("timed_out"),
-                "failure_reason": rec.get("failure_reason"),
-            }
+        rec = json.loads(line)
+        # run_probe_point()'s (common/reorg_probe_common.sh) synthesized outer-timeout fallback
+        # (setup itself hung, before bench_kv could print its own record) doesn't know this
+        # script's "job" field -- skip rather than KeyError; the table just renders that combo
+        # as n/a (build_background_jobs_data() finds no entry for it), same as a missing file.
+        if "job" not in rec or "scenario" not in rec:
+            continue
+        data[(rec["job"], rec["scenario"])] = rec
     return data
-
-
-def _value_size_label(value_size):
-    if isinstance(value_size, str):
-        return value_size
-    return {8: "8B", 1024: "1KB", 65536: "64KB"}.get(value_size, str(value_size))
 
 
 def compute_winners_matrix(raw_data):
@@ -379,55 +264,8 @@ def render_winners_matrix_html(rows):
     return "\n".join(out)
 
 
-def _badge_for_checkpoint_headroom(ratio):
-    """ratio = Insert throughput / checkpoint() throughput. Inverted sense from
-    _badge_for_ratio(): here a HIGH ratio is bad (checkpoint can't keep up with the write rate
-    generating its churn), a LOW ratio is good (checkpoint has headroom)."""
-    if ratio >= 1.1:
-        return ("❌ Falls behind", "bg-rose-600 text-white border-transparent shadow-sm")
-    if ratio >= 0.9:
-        return ("≈ At capacity", "bg-amber-50 text-amber-700 border-amber-200")
-    return ("✅ Keeps up", "bg-emerald-50 text-emerald-700 border-emerald-200")
-
-
-def _render_vs_insert_table_html(throughput_data, raw_data, op_column_header):
-    if not throughput_data:
-        return ""
-    idx32 = THREADS.index(32)
-    out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
-           '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
-           '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Insert (32 threads)</th>',
-           f'<th class="py-2 px-3 font-bold text-slate-700">{op_column_header}</th>',
-           '<th class="py-2 px-3 font-bold text-slate-700">Verdict</th>',
-           "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
-    for scenario_key in ["8B_In-Memory", "1KB_In-Memory", "1KB_LTM", "64KB_LTM"]:
-        entry = throughput_data.get(scenario_key)
-        insert_series = raw_data.get(scenario_key, {}).get("Insert", {}).get("+Inline")
-        if not entry or not insert_series or insert_series[idx32] is None:
-            continue
-        insert_rate = insert_series[idx32]
-        op_rate = entry["records_per_sec"]
-        ratio = insert_rate / op_rate if op_rate else float("inf")
-        label_text, badge_class = _badge_for_checkpoint_headroom(ratio)
-        out.append(f'<tr><td class="py-2 px-3">{scenario_key}</td>'
-                    f'<td class="py-2 px-3">{insert_rate:,.0f}/s</td>'
-                    f'<td class="py-2 px-3">{op_rate:,.0f}/s</td>'
-                    f'<td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border {badge_class} font-bold w-fit">{label_text} ({ratio:.2f}x)</span></td></tr>')
-    out.append("</tbody></table></div>")
-    return "\n".join(out)
-
-
-def render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data):
-    return _render_vs_insert_table_html(checkpoint_throughput_data, raw_data, "checkpoint() steady-state")
-
-
-def render_reorg_vs_insert_table_html(reorg_throughput_data, raw_data):
-    return _render_vs_insert_table_html(reorg_throughput_data, raw_data, "reorganize() full-corpus")
-
-
 def _badge_for_slowdown(pct):
-    """pct: percentage drop in concurrent write TPS vs. isolated (higher = worse). Same 3-tier
+    """pct: percentage drop in concurrent workload QPS vs. isolated (higher = worse). Same 3-tier
     color language as _badge_for_ratio()'s strong tiers, just collapsed to 3 steps since slowdown
     has no "better than isolated" side to distinguish."""
     if pct >= 50:
@@ -437,53 +275,50 @@ def _badge_for_slowdown(pct):
     return "bg-emerald-50 text-emerald-700 border-emerald-200"
 
 
-def render_maintenance_contention_html(maintenance_contention_data):
-    if not maintenance_contention_data:
+def render_background_jobs_summary_html(background_jobs_data):
+    """4 rows (reorganize/in_memory, reorganize/ltm, checkpoint/in_memory, checkpoint/ltm) x 4
+    columns (job duration, Insert/Update/Scan QPS degradation %% while the job runs concurrently),
+    all measured against one fixed 1KB x 10,000,000-record corpus (see build_background_jobs_data()).
+    Deliberately not swept across the matrix's 4 scenario/value-size combos -- this table exists to
+    answer one question (how much does reorganize()/checkpoint() cost, and what does it cost
+    concurrent writers/readers while it runs), not to reproduce the CRUD matrix."""
+    if not background_jobs_data:
         return ""
-    # Grouped by operation (one mini-table per op) rather than by scenario: the reader's actual
-    # question is almost always "how does checkpoint() alone degrade across scenarios", not
-    # "what's every op doing for one scenario", so this ordering puts the 4 scenario rows that
-    # answer that side by side instead of scattered rows apart across separate scenario blocks.
-    out = []
-    op_labels = {"checkpoint": "checkpoint()", "reorganize": "reorganize()"}
-    for op in ["checkpoint", "reorganize"]:
-        rows_for_op = [(sv, maintenance_contention_data[sv][op])
-                       for sv in ["in_memory_8B", "in_memory_1KB", "ltm_1KB", "ltm_64KB"]
-                       if sv in maintenance_contention_data and op in maintenance_contention_data[sv]]
-        if not rows_for_op:
-            continue
-        out.append(f'<h4 class="text-xs font-bold text-slate-700 uppercase tracking-wide mt-4 first:mt-0">{op_labels[op]}</h4>')
-        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
-                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Scenario/Value</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Isolated Write TPS</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Concurrent Write TPS</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Slowdown</th>'
-                    '<th class="py-2 px-3 font-bold text-slate-700">Operation Duration</th>'
-                    '</tr></thead><tbody class="divide-y divide-slate-100">')
-        for scenario_val, r in rows_for_op:
-            if r.get("failure_reason"):
-                out.append(f'<tr><td class="py-2 px-3">{scenario_val}</td>'
-                            f'<td class="py-2 px-3 text-slate-300" colspan="2">n/a</td>'
-                            f'<td class="py-2 px-3"><span class="text-rose-600 font-semibold">did not complete ({r["failure_reason"]})</span></td></tr>')
+    job_labels = {"reorganize": "reorganize()", "checkpoint": "checkpoint()"}
+    scenario_labels = {"in_memory": "in-memory", "ltm": "LTM"}
+    out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
+           '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
+           '<th class="py-2 px-3 font-bold text-slate-700">Job / Scenario</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Duration (1 call)</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Insert QPS degradation</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Update QPS degradation</th>',
+           '<th class="py-2 px-3 font-bold text-slate-700">Scan QPS degradation</th>',
+           "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
+    for job in ["reorganize", "checkpoint"]:
+        for scenario in ["in_memory", "ltm"]:
+            rec = background_jobs_data.get((job, scenario))
+            row_label = f'{job_labels[job]} <span class="text-slate-400">/ {scenario_labels[scenario]}</span>'
+            if not rec:
+                out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
+                            f'<td class="py-2 px-3 text-slate-300" colspan="4">n/a</td></tr>')
                 continue
-            iso = r["isolated_write_tps"]
-            conc = r["concurrent_write_tps"]
-            status = (f'<span class="text-rose-600 font-semibold">&ge;{r["elapsed_sec"]:.0f}s (timeout)</span>'
-                      if r["timed_out"] else f'{r["elapsed_sec"]:.2f}s')
-            note = ('  <span class="text-slate-400">(single-call duration -- Isolated/Concurrent TPS above are '
-                    'averaged over many repeated calls spanning &ge;1s, not this one call)</span>'
-                    if op == "reorganize" and r["elapsed_sec"] < 0.01 else "")
-            if iso:
-                pct = (1 - conc / iso) * 100
-                slowdown_html = (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
+            if rec.get("timed_out"):
+                out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
+                            f'<td class="py-2 px-3" colspan="4"><span class="text-rose-600 font-semibold">'
+                            f'did not complete (timeout)</span></td></tr>')
+                continue
+            duration_cell = f'{rec["job_elapsed_sec"]:.3f}s'
+            cells = [duration_cell]
+            for key in ["insert_degradation_pct", "update_degradation_pct", "scan_degradation_pct"]:
+                pct = rec.get(key)
+                if pct is None:
+                    cells.append('<span class="text-slate-300">n/a</span>')
+                else:
+                    cells.append(f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
                                   f'{_badge_for_slowdown(pct)} font-bold w-fit">{pct:.0f}%</span>')
-            else:
-                slowdown_html = "n/a"
-            out.append(f'<tr><td class="py-2 px-3">{scenario_val}</td>'
-                        f'<td class="py-2 px-3">{iso:,.0f}/s</td><td class="py-2 px-3">{conc:,.0f}/s</td>'
-                        f'<td class="py-2 px-3">{slowdown_html}</td><td class="py-2 px-3">{status}{note}</td></tr>')
-        out.append("</tbody></table></div>")
+            out.append(f'<tr><td class="py-2 px-3">{row_label}</td>' +
+                        "".join(f'<td class="py-2 px-3">{c}</td>' for c in cells) + '</tr>')
+    out.append("</tbody></table></div>")
     return "\n".join(out)
 
 
@@ -504,10 +339,7 @@ def main():
     raw_data = build_raw_data(args.report_dir)
     timeline_data = build_timeline_data(args.report_dir)
     forced_events_data = build_forced_events_data(args.report_dir)
-    reorg_data = build_reorg_scaling_data(args.report_dir)
-    checkpoint_throughput_data = build_checkpoint_throughput_data(args.report_dir)
-    reorg_throughput_data = build_reorg_throughput_data(args.report_dir)
-    maintenance_contention_data = build_maintenance_contention_data(args.report_dir)
+    background_jobs_data = build_background_jobs_data(args.report_dir)
     winners_rows = compute_winners_matrix(raw_data)
 
     html = html.replace(args.template_id, args.report_id)
@@ -522,25 +354,22 @@ def main():
         "const rawData = " + json.dumps(raw_data, indent=2) + ";\n    "
     )
     html = replace_block(
-        html, "const timelineData = {", "const reorgScalingData = {",
+        html, "const timelineData = {", "const workloads =",
         "const timelineData = " + json.dumps(timeline_data, indent=2) + ";\n    " +
         "const forcedEventsData = " + json.dumps(forced_events_data, indent=2) + ";\n    "
     )
-    html = replace_block(
-        html, "const reorgScalingData = {", "const workloads =",
-        "const reorgScalingData = " + json.dumps(reorg_data, indent=2) + ";\n    " +
-        "const checkpointThroughputData = " + json.dumps(checkpoint_throughput_data, indent=2) + ";\n    " +
-        "const reorgThroughputData = " + json.dumps(reorg_throughput_data, indent=2) + ";\n    "
+
+    # Header title / links / description. Regex-based (not an exact previous-string match): the
+    # template chain mutates its own <title>/<h1> text on every generation (each report's own
+    # --title becomes baked-in literal text, not a stable marker), so matching against a fixed
+    # assumed-previous string silently no-ops once any report in the chain used a custom title --
+    # confirmed as the root cause of the 2026090215 report keeping 2026082819's title verbatim.
+    html = re.sub(r"<title>.*?</title>", lambda m: f"<title>{args.title}</title>", html, count=1)
+    html = re.sub(
+        r'(<h1 class="text-3xl font-bold tracking-tight text-slate-900">).*?(</h1>)',
+        lambda m: m.group(1) + args.title + m.group(2),
+        html, count=1,
     )
-
-    # Header title / links / description.
-    old_title = f'<title>VMemKV Performance Charts ({args.template_id})</title>'
-    new_title = f'<title>{args.title}</title>'
-    html = html.replace(old_title, new_title)
-
-    h1_old = f'<h1 class="text-3xl font-bold tracking-tight text-slate-900">Benchmark Results ({args.report_id})</h1>'
-    h1_new = f'<h1 class="text-3xl font-bold tracking-tight text-slate-900">{args.title}</h1>'
-    html = html.replace(h1_old, h1_new)
 
     download_links_start = html.index('<div class="flex flex-wrap gap-2">')
     download_links_end = html.index("</div>", download_links_start)
@@ -550,12 +379,8 @@ def main():
         (f"results_in_memory_1KB.json", "In-mem 1KB"),
         (f"results_ltm_1KB.json", "LTM 1KB"),
         (f"results_ltm_64KB.json", "LTM 64KB"),
-        (f"reorg_scaling_in_memory_8B.jsonl", "Reorg Scaling, In-Mem 8B"),
-        (f"reorg_scaling_in_memory_1KB.jsonl", "Reorg Scaling, In-Mem 1KB"),
-        (f"reorg_scaling_ltm_1KB.jsonl", "Reorg Scaling, LTM 1KB"),
-        (f"reorg_scaling_ltm_64KB.jsonl", "Reorg Scaling, LTM 64KB"),
-        (f"checkpoint_throughput_in_memory.jsonl", "Checkpoint Throughput, In-Memory"),
-        (f"checkpoint_throughput_ltm.jsonl", "Checkpoint Throughput, LTM"),
+        (f"background_jobs_in_memory.jsonl", "Background Jobs, In-Memory"),
+        (f"background_jobs_ltm.jsonl", "Background Jobs, LTM"),
     ]:
         if not (args.report_dir / fname).exists():
             continue
@@ -638,214 +463,20 @@ def main():
 
     html = upsert_section(
         html,
-        heading="Insert vs. Checkpoint() Throughput",
-        icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="gauge",
-        title="Insert vs. Checkpoint() Throughput",
-        description_html='checkpoint() only durabilizes the tail since the last cycle (cost tracks churn, not corpus size), so the operationally relevant question is whether its steady-state throughput (records/sec, measured at churn_ratio=0.25 to isolate the marginal per-record cost from checkpoint()\'s fixed per-call setup overhead -- see run_checkpoint_throughput_probe.sh) can keep up with the sustained Insert rate generating that churn. Same comparison also plotted per-tab (Insert\'s 1/4/16/32-thread line vs. a flat checkpoint() throughput reference line).',
-        table_html=render_checkpoint_vs_insert_table_html(checkpoint_throughput_data, raw_data),
-    )
-    html = upsert_section(
-        html,
-        heading="Insert vs. Reorganize() Throughput",
-        icon_bg="bg-violet-50", icon_text="text-violet-600", icon_name="gauge",
-        title="Insert vs. Reorganize() Throughput",
-        description_html='reorganize() (T1-only, never touches T2) rebuilds the whole T1 structure every call -- cost tracks corpus size, not churn. Full-corpus throughput (records/sec, the T1-only corpus-size sweep\'s own ratio=100% point) compared against the sustained Insert rate that grew that corpus. Same comparison also plotted per-tab. Isolated (no concurrent writers).',
-        table_html=render_reorg_vs_insert_table_html(reorg_throughput_data, raw_data),
-    )
-    html = upsert_section(
-        html,
-        heading="Maintenance Operations: Concurrent-Write Contention",
+        heading="Background Jobs: reorganize() / checkpoint()",
         icon_bg="bg-rose-50", icon_text="text-rose-600", icon_name="swords",
-        title="Maintenance Operations: Concurrent-Write Contention",
-        description_html='Both maintenance operations (checkpoint(), reorganize()) side by side: how much does write throughput degrade while each runs concurrently (32 writer threads, full corpus), and how long does the operation itself take under that contention versus in isolation (see the Insert-vs-throughput tables above for the isolated numbers alone). reorganize()\'s own duration is often under a millisecond even at full corpus size (T1-only, in-memory) -- flagged inline where its concurrent-TPS figure is likely dominated by measurement noise rather than a real effect.',
-        table_html=render_maintenance_contention_html(maintenance_contention_data),
+        title="Background Jobs: reorganize() / checkpoint()",
+        description_html=(
+            "Fixed reference point (1KB values, 10,000,000 records; in-memory unconstrained, "
+            "LTM cgroup-constrained to the same memory budget as the rest of the suite) -- "
+            "not swept across the CRUD matrix's 4 scenario/value-size combos. Duration is a "
+            "single call in isolation; the three degradation columns are the percentage drop in "
+            "concurrent Insert/Update/Scan QPS while that one call runs, measured over a "
+            "matched-duration window on both sides (see run_background_jobs_probe.sh)."
+        ),
+        table_html=render_background_jobs_summary_html(background_jobs_data),
     )
 
-    # Per-tab "Insert vs. X() Throughput" chart configs: one new canvas + section per tab, plus
-    # the JS chart-config function and its initCharts() wiring. Both insertions below are guarded
-    # so a re-run against an already-migrated template is a no-op.
-    _VS_INSERT_CONFIG_JS = """    function %(func_name)s(valSizeKey) {
-      const %(var)s = %(data_var)s[valSizeKey];
-      const insertSeries = rawData[valSizeKey] && rawData[valSizeKey]['Insert'] && rawData[valSizeKey]['Insert']['+Inline'];
-      if (!%(var)s || !insertSeries) return null;
-      const threadLabels = [1, 4, 16, 32];
-      return {
-        type: 'line',
-        data: {
-          labels: threadLabels,
-          datasets: [
-            {
-              label: 'Insert (+Inline)',
-              data: insertSeries,
-              borderColor: '#6366f1',
-              backgroundColor: 'transparent',
-              borderWidth: 2,
-              tension: 0.2, fill: false,
-              pointRadius: 3.5,
-            },
-            {
-              label: '%(series_label)s',
-              data: threadLabels.map(() => %(var)s.records_per_sec),
-              borderColor: '%(color)s',
-              backgroundColor: 'transparent',
-              borderWidth: 2,
-              borderDash: [6, 4],
-              pointRadius: 0,
-              fill: false,
-            },
-          ],
-        },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          animation: { duration: 900, easing: 'easeInOutQuart' },
-          plugins: {
-            legend: { position:'bottom', labels:{ boxWidth:12, font:{size:12,family:'Inter',weight:'500'}, usePointStyle:true } },
-            tooltip: {
-              mode: 'index', intersect: false,
-              backgroundColor: 'rgba(15,23,42,0.95)',
-              titleFont: {size:12,family:'Inter',weight:'bold'},
-              bodyFont: {size:11,family:'Inter'},
-              padding:10, cornerRadius:8,
-              callbacks: {
-                title: items => `${items[0].label} threads`,
-                label: ctx => ` ${ctx.dataset.label}: ${formatVal(ctx.raw)}/s`
-              }
-            }
-          },
-          scales: {
-            x: {
-              title: { display:true, text:'Threads', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8' }
-            },
-            y: {
-              type: 'logarithmic',
-              title: { display:true, text:'Throughput (records/sec, log scale)', font:{size:11,family:'Inter'}, color:'#64748b' },
-              grid: { color:'rgba(100,116,139,0.08)' },
-              ticks: { font:{size:10,family:'Inter'}, color:'#94a3b8', callback: v => formatVal(v) }
-            }
-          }
-        }
-      };
-    }
-
-    """
-
-    if "function makeCheckpointVsInsertConfig(" not in html:
-        checkpoint_config_js = _VS_INSERT_CONFIG_JS % {
-            "func_name": "makeCheckpointVsInsertConfig", "var": "cp", "data_var": "checkpointThroughputData",
-            "series_label": "checkpoint() steady-state", "color": "#059669",
-        }
-        html = html.replace("    function initCharts() {", checkpoint_config_js + "function initCharts() {")
-
-    if "function makeReorgVsInsertConfig(" not in html:
-        if "    function initCharts() {" not in html:
-            raise RuntimeError("initCharts() anchor not found for reorg chart config insertion -- template drifted")
-        reorg_config_js = _VS_INSERT_CONFIG_JS % {
-            "func_name": "makeReorgVsInsertConfig", "var": "rg", "data_var": "reorgThroughputData",
-            "series_label": "reorganize() full-corpus", "color": "#7c3aed",
-        }
-        html = html.replace("    function initCharts() {", reorg_config_js + "function initCharts() {")
-
-    # Each entry appends one more `if (fooCanvas) {...}` wiring block to the chain below, right
-    # before its closing "      }\n    }" -- chained because each step's insertion point is the
-    # previous step's own tail (block 2's marker is byte-identical to block 1's inserted content
-    # + close tail). `guard` mirrors the original per-step idempotency check (a re-run against an
-    # already-migrated template no-ops that step); `drift_msg` names which step failed to locate
-    # its marker, matching the original's distinct RuntimeError per step.
-    _CHART_WIRINGS = [
-        ("-checkpoint-throughput'", """        const cpEid = valSize.toLowerCase().replace(/-/g,'_') + '-checkpoint-throughput';
-        const cpCanvas = document.getElementById('chart-' + cpEid);
-        if (cpCanvas) {
-          const cfg2 = makeCheckpointVsInsertConfig(valSize);
-          if (cfg2) new Chart(cpCanvas, cfg2);
-        }
-""", "reorg-scaling wiring"),
-        ("-reorg-throughput'", """        const rgEid = valSize.toLowerCase().replace(/-/g,'_') + '-reorg-throughput';
-        const rgCanvas = document.getElementById('chart-' + rgEid);
-        if (rgCanvas) {
-          const cfg4 = makeReorgVsInsertConfig(valSize);
-          if (cfg4) new Chart(rgCanvas, cfg4);
-        }
-""", "checkpoint-throughput wiring"),
-    ]
-    _WIRING_CLOSE_TAIL = "      }\n    }"
-    wiring_marker = """        const reorgCanvas = document.getElementById('chart-' + reorgEid);
-        if (reorgCanvas) {
-          const cfg = makeReorgScalingConfig(valSize);
-          if (cfg) new Chart(reorgCanvas, cfg);
-        }
-""" + _WIRING_CLOSE_TAIL
-    for guard, snippet, drift_msg in _CHART_WIRINGS:
-        wiring_new = wiring_marker[: -len(_WIRING_CLOSE_TAIL)] + snippet + _WIRING_CLOSE_TAIL
-        if guard not in html:
-            if wiring_marker not in html:
-                raise RuntimeError(f"initCharts() {drift_msg} marker not found -- template drifted")
-            html = html.replace(wiring_marker, wiring_new)
-        wiring_marker = wiring_new
-
-    # Per-tab "Insert vs. X() Throughput" section, inserted right after `prior_suffix`'s own
-    # section for each scenario tab -- chained the same way as the JS wiring above (the
-    # reorg-throughput section is inserted after the checkpoint-throughput section this same pass
-    # may have just added). `own_suffix` is also this section's idempotency guard (already-present
-    # anchor means an earlier run already inserted it for this scenario).
-    _PER_TAB_THROUGHPUT_SECTIONS = [
-        {
-            "own_suffix": "checkpoint-throughput",
-            "prior_suffix": "reorg-scaling",
-            "bar_color": "bg-emerald-500",
-            "heading": "Insert Throughput vs. Checkpoint() Steady-State Throughput",
-            "description_html": '<strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-emerald-600">緑色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">checkpoint()</code> の定常状態スループット(churn_ratio=0.25での記録数/所要時間。スレッド数に依存しない一定値なので水平線)。緑の線が藍色の線を下回る = 書き込み側が生成するchurnにcheckpoint()の処理速度が追いつかない可能性を示す。',
-            "memo_placeholder": "Checkpoint Throughput 実験データに関するメモを入力...",
-        },
-        {
-            "own_suffix": "reorg-throughput",
-            "prior_suffix": "checkpoint-throughput",
-            "bar_color": "bg-violet-500",
-            "heading": "Insert Throughput vs. Reorganize() Full-Corpus Throughput",
-            "description_html": '<strong class="text-indigo-600">藍色</strong> = Insert スループット(1/4/16/32スレッド)。<strong class="text-violet-600">紫色破線</strong> = <code class="bg-slate-100 px-1 rounded text-xs">reorganize()</code>(T1-only)のフルコーパススループット(T1-only コーパスサイズスイープの ratio=100% 地点。スレッド数に依存しない一定値なので水平線)。単独実行(並行書き込みなし)での比較。',
-            "memo_placeholder": "Reorganize Throughput 実験データに関するメモを入力...",
-        },
-    ]
-
-    def insert_per_tab_throughput_section(html, scenario_key, spec):
-        slug = scenario_key.lower().replace("-", "_")
-        anchor = f'id="memo-{slug}-{spec["own_suffix"]}"'
-        if anchor in html:
-            return html
-        prior_anchor = f'id="memo-{slug}-{spec["prior_suffix"]}"'
-        if prior_anchor not in html:
-            return html
-        section_html = f'''
-      <div class="mt-12 border-t border-slate-200 pt-8 space-y-6">
-        <div class="flex items-center gap-3">
-          <div class="w-2 h-6 {spec["bar_color"]} rounded-full"></div>
-          <h2 class="text-lg font-bold text-slate-900">{spec["heading"]}</h2>
-        </div>
-        <p class="text-sm text-slate-500">
-          {spec["description_html"]}
-        </p>
-        <div class="space-y-3">
-          <div class="flex items-center justify-between border-b border-slate-100 pb-1.5">
-            <h3 class="text-md font-bold text-slate-900">Throughput Comparison</h3>
-            <span class="text-[11px] text-slate-400 bg-slate-100 rounded px-2.5 py-0.5">records/sec</span>
-          </div>
-          <div class="h-80 relative"><canvas id="chart-{slug}-{spec["own_suffix"]}"></canvas></div>
-        </div>
-        <div class="space-y-1.5">
-          <label class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Local Notes</label>
-          <textarea id="memo-{slug}-{spec["own_suffix"]}" oninput="saveMemo('{slug}-{spec["own_suffix"]}', this.value)" placeholder="{spec["memo_placeholder"]}" class="w-full text-xs p-2.5 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500 bg-slate-50/30 resize-y h-14"></textarea>
-        </div>
-      </div>
-'''
-        anchor_idx = html.index(prior_anchor)
-        close_marker = "\n      </div>\n    </div>\n"
-        close_idx = html.index(close_marker, anchor_idx) + len("\n      </div>\n")
-        return html[:close_idx] + section_html.lstrip("\n") + html[close_idx:]
-
-    for spec in _PER_TAB_THROUGHPUT_SECTIONS:
-        for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
-            html = insert_per_tab_throughput_section(html, scenario_key, spec)
 
     args.out.write_text(html)
     print(f"Wrote {args.out} ({len(html)} bytes)")

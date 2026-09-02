@@ -27,22 +27,16 @@ show_help() {
   echo "  --scenario in_memory|ltm|all  Limit which scenario(s) run (default: all)"
   echo "  --value-size SIZE  Limit to one value-size combo within the active scenario(s)"
   echo "                   (e.g. 8B, 1KB, 64KB -- see common/benchmark_matrix.sh)"
-  echo "  --reorg-scaling-probe  After the normal matrix, additionally sweep reorganize()"
-  echo "                   duration vs. corpus size (T1-only) on the same instance via"
-  echo "                   run_reorg_scaling_probe.sh and download its JSONL output"
-  echo "  --checkpoint-throughput-probe  After the normal matrix, additionally measure"
-  echo "                   checkpoint()'s steady-state throughput (records/sec, one point per"
-  echo "                   combo) on the same instance via run_checkpoint_throughput_probe.sh"
-  echo "                   and download its JSONL output."
-  echo "  --maintenance-contention-probe  After the normal matrix, additionally measure"
-  echo "                   concurrent-write contention spot checks for checkpoint() and"
-  echo "                   reorganize() (T1-only) on the same instance via"
-  echo "                   run_maintenance_contention_probe.sh and download its JSONL output."
+  echo "  --background-jobs-probe  After the normal matrix, additionally measure"
+  echo "                   reorganize()/checkpoint() (fixed 1KB/10,000,000-record corpus): each"
+  echo "                   job's own duration plus the QPS degradation it causes to concurrent"
+  echo "                   Insert/Update/Scan on the same instance via"
+  echo "                   run_background_jobs_probe.sh and download its JSONL output."
   echo "  --skip-matrix    Skip the main Google Benchmark-registered CRUD/Scan/YCSB-E matrix"
   echo "                   entirely (and its results download) -- provision/build the instance"
-  echo "                   and run only the *-scaling-probe flags passed alongside this one."
+  echo "                   and run only the *-probe flags passed alongside this one."
   echo "                   For a standalone probe-only run when the matrix has already been"
-  echo "                   measured separately and only a probe (e.g. --reorg-scaling-probe)"
+  echo "                   measured separately and only a probe (e.g. --background-jobs-probe)"
   echo "                   is still needed."
   echo "  --without-rivals  Drop RocksDB/RocksDB-BlobDB/LMDB from the benchmark filter, running"
   echo "                   VMemKV variants only. Use for regression-check runs after a"
@@ -54,9 +48,7 @@ show_help() {
 
 SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
-REORG_SCALING_PROBE=false
-CHECKPOINT_THROUGHPUT_PROBE=false
-MAINTENANCE_CONTENTION_PROBE=false
+BACKGROUND_JOBS_PROBE=false
 SKIP_MATRIX=false
 WITHOUT_RIVALS=false
 
@@ -86,16 +78,8 @@ while [[ $# -gt 0 ]]; do
       VALUE_SIZE_LIMIT="$2"
       shift 2
       ;;
-    --reorg-scaling-probe)
-      REORG_SCALING_PROBE=true
-      shift
-      ;;
-    --checkpoint-throughput-probe)
-      CHECKPOINT_THROUGHPUT_PROBE=true
-      shift
-      ;;
-    --maintenance-contention-probe)
-      MAINTENANCE_CONTENTION_PROBE=true
+    --background-jobs-probe)
+      BACKGROUND_JOBS_PROBE=true
       shift
       ;;
     --skip-matrix)
@@ -763,17 +747,15 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 }
 
 # Runs one "additive extra measurement" probe script against the already-provisioned instance.
-# REORG_SCALING_PROBE, CHECKPOINT_THROUGHPUT_PROBE, and MAINTENANCE_CONTENTION_PROBE below all
-# share this exact orchestration -- up to two invocations (in_memory unconstrained, ltm
-# systemd-run-wrapped with the same MemoryHigh/MemoryMax/MemorySwapMax as run_scenario()'s own ltm
-# wrap), respecting SCENARIO_LIMIT/VALUE_SIZE_LIMIT exactly like the matrix above. Only the probe
-# script, its output basename, the log-file prefix, and a human-readable label differ between the
-# three call sites -- see each call site's own comment for what it measures.
+# BACKGROUND_JOBS_PROBE below uses this orchestration -- up to two invocations (in_memory
+# unconstrained, ltm systemd-run-wrapped with the same MemoryHigh/MemoryMax/MemorySwapMax as
+# run_scenario()'s own ltm wrap), respecting SCENARIO_LIMIT/VALUE_SIZE_LIMIT exactly like the
+# matrix above.
 #
-# Args: $1 = probe script name (e.g. run_reorg_scaling_probe.sh)
-#       $2 = output basename (e.g. reorg_scaling -> reorg_scaling_in_memory.jsonl)
-#       $3 = log-file prefix (e.g. vmemkv_reorg_probe)
-#       $4 = human-readable label for [runner]/[WARN] messages (e.g. reorg-scaling-probe)
+# Args: $1 = probe script name (e.g. run_background_jobs_probe.sh)
+#       $2 = output basename (e.g. background_jobs -> background_jobs_in_memory.jsonl)
+#       $3 = log-file prefix (e.g. vmemkv_background_jobs_probe)
+#       $4 = human-readable label for [runner]/[WARN] messages (e.g. background-jobs-probe)
 #
 # A failure here is logged as [WARN], not [ERROR], and does not fail the whole run: unlike the
 # matrix above, this is a supplementary measurement, not the main deliverable.
@@ -967,37 +949,18 @@ if [[ "$SKIP_MATRIX" != "true" ]]; then
   scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/ycsb_e_timeline_*.json" "${RESULTS_DIR}/" || true
 fi
 
-if [[ "$REORG_SCALING_PROBE" == "true" ]]; then
-  # Additive extra measurement (reorganize() duration vs. corpus size, T1-only vs T1+T2) on top
-  # of the normal matrix just run above -- not part of the Google Benchmark-registered matrix
-  # itself, see run_reorg_scaling_probe.sh's own comment for why. Reuses this same
-  # already-provisioned instance rather than spinning up a dedicated one: run_4parallel_bench.sh's
-  # 4 instances already partition (scenario, value_size) 1:1 the same way this sweep's 4 combos
-  # do, so there is nothing a 5th instance would add. Up to two invocations, exactly mirroring
-  # run_scenario()'s ltm-only cgroup wrap: unconstrained for in_memory's combo(s), systemd-run-
-  # wrapped (same MemoryHigh/MemoryMax/MemorySwapMax as the real ltm scenario) for ltm's --
-  # mixing both under one wrap would starve in_memory's combos of memory they were never meant to
-  # be constrained by. Respects --scenario/--value-size exactly like the matrix above: with
-  # VALUE_SIZE_LIMIT set, only that one combo runs (not its scenario sibling too) and the
-  # downloaded filename is scoped to it, matching results_in_memory_*.json's own convention above,
-  # so run_4parallel_bench.sh's 4 concurrent instances don't clobber each other's output in this
-  # shared local logs/ directory. A failure here is logged but does not fail the whole run --
-  # unlike the matrix above, this is a supplementary measurement, not the main deliverable.
-  run_remote_probe "run_reorg_scaling_probe.sh" "reorg_scaling" "vmemkv_reorg_probe" "reorg-scaling-probe"
-fi
-
-if [[ "$CHECKPOINT_THROUGHPUT_PROBE" == "true" ]]; then
-  # Additive extra measurement (checkpoint()'s steady-state throughput, records/sec, one point
-  # per combo) on top of the normal matrix -- same in_memory/ltm split and combo-filter interface
-  # as REORG_SCALING_PROBE above (run_checkpoint_throughput_probe.sh takes
-  # the same <bin> <output> <db_dir> [combo_filter] interface).
-  run_remote_probe "run_checkpoint_throughput_probe.sh" "checkpoint_throughput" "vmemkv_checkpoint_throughput_probe" "checkpoint-throughput-probe"
-fi
-
-if [[ "$MAINTENANCE_CONTENTION_PROBE" == "true" ]]; then
-  # Additive extra measurement (concurrent-write contention spot checks for checkpoint() and
-  # reorganize(), one point per combo per mode) on top of the normal matrix -- same reasoning and
-  # in_memory/ltm split as REORG_SCALING_PROBE above (run_maintenance_contention_probe.sh takes
-  # the same <bin> <output> <db_dir> [combo_filter] interface).
-  run_remote_probe "run_maintenance_contention_probe.sh" "maintenance_contention" "vmemkv_maint_probe" "maintenance-contention-probe"
+if [[ "$BACKGROUND_JOBS_PROBE" == "true" ]]; then
+  # Additive extra measurement (reorganize()/checkpoint() own duration + Insert/Update/Scan QPS
+  # degradation while each runs, fixed 1KB/10,000,000-record corpus) on top of the normal matrix
+  # just run above -- not part of the Google Benchmark-registered matrix itself, see
+  # run_background_jobs_probe.sh's own comment for why. Supersedes the three retired probes
+  # (reorg-scaling, checkpoint-throughput, maintenance-contention). Up to two invocations, exactly
+  # mirroring run_scenario()'s ltm-only cgroup wrap: unconstrained for in_memory, systemd-run-
+  # wrapped (same MemoryHigh/MemoryMax/MemorySwapMax as the real ltm scenario) for ltm -- mixing
+  # both under one wrap would starve in_memory of memory it was never meant to be constrained by.
+  # Ignores VALUE_SIZE_LIMIT (this probe's corpus is always 1KB, fixed) -- run_5parallel_bench.sh's
+  # dedicated 5th instance passes no --value-size, so this always covers both scenarios here.
+  # A failure here is logged but does not fail the whole run -- unlike the matrix above, this is a
+  # supplementary measurement, not the main deliverable.
+  run_remote_probe "run_background_jobs_probe.sh" "background_jobs" "vmemkv_background_jobs_probe" "background-jobs-probe"
 fi

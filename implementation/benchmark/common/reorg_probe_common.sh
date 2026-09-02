@@ -31,7 +31,7 @@ init_probe_driver() {
   # (see run_bench_aws_c6id.sh's run_scenario(), which does exactly this for the normal benchmark
   # matrix) can invoke a driver script twice -- once unconstrained for in_memory, once
   # systemd-run-wrapped for ltm. The exact-combo form exists so a caller that's already scoped to
-  # one (scenario, value_size) pair -- e.g. one of run_4parallel_bench.sh's 4 instances, which each
+  # one (scenario, value_size) pair -- e.g. one of run_5parallel_bench.sh's 4 CRUD-matrix instances, which each
   # own exactly one such pair -- can run only its own combo instead of duplicating its sibling's.
   # Empty (the default) means "all 4 combos", for local testing.
   COMBO_FILTER="${4:-}"

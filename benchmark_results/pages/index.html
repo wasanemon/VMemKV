@@ -66,36 +66,6 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-09-02</td>
-              <td class="py-4 px-4 font-medium">
-                <a href="2026090215_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i x4 (09/02)
-                </a>
-              </td>
-              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026082819_charts.html" class="text-indigo-600 hover:underline">08/28</a>時点比、<code>--without-rivals</code>: RocksDB/RocksDB-BlobDB/LMDBは08/28の数値を再利用):</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li>コード側の変更: <code>defragment()</code>を恒久的no-op化した上でAPI・<code>TailEntryTracker</code>・T2-generation-pairing機構ごと完全削除(Round 1-3)、T2読み書きハンドル分離とstaleコメント一掃(Round 4)、<code>scan()</code>のキー末尾切り詰めバグ修正と1.04MBレコード上限のthrow化(Round 6)、<code>bulk_load()</code>のSTORE_NOT_FOUNDセンチネル衝突によるデータロス修正(Round 7)、その他デッドコード/ドキュメント修正多数。加えて<code>T1AppendCapacityLog2</code>を2^22→2^21に縮小(RSSフットプリントとhard-stall余地のトレードオフ調整、機能追加ではなく既存ノブの再チューニング)。</li>
-                </ul>
-              </td>
-            </tr>
-            <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-08-28</td>
-              <td class="py-4 px-4 font-medium">
-                <a href="2026082819_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i x4 (08/28)
-                </a>
-              </td>
-              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026082101_charts.html" class="text-indigo-600 hover:underline">08/21</a>時点比、要点のみ、<code>--without-rivals</code>: RocksDB/RocksDB-BlobDB/LMDBは08/21の数値を再利用):</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li><code>checkpoint()</code>の自動発火が64KB値のInsert主体ワークロードで実質的に発火しないバグを修正。<code>maybe_reorganize_if_needed()</code>がWALバイト閾値(<code>WalMaxBytesSinceCheckpoint</code>、既定64MiB)を一度も評価しておらず、エントリ数ベースの閾値だけに依存していた -- 64KB値ではその閾値がT2の実データ量換算で約137GB/約34GBに相当し、64MiB閾値を事実上無力化していた。AWS実スケール(32書き込みスレッド、LTM、64KB値、180秒)でbacklogが有界化しcorpus比で縮小することを確認(4.0%→0.015%)。</li>
-                  <li>checkpointの各フェーズ(msync/T1 reorganize/writer停止/barrier drain/WAL rotate、WAL rotateのgroup-commitリーダー待ち内訳)と、writerの累積ブロック時間を<code>VMemKVStatistics</code>経由で常時観測できるよう追加。所要時間を実際に支配しているのはmsyncでもT1 reorganizeでもなくWAL rotateのgroup-commitリーダー待ちで、データ量ではなく書き込み並行度に依存することを発見。時間ベースのcheckpoint間隔オプション(<code>CheckpointIntervalMs</code>)も追加したが、0.2秒〜60秒の範囲でQPSへの有意な悪影響は見られなかった。</li>
-                  <li>既存の補助probe(<code>run_maintenance_contention_probe.sh</code>のcheckpoint_contention/reorg_contention等)で、LTMフルコーパス・高並行度地点が300秒タイムアウトに達し測定不能になる退行を発見。gdbでの直接観察とAWS A/B比較(本ラウンドのcheckpoint修正適用前後で完全に同一の挙動)により、これは今回の修正が原因ではなく2026-08-21以降に混入した既存の退行(WALのgroup-commitリーダー待ちが極端に長くなる)であることを確認。主要CRUD/YCSB-Eマトリクスは無影響。詳細は<code>TODO.md</code>項目6を参照。</li>
-                </ul>
-              </td>
-            </tr>
-            <tr>
               <td class="py-4 pr-4 text-slate-400">2026-08-21</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026082101_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">

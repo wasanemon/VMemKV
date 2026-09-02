@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -1828,22 +1829,22 @@ void register_all_benchmarks() {
 // time against the same budget (conflating the two would make a timeout ambiguous: slow setup, or
 // slow reorganize/checkpoint?).
 //
-// Five modes, selected via --mode:
+// Four modes, selected via --mode:
 //   t1only / t1t2 (run_bootstrap(), below): a single fresh populate followed by exactly one timed
 //     reorganize()/checkpoint() call.
 //   t1t2_steady (run_steady(), below): measures a *second* (or later) checkpoint() call against a
-//     corpus that already has one checkpointed generation -- see
-//     run_checkpoint_throughput_probe.sh's t1t2_steady sweep.
-//   checkpoint_contention / reorg_contention (run_checkpoint_contention()/run_reorg_contention(),
-//     below): measures reorganize()/checkpoint() latency under concurrent writer contention -- see
-//     run_maintenance_contention_probe.sh.
+//     corpus that already has one checkpointed generation. No automated driver script currently
+//     invokes this mode (its own sweep script was retired in favor of background_job_probe below)
+//     -- reachable directly via this CLI for ad-hoc use.
+//   background_job_probe (run_background_job_probe(), below): fixed 10,000,000-record corpus;
+//     measures one reorganize()/checkpoint() call's own duration plus the QPS degradation it
+//     causes to concurrent Insert/Update/Scan workloads -- see run_background_jobs_probe.sh.
 namespace reorg_probe {
 
 constexpr int kReorgTimeoutSecondsDefault = 60;
 
 // Overridable so a single-call reorganize()/checkpoint() timeout can be tightened for
-// a specific experiment (e.g. a 30s checkpoint_contention comparison) without changing the default
-// used everywhere else this timeout applies.
+// a specific experiment without changing the default used everywhere else this timeout applies.
 static inline int reorg_timeout_seconds() {
   if (const char *override_seconds = std::getenv("VMEMKV_BENCH_REORG_TIMEOUT_SECONDS")) {
     char *end = nullptr;
@@ -1859,8 +1860,7 @@ enum class ProbeMode {
   kT1Only,
   kT1T2,
   kT1T2Steady,
-  kCheckpointContention,
-  kReorgContention,
+  kBackgroundJobProbe,
 };
 
 struct ProbeArgs {
@@ -1870,6 +1870,7 @@ struct ProbeArgs {
   double ratio = 1.0;
   double churn_ratio = 0.0;
   std::string sweep_tag = "default";
+  std::string job;  // "reorganize" | "checkpoint" -- only read by kBackgroundJobProbe.
 };
 
 [[noreturn]] void fail(const std::string &msg) {
@@ -1920,10 +1921,8 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
         args.mode = ProbeMode::kT1T2;
       } else if (value == "t1t2_steady") {
         args.mode = ProbeMode::kT1T2Steady;
-      } else if (value == "checkpoint_contention") {
-        args.mode = ProbeMode::kCheckpointContention;
-      } else if (value == "reorg_contention") {
-        args.mode = ProbeMode::kReorgContention;
+      } else if (value == "background_job_probe") {
+        args.mode = ProbeMode::kBackgroundJobProbe;
       } else {
         fail("unknown --mode: " + std::string(value));
       }
@@ -1935,13 +1934,20 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
     } else if (key == "--sweep-tag") {
       // Only read by run_steady() (t1t2_steady mode) -- every other mode ignores this value.
       args.sweep_tag = std::string(value);
+    } else if (key == "--job") {
+      // Only read by kBackgroundJobProbe.
+      args.job = std::string(value);
     }
   }
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
-        "--mode=<t1only|t1t2|t1t2_steady|checkpoint_contention|reorg_contention> "
-        "--ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>]");
+        "--mode=<t1only|t1t2|t1t2_steady|background_job_probe> "
+        "--ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>] "
+        "[--job=<reorganize|checkpoint>]");
+  }
+  if (args.mode == ProbeMode::kBackgroundJobProbe && args.job != "reorganize" && args.job != "checkpoint") {
+    fail("--mode=background_job_probe requires --job=<reorganize|checkpoint>");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
     fail("--ratio must be in (0.0, 1.0]");
@@ -1993,11 +1999,8 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
     case ProbeMode::kT1T2Steady:
       mode_name = "t1t2_steady";
       break;
-    case ProbeMode::kCheckpointContention:
-      mode_name = "checkpoint_contention";  // Unreachable: this mode reports via its own print, below.
-      break;
-    case ProbeMode::kReorgContention:
-      mode_name = "reorg_contention";  // Unreachable: this mode reports via its own print, below.
+    case ProbeMode::kBackgroundJobProbe:
+      mode_name = "background_job_probe";  // Unreachable: this mode reports via its own print, below.
       break;
   }
   // churn_ratio only means anything for t1t2_steady (run_steady() is the only mode that applies
@@ -2022,8 +2025,7 @@ static std::size_t resolve_writer_threads() {
 }
 
 // Samples `churn_count` random indices in [0, key_count) and update()s each, sharded across up
-// to 16 threads. Shared setup shape for run_steady()/run_checkpoint_contention()'s kUpdateCold
-// pre-churn.
+// to 16 threads. Used by run_steady()'s kUpdateCold pre-churn.
 static void apply_random_churn(vmemkv::variants::VMemKVStore &store,
                                std::size_t key_count,
                                std::size_t churn_count,
@@ -2156,303 +2158,193 @@ static void apply_random_churn(vmemkv::variants::VMemKVStore &store,
   report_and_exit(args, key_count, elapsed_sec, timed_out);
 }
 
-// Shared by run_checkpoint_contention()/run_reorg_contention(): measures
-// how much concurrent write throughput degrades while `run_operation` executes, and the
-// operation's own duration under that contention. Two phases: an isolated write-TPS baseline
-// (fixed op count per thread, no concurrent maintenance operation), and a concurrent phase where
-// writer threads run continuously for `run_operation`'s entire duration (stop-flag controlled,
-// joined right after the timed call returns). Returns {isolated_write_tps, concurrent_write_tps,
-// op_elapsed_sec, timed_out}; the caller (one per maintenance operation, since each prints its
-// own JSON field name for the timed duration) already did whatever corpus setup (populate/
-// checkpoint/churn) is appropriate for that operation before calling this.
+// Background-job probe: for a fixed corpus (args.val_size, kBackgroundJobProbeKeyCount records --
+// in-memory unconstrained, or LTM cgroup-constrained by the *caller* script, this binary itself
+// applies no memory limit), measures one call to reorganize()/checkpoint() (args.job) and, for
+// each of three concurrent workloads (Insert, Update, Scan), the percentage QPS degradation that
+// workload suffers while the job call is in flight. See run_background_jobs_probe.sh.
 //
-// `min_wall_seconds` (default 0: exactly one call, unchanged for checkpoint()):
-// for an operation fast enough that one call's wall-clock window is comparable to writer-thread
-// scheduling jitter (T1-only reorganize(), sub-10ms even at full corpus), a single-call
-// concurrent_write_tps sample is dominated by that jitter rather than any real effect. Passing a
-// positive value repeats `run_operation` back-to-back, inside the same timed_run() call, until at
-// least that much wall-clock time has elapsed; op_elapsed_sec is then the mean per-call duration.
-// Writer threads still start once and run continuously for the whole repeated window, so this
-// doesn't add per-repetition thread start/stop overhead -- it only extends the window they get to
-// run in.
-// kUpdateExisting: update() a uniformly-random existing key -- for a key still resident in base
-// (see try_in_place_update()'s allow_in_place check, vmemkv_impl.hpp), this takes exactly the
-// same write_entry_lockfree()/append path as an insert; for a key already in tail (e.g. one this
-// same call already touched once), it takes the cheap in-place seqlock path instead. Which of the
-// two a given call hits depends on this run's own touch history and on how far a concurrently
-// running checkpoint() has advanced base_boundary -- see must_read_papers/
-// mmap_shared_vs_private_continued.md for why this mix isn't a clean "the cost of an update"
-// number by itself. kInsertFresh sidesteps the ambiguity entirely: every key is guaranteed never
-// touched before (drawn from a shared counter starting past key_count), so every call takes the
-// append path deterministically, every time.
-enum class WriteWorkload { kUpdateExisting, kInsertFresh };
+// Each workload gets its own paired isolated/concurrent measurement, both windows sized to the
+// SAME wall-clock duration (the job call's own measured elapsed time). This is a deliberate fix
+// over an earlier design (run_contention_probe(), removed) whose isolated phase ran a fixed
+// op-count per thread regardless of how long that took, while the concurrent phase's window was
+// set by the job's own (often very different) duration -- comparing TPS across two differently-
+// sized windows is not a fair measurement. Here, phase B (concurrent) runs the job once while
+// workload threads hammer continuously (stop-flag controlled) and measures its own elapsed time;
+// phase A (isolated) then runs the identical thread/workload setup for exactly that same elapsed
+// time (timer-controlled, no concurrent job) as the baseline.
+enum class BackgroundJobWorkload { kInsert, kUpdate, kScan };
 
-template <typename Store, typename OperationFn>
-auto run_contention_probe(Store &store,
-                          std::size_t key_count,
-                          uint32_t val_size,
-                          OperationFn &&run_operation,
-                          double min_wall_seconds,
-                          std::size_t writer_threads,
-                          WriteWorkload workload = WriteWorkload::kUpdateExisting)
-    -> std::tuple<double, double, double, bool> {
-  assert(writer_threads != 0 && "callers must pass an already-resolved thread count (see resolve_writer_threads())");
+// kInsert draws from `next_fresh_key` (shared across a phase's threads, never reused within one
+// measure_workload_degradation() call); kUpdate/kScan pick a uniformly random existing key.
+// kScan issues a small (100-key) ranged scan, mirroring the main Google Benchmark-registered
+// Op=Scan implementation above.
+template <typename Store>
+static void background_job_do_one_op(Store &store,
+                                     uint32_t val_size,
+                                     BackgroundJobWorkload workload,
+                                     std::mt19937_64 &rng,
+                                     std::uniform_int_distribution<std::size_t> &key_dist,
+                                     std::atomic<std::size_t> &next_fresh_key) {
+  switch (workload) {
+    case BackgroundJobWorkload::kInsert: {
+      const std::size_t idx = next_fresh_key.fetch_add(1, std::memory_order_relaxed);
+      store->insert(make_key(idx), make_value_for_key(idx, val_size));
+      return;
+    }
+    case BackgroundJobWorkload::kUpdate: {
+      const std::size_t idx = key_dist(rng);
+      store->update(make_key(idx), make_value_for_key(idx, val_size));
+      return;
+    }
+    case BackgroundJobWorkload::kScan: {
+      const std::size_t start = key_dist(rng);
+      std::size_t result_count = store->scan(
+          make_key(start), make_key(start + 99), [](std::span<const std::byte>, std::span<const std::byte> value) {
+            benchmark::DoNotOptimize(touch_bytes(value));
+          });
+      benchmark::DoNotOptimize(result_count);
+      return;
+    }
+  }
+}
 
-  // Shared across every writer thread and both phases (A then B) so kInsertFresh never reuses a
-  // key within one run_contention_probe() call, regardless of how many total ops end up issued.
-  std::atomic<std::size_t> next_fresh_key{key_count};
+struct WorkloadDegradation {
+  double job_elapsed_sec = 0.0;
+  double degradation_pct = 0.0;
+  bool timed_out = false;
+};
 
-  // stop == nullptr: run exactly fixed_ops then return. stop != nullptr: run until *stop is set,
-  // ignoring fixed_ops, returning however many ops actually completed.
-  auto run_writer = [&store, key_count, val_size, workload, &next_fresh_key](
-                        std::size_t seed_offset, const std::atomic<bool> *stop, std::size_t fixed_ops) -> std::size_t {
-    std::mt19937_64 rng(kBenchmarkSeed + seed_offset);
-    std::uniform_int_distribution<std::size_t> key_dist(0, key_count - 1);
-    std::size_t done = 0;
-    auto do_one_op = [&]() {
-      if (workload == WriteWorkload::kInsertFresh) {
-        const std::size_t idx = next_fresh_key.fetch_add(1, std::memory_order_relaxed);
-        store->insert(make_key(idx), make_value_for_key(idx, val_size));
-      } else {
-        const std::size_t idx = key_dist(rng);
-        store->update(make_key(idx), make_value_for_key(idx, val_size));
-      }
-    };
-    if (stop == nullptr) {
-      for (; done < fixed_ops; ++done) {
-        do_one_op();
-      }
-    } else {
-      while (!stop->load(std::memory_order_relaxed)) {
-        do_one_op();
+template <typename Store, typename JobFn>
+static auto measure_workload_degradation(Store &store,
+                                         std::size_t key_count,
+                                         uint32_t val_size,
+                                         BackgroundJobWorkload workload,
+                                         std::size_t thread_count,
+                                         JobFn &&run_job) -> WorkloadDegradation {
+  // Phase B: concurrent -- workload threads run continuously while the job executes once.
+  std::atomic<std::size_t> next_fresh_key_b{key_count};
+  std::atomic<bool> stop_b{false};
+  std::vector<std::thread> workers_b;
+  std::vector<std::size_t> counts_b(thread_count, 0);
+  workers_b.reserve(thread_count);
+  for (std::size_t t = 0; t < thread_count; ++t) {
+    workers_b.emplace_back([&, t]() {
+      std::mt19937_64 rng(kBenchmarkSeed + 9000 + t);
+      std::uniform_int_distribution<std::size_t> key_dist(0, key_count > 100 ? key_count - 100 : 1);
+      std::size_t done = 0;
+      while (!stop_b.load(std::memory_order_relaxed)) {
+        background_job_do_one_op(store, val_size, workload, rng, key_dist, next_fresh_key_b);
         ++done;
       }
-    }
-    return done;
-  };
-
-  // Phase A: isolated baseline -- fixed op count per thread, no concurrent operation.
-  constexpr std::size_t kOpsPerThreadBaseline = 20'000;
-  double isolated_write_tps = 0.0;
-  {
-    std::vector<std::thread> workers;
-    workers.reserve(writer_threads);
-    const auto t0 = std::chrono::steady_clock::now();
-    for (std::size_t t = 0; t < writer_threads; ++t) {
-      workers.emplace_back([&run_writer, t] { run_writer(t, nullptr, kOpsPerThreadBaseline); });
-    }
-    for (auto &w : workers) {
-      w.join();
-    }
-    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    isolated_write_tps = static_cast<double>(writer_threads * kOpsPerThreadBaseline) / elapsed;
+      counts_b[t] = done;
+    });
   }
-
-  // Phase B: concurrent -- writer threads run continuously for the operation's entire duration.
-  std::atomic<bool> stop{false};
-  std::vector<std::size_t> counts(writer_threads, 0);
-  std::vector<std::thread> workers;
-  workers.reserve(writer_threads);
-  for (std::size_t t = 0; t < writer_threads; ++t) {
-    workers.emplace_back([&run_writer, &counts, t, &stop] { counts[t] = run_writer(t + 1000, &stop, 0); });
-  }
-  const auto b0 = std::chrono::steady_clock::now();
-  std::size_t reps = 0;
-  auto [op_elapsed_sec, timed_out] = timed_run([&run_operation, &reps, min_wall_seconds]() {
-    const auto loop_start = std::chrono::steady_clock::now();
-    do {
-      run_operation();
-      ++reps;
-    } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - loop_start).count() < min_wall_seconds);
-  });
-  const auto b1 = std::chrono::steady_clock::now();
-  stop.store(true, std::memory_order_relaxed);
-  for (auto &w : workers) {
+  auto [job_elapsed_sec, timed_out] = timed_run(std::forward<JobFn>(run_job));
+  stop_b.store(true, std::memory_order_relaxed);
+  for (auto &w : workers_b) {
     w.join();
   }
-  const double wall = std::chrono::duration<double>(b1 - b0).count();
-  std::size_t total_ops = 0;
-  for (auto c : counts) {
-    total_ops += c;
+  if (timed_out || job_elapsed_sec <= 0.0) {
+    return {job_elapsed_sec, 0.0, timed_out};
   }
-  const double concurrent_write_tps = wall > 0.0 ? static_cast<double>(total_ops) / wall : 0.0;
-  const double avg_op_elapsed_sec = reps > 0 ? op_elapsed_sec / static_cast<double>(reps) : op_elapsed_sec;
-
-  return {isolated_write_tps, concurrent_write_tps, avg_op_elapsed_sec, timed_out};
-}
-
-// Checkpoint-contention mode: same populate+checkpoint+pre-churn setup as run_steady()'s
-// t1t2_steady mode (a fixed 0.25 churn ratio -- isolates checkpoint()'s marginal per-record cost
-// from its fixed per-call setup overhead, same reasoning as run_checkpoint_throughput_probe.sh).
-// --ratio scales corpus size.
-// VMEMKV_BENCH_WORKLOAD selects what run_contention_probe()'s writer threads do, and what setup
-// this function does to make that measurement mean what its name says:
-//  - "update_cold" (default, original behavior): 25%-of-corpus pre-churn, then (if reused) one
-//    more checkpoint() that re-bases everything -- so at measurement time every key is base-
-//    resident, and a write_entry_lockfree()/in-place split emerges from this run's own touch
-//    history plus the concurrently-running checkpoint()'s base_boundary advancement. Kept as the
-//    original reference point; interpret its isolated/concurrent split with the caveat in
-//    must_read_papers/mmap_shared_vs_private_continued.md.
-//  - "update_warm": every key is update()'d once (moving it to tail) *without* a following
-//    checkpoint(), so at measurement time every key is guaranteed tail-resident -- every
-//    update() during measurement takes the cheap in-place seqlock path (see
-//    try_in_place_update()'s allow_in_place check, vmemkv_impl.hpp), a clean "cost of an
-//    in-place update" number rather than a mix.
-//  - "insert": no pre-churn at all -- corpus stays exactly as populated. Measurement uses fresh,
-//    never-before-used keys (WriteWorkload::kInsertFresh in run_contention_probe()), so every
-//    call deterministically takes the append path, the same one a base-resident update() takes.
-enum class ContentionWorkload { kUpdateCold, kUpdateWarm, kInsert };
-
-auto parse_contention_workload() -> ContentionWorkload {
-  const char *env = std::getenv("VMEMKV_BENCH_WORKLOAD");
-  if (env == nullptr) return ContentionWorkload::kUpdateCold;
-  const std::string_view value(env);
-  if (value == "update_warm") return ContentionWorkload::kUpdateWarm;
-  if (value == "insert") return ContentionWorkload::kInsert;
-  return ContentionWorkload::kUpdateCold;
-}
-
-auto contention_workload_name(ContentionWorkload workload) -> const char * {
-  switch (workload) {
-    case ContentionWorkload::kUpdateWarm:
-      return "update_warm";
-    case ContentionWorkload::kInsert:
-      return "insert";
-    case ContentionWorkload::kUpdateCold:
-    default:
-      return "update_cold";
+  std::size_t concurrent_ops = 0;
+  for (auto c : counts_b) {
+    concurrent_ops += c;
   }
+  const double concurrent_tps = static_cast<double>(concurrent_ops) / job_elapsed_sec;
+
+  // Phase A: isolated -- same setup, run for exactly job_elapsed_sec (timer-controlled), not a
+  // fixed op count -- matches Phase B's own window so the two TPS figures are comparable.
+  std::atomic<std::size_t> next_fresh_key_a{key_count};
+  std::atomic<bool> stop_a{false};
+  std::vector<std::thread> workers_a;
+  std::vector<std::size_t> counts_a(thread_count, 0);
+  workers_a.reserve(thread_count);
+  for (std::size_t t = 0; t < thread_count; ++t) {
+    workers_a.emplace_back([&, t]() {
+      std::mt19937_64 rng(kBenchmarkSeed + 5000 + t);
+      std::uniform_int_distribution<std::size_t> key_dist(0, key_count > 100 ? key_count - 100 : 1);
+      std::size_t done = 0;
+      while (!stop_a.load(std::memory_order_relaxed)) {
+        background_job_do_one_op(store, val_size, workload, rng, key_dist, next_fresh_key_a);
+        ++done;
+      }
+      counts_a[t] = done;
+    });
+  }
+  std::this_thread::sleep_for(std::chrono::duration<double>(job_elapsed_sec));
+  stop_a.store(true, std::memory_order_relaxed);
+  for (auto &w : workers_a) {
+    w.join();
+  }
+  std::size_t isolated_ops = 0;
+  for (auto c : counts_a) {
+    isolated_ops += c;
+  }
+  const double isolated_tps = static_cast<double>(isolated_ops) / job_elapsed_sec;
+  const double degradation_pct = isolated_tps > 0.0 ? (1.0 - concurrent_tps / isolated_tps) * 100.0 : 0.0;
+  return {job_elapsed_sec, degradation_pct, false};
 }
 
-[[noreturn]] void run_checkpoint_contention(const ProbeArgs &args) {
+// Fixed corpus size -- a single reproducible reference point (see this file's own doc comment
+// above) rather than a sweep across the matrix's 4 scenario/value-size combos.
+constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
+
+[[noreturn]] void run_background_job_probe(const ProbeArgs &args) {
   using Store = vmemkv::variants::VMemKVStore;
 
-  const ContentionWorkload workload = parse_contention_workload();
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-
-  const std::string path = reorg_probe_path(args,
-                                            std::string("checkpointcontention_") + contention_workload_name(workload) +
-                                                "_" + std::to_string(static_cast<int>(args.ratio * 100)));
-
+  const std::size_t key_count = kBackgroundJobProbeKeyCount;
+  const std::string path = reorg_probe_path(args, "backgroundjob_" + args.job);
   const std::size_t resolved_writer_threads = resolve_writer_threads();
 
-  // Suppressed for the whole setup phase below (population + initial checkpoint + optional
-  // pre-churn/warm-up), not just population: an auto-triggered checkpoint mid-warm-up would hit
-  // the exact same "concurrent with an active writer" cost this mode exists to isolate. Lifted
-  // again right before run_contention_probe() -- see its own explicit checkpoint() lambda, which
-  // this never touches (that's a manually requested call, not the auto-trigger this gates).
+  // Suppressed during setup only (population + initial checkpoint): an auto-triggered
+  // reorganize/checkpoint mid-populate would pollute the measurement below with exactly the
+  // cost this probe exists to isolate.
   setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
   populate_random_order(*store, {key_count, args.val_size});
   store->checkpoint();
-
-  if (workload == ContentionWorkload::kUpdateWarm) {
-    // Every key, once, via the real update() API (WAL-durable, same call the measurement phase
-    // itself makes) -- moves every key to tail. Deliberately *not* followed by a checkpoint()
-    // here: base_boundary must stay put so every key is still tail-resident (offset >=
-    // base_boundary) once this is durable.
-    const std::size_t warm_threads =
-        std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}});
-    std::vector<std::thread> workers;
-    workers.reserve(warm_threads);
-    for (std::size_t t = 0; t < warm_threads; ++t) {
-      workers.emplace_back([&store, key_count, val_size = args.val_size, t, warm_threads]() {
-        for (std::size_t idx = t; idx < key_count; idx += warm_threads) {
-          store->update(make_key(idx), make_value_for_key(idx, val_size));
-        }
-      });
-    }
-    for (auto &worker : workers) {
-      worker.join();
-    }
-  } else if (workload == ContentionWorkload::kUpdateCold) {
-    constexpr double kPreChurnRatio = 0.25;
-    const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * kPreChurnRatio));
-    apply_random_churn(
-        *store, key_count, churn_count, kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000), args.val_size);
-  }
-  // kInsert: no pre-churn/warm-up at all -- the populated+checkpointed corpus is exactly what
-  // the measurement phase's fresh-key inserts will be appended after.
   unsetenv("VMEMKV_SUPPRESS_AUTO_REORG");
 
-  const WriteWorkload write_workload =
-      workload == ContentionWorkload::kInsert ? WriteWorkload::kInsertFresh : WriteWorkload::kUpdateExisting;
-  auto [isolated_write_tps, concurrent_write_tps, checkpoint_elapsed_sec, timed_out] = run_contention_probe(
-      store,
-      key_count,
-      args.val_size,
-      [&store]() { store->checkpoint(); },
-      0.0,
-      resolved_writer_threads,
-      write_workload);
+  std::function<void()> run_job;
+  if (args.job == "reorganize") {
+    run_job = [&store]() { store->reorganize(); };
+  } else {
+    run_job = [&store]() { store->checkpoint(); };
+  }
 
-  const auto final_stats = store->impl().get_statistics();
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"checkpoint_contention\"," << "\"workload\":\"" << contention_workload_name(workload)
-            << "\"," << "\"ratio\":" << args.ratio << "," << "\"key_count\":" << key_count << ","
-            << "\"writer_threads\":" << resolved_writer_threads << ","
-            << "\"isolated_write_tps\":" << isolated_write_tps << ","
-            << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
-            << "\"checkpoint_elapsed_sec\":" << checkpoint_elapsed_sec << ","
-            << "\"timed_out\":" << (timed_out ? "true" : "false") << ","
-            << "\"last_checkpoint_us\":" << final_stats.last_checkpoint_duration_us << ","
-            << "\"last_checkpoint_msync_us\":" << final_stats.last_checkpoint_msync_duration_us << ","
-            << "\"last_checkpoint_t1_reorganize_us\":" << final_stats.last_checkpoint_t1_reorganize_duration_us << ","
-            << "\"last_checkpoint_stop_writers_us\":" << final_stats.last_checkpoint_stop_writers_duration_us << ","
-            << "\"last_checkpoint_barrier_drain_us\":" << final_stats.last_checkpoint_barrier_drain_duration_us << ","
-            << "\"last_checkpoint_wal_rotate_us\":" << final_stats.last_checkpoint_wal_rotate_duration_us << ","
-            << "\"last_checkpoint_wal_rotate_leader_wait_us\":" << final_stats.last_checkpoint_wal_rotate_leader_wait_us
-            << "," << "\"last_checkpoint_bytes_synced\":" << final_stats.last_checkpoint_bytes_synced << ","
-            << "\"last_checkpoint_corpus_bytes\":" << final_stats.last_checkpoint_corpus_bytes << "}" << std::endl;
-  std::_Exit(timed_out ? 124 : 0);
-}
+  bool any_timed_out = false;
+  double reported_elapsed_sec = 0.0;
+  std::optional<double> insert_pct;
+  std::optional<double> update_pct;
+  std::optional<double> scan_pct;
+  const std::array<std::pair<BackgroundJobWorkload, std::optional<double> *>, 3> workloads{{
+      {BackgroundJobWorkload::kInsert, &insert_pct},
+      {BackgroundJobWorkload::kUpdate, &update_pct},
+      {BackgroundJobWorkload::kScan, &scan_pct},
+  }};
+  for (const auto &[workload, out_pct] : workloads) {
+    auto result =
+        measure_workload_degradation(store, key_count, args.val_size, workload, resolved_writer_threads, run_job);
+    reported_elapsed_sec = result.job_elapsed_sec;
+    if (result.timed_out) {
+      any_timed_out = true;
+      break;
+    }
+    *out_pct = result.degradation_pct;
+  }
 
-// Reorg-contention mode: same populate+checkpoint setup as run_checkpoint_contention(), minus its
-// pre-churn/workload options. reorganize() is T1-only (never touches T2); its cost tracks live key
-// count. --ratio scales corpus size.
-//
-// Passes min_wall_seconds=1.0 to run_contention_probe(): a single reorganize() call is sub-10ms
-// even at full corpus, too short a window for concurrent_write_tps to reflect anything but writer
-// thread scheduling jitter (see that function's own comment) -- repeating the call for at least a
-// second gives writer threads a steady-state window to run in instead.
-constexpr double kReorgContentionMinWallSeconds = 1.0;
-[[noreturn]] void run_reorg_contention(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-
-  const std::string path =
-      reorg_probe_path(args, "reorgcontention_" + std::to_string(static_cast<int>(args.ratio * 100)));
-
-  const std::size_t resolved_writer_threads = resolve_writer_threads();
-
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  populate_random_order(*store, {key_count, args.val_size});
-  store->checkpoint();
-
-  auto [isolated_write_tps, concurrent_write_tps, reorg_elapsed_sec, timed_out] = run_contention_probe(
-      store,
-      key_count,
-      args.val_size,
-      [&store]() { store->reorganize(); },
-      kReorgContentionMinWallSeconds,
-      resolved_writer_threads);
-
-  // Inlined (not shared with run_checkpoint_contention()'s print below): that mode's result
-  // carries a workload field and trailing checkpoint-phase stats this mode doesn't have, so a
-  // shared helper would need as many optional fields as it saves lines.
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"reorg_contention\"," << "\"ratio\":" << args.ratio << ","
-            << "\"key_count\":" << key_count << "," << "\"writer_threads\":" << resolved_writer_threads << ","
-            << "\"isolated_write_tps\":" << isolated_write_tps << ","
-            << "\"concurrent_write_tps\":" << concurrent_write_tps << ","
-            << "\"reorg_elapsed_sec\":" << reorg_elapsed_sec << ","
-            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
-  std::_Exit(timed_out ? 124 : 0);
+  auto pct_json = [](std::optional<double> v) -> std::string { return v.has_value() ? std::to_string(*v) : "null"; };
+  std::cout << "{\"job\":\"" << args.job << "\"," << "\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\","
+            << "\"value_size\":" << args.val_size << "," << "\"key_count\":" << key_count << ","
+            << "\"writer_threads\":" << resolved_writer_threads << "," << "\"job_elapsed_sec\":" << reported_elapsed_sec
+            << "," << "\"insert_degradation_pct\":" << pct_json(insert_pct) << ","
+            << "\"update_degradation_pct\":" << pct_json(update_pct) << ","
+            << "\"scan_degradation_pct\":" << pct_json(scan_pct) << ","
+            << "\"timed_out\":" << (any_timed_out ? "true" : "false") << "}" << std::endl;
+  std::_Exit(any_timed_out ? 124 : 0);
 }
 
 [[noreturn]] void run(const ProbeArgs &args) {
@@ -2468,10 +2360,8 @@ constexpr double kReorgContentionMinWallSeconds = 1.0;
   }
   if (args.mode == ProbeMode::kT1T2Steady) {
     run_steady(args);
-  } else if (args.mode == ProbeMode::kCheckpointContention) {
-    run_checkpoint_contention(args);
-  } else if (args.mode == ProbeMode::kReorgContention) {
-    run_reorg_contention(args);
+  } else if (args.mode == ProbeMode::kBackgroundJobProbe) {
+    run_background_job_probe(args);
   } else {
     run_bootstrap(args);
   }
