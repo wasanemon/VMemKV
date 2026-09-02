@@ -73,7 +73,12 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">新しいレポート生成パイプラインでの初回計測(<code>--without-rivals</code>: RocksDB/RocksDB-BlobDB/LMDBは2026-08-27の数値を再利用)。VMemKVの設計: T2は<code>MAP_SHARED</code>(page cacheへ直接書き込み、<code>msync()</code>で永続化)、<code>defragment()</code>は恒久的no-op(API削除済み)、<code>T1AppendCapacityLog2</code>=2^21。今回はパイプライン側(title/h1置換バグ修正、旧probe関連コード整理)のみの変更。</p>
+                <p class="mb-1.5">(<a href="2026082101_charts.html" class="text-indigo-600 hover:underline">08/21</a>時点比、設計面の差分のみ。rival数値は2026-08-27の計測を再利用):</p>
+                <ul class="list-disc pl-4 space-y-1">
+                  <li>T2を<code>MAP_PRIVATE</code>→<code>MAP_SHARED</code>化(page cacheへの書き込みが<code>msync()</code>でそのまま永続化される設計に変更)、WALを世代単位でセグメント分割。<code>checkpoint()</code>のWALバイト閾値(<code>WalMaxBytesSinceCheckpoint</code>)が大きい値サイズ(64KB等)で実質発火しなかったバグを修正。</li>
+                  <li><code>defragment()</code>を恒久的no-op化した上でAPI・<code>TailEntryTracker</code>・T2-generation-pairing機構ごと完全削除。<code>T1AppendCapacityLog2</code>を2^22→2^21に縮小(RSSフットプリント対策、TODO.md参照)。</li>
+                </ul>
+                <p class="mb-1.5 mt-3">新しいレポート生成パイプラインでの初回計測でもある(<code>--without-rivals</code>):</p>
                 <ul class="list-disc pl-4 space-y-1">
                   <li>Summary tabをWorkload Winners行列と新設のBackground Jobsテーブル(reorganize()/checkpoint() &times; in_memory/ltm、固定1KB&times;1,000万件コーパス)のみに簡素化。</li>
                   <li>Background Jobs計測結果: in_memoryでは両ジョブとも完了(reorganize() 1.495秒・Insert劣化49%/Update劣化-6%/Scan劣化83%、checkpoint() 4.193秒・Insert劣化49%/Update劣化2%/Scan劣化27%)。ltmでは両ジョブとも内部タイムアウト(60秒)に到達し未完了 -- 1KB&times;1,000万件コーパスに対し、LTM(cgroup制約)下でのreorganize()/checkpoint()が60秒を超えることを示す一点のデータ。原因分析は別途。</li>
