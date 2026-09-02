@@ -1,0 +1,4 @@
+{"scenario":"in_memory","value_size":8,"mode":"t1only","ratio":0.25,"churn_ratio":null,"key_count":5000000,"elapsed_sec":1.09699,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1only","ratio":0.5,"churn_ratio":null,"key_count":10000000,"elapsed_sec":1.53962,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1only","ratio":0.75,"churn_ratio":null,"key_count":15000000,"elapsed_sec":1.06306,"timed_out":false}
+{"scenario":"in_memory","value_size":8,"mode":"t1only","ratio":1,"churn_ratio":null,"key_count":20000000,"elapsed_sec":3.04878,"timed_out":false}

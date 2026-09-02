@@ -66,6 +66,21 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-09-02</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026090215_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i x4 (09/02)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <p class="mb-1.5">(<a href="2026082819_charts.html" class="text-indigo-600 hover:underline">08/28</a>時点比、<code>--without-rivals</code>: RocksDB/RocksDB-BlobDB/LMDBは08/28の数値を再利用):</p>
+                <ul class="list-disc pl-4 space-y-1">
+                  <li>コード側の変更: <code>defragment()</code>を恒久的no-op化した上でAPI・<code>TailEntryTracker</code>・T2-generation-pairing機構ごと完全削除(Round 1-3)、T2読み書きハンドル分離とstaleコメント一掃(Round 4)、<code>scan()</code>のキー末尾切り詰めバグ修正と1.04MBレコード上限のthrow化(Round 6)、<code>bulk_load()</code>のSTORE_NOT_FOUNDセンチネル衝突によるデータロス修正(Round 7)、その他デッドコード/ドキュメント修正多数。加えて<code>T1AppendCapacityLog2</code>を2^22→2^21に縮小(RSSフットプリントとhard-stall余地のトレードオフ調整、機能追加ではなく既存ノブの再チューニング)。</li>
+                  <li><strong>defragmentのno-op化以外にも設計レベルの変更(AppendRegion容量縮小)を含む</strong>ため、単純な「リファクタリングのみ」比較にはならない点に注意。08/28・08/21両方と比較したところ、中央値では大半のセルが+1〜+8%(単発spotインスタンス間の通常のばらつき範囲)に収まる一方、2つの系統的な差分を検出: (1) LTM・高スレッド数(16/32)でのInsert/Update/Delete系が一貫して-25%〜-70%低下(1KB/64KB値、Baseline/Bloom-T1InlineValue双方、両旧レポートに対して同方向・同程度) -- AppendRegion容量縮小により持続書き込み下でreorganize()がより頻繁に発火するようになったことが原因として最も妥当。(2) YCSB-E/Scan/Update系でthreads:32が広範囲かつ一貫して+60%〜+300%超の改善 -- 全シナリオ・全variantで同方向に揃っており偶然のノイズにしては出来すぎているが、単発測定(繰り返し試行なし)のため、この主張を論文等で使う場合は複数回計測での再検証を推奨。</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
               <td class="py-4 pr-4 text-slate-400">2026-08-28</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026082819_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
