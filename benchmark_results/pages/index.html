@@ -73,7 +73,7 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">新しいレポート生成パイプラインでの初回計測(<code>--without-rivals</code>: RocksDB/RocksDB-BlobDB/LMDBは2026-08-27の数値を再利用)。コード側の変更はなし(title/h1置換バグ修正、defragment/旧probe関連コードの整理のみ)。</p>
+                <p class="mb-1.5">新しいレポート生成パイプラインでの初回計測(<code>--without-rivals</code>: RocksDB/RocksDB-BlobDB/LMDBは2026-08-27の数値を再利用)。VMemKVの設計: T2は<code>MAP_SHARED</code>(page cacheへ直接書き込み、<code>msync()</code>で永続化)、<code>defragment()</code>は恒久的no-op(API削除済み)、<code>T1AppendCapacityLog2</code>=2^21。今回はパイプライン側(title/h1置換バグ修正、旧probe関連コード整理)のみの変更。</p>
                 <ul class="list-disc pl-4 space-y-1">
                   <li>Summary tabをWorkload Winners行列と新設のBackground Jobsテーブル(reorganize()/checkpoint() &times; in_memory/ltm、固定1KB&times;1,000万件コーパス)のみに簡素化。</li>
                   <li>Background Jobs計測結果: in_memoryでは両ジョブとも完了(reorganize() 1.495秒・Insert劣化49%/Update劣化-6%/Scan劣化83%、checkpoint() 4.193秒・Insert劣化49%/Update劣化2%/Scan劣化27%)。ltmでは両ジョブとも内部タイムアウト(60秒)に到達し未完了 -- 1KB&times;1,000万件コーパスに対し、LTM(cgroup制約)下でのreorganize()/checkpoint()が60秒を超えることを示す一点のデータ。原因分析は別途。</li>
