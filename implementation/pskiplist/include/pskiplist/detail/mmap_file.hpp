@@ -49,6 +49,13 @@ class MmapFile {
   [[nodiscard]] auto data() const -> void * { return data_; }
   [[nodiscard]] auto size() const -> size_t { return size_; }
 
+  // Blocks until the mapping's dirty pages are durable on the underlying storage (3章).
+  void sync() const {
+    if (::msync(data_, size_, MS_SYNC) != 0) {
+      throw std::system_error(errno, std::generic_category(), "msync");
+    }
+  }
+
  private:
   int fd_ = -1;
   void *data_ = nullptr;

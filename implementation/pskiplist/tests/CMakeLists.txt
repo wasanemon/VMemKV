@@ -6,6 +6,7 @@ add_executable(test_pskiplist
   normal/test_concurrent.cpp
   normal/test_mmap_storage.cpp
   normal/test_manifest.cpp
+  normal/test_checkpoint.cpp
   error/test_functional.cpp
   error/test_manifest.cpp
 )

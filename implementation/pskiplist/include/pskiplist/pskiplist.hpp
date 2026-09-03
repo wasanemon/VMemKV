@@ -286,6 +286,13 @@ class MmapFile {
   [[nodiscard]] auto data() const -> void * { return data_; }
   [[nodiscard]] auto size() const -> size_t { return size_; }
 
+  // Blocks until the mapping's dirty pages are durable on the underlying storage (3章).
+  void sync() const {
+    if (::msync(data_, size_, MS_SYNC) != 0) {
+      throw std::system_error(errno, std::generic_category(), "msync");
+    }
+  }
+
  private:
   int fd_ = -1;
   void *data_ = nullptr;
@@ -317,7 +324,8 @@ class PSkipList {
   // up front, since a sparse file only consumes disk for pages actually written. The data
   // file at `path` is mutated in place via MAP_SHARED; it is not rewritten on checkpoint.
   explicit PSkipList(const std::filesystem::path &path, size_t capacity_bytes)
-      : file_(path, capacity_bytes),
+      : path_(path),
+        file_(path, capacity_bytes),
         nodes_(static_cast<DurableNode<Key> *>(file_.data())),
         capacity_slots_(file_.size() / sizeof(DurableNode<Key>)) {
     if (capacity_slots_ < 2) {
@@ -367,6 +375,7 @@ class PSkipList {
         if (fresh == kNullOffset) return false;
         nodes_[fresh].key = key;
         nodes_[fresh].value.store(PackedValue::live(payload).raw(), std::memory_order_relaxed);
+        nodes_[fresh].epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_relaxed);
       }
       nodes_[fresh].forward0.store(pack_forward(existing, false), std::memory_order_relaxed);
 
@@ -435,6 +444,25 @@ class PSkipList {
 
     const std::lock_guard<std::mutex> free_lock(free_mutex_);
     free_list_.insert(free_list_.end(), snapshot.begin(), snapshot.end());
+  }
+
+  // Synchronous and blocking. Any put()/remove() that had already returned before this
+  // call started is durable once this returns true; whether one that started during the
+  // call is durable is unspecified. Concurrent checkpoint() calls are serialized on
+  // epoch_mutex_. Only writers are waited for — a long-running scan() never blocks this.
+  [[nodiscard]] auto checkpoint() -> bool {
+    const std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
+
+    const uint64_t published_epoch = epoch_.load(std::memory_order_acquire);
+    epoch_.fetch_add(1, std::memory_order_acq_rel);
+    auto &old_slot = epoch_slots_[published_epoch & 1];
+    while (old_slot.writers.load(std::memory_order_acquire) != 0) {
+      std::this_thread::yield();
+    }
+
+    file_.sync();
+    write_manifest(path_, published_epoch, high_water_mark_.load(std::memory_order_acquire));
+    return true;
   }
 
  private:
@@ -522,6 +550,7 @@ class PSkipList {
     static_cast<void>(find_at_or_after(key, &predecessor));
   }
 
+  std::filesystem::path path_;
   MmapFile file_;
   DurableNode<Key> *nodes_;
   size_t capacity_slots_;
