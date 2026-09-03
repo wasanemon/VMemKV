@@ -2,18 +2,21 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <stdexcept>
 #include <system_error>
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace pskiplist {
 
 // RAII POSIX file opened, sized, and mapped MAP_SHARED for direct in-place mutation.
-// Sized once at construction and never grown (2.6節). The file is always truncated to
-// zero first, so construction always starts from a fresh, fully-zeroed mapping —
-// reopening an existing file's prior contents is recovery's concern, not this class's.
+// Sized once at construction and never grown (2.6節). A brand-new (empty) file is
+// zero-extended to size_bytes; an existing non-empty file's content is preserved as-is
+// (recovery, 3章, decides what in it to trust) and must already be exactly size_bytes —
+// a mismatch is a construction error, not something this class silently resolves.
 class MmapFile {
  public:
   MmapFile(const std::filesystem::path &path, size_t size_bytes) : size_(size_bytes) {
@@ -21,11 +24,28 @@ class MmapFile {
     if (fd_ < 0) {
       throw std::system_error(errno, std::generic_category(), "open(" + path.string() + ")");
     }
-    if (::ftruncate(fd_, 0) != 0 || ::ftruncate(fd_, static_cast<off_t>(size_)) != 0) {
+
+    struct stat st {};
+    if (::fstat(fd_, &st) != 0) {
       const int err = errno;
       ::close(fd_);
-      throw std::system_error(err, std::generic_category(), "ftruncate(" + path.string() + ")");
+      throw std::system_error(err, std::generic_category(), "fstat(" + path.string() + ")");
     }
+
+    if (st.st_size == 0) {
+      if (::ftruncate(fd_, static_cast<off_t>(size_)) != 0) {
+        const int err = errno;
+        ::close(fd_);
+        throw std::system_error(err, std::generic_category(), "ftruncate(" + path.string() + ")");
+      }
+    } else {
+      reused_ = true;
+      if (static_cast<size_t>(st.st_size) != size_) {
+        ::close(fd_);
+        throw std::invalid_argument("pskiplist: " + path.string() + " exists with a size that does not match capacity_bytes");
+      }
+    }
+
     data_ = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (data_ == MAP_FAILED) {
       const int err = errno;
@@ -48,6 +68,9 @@ class MmapFile {
 
   [[nodiscard]] auto data() const -> void * { return data_; }
   [[nodiscard]] auto size() const -> size_t { return size_; }
+  // True if `path` already existed with content (i.e. wasn't freshly created) —
+  // PSkipList uses this to decide whether to run recovery instead of a fresh init.
+  [[nodiscard]] auto reused() const -> bool { return reused_; }
 
   // Blocks until the mapping's dirty pages are durable on the underlying storage (3章).
   void sync() const {
@@ -60,6 +83,7 @@ class MmapFile {
   int fd_ = -1;
   void *data_ = nullptr;
   size_t size_ = 0;
+  bool reused_ = false;
 };
 
 }  // namespace pskiplist

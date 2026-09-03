@@ -38,9 +38,11 @@ class PSkipList {
     if (capacity_slots_ < 2) {
       throw std::invalid_argument("pskiplist: capacity_bytes too small to hold head/tail sentinels");
     }
-    ::new (&nodes_[kHead]) DurableNode<Key>();
-    ::new (&nodes_[kTail]) DurableNode<Key>();
-    nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
+    if (file_.reused()) {
+      recover();
+    } else {
+      initialize_fresh();
+    }
   }
 
   PSkipList(const PSkipList &) = delete;
@@ -175,6 +177,57 @@ class PSkipList {
  private:
   static constexpr Offset kHead = 0;
   static constexpr Offset kTail = 1;
+
+  void initialize_fresh() {
+    ::new (&nodes_[kHead]) DurableNode<Key>();
+    ::new (&nodes_[kTail]) DurableNode<Key>();
+    nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
+  }
+
+  // Called only when the backing file already had content. No manifest means no
+  // checkpoint() ever completed for this file, so nothing in it is trusted — start fresh
+  // exactly as a brand-new file would. Otherwise, walk Level 0 from head, trusting nodes
+  // in encounter order only while their epoch stamp is <= the manifest's: a node past
+  // that point may have been concurrently written by a writer checkpoint() didn't wait
+  // for, so neither it nor anything reachable only through it is trustworthy, and the
+  // walk stops there, splicing the chain to end at that point. Every allocated slot
+  // (2章) below the manifest's high_water_mark that the walk didn't reach — whether never
+  // linked in, or unlinked-but-not-yet-reclaimed before the crash — becomes free (2.3節's
+  // mark-and-sweep). high_water_mark_ rolls back to the manifest's value: any allocation
+  // racing the checkpoint that isn't captured by it is simply not recovered.
+  void recover() {
+    const auto manifest = read_manifest(path_);
+    if (!manifest.has_value()) {
+      initialize_fresh();
+      return;
+    }
+
+    const uint64_t threshold = manifest->epoch;
+    const uint64_t recovered_high_water_mark = manifest->high_water_mark;
+
+    std::vector<bool> reached(recovered_high_water_mark, false);
+    Offset pred = kHead;
+    Offset current = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
+    while (current != kTail) {
+      if (current >= recovered_high_water_mark ||
+          nodes_[current].epoch.load(std::memory_order_relaxed) > threshold) {
+        nodes_[pred].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
+        break;
+      }
+      reached[current] = true;
+      pred = current;
+      current = forward_offset(nodes_[current].forward0.load(std::memory_order_relaxed));
+    }
+
+    free_list_.clear();
+    for (Offset offset = 2; offset < recovered_high_water_mark; ++offset) {
+      if (!reached[offset]) {
+        free_list_.push_back(offset);
+      }
+    }
+
+    high_water_mark_.store(recovered_high_water_mark, std::memory_order_relaxed);
+  }
 
   [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool {
     return !less_(a, b) && !less_(b, a);

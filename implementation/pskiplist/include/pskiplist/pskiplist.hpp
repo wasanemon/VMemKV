@@ -239,18 +239,21 @@ inline void write_manifest(const std::filesystem::path &data_path, uint64_t epoc
 
 #include <cstddef>
 #include <filesystem>
+#include <stdexcept>
 #include <system_error>
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace pskiplist {
 
 // RAII POSIX file opened, sized, and mapped MAP_SHARED for direct in-place mutation.
-// Sized once at construction and never grown (2.6節). The file is always truncated to
-// zero first, so construction always starts from a fresh, fully-zeroed mapping —
-// reopening an existing file's prior contents is recovery's concern, not this class's.
+// Sized once at construction and never grown (2.6節). A brand-new (empty) file is
+// zero-extended to size_bytes; an existing non-empty file's content is preserved as-is
+// (recovery, 3章, decides what in it to trust) and must already be exactly size_bytes —
+// a mismatch is a construction error, not something this class silently resolves.
 class MmapFile {
  public:
   MmapFile(const std::filesystem::path &path, size_t size_bytes) : size_(size_bytes) {
@@ -258,11 +261,28 @@ class MmapFile {
     if (fd_ < 0) {
       throw std::system_error(errno, std::generic_category(), "open(" + path.string() + ")");
     }
-    if (::ftruncate(fd_, 0) != 0 || ::ftruncate(fd_, static_cast<off_t>(size_)) != 0) {
+
+    struct stat st {};
+    if (::fstat(fd_, &st) != 0) {
       const int err = errno;
       ::close(fd_);
-      throw std::system_error(err, std::generic_category(), "ftruncate(" + path.string() + ")");
+      throw std::system_error(err, std::generic_category(), "fstat(" + path.string() + ")");
     }
+
+    if (st.st_size == 0) {
+      if (::ftruncate(fd_, static_cast<off_t>(size_)) != 0) {
+        const int err = errno;
+        ::close(fd_);
+        throw std::system_error(err, std::generic_category(), "ftruncate(" + path.string() + ")");
+      }
+    } else {
+      reused_ = true;
+      if (static_cast<size_t>(st.st_size) != size_) {
+        ::close(fd_);
+        throw std::invalid_argument("pskiplist: " + path.string() + " exists with a size that does not match capacity_bytes");
+      }
+    }
+
     data_ = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (data_ == MAP_FAILED) {
       const int err = errno;
@@ -285,6 +305,9 @@ class MmapFile {
 
   [[nodiscard]] auto data() const -> void * { return data_; }
   [[nodiscard]] auto size() const -> size_t { return size_; }
+  // True if `path` already existed with content (i.e. wasn't freshly created) —
+  // PSkipList uses this to decide whether to run recovery instead of a fresh init.
+  [[nodiscard]] auto reused() const -> bool { return reused_; }
 
   // Blocks until the mapping's dirty pages are durable on the underlying storage (3章).
   void sync() const {
@@ -297,6 +320,7 @@ class MmapFile {
   int fd_ = -1;
   void *data_ = nullptr;
   size_t size_ = 0;
+  bool reused_ = false;
 };
 
 }  // namespace pskiplist
@@ -331,9 +355,11 @@ class PSkipList {
     if (capacity_slots_ < 2) {
       throw std::invalid_argument("pskiplist: capacity_bytes too small to hold head/tail sentinels");
     }
-    ::new (&nodes_[kHead]) DurableNode<Key>();
-    ::new (&nodes_[kTail]) DurableNode<Key>();
-    nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
+    if (file_.reused()) {
+      recover();
+    } else {
+      initialize_fresh();
+    }
   }
 
   PSkipList(const PSkipList &) = delete;
@@ -468,6 +494,57 @@ class PSkipList {
  private:
   static constexpr Offset kHead = 0;
   static constexpr Offset kTail = 1;
+
+  void initialize_fresh() {
+    ::new (&nodes_[kHead]) DurableNode<Key>();
+    ::new (&nodes_[kTail]) DurableNode<Key>();
+    nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
+  }
+
+  // Called only when the backing file already had content. No manifest means no
+  // checkpoint() ever completed for this file, so nothing in it is trusted — start fresh
+  // exactly as a brand-new file would. Otherwise, walk Level 0 from head, trusting nodes
+  // in encounter order only while their epoch stamp is <= the manifest's: a node past
+  // that point may have been concurrently written by a writer checkpoint() didn't wait
+  // for, so neither it nor anything reachable only through it is trustworthy, and the
+  // walk stops there, splicing the chain to end at that point. Every allocated slot
+  // (2章) below the manifest's high_water_mark that the walk didn't reach — whether never
+  // linked in, or unlinked-but-not-yet-reclaimed before the crash — becomes free (2.3節's
+  // mark-and-sweep). high_water_mark_ rolls back to the manifest's value: any allocation
+  // racing the checkpoint that isn't captured by it is simply not recovered.
+  void recover() {
+    const auto manifest = read_manifest(path_);
+    if (!manifest.has_value()) {
+      initialize_fresh();
+      return;
+    }
+
+    const uint64_t threshold = manifest->epoch;
+    const uint64_t recovered_high_water_mark = manifest->high_water_mark;
+
+    std::vector<bool> reached(recovered_high_water_mark, false);
+    Offset pred = kHead;
+    Offset current = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
+    while (current != kTail) {
+      if (current >= recovered_high_water_mark ||
+          nodes_[current].epoch.load(std::memory_order_relaxed) > threshold) {
+        nodes_[pred].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
+        break;
+      }
+      reached[current] = true;
+      pred = current;
+      current = forward_offset(nodes_[current].forward0.load(std::memory_order_relaxed));
+    }
+
+    free_list_.clear();
+    for (Offset offset = 2; offset < recovered_high_water_mark; ++offset) {
+      if (!reached[offset]) {
+        free_list_.push_back(offset);
+      }
+    }
+
+    high_water_mark_.store(recovered_high_water_mark, std::memory_order_relaxed);
+  }
 
   [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool {
     return !less_(a, b) && !less_(b, a);
