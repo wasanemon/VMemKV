@@ -201,8 +201,11 @@ class PSkipList {
     for (;;) {
       Offset pred = kHead;
       Offset current = forward_offset(nodes_[pred].forward0.load(std::memory_order_acquire));
-      bool restart = false;
-      while (current != kTail) {
+      for (;;) {
+        if (current == kTail) {
+          *predecessor = pred;
+          return current;
+        }
         const uint64_t current_raw = nodes_[current].forward0.load(std::memory_order_acquire);
         if (forward_marked(current_raw)) {
           const Offset successor = forward_offset(current_raw);
@@ -211,19 +214,15 @@ class PSkipList {
           if (nodes_[pred].forward0.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
             enqueue_pending_unlink(current);
           }
-          restart = true;
-          break;
+          break;  // restart the whole search from head
         }
-        if (less_(nodes_[current].key, key)) {
-          pred = current;
-          current = forward_offset(current_raw);
-        } else {
-          break;
+        if (!less_(nodes_[current].key, key)) {
+          *predecessor = pred;
+          return current;
         }
+        pred = current;
+        current = forward_offset(current_raw);
       }
-      if (restart) continue;
-      *predecessor = pred;
-      return current;
     }
   }
 
