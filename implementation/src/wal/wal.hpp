@@ -116,7 +116,7 @@ class Wal {
     }
   };
 
-  explicit Wal(const std::filesystem::path &path);
+  explicit Wal(std::filesystem::path path);
   ~Wal() noexcept;
 
   Wal(const Wal &) = delete;
@@ -195,7 +195,7 @@ class Wal {
   // write_and_fsync_batch() (see that method's own comment). A torn tail found with
   // allow_truncate=false is therefore a genuine integrity failure, not an ordinary crash
   // artifact, and throws instead of silently truncating.
-  auto scan_and_validate(int fd, bool allow_truncate) const -> uint64_t;
+  static auto scan_and_validate(int segment_fd, bool allow_truncate) -> uint64_t;
 
   // Drains and writes+fsyncs everything assigned an LSN so far, looping to absorb backlog that
   // arrives mid-flush. Caller must already hold leadership. Returns the next_lsn_ snapshot caught
@@ -230,8 +230,10 @@ class Wal {
   // Shared pread wrappers used by scan_and_validate()/replay(), which otherwise would each
   // hand-roll an identical "pread this many bytes at this offset or throw" sequence. Take an
   // explicit fd (not fd_) since both callers read arbitrary segments, not just the active one.
-  [[nodiscard]] auto read_header_at(int fd, uint64_t offset) const -> WalRecordHeader;
-  [[nodiscard]] auto read_payload_at(int fd, uint64_t offset, uint64_t payload_len) const -> std::vector<std::byte>;
+  [[nodiscard]] static auto read_header_at(int segment_fd, uint64_t offset) -> WalRecordHeader;
+  [[nodiscard]] static auto read_payload_at(int segment_fd,
+                                            uint64_t offset,
+                                            uint64_t payload_len) -> std::vector<std::byte>;
 
   // Atomic because replay()/size_bytes() can read fd_ concurrently with rotate_segment()'s
   // close()-then-reassign; a plain int would be a data race (UB) and risk a

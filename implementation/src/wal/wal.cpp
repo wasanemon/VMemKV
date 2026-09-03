@@ -42,7 +42,7 @@ constexpr uint64_t kIterationsPerMillionForLog = 1'000'000;
 
 }  // namespace
 
-Wal::Wal(const std::filesystem::path &path) : path_(path) {
+Wal::Wal(std::filesystem::path path) : path_(std::move(path)) {
   const std::vector<uint64_t> generations = discover_segments(path_);
 
   if (generations.empty()) {
@@ -120,9 +120,9 @@ auto Wal::discover_segments(const std::filesystem::path &wal_path) -> std::vecto
   return generations;
 }
 
-auto Wal::scan_and_validate(int fd, bool allow_truncate) const -> uint64_t {
+auto Wal::scan_and_validate(int segment_fd, bool allow_truncate) -> uint64_t {
   struct stat file_stat {};
-  if (::fstat(fd, &file_stat) != 0) {
+  if (::fstat(segment_fd, &file_stat) != 0) {
     throw std::system_error(errno, std::generic_category(), "fstat wal segment");
   }
   const auto file_size = static_cast<uint64_t>(file_stat.st_size);
@@ -131,7 +131,7 @@ auto Wal::scan_and_validate(int fd, bool allow_truncate) const -> uint64_t {
   uint64_t last_valid_lsn = 0;
 
   while (file_size - offset >= sizeof(WalRecordHeader)) {
-    const WalRecordHeader header = read_header_at(fd, offset);
+    const WalRecordHeader header = read_header_at(segment_fd, offset);
 
     if (header.magic != kWalRecordMagic || header.format_version != kWalFormatVersion) {
       break;  // Corrupt, or a record layout this build doesn't understand: stop here.
@@ -142,7 +142,7 @@ auto Wal::scan_and_validate(int fd, bool allow_truncate) const -> uint64_t {
       break;  // Torn payload: stop here.
     }
 
-    const std::vector<std::byte> payload = read_payload_at(fd, offset + sizeof(WalRecordHeader), payload_len);
+    const std::vector<std::byte> payload = read_payload_at(segment_fd, offset + sizeof(WalRecordHeader), payload_len);
 
     const std::span<const std::byte> key_span(payload.data(), header.key_len);
     const std::span<const std::byte> value_span(payload.data() + header.key_len, header.value_len);
@@ -158,7 +158,7 @@ auto Wal::scan_and_validate(int fd, bool allow_truncate) const -> uint64_t {
     if (!allow_truncate) {
       throw std::runtime_error("wal: corrupt tail found in a retired (non-active) segment");
     }
-    if (::ftruncate(fd, static_cast<off_t>(offset)) != 0) {
+    if (::ftruncate(segment_fd, static_cast<off_t>(offset)) != 0) {
       throw std::system_error(errno, std::generic_category(), "ftruncate wal");
     }
   }
@@ -166,19 +166,19 @@ auto Wal::scan_and_validate(int fd, bool allow_truncate) const -> uint64_t {
   return last_valid_lsn;
 }
 
-auto Wal::read_header_at(int fd, uint64_t offset) const -> WalRecordHeader {
+auto Wal::read_header_at(int segment_fd, uint64_t offset) -> WalRecordHeader {
   WalRecordHeader header;
-  const ssize_t header_read = ::pread(fd, &header, sizeof(header), static_cast<off_t>(offset));
+  const ssize_t header_read = ::pread(segment_fd, &header, sizeof(header), static_cast<off_t>(offset));
   if (header_read != static_cast<ssize_t>(sizeof(header))) {
     throw std::system_error(errno, std::generic_category(), "pread wal header");
   }
   return header;
 }
 
-auto Wal::read_payload_at(int fd, uint64_t offset, uint64_t payload_len) const -> std::vector<std::byte> {
+auto Wal::read_payload_at(int segment_fd, uint64_t offset, uint64_t payload_len) -> std::vector<std::byte> {
   std::vector<std::byte> payload(payload_len);
   if (payload_len > 0) {
-    const ssize_t payload_read = ::pread(fd, payload.data(), payload_len, static_cast<off_t>(offset));
+    const ssize_t payload_read = ::pread(segment_fd, payload.data(), payload_len, static_cast<off_t>(offset));
     if (payload_read != static_cast<ssize_t>(payload_len)) {
       throw std::system_error(errno, std::generic_category(), "pread wal payload");
     }

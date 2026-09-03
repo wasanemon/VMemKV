@@ -26,8 +26,8 @@ inline constexpr size_t kCacheLineSize = 64;
 class GlobalThreadId {
  public:
   static auto get() noexcept -> size_t {
-    thread_local const size_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
-    return id;
+    thread_local const size_t thread_id = next_id_.fetch_add(1, std::memory_order_relaxed);
+    return thread_id;
   }
 
  private:
@@ -138,16 +138,16 @@ class ThreadReferenceTracker {
   // whatever boundary that wait is enforcing either (it hasn't reached the read that would
   // matter yet), so missing it here is never a correctness problem, only a growth timing detail.
   auto slot_for_current_thread() const -> std::atomic<T> & {
-    const size_t id = GlobalThreadId::get();
-    if (id < capacity_.load(std::memory_order_acquire)) {
-      return slots_[id].value;
+    const size_t thread_id = GlobalThreadId::get();
+    if (thread_id < capacity_.load(std::memory_order_acquire)) {
+      return slots_[thread_id].value;
     }
     const std::lock_guard<std::mutex> lock(growth_mutex_);
-    while (slots_.size() <= id) {
+    while (slots_.size() <= thread_id) {
       slots_.emplace_back();
     }
     capacity_.store(slots_.size(), std::memory_order_release);
-    return slots_[id].value;
+    return slots_[thread_id].value;
   }
 
   auto current_slot_count() const -> size_t {

@@ -109,6 +109,7 @@ struct T2Memory {
 
   // `initial_bytes_used`: for a rebuilt/adopted mapping with live records already at construction
   // time; 0 for a brand-new empty file.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   T2Memory(std::byte *base_ptr, uint64_t capacity_bytes, uint64_t initial_bytes_used) noexcept
       : base(base_ptr), capacity(capacity_bytes), bytes_used(initial_bytes_used), base_boundary(initial_bytes_used) {}
 
