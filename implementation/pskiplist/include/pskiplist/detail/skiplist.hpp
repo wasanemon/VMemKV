@@ -45,7 +45,7 @@ class PSkipList {
   auto operator=(const PSkipList &) -> PSkipList & = delete;
 
   [[nodiscard]] auto get(const Key &key) const -> std::optional<uint64_t> {
-    const EpochToken token(active_, epoch_parity_);
+    const EpochToken token(epoch_slots_, epoch_, EpochRole::kReader);
     Offset predecessor = kNullOffset;
     const Offset current = find_at_or_after(key, &predecessor);
     if (current == kNullOffset || current == kTail || !keys_equal(nodes_[current].key, key)) {
@@ -57,7 +57,7 @@ class PSkipList {
   }
 
   [[nodiscard]] auto put(const Key &key, uint64_t payload) -> bool {
-    const EpochToken token(active_, epoch_parity_);
+    const EpochToken token(epoch_slots_, epoch_, EpochRole::kWriter);
     Offset fresh = kNullOffset;
     for (;;) {
       Offset predecessor = kNullOffset;
@@ -92,7 +92,7 @@ class PSkipList {
   }
 
   [[nodiscard]] auto remove(const Key &key) -> bool {
-    const EpochToken token(active_, epoch_parity_);
+    const EpochToken token(epoch_slots_, epoch_, EpochRole::kWriter);
     Offset predecessor = kNullOffset;
     const Offset current = find_at_or_after(key, &predecessor);
     if (current == kNullOffset || current == kTail || !keys_equal(nodes_[current].key, key)) return false;
@@ -113,7 +113,7 @@ class PSkipList {
 
   template <typename Callback>
   void scan(const Key &begin, const Key &end, Callback &&callback) const {
-    const EpochToken token(active_, epoch_parity_);
+    const EpochToken token(epoch_slots_, epoch_, EpochRole::kReader);
     Offset predecessor = kNullOffset;
     Offset current = find_at_or_after(begin, &predecessor);
     while (current != kNullOffset && current != kTail) {
@@ -128,7 +128,7 @@ class PSkipList {
   }
 
   void reclaim() {
-    const std::lock_guard<std::mutex> reclaim_lock(reclaim_mutex_);
+    const std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
 
     std::vector<Offset> snapshot;
     {
@@ -136,9 +136,13 @@ class PSkipList {
       snapshot.swap(pending_unlinks_);
     }
 
-    const uint64_t old_parity = epoch_parity_.load(std::memory_order_acquire) & 1;
-    epoch_parity_.fetch_add(1, std::memory_order_acq_rel);
-    while (active_[old_parity].load(std::memory_order_acquire) != 0) {
+    // Physical-reclaim safety needs every possible holder of a stale offset — reader or
+    // writer — to have drained, unlike checkpoint()'s writer-only wait (3章).
+    const uint64_t old_parity = epoch_.load(std::memory_order_acquire) & 1;
+    epoch_.fetch_add(1, std::memory_order_acq_rel);
+    auto &old_slot = epoch_slots_[old_parity];
+    while (old_slot.readers.load(std::memory_order_acquire) != 0 ||
+           old_slot.writers.load(std::memory_order_acquire) != 0) {
       std::this_thread::yield();
     }
 
@@ -237,9 +241,9 @@ class PSkipList {
   std::atomic<Offset> high_water_mark_{2};
   Compare less_{};
 
-  mutable std::array<std::atomic<int64_t>, 2> active_{};
-  mutable std::atomic<uint64_t> epoch_parity_{0};
-  std::mutex reclaim_mutex_;
+  mutable std::array<EpochSlot, 2> epoch_slots_{};
+  mutable std::atomic<uint64_t> epoch_{0};
+  std::mutex epoch_mutex_;
   mutable std::mutex pending_mutex_;
   mutable std::vector<Offset> pending_unlinks_;
   std::mutex free_mutex_;
