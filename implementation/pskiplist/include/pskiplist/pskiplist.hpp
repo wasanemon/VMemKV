@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -14,7 +13,14 @@
 namespace pskiplist {
 
 using Offset = uint64_t;
-inline constexpr Offset kNullOffset = std::numeric_limits<Offset>::max();
+inline constexpr uint64_t kForwardMarkBit = uint64_t{1} << 63;
+inline constexpr Offset kNullOffset = kForwardMarkBit - 1;
+
+[[nodiscard]] inline constexpr auto pack_forward(Offset offset, bool marked) -> uint64_t {
+  return offset | (marked ? kForwardMarkBit : uint64_t{0});
+}
+[[nodiscard]] inline constexpr auto forward_offset(uint64_t raw) -> Offset { return raw & ~kForwardMarkBit; }
+[[nodiscard]] inline constexpr auto forward_marked(uint64_t raw) -> bool { return (raw & kForwardMarkBit) != 0; }
 
 enum class NodeState : uint8_t {
   kLive = 0,
@@ -48,14 +54,14 @@ struct DurableNode {
   std::atomic<uint64_t> epoch{0};
   Key key{};
   std::atomic<uint64_t> value{0};
-  std::atomic<Offset> forward0{kNullOffset};
+  mutable std::atomic<uint64_t> forward0{pack_forward(kNullOffset, false)};
 };
 
 template <typename Key, typename Compare = std::less<Key>>
 class PSkipList {
  public:
   explicit PSkipList(size_t capacity_nodes) : nodes_(capacity_nodes + 2) {
-    nodes_[kHead].forward0.store(kTail, std::memory_order_relaxed);
+    nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
   }
 
   PSkipList(const PSkipList &) = delete;
@@ -98,10 +104,11 @@ class PSkipList {
         nodes_[fresh].key = key;
         nodes_[fresh].value.store(PackedValue::live(payload).raw(), std::memory_order_relaxed);
       }
-      nodes_[fresh].forward0.store(existing, std::memory_order_relaxed);
+      nodes_[fresh].forward0.store(pack_forward(existing, false), std::memory_order_relaxed);
 
-      Offset expected_next = existing;
-      if (nodes_[predecessor].forward0.compare_exchange_strong(expected_next, fresh, std::memory_order_acq_rel)) {
+      uint64_t expected_next = pack_forward(existing, false);
+      const uint64_t desired_next = pack_forward(fresh, false);
+      if (nodes_[predecessor].forward0.compare_exchange_strong(expected_next, desired_next, std::memory_order_acq_rel)) {
         return true;
       }
     }
@@ -139,7 +146,7 @@ class PSkipList {
       if (v.state() == NodeState::kLive) {
         callback(node.key, v.payload());
       }
-      current = node.forward0.load(std::memory_order_acquire);
+      current = forward_offset(node.forward0.load(std::memory_order_acquire));
     }
   }
 
@@ -185,15 +192,44 @@ class PSkipList {
     return !less_(a, b) && !less_(b, a);
   }
 
+  // Traverses to the first node with key >= `key`, helping to physically unlink any
+  // marked (logically deleted) node it encounters along the way (4.2節). A helping CAS
+  // that wins pushes the unlinked node to the pending-unlink queue; on any CAS outcome
+  // touching a marked node the whole search restarts from head, since a stale predecessor
+  // can no longer be trusted.
   [[nodiscard]] auto find_at_or_after(const Key &key, Offset *predecessor) const -> Offset {
-    Offset pred = kHead;
-    Offset current = nodes_[pred].forward0.load(std::memory_order_acquire);
-    while (current != kTail && current != kNullOffset && less_(nodes_[current].key, key)) {
-      pred = current;
-      current = nodes_[current].forward0.load(std::memory_order_acquire);
+    for (;;) {
+      Offset pred = kHead;
+      Offset current = forward_offset(nodes_[pred].forward0.load(std::memory_order_acquire));
+      bool restart = false;
+      while (current != kTail) {
+        const uint64_t current_raw = nodes_[current].forward0.load(std::memory_order_acquire);
+        if (forward_marked(current_raw)) {
+          const Offset successor = forward_offset(current_raw);
+          uint64_t expected = pack_forward(current, false);
+          const uint64_t desired = pack_forward(successor, false);
+          if (nodes_[pred].forward0.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+            enqueue_pending_unlink(current);
+          }
+          restart = true;
+          break;
+        }
+        if (less_(nodes_[current].key, key)) {
+          pred = current;
+          current = forward_offset(current_raw);
+        } else {
+          break;
+        }
+      }
+      if (restart) continue;
+      *predecessor = pred;
+      return current;
     }
-    *predecessor = pred;
-    return current;
+  }
+
+  void enqueue_pending_unlink(Offset offset) const {
+    const std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+    pending_unlinks_.push_back(offset);
   }
 
   auto allocate() -> Offset {
@@ -222,22 +258,16 @@ class PSkipList {
       return;
     }
 
-    {
-      const std::lock_guard<std::mutex> unlink_lock(unlink_mutex_);
-      for (;;) {
-        Offset predecessor = kNullOffset;
-        const Offset found = find_at_or_after(key, &predecessor);
-        if (found != node_offset) return;
-        Offset expected_next = node_offset;
-        const Offset successor = nodes_[node_offset].forward0.load(std::memory_order_acquire);
-        if (nodes_[predecessor].forward0.compare_exchange_strong(expected_next, successor, std::memory_order_acq_rel)) {
-          break;
-        }
+    uint64_t forward_raw = nodes_[node_offset].forward0.load(std::memory_order_acquire);
+    while (!forward_marked(forward_raw)) {
+      const uint64_t marked = pack_forward(forward_offset(forward_raw), true);
+      if (nodes_[node_offset].forward0.compare_exchange_strong(forward_raw, marked, std::memory_order_acq_rel)) {
+        break;
       }
     }
 
-    const std::lock_guard<std::mutex> pending_lock(pending_mutex_);
-    pending_unlinks_.push_back(node_offset);
+    Offset predecessor = kNullOffset;
+    static_cast<void>(find_at_or_after(key, &predecessor));
   }
 
   std::vector<DurableNode<Key>> nodes_;
@@ -247,9 +277,8 @@ class PSkipList {
   mutable std::array<std::atomic<int64_t>, 2> active_{};
   mutable std::atomic<uint64_t> epoch_parity_{0};
   std::mutex reclaim_mutex_;
-  std::mutex pending_mutex_;
-  std::mutex unlink_mutex_;
-  std::vector<Offset> pending_unlinks_;
+  mutable std::mutex pending_mutex_;
+  mutable std::vector<Offset> pending_unlinks_;
   std::mutex free_mutex_;
   std::vector<Offset> free_list_;
 };

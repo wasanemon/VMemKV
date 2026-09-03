@@ -134,3 +134,39 @@ TEST_CASE("reclaim() running concurrently with put/remove/get stays consistent")
     CHECK(skiplist.get(key).has_value() == in_scan);
   }
 }
+
+TEST_CASE("concurrent remove of a dense adjacent key range fully reclaims capacity") {
+  constexpr int kKeys = 4000;
+  constexpr int kThreads = 8;
+  PSkipList<int> skiplist(kKeys);
+
+  for (int i = 0; i < kKeys; ++i) {
+    REQUIRE(skiplist.put(i, static_cast<uint64_t>(i)));
+  }
+
+  std::atomic<int> next_key{0};
+  std::vector<std::thread> workers;
+  for (int t = 0; t < kThreads; ++t) {
+    workers.emplace_back([&skiplist, &next_key] {
+      for (;;) {
+        const int key = next_key.fetch_add(1, std::memory_order_relaxed);
+        if (key >= kKeys) break;
+        CHECK(skiplist.remove(key));
+      }
+    });
+  }
+  for (auto &worker : workers) worker.join();
+
+  std::vector<int> scanned;
+  skiplist.scan(0, kKeys, [&](int key, uint64_t) { scanned.push_back(key); });
+  CHECK(scanned.empty());
+
+  skiplist.reclaim();
+
+  for (int i = 0; i < kKeys; ++i) {
+    CHECK(skiplist.put(kKeys + i, static_cast<uint64_t>(i)));
+  }
+  int count = 0;
+  skiplist.scan(kKeys, 2 * kKeys, [&](int, uint64_t) { ++count; });
+  CHECK(count == kKeys);
+}

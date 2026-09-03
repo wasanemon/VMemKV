@@ -34,7 +34,7 @@ struct DurableNode {
     Key key;
     Value value;                     // 状態(live/tombstoned-linked/tombstoned-unlinked)を
                                       // value内の専用ビットで表現(4章)
-    std::atomic<Offset> forward0;    // Level 0の次ノードへのoffset
+    std::atomic<Offset> forward0;    // Level 0の次ノードへのoffset + 論理削除markビット(4.2節)
 };
 ```
 
@@ -43,6 +43,9 @@ struct DurableNode {
   サイズになる。
 - ノード間の相互参照は**単一mmap'dファイル内のoffset**(生ポインタではない)。プロセス
   再起動でmmap先の仮想アドレスが変わっても構造が壊れない。
+- `Offset`の最上位ビット(bit 63)は、物理unlinkのhelping(4.2節)が使うmarkビットとして
+  予約する。実際に表現できるoffset値は下位63ビットの範囲(`kNullOffset`もこの範囲に
+  収まるsentinel値)であり、ノード数の実用上の上限に対して十分すぎるほど余裕がある。
 - **`Value`は64bit以下の、単語1つでアトミックに書き換えられる型に限る**(`Key`も同様に
   固定長)。より大きなデータを扱いたい場合は、`Value`に呼び出し側管理の外部ストレージへの
   offsetやポインタを自分で埋め込む(pskiplist自身はその先の中身を一切関知しない)。この
@@ -66,7 +69,7 @@ torn writeの対象になる問題を回避するため)——起動時と稼働
 - **起動時**: recovery時にLevel 0を辿るrecovery walk(2.2節)の副産物として一括導出する
   ——到達できたoffsetの集合が「生存ノード」、確保済み範囲のうちそれ以外が「フリー」。
 - **稼働中**: ノードの状態が`tombstoned-unlinked`に遷移し、かつpredecessorの実ポインタも
-  物理的に付け替え済みになったら(4章)、いったんin-memoryの「unlink待ちキュー」に
+  物理的に付け替え済みになったら(4.2節)、いったんin-memoryの「unlink待ちキュー」に
   (offset, unlink_epoch)として積む。checkpoint()が新しいepoch`E`をpublishした後、
   このキューを掃き、`unlink_epoch <= E`(3章)かつ、そのunlink epoch以下で登録した
   readerが残っていないものをフリーリストへ移す。reader確認はcheckpoint()の本体とは
@@ -194,8 +197,10 @@ struct PSkipListManifestHeader {
 
 各レベルは独立したlock-free listであり、他スレッドから観測されうる変化は結局
 少数のアトミック操作だけに集約される(具体的な内訳は本章末の一覧を参照)。findで辿る・
-上位レベルをリンクする・削除後に物理的にunlinkする、といった残りの処理はこれらの前後に
-付随する段取りに過ぎず、正しさそのものには影響しない。
+上位レベルをリンクする、といった残りの処理はこれらの前後に付随する段取りに過ぎず、
+linearization pointには影響しない。削除後の物理unlink(predecessorの実ポインタの
+付け替え)だけは別枠で扱う——linearization pointを動かすものではないが、隣接ノードの
+同時unlinkに対するメモリ安全性を独自に確保する必要があり、4.2節で扱う。
 
 put(42)のlinearization point通過**直後**のスナップショット:
 
@@ -239,8 +244,8 @@ put/get/removeの呼び出し区間は互いに重なってよいが、結果は
   するCASで`live`+新valueへ書き換える(4.1節)。
 - **remove**: ノード自身の状態を`live`から`tombstoned-linked`へ書き換えるCAS
   (期待値=現在のvalue、失敗したら読み直して再試行)。Level 0からの物理unlinkは
-  この後に起こる別イベントで、正しさには関係しない(物理回収のタイミングにのみ
-  関わる——3章参照)。
+  この後の別イベントであり、linearization pointには影響しないが、reclaim(2.3節)の
+  安全性のためには4.2節の手順で正しく完了させる必要がある。
 - **get/scan**: Level 0の該当区間を読み終えた時点。
 
 図の例では、Thread Bのtraversalがこのリンクより**後**にpredecessorへ到達したため`42`を
@@ -255,9 +260,10 @@ put/get/removeの呼び出し区間は互いに重なってよいが、結果は
 - **put(既存ノードへの書き込み)**: 期待値=読み取った現在の状態、望む値=`live`+新value。
 - **remove**: 期待値=`live`+現在のvalue、望む値=`tombstoned-linked`+同じvalue。
 - **物理unlinkの第一歩**: 期待値=`tombstoned-linked`、望む値=`tombstoned-unlinked`。
-  predecessorの実ポインタを書き換えるのはこの後の別ステップで、正しさには関与しない
-  (2.3節)——`find()`/`get()`/`scan()`は辿り着いたノード自身の状態を見て判定するため、
-  predecessorのポインタが多少古くても正しく動作する。
+  predecessorの実ポインタを書き換えるのはこの後の別ステップ(4.2節)であり、
+  `find()`/`get()`/`scan()`はいずれも辿り着いたノード自身の状態を見て判定するため、
+  predecessorのポインタが多少古くても読み取り結果は正しい。ただし物理回収(2.3節)の
+  安全性のためには、4.2節の手順でこの物理unlinkを正しく完了させる必要がある。
 
 put(既存ノードへの書き込み)と物理unlinkの第一歩は、同じノードの同じワードに対して
 異なる期待値でCASを試みる関係になる。どちらか一方が成功すれば、他方のCASは期待値
@@ -265,6 +271,31 @@ put(既存ノードへの書き込み)と物理unlinkの第一歩は、同じノ
 unlinkが先に成功していればput()は「このノードはもう存在しない」と判定して`find()`から
 やり直せばよい。事後に到達可能性を別途確認する手順は不要——CASの成否そのものが
 判定になる。
+
+### 4.2 物理unlinkのhelping
+
+Level 0からの物理unlink(4.1節の第一歩の後)は、`get`/`put`/`remove`/`scan`が共有する
+探索処理(`find`)の中で、lock-freeなhelpingとして完了する。専用のロックは持たない。
+
+- 物理unlinkの第一歩(`value`をtombstoned-unlinkedへCAS)に成功した直後、対象ノード
+  自身の`forward0`に対して、現在のsuccessorを保ったままmarkビット(2.1節)を立てる
+  CASを行う。successorが他の並行insertによって変わっていれば、最新のsuccessorで
+  読み直して再試行する。
+- predecessorではなく削除対象ノード自身の`forward0`をmarkすることで、以後そのワードに
+  対する「unmark前提」のCASは全て期待値不一致で失敗するようになり、ワードは事実上
+  凍結される。
+- `find`は探索中にmark済みのノードへ出くわすたびに、predecessorの`forward0`を
+  「そのノード → そのノードの現在のsuccessor」へCASして物理的に切り離すhelpingを行う。
+  このCASに成功したスレッドだけが、そのノードをunlink待ちキュー(2.3節)へ積む——CASの
+  成否自体が一意な完了判定になるため、複数スレッドが同時にhelpingを試みても二重に
+  積まれることはない。
+- remove()自身も、markの直後に一度だけ同じsplice CASを試みてよい(多くの場合ここで
+  完了する)。仮に競合で失敗しても、以後にその区間を通過する`find`が必ずhelpingするため、
+  物理unlinkはいずれ完了する。
+- markビットにより、隣接ノードの同時物理unlinkや、物理unlink中のノードの直後への
+  新規insertが競合しても、いずれか片方のCASが必ず期待値不一致で失敗し、最新状態からの
+  再試行を強制される。これにより、既に切り離されたはずのノードが古いsuccessor値経由で
+  誤って再びチェーンに繋がってしまう、といった事態は起こらない。
 
 ## 5. API
 
@@ -290,8 +321,8 @@ class PSkipList {
 
   // Delete: O(log N) expected。ノード自身の状態をlive→tombstoned-linkedへCASする
   // (linearization point、4.1節) → ノード自身の状態をtombstoned-linked→
-  // tombstoned-unlinkedへCAS → predecessorのforward0を実際に付け替える(2.1節/4.1節、
-  // 正しさには無関係の後始末) → 上位レベルのunlinkはvolatile側のbest-effort(2.4節)
+  // tombstoned-unlinkedへCAS → forward0へのmark+predecessorの付け替え(4.2節、
+  // lock-free helping) → 上位レベルのunlinkはvolatile側のbest-effort(2.4節)
   // → 後日(EBR + checkpoint epochの条件を満たしてから)物理回収。
   // 戻り値: 対象キーが存在し、削除できた場合はtrue。存在しなかった場合はfalse。
   [[nodiscard]] auto remove(const Key &key) -> bool;
@@ -321,7 +352,9 @@ msync()と競合するケースまで)網羅しようとすると組み合わせ
 
 - **concurrency-safety**: EBR quiescence(3章)が「epoch Eで登録した操作が全員
   deregisterするまでblockし続けるか」を、意図的なスレッドスケジューリング下で検証する。
-  ThreadSanitizerに加え、簡易的なlinearizability checkerの導入も検討する。
+  隣接するノードの同時remove()、およびmarkされたノードへのhelping(4.2節)が正しく
+  収束するかもこの検証に含める。ThreadSanitizerに加え、簡易的なlinearizability
+  checkerの導入も検討する。
 - **crash-consistency**: quiescenceの正しさを前提にすれば、msync()の瞬間は「並行書き込み
   のない確定状態」とみなせる。そこに至る各アトミックステップ(insertのノード書き込み・
   level 0 CAS、remove/物理unlinkの状態遷移CASなど、4.1節)の直後でクラッシュを注入し、`recover()`が
@@ -350,7 +383,7 @@ msync()と競合するケースまで)網羅しようとすると組み合わせ
 
 | 設計要素 | 採用元 | 内容 |
 | --- | --- | --- |
-| 並行アルゴリズムの土台(各レベルを独立したlock-free listとして扱う) | Herlihy, M., Shavit, N. のlock-free skip list(*The Art of Multiprocessor Programming*) | 論理削除(mark)と物理unlink(helping)を分離する基本設計。本設計ではmarkを各レベルのポインタではなくノード自身の3値の状態(2.1節/4.1節)に単純化している — Level 0のみが正しさの根拠という前提があるからこそ可能な簡略化 |
+| 並行アルゴリズムの土台(各レベルを独立したlock-free listとして扱う) | Herlihy, M., Shavit, N. のlock-free skip list(*The Art of Multiprocessor Programming*) | 論理削除(mark)と物理unlink(helping)を分離する基本設計。論理状態はノード自身の3値の状態(2.1節/4.1節)に単純化しつつ、物理unlink自体は原典どおりforward0へのmark+helping(4.2節)で行う — Level 0のみが正しさの根拠という前提があるからこそ、markの対象を各レベルのポインタではなく単一のforward0に絞り込める |
 | offsetベースのノード参照 | UPSkipList(RIVスタイルのoffsetエンコーディング) / LMDB系のmmap+offset設計 | mmap先の仮想アドレスがプロセスごとに変わっても構造が壊れない |
 | Level 0のみが正しさの根拠、上位レベルはDRAM専用・recovery時に再構築 | ASCS / NV-Skiplist(独立に同じ結論) | 複数レベルのポインタ更新にまたがるtorn writeの問題を、上位レベルを永続化対象から外すことで回避する |
 | insertの書き込み順序(新規ノード本体→自ノードのforwardポインタ→predecessorのCAS、bottom-up) | ASCS(Atomic Skiplistの挿入アルゴリズム) | ログなしでfailure-atomicな挿入を実現する具体的な手順 |
