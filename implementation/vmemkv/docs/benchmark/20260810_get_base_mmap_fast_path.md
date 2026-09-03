@@ -71,5 +71,5 @@
 
 ## 生データ
 
-- `implementation/benchmark/logs/get_base_mmap_fix_verification/` — i4i.2xlarge、4-way比較(sbs_before/sbs_after/baseline/rocksdb)
-- `implementation/benchmark/logs/get_base_mmap_fix_verification32/` — i4i.8xlarge実32コア、同4-way比較
+- `implementation/vmemkv/benchmark/logs/get_base_mmap_fix_verification/` — i4i.2xlarge、4-way比較(sbs_before/sbs_after/baseline/rocksdb)
+- `implementation/vmemkv/benchmark/logs/get_base_mmap_fix_verification32/` — i4i.8xlarge実32コア、同4-way比較

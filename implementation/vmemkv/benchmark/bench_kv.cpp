@@ -216,7 +216,7 @@ constexpr std::size_t kInMemoryInlineCorpusEntries = 20'000'000;
 // in_memory/1KB directly comparable to ltm/1KB (same data, different memory pressure) and fast to
 // populate on real NVMe. 8B keeps its own separate, smaller fixed cap (kInMemoryInlineCorpusEntries)
 // since even this same entry count at 8B's much smaller footprint would be needlessly small.
-// Background and a ruled-out hang theory: implementation/docs/benchmark/20260805_in_memory_1kb_corpus_sizing.md.
+// Background and a ruled-out hang theory: implementation/vmemkv/docs/benchmark/20260805_in_memory_1kb_corpus_sizing.md.
 constexpr std::size_t kInMemory1KBCorpusEntries = 8'000'000;
 constexpr double kZipfPivot = 1.5;
 constexpr double kHalfStep = 0.5;

@@ -33,11 +33,11 @@ jobs:
     - name: Verify Code Formatting
       run: |
         # Run clang-format dry-run to check for style violations in C++ files
-        find implementation/src implementation/tests implementation/benchmark \( -name "*.cpp" -o -name "*.hpp" \) -print0 | xargs -0 clang-format --dry-run --Werror
+        find implementation/vmemkv/src implementation/vmemkv/tests implementation/vmemkv/benchmark \( -name "*.cpp" -o -name "*.hpp" \) -print0 | xargs -0 clang-format --dry-run --Werror
 
     - name: Configure CMake
       run: |
-        cmake -S implementation -B build \
+        cmake -S implementation/vmemkv -B build \
           -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_WARN_DEPRECATED=OFF \

@@ -111,14 +111,14 @@ find_program(GIT_EXECUTABLE git)
 if(GIT_EXECUTABLE AND EXISTS "${CMAKE_SOURCE_DIR}/../.git")
   message(STATUS "Configuring Git hooks path...")
   execute_process(
-    COMMAND ${GIT_EXECUTABLE} config core.hooksPath "implementation/githooks"
+    COMMAND ${GIT_EXECUTABLE} config core.hooksPath "implementation/vmemkv/githooks"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
     RESULT_VARIABLE GIT_HOOKS_RESULT
   )
   if(NOT GIT_HOOKS_RESULT EQUAL 0)
     message(WARNING "Failed to configure Git hooks path.")
   else()
-    message(STATUS "Git hooks path successfully set to implementation/githooks")
+    message(STATUS "Git hooks path successfully set to implementation/vmemkv/githooks")
   endif()
   
   # Make the hook executable on UNIX systems

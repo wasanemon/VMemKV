@@ -165,7 +165,7 @@ count_remote_benchmarks() {
   local benchmark_filter="$1"
   local env_prefix="${2:-}"
   local runtime_prefix="${3:-}"
-  ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc 'cd ~/faultkv/implementation && ${env_prefix:+${env_prefix} }${runtime_prefix:+${runtime_prefix} }./build-rel/benchmark/bench_kv --benchmark_list_tests --benchmark_filter=\"${benchmark_filter}\" 2>/dev/null | awk \"NF { c++ } END { print c + 0 }\"'" | tail -n 1
+  ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "bash -lc 'cd ~/faultkv/implementation/vmemkv && ${env_prefix:+${env_prefix} }${runtime_prefix:+${runtime_prefix} }./build-rel/benchmark/bench_kv --benchmark_list_tests --benchmark_filter=\"${benchmark_filter}\" 2>/dev/null | awk \"NF { c++ } END { print c + 0 }\"'" | tail -n 1
 }
 
 signal_log() {
@@ -427,7 +427,7 @@ sync_repo_to_remote() {
 build_remote_benchmark() {
   echo "Building bench_kv on AWS instance..."
   ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "
-    cd ~/faultkv/implementation &&
+    cd ~/faultkv/implementation/vmemkv &&
     cmake -S . -B build-rel -GNinja \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -march=native' \
@@ -592,7 +592,7 @@ run_scenario() {
     # bench_kv partway through populate. Observed directly: every LTM priming attempt without this
     # fix died to the OOM killer, never a script or SSH problem.
     priming_cmd="
-cd /home/ubuntu/faultkv/implementation &&
+cd /home/ubuntu/faultkv/implementation/vmemkv &&
 VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} } VMEMKV_BENCH_SKIP_CLEANUP=1 \
 ./benchmark/common/run_scenario.sh \
   './build-rel/benchmark/bench_kv' \
@@ -612,7 +612,7 @@ VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES ${scenario_runtime_e
   fi
 
   remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
+cd /home/ubuntu/faultkv/implementation/vmemkv &&
 ${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} }${skip_cleanup_env_prefix:+${skip_cleanup_env_prefix} } \
 ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 ./benchmark/common/run_scenario.sh \
@@ -652,7 +652,7 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
     echo "[runner] discovering per-store isolation groups for scenario=$scenario_key ..."
     local all_bench_names
     all_bench_names=$(ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
-      "bash -lc 'cd ~/faultkv/implementation && ${scenario_env_prefix:+${scenario_env_prefix} }./build-rel/benchmark/bench_kv --benchmark_list_tests --benchmark_filter=\"${scenario_run_filter}\" 2>/dev/null'")
+      "bash -lc 'cd ~/faultkv/implementation/vmemkv && ${scenario_env_prefix:+${scenario_env_prefix} }./build-rel/benchmark/bench_kv --benchmark_list_tests --benchmark_filter=\"${scenario_run_filter}\" 2>/dev/null'")
 
     local -a identities=()
     while IFS= read -r identity_line; do
@@ -689,7 +689,7 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
           >>"$scenario_stdout_log" 2>>"$scenario_stderr_log"
 
         group_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
+cd /home/ubuntu/faultkv/implementation/vmemkv &&
 ${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} }VMEMKV_BENCH_SKIP_CLEANUP=1 \
 ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 ./benchmark/common/run_scenario.sh \
@@ -784,7 +784,7 @@ run_remote_probe() {
     : >"$inmem_stdout_log"
     : >"$inmem_stderr_log"
     local inmem_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
+cd /home/ubuntu/faultkv/implementation/vmemkv &&
 ./benchmark/${probe_script} './build-rel/benchmark/bench_kv' '/mnt/nvme/${output_basename}_in_memory.jsonl' '/mnt/nvme' '$inmem_combo_filter'
     "
     local inmem_remote_cmd_quoted
@@ -821,7 +821,7 @@ cd /home/ubuntu/faultkv/implementation &&
     # MemoryMax (2x LTM_MEMORY_BUDGET_BYTES, see below), not the declared budget itself, mis-sizing
     # every corpus by 2x -- same reasoning as run_scenario()'s priming/measurement passes above.
     local ltm_remote_cmd="
-cd /home/ubuntu/faultkv/implementation &&
+cd /home/ubuntu/faultkv/implementation/vmemkv &&
 VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
 ./benchmark/${probe_script} './build-rel/benchmark/bench_kv' '/mnt/nvme/${output_basename}_ltm.jsonl' '/mnt/nvme' '$ltm_combo_filter'
     "
@@ -913,7 +913,7 @@ if [[ "$SKIP_MATRIX" != "true" ]]; then
 fi
 
 # ── Retrieve Results & Save ───────────────────────────────────────────────
-RESULTS_DIR="${REPO_ROOT}/implementation/benchmark/logs"
+RESULTS_DIR="${REPO_ROOT}/implementation/vmemkv/benchmark/logs"
 mkdir -p "$RESULTS_DIR"
 
 if [[ "$SKIP_MATRIX" != "true" ]]; then

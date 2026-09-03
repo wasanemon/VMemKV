@@ -68,7 +68,7 @@ LTMでの改善が、`MADV_RANDOM`が本来助けるはずだったin-memory・�
 
 ## 生データ
 
-- `implementation/benchmark/logs/ltm_64kb_t2_no_madvise_random/` — `perf stat`出力・ベンチマークJSON・`/proc/diskstats`前後差分(Baseline/T2NoMadviseRandom/RocksDBの3系統)、および in-memory退行チェックの生JSON(`result_inmem.json`)
+- `implementation/vmemkv/benchmark/logs/ltm_64kb_t2_no_madvise_random/` — `perf stat`出力・ベンチマークJSON・`/proc/diskstats`前後差分(Baseline/T2NoMadviseRandom/RocksDBの3系統)、および in-memory退行チェックの生JSON(`result_inmem.json`)
 
 ## 追記(2026-08-10, 同日): 厳密な再検証 — in-memory退行チェックの再実施、および高並列(threads:16)での効果減衰の確認
 
@@ -120,7 +120,7 @@ Baseline/T2NoMadviseRandomをそれぞれ**別プロセス**として交互に�
 
 ## 生データ(追記分)
 
-- `implementation/benchmark/logs/t2_no_madvise_random_verification/` — Part A(`parta_*.json`、variantごと独立プロセス・5反復)、Part B(`resultb_*.json`、`perfb_*.txt`、`diskstatsb_*.txt`、threads:16込み)
+- `implementation/vmemkv/benchmark/logs/t2_no_madvise_random_verification/` — Part A(`parta_*.json`、variantごと独立プロセス・5反復)、Part B(`resultb_*.json`、`perfb_*.txt`、`diskstatsb_*.txt`、threads:16込み)
 
 ## 追記2(2026-08-10, 同日): i4i.8xlarge実32コアでの再検証 — threads:32で逆転(Baselineより悪化)を確認
 
@@ -169,4 +169,4 @@ variantごと独立プロセス、5反復、中央値比較。全条件で**0.98
 
 ## 生データ(追記2分)
 
-- `implementation/benchmark/logs/t2_no_madvise_random_verification32/` — i4i.8xlarge実32コアでのPart A(`parta32_*.json`)、Part B(`resultb32_*.json`、`perfb32_*.txt`、`diskstatsb32_*.txt`、threads:32込み)
+- `implementation/vmemkv/benchmark/logs/t2_no_madvise_random_verification32/` — i4i.8xlarge実32コアでのPart A(`parta32_*.json`)、Part B(`resultb32_*.json`、`perfb32_*.txt`、`diskstatsb32_*.txt`、threads:32込み)

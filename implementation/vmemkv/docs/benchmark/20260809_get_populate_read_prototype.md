@@ -41,4 +41,4 @@
 
 ## 生データ
 
-- `implementation/benchmark/logs/ltm_64kb_get_populate_read_prototype/` — `perf stat`出力・ベンチマークJSON・`/proc/diskstats`前後差分(Baseline/GetPopulateRead/RocksDBの3系統)
+- `implementation/vmemkv/benchmark/logs/ltm_64kb_get_populate_read_prototype/` — `perf stat`出力・ベンチマークJSON・`/proc/diskstats`前後差分(Baseline/GetPopulateRead/RocksDBの3系統)

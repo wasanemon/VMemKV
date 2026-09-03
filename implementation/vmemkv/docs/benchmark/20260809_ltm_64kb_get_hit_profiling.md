@@ -63,4 +63,4 @@ LTM/64KB Get/Hitの劣後は、1KBの時のような**計測アーティファ�
 
 ## 生データ
 
-- `implementation/benchmark/logs/ltm_64kb_get_hit_profile/` — `perf stat`出力(3ストア分)、ベンチマークJSON出力(3ストア分)、`/proc/diskstats`前後差分(3ストア分)
+- `implementation/vmemkv/benchmark/logs/ltm_64kb_get_hit_profile/` — `perf stat`出力(3ストア分)、ベンチマークJSON出力(3ストア分)、`/proc/diskstats`前後差分(3ストア分)

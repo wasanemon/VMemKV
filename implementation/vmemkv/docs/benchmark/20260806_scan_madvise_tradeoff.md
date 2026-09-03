@@ -19,7 +19,7 @@
 
 ## 発見の経緯: `NoMadvise` アブレーションが機能していなかった
 
-`implementation/src/vmemkv_impl.hpp` を確認すると、`madvise()` の呼び出しは2箇所にしか存在しない。
+`implementation/vmemkv/src/vmemkv_impl.hpp` を確認すると、`madvise()` の呼び出しは2箇所にしか存在しない。
 
 1. コンストラクタ内、初回のT2 mmap時(187-192行目)。ここは `if constexpr (ConfigT::UseMadviseRandom)` で正しくガードされている。
 2. `mmap_t2_memory()`(959-981行目)。reorganize/checkpoint reload でT2を作り直すたびに呼ばれる、共有の再mmapヘルパー。**修正前はここに `if constexpr` ガードが無く、`ConfigT::UseMadviseRandom` の値に関わらず常に `MADV_RANDOM` を適用していた。**
@@ -92,7 +92,7 @@ Scanの間だけ `MADV_RANDOM` を外す、という素朴な設計(例えば低
 
 結果1・結果2を踏まえ、「T2のmadviseは常時 `MADV_RANDOM`(Get保護を優先)のまま固定し、Scanは別の手段で改善する」という方針を検討した。有力な候補は、**`madvise`を一切使わず、複数スレッドで並行してT2の生ページタッチを行い、swap/page cache evictionによるI/O待ちを重ねる**というアプリケーション側の並列プリフェッチである。
 
-この核心メカニズム(「madviseを介さない、複数スレッドの並行タッチだけでI/O待ちが重なるか」)を、VMemKVの実装に触れず独立したマイクロベンチマーク(`implementation/microbenchmark/bench.cpp`、既存のmmap vs pread+LRU比較ツール)の `--threads` オプションを使って検証した。この経路は `madvise(m, total, MADV_RANDOM)` を固定で適用しているので(`bench.cpp` 279行目)、「T2をmadvise常時RANDOMのまま」という決定した方針とも整合する条件になっている。
+この核心メカニズム(「madviseを介さない、複数スレッドの並行タッチだけでI/O待ちが重なるか」)を、VMemKVの実装に触れず独立したマイクロベンチマーク(`implementation/vmemkv/microbenchmark/bench.cpp`、既存のmmap vs pread+LRU比較ツール)の `--threads` オプションを使って検証した。この経路は `madvise(m, total, MADV_RANDOM)` を固定で適用しているので(`bench.cpp` 279行目)、「T2をmadvise常時RANDOMのまま」という決定した方針とも整合する条件になっている。
 
 **手法**: AWS `i4i.2xlarge`(8 vCPU)、`systemd-run -p MemoryHigh=1GiB -p MemoryMax=2GiB` のcgroup下、8GBのデータファイル(`MAP_SHARED`読み取り専用、4KBページ)に対し、point mode(1回のアクセスにつき1ページを読むだけの単純なランダム/Zipfアクセス、prefetchやscan-widthは無効)で、threads=1とthreads=8のスループットを比較した。`--ops` は全スレッド合計で固定(20,000)なので、スレッド数を増やしても総仕事量は変わらず、純粋に並行実行によるI/O待ちの重なりだけを見ている。計測直前に `drop_caches` でページキャッシュを破棄している。
 
@@ -320,13 +320,13 @@ chunk数によらず、IoUringScanPrefetchとBaselineの実測メジャーフォ
 
 ## 関連コミット・参照
 
-- バグ修正: commit `1c659e1`(`fix: NoMadvise ablation silently no-op for post-reorg T2 (Scan benchmarks)`)、`implementation/src/vmemkv_impl.hpp` の `mmap_t2_memory()`。
-- 関連する既存の設計判断: `implementation/docs/specification/low_level_design.md` 4.5節(`scan_active_` フラグ)、7.7節(`MADV_RANDOM` アブレーションの元々の記述)。
+- バグ修正: commit `1c659e1`(`fix: NoMadvise ablation silently no-op for post-reorg T2 (Scan benchmarks)`)、`implementation/vmemkv/src/vmemkv_impl.hpp` の `mmap_t2_memory()`。
+- 関連する既存の設計判断: `implementation/vmemkv/docs/specification/low_level_design.md` 4.5節(`scan_active_` フラグ)、7.7節(`MADV_RANDOM` アブレーションの元々の記述)。
 - 結果5・結果7で使用したツール: `prefetch_probe.cpp`(本セッションで新規作成した`liburing`使用の使い捨てプローブ。VMemKVには非依存。リポジトリには未追加 ―— 再取得する場合は本ドキュメントの手法セクションの記述を元に再現可能)。結果7では`--mode scatter-raw`/`--mode scatter-uring`(分散した小さいレコード群を模擬するモード)を追加している。
 - 結果7の実装(`IoUringScanPrefetch`タグ、`prefetch_scan_range()`、CMakeのliburing検出等)は不採用と判断し差し戻した。コミット前だったため`git checkout`で復元しており、リポジトリの履歴には残っていない。
 - **旧7.4.1節(`MADV_WILLNEED` 不採用の経緯、原因を「mmap_lock競合」と推定)は、本ドキュメントの結果4での直接計測(この推定を支持しない)を受けて削除した。** 該当する実験結果とその訂正は結果4に記録している。7.4.2節だった `MADV_HUGEPAGE` 不採用の記述は 7.4.1節として存置。
 - 手法の前提となる調査: `20260805_ltm_get_hit_profiling.md`(ページキャッシュ共有アーティファクトの排除、`drop_caches` 対称化)。
-- 結果3で使用したツール: `implementation/microbenchmark/bench.cpp`(既存のmmap vs pread+LRU比較マイクロベンチマーク。`README.md`/`REPORT.md`参照)。
+- 結果3で使用したツール: `implementation/vmemkv/microbenchmark/bench.cpp`(既存のmmap vs pread+LRU比較マイクロベンチマーク。`README.md`/`REPORT.md`参照)。
 - 結果8の再実装(`IoUringScanPrefetch`タグ、タイミング計装付き`prefetch_scan_range()`、`VMEMKV_SCAN_PREFETCH_CHUNK_COUNT_OVERRIDE`環境変数、CMakeのliburing検出、`bench_kv.cpp`の`MajFlt_PerIter`/`MinFlt_PerIter`カウンタ)も、結果7と同じ理由(不採用の再確認が目的の診断コードであり、本採用する変更ではない)でコミット前に`git checkout`で差し戻した。リポジトリの履歴には残っていない。
 
-本ドキュメントの結果1・結果2の実験は `run_bench_aws_c6id.sh` を使わず、同スクリプトのプロビジョニング手順(AMI解決・セキュリティグループ・NVMeスワップセットアップ・cgroup wrap)を流用しつつ `bench_kv` を `--benchmark_filter` で直接絞り込む形で、10分以内の反復イテレーションとして実施した。結果3は同様のプロビジョニング手順を流用しつつ、`implementation/microbenchmark/bench.cpp` を対象に実施した(スワップファイルは不要 ―― `MAP_SHARED`読み取り専用ファイルなのでページキャッシュのevict+re-readのみで再現できる)。生のベンチマーク出力はインスタンス終了とともに破棄しており、リポジトリには含めていない(再取得する場合は本ドキュメントの手法セクションの手順で再現可能)。
+本ドキュメントの結果1・結果2の実験は `run_bench_aws_c6id.sh` を使わず、同スクリプトのプロビジョニング手順(AMI解決・セキュリティグループ・NVMeスワップセットアップ・cgroup wrap)を流用しつつ `bench_kv` を `--benchmark_filter` で直接絞り込む形で、10分以内の反復イテレーションとして実施した。結果3は同様のプロビジョニング手順を流用しつつ、`implementation/vmemkv/microbenchmark/bench.cpp` を対象に実施した(スワップファイルは不要 ―― `MAP_SHARED`読み取り専用ファイルなのでページキャッシュのevict+re-readのみで再現できる)。生のベンチマーク出力はインスタンス終了とともに破棄しており、リポジトリには含めていない(再取得する場合は本ドキュメントの手法セクションの手順で再現可能)。

@@ -4,7 +4,7 @@
 
 `TODO.md` の Item 6「現在のベンチマーク結果の怪しい点の調査と修正」に基づき、
 `benchmark_results/2026071600/` の計測結果に対して指摘された以下 3 点を、ベンチマークコード
-(`implementation/benchmark/bench_kv.cpp`, `implementation/src/rivals/rocksdb_store.hpp`) と
+(`implementation/vmemkv/benchmark/bench_kv.cpp`, `implementation/vmemkv/src/rivals/rocksdb_store.hpp`) と
 実際の JSON 結果を突き合わせて調査した。
 
 1. LTM(1KB) の Get/Hit(Zipf) だけ Baseline が RocksDB に負けている

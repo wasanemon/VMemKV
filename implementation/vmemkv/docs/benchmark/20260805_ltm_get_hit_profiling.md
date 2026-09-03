@@ -76,7 +76,7 @@ VMemKVのT2領域(`MAP_PRIVATE`の生mmap)は値を非圧縮のままmmapし、O
 
 ### 発見の経緯(コード調査)
 
-- `implementation/src/rivals/rocksdb_blobdb_store.hpp`を確認すると、ブロックキャッシュサイズは明示的に設定されておらず、RocksDBライブラリのデフォルト(約32MB)のまま——`VMEMKV_CONTEXT_memory_budget_bytes`(1GiB)とは無関係。blobキャッシュに至っては`nullptr`(完全に無効)。つまりRocksDB自身は8GBのコーパスをキャッシュする仕組みを実質何も持っていない。
+- `implementation/vmemkv/src/rivals/rocksdb_blobdb_store.hpp`を確認すると、ブロックキャッシュサイズは明示的に設定されておらず、RocksDBライブラリのデフォルト(約32MB)のまま——`VMEMKV_CONTEXT_memory_budget_bytes`(1GiB)とは無関係。blobキャッシュに至っては`nullptr`(完全に無効)。つまりRocksDB自身は8GBのコーパスをキャッシュする仕組みを実質何も持っていない。
 - `min_blob_size=256`のため、本ベンチマークの1KB値(全体の80%)は実際に別のblobファイルへ格納される——「小さい値だからインライン化されて読まずに済む」という説明も成立しない。
 - クローン処理(`clone_from()`, `rocksdb_blobdb_store.hpp:218-237`)は`rocksdb::Checkpoint::CreateCheckpoint`を使っており、これはSST/blobファイルの実体をコピーせず**ハードリンク**する。
 - マスターコーパスは制約なし(cgroup外)のプライミングパスで構築される。cgroup v2ではページキャッシュは「最初にそのページをフォールトさせたcgroup」に課金されるため、cgroup制約下の計測プロセスがハードリンク経由で同じページを読んでも新規課金は発生せず、`MemoryHigh=1GiB`の再回収圧力がほとんどかからない。
@@ -128,10 +128,10 @@ VMemKVのT2領域(`MAP_PRIVATE`の生mmap)は値を非圧縮のままmmapし、O
 
 ## 生データ
 
-- `implementation/benchmark/logs/ltm_get_hit_profile/` — VMemKV側の基礎プロファイリング: perf report、perf stat結果、vmstat/TLB差分、ベンチマークJSON出力
-- `implementation/benchmark/logs/ltm_get_hit_profile_deepdive/` — ディスクI/O待ち時間の直接測定: `/usr/bin/time -v`出力、diskstats前後差分、sched latencyレポート、完全版perf report
-- `implementation/benchmark/logs/ltm_get_hit_profile_e2/` — VMemKV自身のZipf/Uniform・1KB/64KB依存性(結果3): 8条件分のベンチマークJSON出力・diskstats前後差分
-- `implementation/benchmark/logs/ltm_get_hit_profile_e3/` — `drop_caches`対照実験の生データ: `hardlink_proof.txt`、RocksDB/VMemKVそれぞれの`drop_caches`前後のベンチマークJSON・perf stat・diskstats
+- `implementation/vmemkv/benchmark/logs/ltm_get_hit_profile/` — VMemKV側の基礎プロファイリング: perf report、perf stat結果、vmstat/TLB差分、ベンチマークJSON出力
+- `implementation/vmemkv/benchmark/logs/ltm_get_hit_profile_deepdive/` — ディスクI/O待ち時間の直接測定: `/usr/bin/time -v`出力、diskstats前後差分、sched latencyレポート、完全版perf report
+- `implementation/vmemkv/benchmark/logs/ltm_get_hit_profile_e2/` — VMemKV自身のZipf/Uniform・1KB/64KB依存性(結果3): 8条件分のベンチマークJSON出力・diskstats前後差分
+- `implementation/vmemkv/benchmark/logs/ltm_get_hit_profile_e3/` — `drop_caches`対照実験の生データ: `hardlink_proof.txt`、RocksDB/VMemKVそれぞれの`drop_caches`前後のベンチマークJSON・perf stat・diskstats
 
 `perf.data`/`perf sched.data`(バイナリのrawプロファイル)や`/proc/interrupts`の生ファイルはリポジトリに含めていない——再取得する場合は本ドキュメントの手法セクションの手順で再現可能。
 

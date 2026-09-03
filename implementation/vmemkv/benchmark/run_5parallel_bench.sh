@@ -103,7 +103,7 @@ done
 if [[ "$failed" -eq 0 ]]; then
   echo "========================================================"
   echo " All 5 Parallel Benchmarks Finished SUCCESSFULLY!       "
-  echo " Results downloaded to implementation/benchmark/logs/   "
+  echo " Results downloaded to implementation/vmemkv/benchmark/logs/   "
   echo "========================================================"
 else
   echo "========================================================"

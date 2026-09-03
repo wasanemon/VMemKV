@@ -537,7 +537,7 @@ T1のインデックススロットに十分な空きビット領域がないた
 
 #### 7.4.1 T2 の Huge Page 化 (`MADV_HUGEPAGE`) は不採用
 
-THP はスワップアウト時に 2MB 単位を保たず、512 個の 4KB ページに分割されてから個別にスワップされる。そのため、LTM Get_Hit のようにスワップが継続的に発生するシナリオでは、フォールト単位を 2MB に引き上げてもフォールト回数の削減には寄与しない。詳細は `implementation/docs/benchmark/20260805_t2_huge_page_investigation.md` を参照。
+THP はスワップアウト時に 2MB 単位を保たず、512 個の 4KB ページに分割されてから個別にスワップされる。そのため、LTM Get_Hit のようにスワップが継続的に発生するシナリオでは、フォールト単位を 2MB に引き上げてもフォールト回数の削減には寄与しない。詳細は `implementation/vmemkv/docs/benchmark/20260805_t2_huge_page_investigation.md` を参照。
 
 ### 7.5 Sorted Bloom Filter
 
@@ -554,7 +554,7 @@ Tier 2 の主 mmap(`base`、2.2節)に対して、仮想メモリマップ時の
 
 ### 7.8 Scan の io_uring 並列プリフェッチは不採用
 
-`madvise(MADV_POPULATE_READ)` によるページキャッシュ温めは所有権のあるコピーを伴わないため、cgroup の継続的な回収圧力下では読み取り前に再度追い出される(prefetch-then-evict)。Scan の高速化は 7.9 節の base 専用 mmap(所有権付きの実データ読み取り)によって行う。詳細は `implementation/docs/benchmark/20260806_scan_madvise_tradeoff.md` を参照。
+`madvise(MADV_POPULATE_READ)` によるページキャッシュ温めは所有権のあるコピーを伴わないため、cgroup の継続的な回収圧力下では読み取り前に再度追い出される(prefetch-then-evict)。Scan の高速化は 7.9 節の base 専用 mmap(所有権付きの実データ読み取り)によって行う。詳細は `implementation/vmemkv/docs/benchmark/20260806_scan_madvise_tradeoff.md` を参照。
 
 ### 7.9 Scan/Get の base 領域専用読み取り経路
 
@@ -565,7 +565,7 @@ T2 の「base」領域(2.2節)は書き込み後二度と変更されないた�
   - `base_mmap_scan_seq`(read-only mmap、`MADV_SEQUENTIAL`): 埋め込みサイズヒントが1ページ以下のレコード用。広い先読み窓で多数の小さいレコードのフォルトを少数の major fault にまとめられる。`scan_impl()`・`get_impl()`双方の小レコード読み取りで使う。
   - `base_mmap_scan`(read-only mmap、カーネルのデフォルト(適応的)readahead方針): それより大きいレコード用。`scan_impl()`の大レコード読み取りと、`get_impl()`の大レコード読み取りのうちページキャッシュ常駐が確認できた場合(`mincore()`)に使う。無条件に`MADV_SEQUENTIAL`を付けると、大きいレコードのコーパスをZipfのような偏ったアクセスで読む場合に読み取りバイト数が余分に増えることが測定で判明したため、こちらは意図的に控えめな方針にしてある。
   - `read_fd`(`dup()`したファイルディスクリプタ経由の`pread()`): `get_impl()`の大レコード読み取りで、上記のページキャッシュ常駐確認が取れなかった場合に、そのレコード1つぶんにサイズを絞って読む。
-- **測定方法・結果**: `implementation/docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md`(base/tail split と実データ読み取りの元設計)、`implementation/docs/benchmark/20260810_t2_no_madvise_random.md`を参照。`Scan` は他の Op と共通のマスターコーパスを使用する。
+- **測定方法・結果**: `implementation/vmemkv/docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md`(base/tail split と実データ読み取りの元設計)、`implementation/vmemkv/docs/benchmark/20260810_t2_no_madvise_random.md`を参照。`Scan` は他の Op と共通のマスターコーパスを使用する。
 
 ## 8. Parameters
 

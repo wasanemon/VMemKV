@@ -10,7 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-IMPL_ROOT="$REPO_ROOT/implementation"
+IMPL_ROOT="$REPO_ROOT/implementation/vmemkv"
 
 # Shared matrix and helpers.
 # shellcheck source=common/benchmark_matrix.sh

@@ -9,13 +9,13 @@
 
 ## 背景
 
-VMemKVの3つのメンテナンス操作(`checkpoint()`・`defragment()`・`reorganize()`)は、それぞれ異なるコスト特性を持つ。`benchmark_results/pages/2026082101_charts.html`のsummary tabに各操作の素のスループット比較(Insert vs 各操作)と、並行書き込み下での干渉度(Maintenance Operations: Concurrent-Write Contention)が揃ったことで、初めて3操作を横並びで比較できるようになった。本ドキュメントはこのデータと、各操作の自動トリガー条件(`implementation/include/vmemkv/config.hpp`)を突き合わせ、どの操作から着手すべきか、どれは着手不要かを判断するための整理である。
+VMemKVの3つのメンテナンス操作(`checkpoint()`・`defragment()`・`reorganize()`)は、それぞれ異なるコスト特性を持つ。`benchmark_results/pages/2026082101_charts.html`のsummary tabに各操作の素のスループット比較(Insert vs 各操作)と、並行書き込み下での干渉度(Maintenance Operations: Concurrent-Write Contention)が揃ったことで、初めて3操作を横並びで比較できるようになった。本ドキュメントはこのデータと、各操作の自動トリガー条件(`implementation/vmemkv/include/vmemkv/config.hpp`)を突き合わせ、どの操作から着手すべきか、どれは着手不要かを判断するための整理である。
 
 ## データソース
 
 - スループット比較・干渉度: `benchmark_results/pages/2026082101_charts.html`(データ元は`benchmark_results/2026082101/`配下の各JSONL)
 - 計測環境: AWS i4i.8xlarge、32 writer threads、LTMは`systemd-run`スコープでのcgroupメモリ制約下(`MemoryHigh=1GiB`/`MemoryMax=2GiB`/`MemorySwapMax=1TiB`、`target_ratio=8.0`)
-- トリガー条件: `implementation/include/vmemkv/config.hpp`の該当定数、および`implementation/src/vmemkv_impl.hpp`の`reorg_worker_loop()`
+- トリガー条件: `implementation/vmemkv/include/vmemkv/config.hpp`の該当定数、および`implementation/vmemkv/src/vmemkv_impl.hpp`の`reorg_worker_loop()`
 
 ## 1. 単体スループット負荷率
 

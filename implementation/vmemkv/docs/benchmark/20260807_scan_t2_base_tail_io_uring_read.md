@@ -150,6 +150,6 @@ standaloneのマイクロベンチマーク(mmap+MADV_RANDOM / mmap+MADV_SEQUENT
 
 ## 参照
 
-- `implementation/docs/benchmark/20260806_scan_madvise_tradeoff.md` — 本ドキュメントの前提となる結果7・結果8(madvise-populate方式の不採用)。
-- `implementation/docs/specification/low_level_design.md` 2.2節(T2 base/tail split)、3.3節(Update時のin-place迂回)、7.9節(`ScanBaseSequential`の要約、上記追記を反映済み)。
+- `implementation/vmemkv/docs/benchmark/20260806_scan_madvise_tradeoff.md` — 本ドキュメントの前提となる結果7・結果8(madvise-populate方式の不採用)。
+- `implementation/vmemkv/docs/specification/low_level_design.md` 2.2節(T2 base/tail split)、3.3節(Update時のin-place迂回)、7.9節(`ScanBaseSequential`の要約、上記追記を反映済み)。
 - ブランチ: `scan-t2-base-tail-io-uring-read`。
