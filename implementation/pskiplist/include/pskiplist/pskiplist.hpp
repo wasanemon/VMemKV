@@ -39,6 +39,26 @@ inline constexpr Offset kNullOffset = kForwardMarkBit - 1;
 [[nodiscard]] inline constexpr auto forward_offset(uint64_t raw) -> Offset { return raw & ~kForwardMarkBit; }
 [[nodiscard]] inline constexpr auto forward_marked(uint64_t raw) -> bool { return (raw & kForwardMarkBit) != 0; }
 
+// A tagged (offset, generation counter) pair packed into one word, for the free list's
+// Treiber stack head: the counter changes on every push and pop so a thread that stalls
+// mid-pop with a stale head value can never CAS it back in undetected, even if the exact
+// same offset has since been popped and pushed again (the classic ABA hazard for a plain
+// offset-only stack head). 24 bits of counter is generous — wrapping it back to a value
+// a stalled thread could still match would need that many free-list push/pop cycles to
+// land on the same offset again during a single stall, which isn't realistic. 40 bits of
+// offset is equally generous for node counts.
+inline constexpr int kTaggedOffsetBits = 40;
+inline constexpr uint64_t kTaggedOffsetMask = (uint64_t{1} << kTaggedOffsetBits) - 1;
+inline constexpr Offset kMaxTaggedOffset = kTaggedOffsetMask;
+
+[[nodiscard]] inline constexpr auto pack_tagged(Offset offset, uint32_t tag) -> uint64_t {
+  return (offset & kTaggedOffsetMask) | (static_cast<uint64_t>(tag) << kTaggedOffsetBits);
+}
+[[nodiscard]] inline constexpr auto tagged_offset(uint64_t raw) -> Offset { return raw & kTaggedOffsetMask; }
+[[nodiscard]] inline constexpr auto tagged_generation(uint64_t raw) -> uint32_t {
+  return static_cast<uint32_t>(raw >> kTaggedOffsetBits);
+}
+
 }  // namespace pskiplist
 
 #include <cstdint>
@@ -355,6 +375,9 @@ class PSkipList {
     if (capacity_slots_ < 2) {
       throw std::invalid_argument("pskiplist: capacity_bytes too small to hold head/tail sentinels");
     }
+    if (capacity_slots_ > kMaxTaggedOffset) {
+      throw std::invalid_argument("pskiplist: capacity_bytes exceeds the maximum representable node count");
+    }
     if (file_.reused()) {
       recover();
     } else {
@@ -452,11 +475,9 @@ class PSkipList {
   void reclaim() {
     const std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
 
-    std::vector<Offset> snapshot;
-    {
-      const std::lock_guard<std::mutex> pending_lock(pending_mutex_);
-      snapshot.swap(pending_unlinks_);
-    }
+    // Take exclusive ownership of every offset currently pending unlink; nothing else
+    // will touch these nodes' forward0 links until free_push() below repurposes them.
+    Offset pending_head = drain_pending_unlinks();
 
     // Physical-reclaim safety needs every possible holder of a stale offset — reader or
     // writer — to have drained, unlike checkpoint()'s writer-only wait (3章).
@@ -468,8 +489,11 @@ class PSkipList {
       std::this_thread::yield();
     }
 
-    const std::lock_guard<std::mutex> free_lock(free_mutex_);
-    free_list_.insert(free_list_.end(), snapshot.begin(), snapshot.end());
+    while (pending_head != kNullOffset) {
+      const Offset next = forward_offset(nodes_[pending_head].forward0.load(std::memory_order_relaxed));
+      free_push(pending_head);
+      pending_head = next;
+    }
   }
 
   // Synchronous and blocking. Any put()/remove() that had already returned before this
@@ -536,10 +560,10 @@ class PSkipList {
       current = forward_offset(nodes_[current].forward0.load(std::memory_order_relaxed));
     }
 
-    free_list_.clear();
+    free_head_.store(0, std::memory_order_relaxed);
     for (Offset offset = 2; offset < recovered_high_water_mark; ++offset) {
       if (!reached[offset]) {
-        free_list_.push_back(offset);
+        free_push(offset);
       }
     }
 
@@ -584,20 +608,59 @@ class PSkipList {
     }
   }
 
+  // Lock-free multi-producer stack: any number of unlinkers push concurrently, and
+  // reclaim() drains the whole thing with a single atomic exchange. There's no per-item
+  // pop here, so there's no ABA hazard to guard against — unlike the free list below.
   void enqueue_pending_unlink(Offset offset) const {
-    const std::lock_guard<std::mutex> pending_lock(pending_mutex_);
-    pending_unlinks_.push_back(offset);
+    Offset old_head = pending_head_.load(std::memory_order_relaxed);
+    do {
+      // Keep the mark bit set: this word is already frozen against any stale unmarked-
+      // expecting CAS from a thread that read this node before it was ever removed (4.2節)
+      // — clearing it here would let such a CAS coincidentally match this repurposed
+      // "next pending" value and corrupt the chain.
+      nodes_[offset].forward0.store(pack_forward(old_head, true), std::memory_order_relaxed);
+    } while (!pending_head_.compare_exchange_weak(old_head, offset, std::memory_order_acq_rel,
+                                                   std::memory_order_relaxed));
+  }
+
+  [[nodiscard]] auto drain_pending_unlinks() const -> Offset {
+    return pending_head_.exchange(kNullOffset, std::memory_order_acq_rel);
+  }
+
+  // Lock-free Treiber stack with a tagged head (marked_offset.hpp) to rule out ABA: a
+  // freed node's own forward0 becomes the "next free" link, safe to repurpose since
+  // nothing reaches it through the live chain anymore.
+  void free_push(Offset offset) {
+    uint64_t old_head = free_head_.load(std::memory_order_relaxed);
+    for (;;) {
+      // Marked for the same reason as enqueue_pending_unlink above.
+      nodes_[offset].forward0.store(pack_forward(tagged_offset(old_head), true), std::memory_order_relaxed);
+      const uint64_t new_head = pack_tagged(offset, tagged_generation(old_head) + 1);
+      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel,
+                                            std::memory_order_relaxed)) {
+        return;
+      }
+    }
+  }
+
+  auto free_pop() -> Offset {
+    uint64_t old_head = free_head_.load(std::memory_order_acquire);
+    for (;;) {
+      const Offset offset = tagged_offset(old_head);
+      if (offset == 0) return kNullOffset;  // empty: offset 0 (kHead) is never freed
+      const Offset next = forward_offset(nodes_[offset].forward0.load(std::memory_order_relaxed));
+      const uint64_t new_head = pack_tagged(next, tagged_generation(old_head) + 1);
+      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel,
+                                            std::memory_order_relaxed)) {
+        return offset;
+      }
+    }
   }
 
   auto allocate() -> Offset {
-    {
-      const std::lock_guard<std::mutex> free_lock(free_mutex_);
-      if (!free_list_.empty()) {
-        const Offset reused = free_list_.back();
-        free_list_.pop_back();
-        return reused;
-      }
-    }
+    const Offset reused = free_pop();
+    if (reused != kNullOffset) return reused;
+
     const Offset next = high_water_mark_.fetch_add(1, std::memory_order_relaxed);
     if (next >= capacity_slots_) {
       high_water_mark_.fetch_sub(1, std::memory_order_relaxed);
@@ -637,10 +700,8 @@ class PSkipList {
   mutable std::array<EpochSlot, 2> epoch_slots_{};
   mutable std::atomic<uint64_t> epoch_{0};
   std::mutex epoch_mutex_;
-  mutable std::mutex pending_mutex_;
-  mutable std::vector<Offset> pending_unlinks_;
-  std::mutex free_mutex_;
-  std::vector<Offset> free_list_;
+  mutable std::atomic<Offset> pending_head_{kNullOffset};
+  std::atomic<uint64_t> free_head_{0};
 };
 
 }  // namespace pskiplist
