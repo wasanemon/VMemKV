@@ -158,6 +158,47 @@ class EpochToken {
 
 }  // namespace pskiplist
 
+#include <cstdint>
+#include <functional>
+#include <random>
+#include <thread>
+
+namespace pskiplist {
+
+inline constexpr double kDefaultLevelPromotionProbability = 0.25;
+inline constexpr int kDefaultMaxLevel = 32;
+
+// Assigns each new node's participation height via a geometric distribution (2.5節):
+// starting at level 1, promotes to the next level with probability `p` until it stops or
+// reaches `max_level`. RNG state is thread-local, seeded once per thread from `seed`
+// combined with the calling thread's id — concurrent callers never synchronize on a
+// shared generator, and a fixed `seed` gives a reproducible sequence for single-threaded
+// use (6章's fault-injection tests), without claiming exact reproducibility across
+// concurrent interleavings.
+class LevelGenerator {
+ public:
+  explicit LevelGenerator(uint64_t seed, int max_level = kDefaultMaxLevel,
+                           double p = kDefaultLevelPromotionProbability)
+      : seed_(seed), max_level_(max_level), p_(p) {}
+
+  [[nodiscard]] auto next_level() const -> int {
+    thread_local std::mt19937_64 rng(seed_ ^ std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    int level = 1;
+    while (level < max_level_ && unit(rng) < p_) {
+      ++level;
+    }
+    return level;
+  }
+
+ private:
+  uint64_t seed_;
+  int max_level_;
+  double p_;
+};
+
+}  // namespace pskiplist
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -344,6 +385,44 @@ class MmapFile {
   size_t size_ = 0;
   bool reused_ = false;
 };
+
+}  // namespace pskiplist
+
+#include <atomic>
+#include <cstddef>
+#include <new>
+
+namespace pskiplist {
+
+// A single volatile, DRAM-only skip-list node participating in levels 1..height (2.4節).
+// Its forward pointers for all `height` levels are allocated as one contiguous block
+// following the header rather than as `height` separate allocations (8章), so a search
+// descending through this node's levels stays in one cache-line neighborhood. Only ever
+// constructed via allocate_upper_node() below, which owns the combined allocation.
+struct UpperNode {
+  Offset durable_offset;
+  int height;
+  std::atomic<UpperNode *> forwards[1];  // actually `height` entries — see allocate_upper_node()
+};
+
+[[nodiscard]] inline auto allocate_upper_node(Offset durable_offset, int height) -> UpperNode * {
+  void *memory =
+      ::operator new(sizeof(UpperNode) + sizeof(std::atomic<UpperNode *>) * static_cast<size_t>(height - 1));
+  auto *node = static_cast<UpperNode *>(memory);
+  ::new (&node->durable_offset) Offset(durable_offset);
+  ::new (&node->height) int(height);
+  for (int level = 0; level < height; ++level) {
+    ::new (&node->forwards[level]) std::atomic<UpperNode *>(nullptr);
+  }
+  return node;
+}
+
+inline void deallocate_upper_node(UpperNode *node) {
+  for (int level = 0; level < node->height; ++level) {
+    node->forwards[level].~atomic();
+  }
+  ::operator delete(node);
+}
 
 }  // namespace pskiplist
 

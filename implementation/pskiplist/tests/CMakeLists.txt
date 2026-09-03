@@ -8,6 +8,8 @@ add_executable(test_pskiplist
   normal/test_manifest.cpp
   normal/test_checkpoint.cpp
   normal/test_recovery.cpp
+  normal/test_level_generator.cpp
+  normal/test_upper_node.cpp
   error/test_functional.cpp
   error/test_manifest.cpp
   error/test_recovery.cpp
