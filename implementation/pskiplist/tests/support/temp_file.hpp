@@ -20,7 +20,10 @@ class TempFile {
     path_ = std::filesystem::temp_directory_path() /
             ("pskiplist_test_" + label + "_" + std::to_string(::getpid()) + "_" + std::to_string(id));
   }
-  ~TempFile() { std::filesystem::remove(path_); }
+  ~TempFile() {
+    std::filesystem::remove(path_);
+    std::filesystem::remove(pskiplist::manifest_path(path_));
+  }
 
   TempFile(const TempFile &) = delete;
   auto operator=(const TempFile &) -> TempFile & = delete;
