@@ -9,10 +9,26 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
 endif()
 
+file(GLOB PSKIPLIST_DETAIL_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/include/pskiplist/detail/*.hpp)
+
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/include/pskiplist/pskiplist.hpp
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/amalgamate.sh
+  DEPENDS
+    ${PSKIPLIST_DETAIL_HEADERS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/pskiplist/pskiplist_dev.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/amalgamate.sh
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  COMMENT "Amalgamating pskiplist.hpp from detail/ sources (requires quom; skips with a warning if not installed)"
+  VERBATIM
+)
+add_custom_target(pskiplist_amalgamate DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/pskiplist/pskiplist.hpp)
+
 add_library(pskiplist INTERFACE)
 target_include_directories(pskiplist INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+add_dependencies(pskiplist pskiplist_amalgamate)
 
 add_library(pskiplist_warnings INTERFACE)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -34,3 +50,4 @@ FetchContent_MakeAvailable(doctest)
 
 enable_testing()
 add_subdirectory(tests)
+add_subdirectory(examples)
