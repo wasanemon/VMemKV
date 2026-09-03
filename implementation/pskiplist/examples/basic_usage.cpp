@@ -1,12 +1,19 @@
 #include <pskiplist/pskiplist.hpp>
 
 #include <cassert>
+#include <cstddef>
 #include <cstdio>
+#include <filesystem>
 #include <thread>
 #include <vector>
 
 int main() {
-  pskiplist::PSkipList<int> list(1000);
+  // PSkipList is backed by a single mmap'd file, MAP_SHARED, mutated in place.
+  // capacity_bytes is fixed for the mapping's lifetime (see high_level_design.md 2.6節);
+  // here it's sized for 1000 usable nodes plus the head/tail sentinels.
+  const auto path = std::filesystem::temp_directory_path() / "pskiplist_basic_usage_example.dat";
+  const size_t capacity_bytes = sizeof(pskiplist::DurableNode<int>) * 1002;
+  pskiplist::PSkipList<int> list(path, capacity_bytes);
 
   // put()/get(): insert a key, then look it up.
   if (!list.put(42, 100)) return 1;
@@ -51,5 +58,6 @@ int main() {
   // get()/put()/remove()/scan() from other threads.
   list.reclaim();
 
+  std::filesystem::remove(path);
   return 0;
 }

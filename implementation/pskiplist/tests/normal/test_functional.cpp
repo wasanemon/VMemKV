@@ -4,9 +4,13 @@
 #include <pskiplist/pskiplist.hpp>
 #include <vector>
 
+#include "support/temp_file.hpp"
+
 using pskiplist::NodeState;
 using pskiplist::PackedValue;
 using pskiplist::PSkipList;
+using pskiplist_test::capacity_bytes_for_nodes;
+using pskiplist_test::TempFile;
 
 TEST_CASE("PackedValue round-trips state and payload") {
   const auto v = PackedValue::live(12345);
@@ -19,13 +23,15 @@ TEST_CASE("PackedValue round-trips state and payload") {
 }
 
 TEST_CASE("put then get round-trips the value") {
-  PSkipList<int> skiplist(16);
+  TempFile tmp("put_get");
+  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(16));
   REQUIRE(skiplist.put(42, 100));
   CHECK(skiplist.get(42) == 100);
 }
 
 TEST_CASE("put on an existing key updates in place, not a duplicate") {
-  PSkipList<int> skiplist(16);
+  TempFile tmp("put_update");
+  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(16));
   REQUIRE(skiplist.put(42, 100));
   REQUIRE(skiplist.put(42, 200));
   CHECK(skiplist.get(42) == 200);
@@ -36,7 +42,8 @@ TEST_CASE("put on an existing key updates in place, not a duplicate") {
 }
 
 TEST_CASE("put after remove resurrects the same slot") {
-  PSkipList<int> skiplist(16);
+  TempFile tmp("put_after_remove");
+  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(16));
   REQUIRE(skiplist.put(42, 100));
   REQUIRE(skiplist.remove(42));
   REQUIRE(skiplist.put(42, 300));
@@ -48,7 +55,8 @@ TEST_CASE("put after remove resurrects the same slot") {
 }
 
 TEST_CASE("scan visits live keys in ascending order within [begin, end)") {
-  PSkipList<int> skiplist(64);
+  TempFile tmp("scan_order");
+  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(64));
   for (int key : {50, 10, 30, 20, 40, 5, 60}) {
     REQUIRE(skiplist.put(key, static_cast<uint64_t>(key) * 10));
   }
@@ -62,7 +70,8 @@ TEST_CASE("scan visits live keys in ascending order within [begin, end)") {
 }
 
 TEST_CASE("scan skips tombstoned entries") {
-  PSkipList<int> skiplist(64);
+  TempFile tmp("scan_skips_tombstoned");
+  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(64));
   for (int key : {10, 20, 30, 40}) {
     REQUIRE(skiplist.put(key, static_cast<uint64_t>(key)));
   }
@@ -74,7 +83,8 @@ TEST_CASE("scan skips tombstoned entries") {
 }
 
 TEST_CASE("put after remove and reclaim of a different key reuses the slot") {
-  PSkipList<int> skiplist(1);
+  TempFile tmp("reclaim_reuses_slot");
+  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(1));
   REQUIRE(skiplist.put(1, 10));
   REQUIRE(skiplist.remove(1));
   skiplist.reclaim();

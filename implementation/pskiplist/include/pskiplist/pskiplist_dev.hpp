@@ -6,4 +6,5 @@
 #include "pskiplist/detail/packed_value.hpp"
 #include "pskiplist/detail/durable_node.hpp"
 #include "pskiplist/detail/epoch_token.hpp"
+#include "pskiplist/detail/mmap_file.hpp"
 #include "pskiplist/detail/skiplist.hpp"

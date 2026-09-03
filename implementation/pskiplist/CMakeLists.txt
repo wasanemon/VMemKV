@@ -9,7 +9,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-file(GLOB PSKIPLIST_DETAIL_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/include/pskiplist/detail/*.hpp)
+file(GLOB PSKIPLIST_DETAIL_HEADERS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/pskiplist/detail/*.hpp)
 
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/include/pskiplist/pskiplist.hpp

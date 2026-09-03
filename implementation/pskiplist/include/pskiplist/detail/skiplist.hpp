@@ -4,9 +4,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -14,6 +17,7 @@
 #include "pskiplist/detail/durable_node.hpp"
 #include "pskiplist/detail/epoch_token.hpp"
 #include "pskiplist/detail/marked_offset.hpp"
+#include "pskiplist/detail/mmap_file.hpp"
 #include "pskiplist/detail/packed_value.hpp"
 
 namespace pskiplist {
@@ -22,7 +26,18 @@ template <typename Key, typename Compare = std::less<Key>>
   requires SkipListKey<Key> && SkipListCompare<Compare, Key>
 class PSkipList {
  public:
-  explicit PSkipList(size_t capacity_nodes) : nodes_(capacity_nodes + 2) {
+  // `capacity_bytes` is fixed for the lifetime of the mapping (2.6節) — sized generously
+  // up front, since a sparse file only consumes disk for pages actually written. The data
+  // file at `path` is mutated in place via MAP_SHARED; it is not rewritten on checkpoint.
+  explicit PSkipList(const std::filesystem::path &path, size_t capacity_bytes)
+      : file_(path, capacity_bytes),
+        nodes_(static_cast<DurableNode<Key> *>(file_.data())),
+        capacity_slots_(file_.size() / sizeof(DurableNode<Key>)) {
+    if (capacity_slots_ < 2) {
+      throw std::invalid_argument("pskiplist: capacity_bytes too small to hold head/tail sentinels");
+    }
+    ::new (&nodes_[kHead]) DurableNode<Key>();
+    ::new (&nodes_[kTail]) DurableNode<Key>();
     nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
   }
 
@@ -188,7 +203,7 @@ class PSkipList {
       }
     }
     const Offset next = high_water_mark_.fetch_add(1, std::memory_order_relaxed);
-    if (next >= nodes_.size()) {
+    if (next >= capacity_slots_) {
       high_water_mark_.fetch_sub(1, std::memory_order_relaxed);
       return kNullOffset;
     }
@@ -216,7 +231,9 @@ class PSkipList {
     static_cast<void>(find_at_or_after(key, &predecessor));
   }
 
-  std::vector<DurableNode<Key>> nodes_;
+  MmapFile file_;
+  DurableNode<Key> *nodes_;
+  size_t capacity_slots_;
   std::atomic<Offset> high_water_mark_{2};
   Compare less_{};
 
