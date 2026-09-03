@@ -9,23 +9,17 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-add_library(pskiplist_headers INTERFACE)
-target_include_directories(pskiplist_headers INTERFACE
+add_library(pskiplist INTERFACE)
+target_include_directories(pskiplist INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 add_library(pskiplist_warnings INTERFACE)
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  target_compile_options(pskiplist_warnings INTERFACE -Wall -Wextra -Wpedantic -Werror)
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(pskiplist_warnings INTERFACE -Wall -Wextra -Wpedantic -Werror)
 elseif(MSVC)
   target_compile_options(pskiplist_warnings INTERFACE /W4 /WX)
 endif()
-
-# pskiplist is header-only for now (see include/pskiplist/pskiplist.hpp).
-add_library(pskiplist INTERFACE)
-target_link_libraries(pskiplist INTERFACE pskiplist_headers)
 
 # ── doctest (single-header, header-only test framework) ─────────────────────
 include(FetchContent)
