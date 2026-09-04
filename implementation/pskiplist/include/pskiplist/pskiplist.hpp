@@ -836,6 +836,13 @@ class PSkipList {
     const uint64_t threshold = manifest->epoch;
     const uint64_t recovered_high_water_mark = manifest->high_water_mark;
 
+    // epoch_ is a per-process counter, not persisted, and restarts at 0 on every reopen.
+    // Left unseeded, this session's checkpoints would publish epoch numbers below the
+    // previous session's, and a later recovery would then wrongly trim nodes this session
+    // already checkpointed (their epoch stamps would look "too new" against that lower
+    // threshold). Resume from threshold + 1 to keep numbering monotonic across restarts.
+    epoch_.store(threshold + 1, std::memory_order_relaxed);
+
     std::vector<bool> reached(recovered_high_water_mark, false);
     Offset pred = kHead;
     Offset current = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));

@@ -45,6 +45,33 @@ TEST_CASE("writes after the last checkpoint are not recovered") {
   CHECK_FALSE(reopened.get(2).has_value());
 }
 
+TEST_CASE("data checkpointed under a high epoch survives a later session with a lower one") {
+  // epoch_ is an in-process counter that starts at 0 every time the file is reopened; it
+  // must resume from the manifest's published epoch, not restart from zero, or a later
+  // session's checkpoint() — which necessarily publishes its own low epoch — makes
+  // recover() wrongly trim data an earlier session already durably checkpointed.
+  TempFile tmp("recover_epoch_continuity");
+  const size_t bytes = capacity_bytes_for_nodes<int>(64);
+  {
+    PSkipList<int> skiplist(tmp.path(), bytes);
+    for (int i = 0; i < 5; ++i) {
+      REQUIRE(skiplist.checkpoint());
+    }
+    REQUIRE(skiplist.put(1, 100));  // stamped with this session's now-advanced epoch
+    REQUIRE(skiplist.checkpoint());
+  }
+  {
+    PSkipList<int> reopened(tmp.path(), bytes);
+    REQUIRE(reopened.get(1) == 100);
+    REQUIRE(reopened.put(2, 200));  // this session's epoch_ restarts at 0
+    REQUIRE(reopened.checkpoint());
+  }
+
+  PSkipList<int> twice_reopened(tmp.path(), bytes);
+  CHECK(twice_reopened.get(1) == 100);
+  CHECK(twice_reopened.get(2) == 200);
+}
+
 TEST_CASE("reopening a file with content but no manifest starts fresh") {
   TempFile tmp("recover_no_manifest");
   const size_t bytes = capacity_bytes_for_nodes<int>(64);
