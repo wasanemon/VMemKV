@@ -858,6 +858,22 @@ class PSkipList {
     }
 
     high_water_mark_.store(recovered_high_water_mark, std::memory_order_relaxed);
+    rebuild_upper_levels();
+  }
+
+  // The upper levels are pure DRAM search hints (2.4節) — never persisted, so a process
+  // restart always starts them empty and rebuilds by walking the now-trusted Level 0 chain
+  // above, re-rolling each surviving node's height exactly as put() would for a fresh
+  // insert. Single-threaded (the constructor's caller guarantees no concurrent access yet,
+  // matching the destructor's assumption), so link_upper_levels's CAS retries are all
+  // uncontended — this is O(corpus) as noted in 7章's open-questions list, unavoidable
+  // without persisting the upper levels themselves (which 2.4節 deliberately avoids).
+  void rebuild_upper_levels() {
+    Offset current = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
+    while (current != kTail) {
+      link_upper_levels(current, nodes_[current].key, level_generator_.next_level());
+      current = forward_offset(nodes_[current].forward0.load(std::memory_order_relaxed));
+    }
   }
 
   [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool {
