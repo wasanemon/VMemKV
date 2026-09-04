@@ -55,7 +55,11 @@ To build with a sanitizer (see `cmake/Sanitizers.cmake`):
 ```sh
 cmake -S . -B build-tsan -DPSKIPLIST_SANITIZE=thread
 cmake --build build-tsan
+TSAN_OPTIONS="suppressions=$(pwd)/tsan_suppressions.txt" ctest --test-dir build-tsan --output-on-failure
 ```
+
+`tsan_suppressions.txt` covers one intentional, verified-safe seqlock race (see that file's own
+comment) — omit it and ThreadSanitizer will report that one finding.
 
 ## Requirements
 

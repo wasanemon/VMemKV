@@ -11,6 +11,11 @@ namespace pskiplist {
 template <typename Key>
 concept SkipListKey = std::is_trivially_copyable_v<Key> && std::default_initializable<Key>;
 
+// Same requirements as SkipListKey — `Value` is stored and copied the same way, just without
+// needing an ordering.
+template <typename Value>
+concept SkipListValue = std::is_trivially_copyable_v<Value> && std::default_initializable<Value>;
+
 template <typename Compare, typename Key>
 concept SkipListCompare = std::default_initializable<Compare> && std::predicate<Compare, const Key &, const Key &>;
 

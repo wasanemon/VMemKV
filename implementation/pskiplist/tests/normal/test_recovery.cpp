@@ -75,6 +75,31 @@ TEST_CASE("removing a checkpointed key and reusing its slot doesn't lose it if n
   CHECK_FALSE(reopened.get(2).has_value());
 }
 
+// Regression test for checkpointed_state (durable_node.hpp): reverting `value` to
+// checkpointed_value during recover() no longer implies reverting state too, now that they're
+// separate fields instead of one packed word — this exercises exactly the crash window
+// checkpointed_state exists to cover (remove() then put() resurrecting the same key, all after
+// the last checkpoint and never re-checkpointed): the key must come back fully live with its
+// original pre-removal value, not stuck half-tombstoned.
+TEST_CASE("a remove-then-resurrect after the last checkpoint reverts to the pre-removal value") {
+  TempFile tmp("recover_remove_then_resurrect_not_checkpointed");
+  const size_t bytes = capacity_bytes_for_nodes<int>(64);
+  {
+    PSkipList<int> skiplist(tmp.path(), bytes);
+    REQUIRE(skiplist.put(1, 100));
+    REQUIRE(skiplist.checkpoint());
+    REQUIRE(skiplist.remove(1));
+    REQUIRE(skiplist.put(1, 999));  // resurrects the same key — never checkpointed after this
+  }
+
+  PSkipList<int> reopened(tmp.path(), bytes);
+  const auto val = reopened.get(1);
+  REQUIRE(val.has_value());
+  CHECK(*val == 100);           // reverted to the checkpointed (pre-removal) value, fully live
+  CHECK(reopened.put(1, 200));  // still a normal, live, updatable key
+  CHECK(reopened.get(1) == 200);
+}
+
 TEST_CASE("data checkpointed under a high epoch survives a later session with a lower one") {
   // epoch_ is an in-process counter that starts at 0 every time the file is reopened; it
   // must resume from the manifest's published epoch, not restart from zero, or a later

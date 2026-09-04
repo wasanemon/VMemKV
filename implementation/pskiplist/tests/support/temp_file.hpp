@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <pskiplist/pskiplist.hpp>
 #include <string>
@@ -37,9 +38,9 @@ class TempFile {
 // Bytes needed to hold `usable_nodes` insertable slots plus the head/tail sentinels,
 // matching how capacity was expressed before the mmap-backed constructor (in node
 // counts) — keeps small-capacity tests (e.g. "capacity exhausted") easy to state exactly.
-template <typename Key>
+template <typename Key, typename Value = uint64_t>
 [[nodiscard]] auto capacity_bytes_for_nodes(size_t usable_nodes) -> size_t {
-  return (usable_nodes + 2) * sizeof(pskiplist::DurableNode<Key>);
+  return (usable_nodes + 2) * sizeof(pskiplist::DurableNode<Key, Value>);
 }
 
 }  // namespace pskiplist_test

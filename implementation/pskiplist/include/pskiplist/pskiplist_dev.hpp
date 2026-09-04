@@ -9,7 +9,7 @@
 #include "pskiplist/detail/marked_offset.hpp"
 #include "pskiplist/detail/marked_pointer.hpp"
 #include "pskiplist/detail/mmap_file.hpp"
-#include "pskiplist/detail/packed_value.hpp"
 #include "pskiplist/detail/skiplist.hpp"
+#include "pskiplist/detail/tombstone.hpp"
 #include "pskiplist/detail/upper_node.hpp"
 #include "pskiplist/detail/version.hpp"

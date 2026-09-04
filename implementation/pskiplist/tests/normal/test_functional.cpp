@@ -6,20 +6,42 @@
 
 #include "support/temp_file.hpp"
 
-using pskiplist::NodeState;
-using pskiplist::PackedValue;
 using pskiplist::PSkipList;
 using pskiplist_test::capacity_bytes_for_nodes;
 using pskiplist_test::TempFile;
 
-TEST_CASE("PackedValue round-trips state and payload") {
-  const auto v = PackedValue::live(12345);
-  CHECK(v.state() == NodeState::kLive);
-  CHECK(v.payload() == 12345);
+// Regression test: two earlier designs each reserved part of `value`'s bit space for node
+// state (first 2 packed bits, then 2 reserved sentinel values) and both silently mishandled
+// some legitimate payloads. Now that state lives in its own field (durable_node.hpp), `Value`
+// has no reserved values at all -- every uint64_t, including all-1-bits, must round-trip.
+TEST_CASE("put/get round-trips full-width payloads, including all-1-bits") {
+  TempFile tmp("put_get_full_width_payload");
+  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(16));
+  const uint64_t kHighBitsSet = 0xC000000000000001ULL;
+  REQUIRE(skiplist.put(1, kHighBitsSet));
+  CHECK(skiplist.get(1) == kHighBitsSet);
+  REQUIRE(skiplist.put(1, ~uint64_t{0}));
+  CHECK(skiplist.get(1) == ~uint64_t{0});
+}
 
-  const auto tombstoned = v.with_state(NodeState::kTombstonedLinked);
-  CHECK(tombstoned.state() == NodeState::kTombstonedLinked);
-  CHECK(tombstoned.payload() == 12345);
+// Value is a real template parameter (mirrors Key) backed by a seqlock, not a single CAS'd
+// word -- any trivially-copyable, default-constructible struct works, not just uint64_t.
+TEST_CASE("put/get round-trips a custom struct Value") {
+  struct Pair {
+    uint64_t a = 0;
+    uint32_t b = 0;
+    auto operator==(const Pair &) const -> bool = default;
+  };
+  TempFile tmp("put_get_struct_value");
+  PSkipList<int, Pair> skiplist(tmp.path(), capacity_bytes_for_nodes<int, Pair>(16));
+  REQUIRE(skiplist.put(1, Pair{42, 7}));
+  const auto found = skiplist.get(1);
+  REQUIRE(found.has_value());
+  CHECK(*found == Pair{42, 7});
+  REQUIRE(skiplist.put(1, Pair{100, 200}));
+  CHECK(skiplist.get(1) == Pair{100, 200});
+  REQUIRE(skiplist.remove(1));
+  CHECK_FALSE(skiplist.get(1).has_value());
 }
 
 TEST_CASE("put then get round-trips the value") {

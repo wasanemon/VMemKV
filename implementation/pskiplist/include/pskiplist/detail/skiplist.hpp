@@ -12,6 +12,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "pskiplist/detail/concepts.hpp"
@@ -23,13 +24,13 @@
 #include "pskiplist/detail/marked_offset.hpp"
 #include "pskiplist/detail/marked_pointer.hpp"
 #include "pskiplist/detail/mmap_file.hpp"
-#include "pskiplist/detail/packed_value.hpp"
+#include "pskiplist/detail/tombstone.hpp"
 #include "pskiplist/detail/upper_node.hpp"
 
 namespace pskiplist {
 
-template <typename Key, typename Compare = std::less<Key>>
-  requires SkipListKey<Key> && SkipListCompare<Compare, Key>
+template <typename Key, typename Value = uint64_t, typename Compare = std::less<Key>>
+  requires SkipListKey<Key> && SkipListValue<Value> && SkipListCompare<Compare, Key>
 class PSkipList {
  public:
   // `capacity_bytes` is fixed for the mapping's lifetime; size generously — a sparse file
@@ -37,8 +38,8 @@ class PSkipList {
   explicit PSkipList(const std::filesystem::path &path, size_t capacity_bytes)
       : path_(path),
         file_(path, capacity_bytes),
-        nodes_(static_cast<DurableNode<Key> *>(file_.data())),
-        capacity_slots_(file_.size() / sizeof(DurableNode<Key>)),
+        nodes_(static_cast<DurableNode<Key, Value> *>(file_.data())),
+        capacity_slots_(file_.size() / sizeof(DurableNode<Key, Value>)),
         level_generator_(std::random_device{}()) {
     if (capacity_slots_ < 2) {
       throw std::invalid_argument("pskiplist: capacity_bytes too small to hold head/tail sentinels");
@@ -71,19 +72,29 @@ class PSkipList {
   PSkipList(const PSkipList &) = delete;
   auto operator=(const PSkipList &) -> PSkipList & = delete;
 
-  [[nodiscard]] auto get(const Key &key) const -> std::optional<uint64_t> {
+  [[nodiscard]] auto get(const Key &key) const -> std::optional<Value> {
+    const auto found = get_with_key(key);
+    if (!found.has_value()) return std::nullopt;
+    return found->second;
+  }
+
+  // Like get(), but also returns the matched node's actual stored key — not merely `key` itself.
+  // Useful when Compare/keys_equal treats keys as equal despite differing in some payload-carrying
+  // bits Compare ignores (e.g. metadata packed into otherwise-unordered bits of a composite key).
+  [[nodiscard]] auto get_with_key(const Key &key) const -> std::optional<std::pair<Key, Value>> {
     const EpochToken token(epoch_slots_, epoch_, EpochRole::kReader);
     Offset predecessor = kNullOffset;
     const Offset current = find_at_or_after(key, &predecessor, search_upper_levels(key).level0_hint);
     if (current == kNullOffset || current == kTail || !keys_equal(nodes_[current].key, key)) {
       return std::nullopt;
     }
-    const PackedValue v(nodes_[current].value.load(std::memory_order_acquire));
-    if (v.state() != NodeState::kLive) return std::nullopt;
-    return v.payload();
+    if (nodes_[current].state.load(std::memory_order_acquire) != NodeState::kLive) {
+      return std::nullopt;
+    }
+    return std::make_pair(nodes_[current].key, read_value(current));
   }
 
-  [[nodiscard]] auto put(const Key &key, uint64_t payload) -> bool {
+  [[nodiscard]] auto put(const Key &key, const Value &payload) -> bool {
     const EpochToken token(epoch_slots_, epoch_, EpochRole::kWriter);
     const Offset hint = search_upper_levels(key).level0_hint;
     Offset fresh = kNullOffset;
@@ -91,27 +102,35 @@ class PSkipList {
       Offset predecessor = kNullOffset;
       const Offset existing = find_at_or_after(key, &predecessor, hint);
       if (existing != kNullOffset && existing != kTail && keys_equal(nodes_[existing].key, key)) {
-        uint64_t expected = nodes_[existing].value.load(std::memory_order_acquire);
-        if (PackedValue(expected).state() == NodeState::kTombstonedUnlinked) {
+        const NodeState state = nodes_[existing].state.load(std::memory_order_acquire);
+        if (state == NodeState::kTombstonedUnlinked) {
           std::this_thread::yield();
           continue;
         }
-        shadow_if_first_touch_since_checkpoint(existing, expected);
-        const uint64_t desired = PackedValue::live(payload).raw();
-        if (nodes_[existing].value.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
-          return true;
+        write_value_locked(existing, [&](Value &v) { v = payload; });
+        if (state == NodeState::kTombstonedLinked) {
+          NodeState expected = NodeState::kTombstonedLinked;
+          if (!nodes_[existing].state.compare_exchange_strong(expected, NodeState::kLive, std::memory_order_acq_rel)) {
+            // Lost the resurrect race to a concurrent physically_unlink_best_effort(), which
+            // just committed to permanently retiring this offset -- the value write above is
+            // harmless waste on a node that's about to be spliced out. Retry from the top.
+            continue;
+          }
         }
-        continue;
+        return true;
       }
 
       if (fresh == kNullOffset) {
         fresh = allocate();
         if (fresh == kNullOffset) return false;
         nodes_[fresh].key = key;
-        nodes_[fresh].value.store(PackedValue::live(payload).raw(), std::memory_order_relaxed);
+        nodes_[fresh].value = payload;
         nodes_[fresh].epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_relaxed);
-        // A reused slot may carry a previous occupant's shadow; clear it.
-        nodes_[fresh].checkpointed_value.store(0, std::memory_order_relaxed);
+        // A reused slot may carry a previous occupant's state/shadow; reset it.
+        nodes_[fresh].state.store(NodeState::kLive, std::memory_order_relaxed);
+        nodes_[fresh].checkpointed_state.store(NodeState::kLive, std::memory_order_relaxed);
+        nodes_[fresh].version.store(0, std::memory_order_relaxed);
+        nodes_[fresh].checkpointed_value = Value{};
         nodes_[fresh].mutation_epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_relaxed);
       }
       nodes_[fresh].forward0.store(pack_forward(existing, false), std::memory_order_relaxed);
@@ -133,14 +152,16 @@ class PSkipList {
     if (current == kNullOffset || current == kTail || !keys_equal(nodes_[current].key, key)) return false;
 
     for (;;) {
-      uint64_t expected = nodes_[current].value.load(std::memory_order_acquire);
-      const PackedValue v(expected);
-      if (v.state() != NodeState::kLive) return false;
-      shadow_if_first_touch_since_checkpoint(current, expected);
-      const uint64_t desired = v.with_state(NodeState::kTombstonedLinked).raw();
-      if (nodes_[current].value.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+      if (nodes_[current].state.load(std::memory_order_acquire) != NodeState::kLive) {
+        return false;
+      }
+      write_value_locked(current, [](Value &) {});  // no value change, just the shadow capture
+      NodeState expected = NodeState::kLive;
+      if (nodes_[current].state.compare_exchange_strong(
+              expected, NodeState::kTombstonedLinked, std::memory_order_acq_rel)) {
         break;
       }
+      // Lost the race to a concurrent remove() — re-check state fresh next iteration.
     }
 
     unlink_upper_levels(key, current);
@@ -158,9 +179,8 @@ class PSkipList {
     while (current != kNullOffset && current != kTail) {
       const auto &node = nodes_[current];
       if (!less_(node.key, end)) break;
-      const PackedValue v(node.value.load(std::memory_order_acquire));
-      if (v.state() == NodeState::kLive) {
-        callback(node.key, v.payload());
+      if (node.state.load(std::memory_order_acquire) == NodeState::kLive) {
+        callback(node.key, read_value(current));
       }
       current = forward_offset(node.forward0.load(std::memory_order_acquire));
     }
@@ -237,17 +257,63 @@ class PSkipList {
   };
 
   void initialize_fresh() {
-    ::new (&nodes_[kHead]) DurableNode<Key>();
-    ::new (&nodes_[kTail]) DurableNode<Key>();
+    ::new (&nodes_[kHead]) DurableNode<Key, Value>();
+    ::new (&nodes_[kTail]) DurableNode<Key, Value>();
     nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
+  }
+
+  // Seqlock read of `value`, mirroring the classic read-retry pattern (load version, read data,
+  // fence, re-check version unchanged) — same idea as vmemkv's own T2FlatFile record seqlock.
+  [[nodiscard]] auto read_value(Offset offset) const -> Value {
+    const auto &node = nodes_[offset];
+    for (;;) {
+      const uint64_t v1 = node.version.load(std::memory_order_acquire);
+      if ((v1 & 1) != 0) {
+        std::this_thread::yield();
+        continue;
+      }
+      Value result = node.value;
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (v1 == node.version.load(std::memory_order_relaxed)) {
+        return result;
+      }
+    }
+  }
+
+  // Claims exclusive write access to `offset`'s value (version even->odd CAS — this doubles as
+  // write-side mutual exclusion against other concurrent writers of the same node, not just a
+  // reader-tear guard), shadows the pre-mutation value+state on first touch since the last
+  // checkpoint, runs `mutate(value)`, then releases (version -> v+2). Used by both put() (real
+  // mutation) and remove() (no-op mutation — it only needs the shadow capture).
+  template <typename MutateFn>
+  void write_value_locked(Offset offset, MutateFn &&mutate) {
+    auto &node = nodes_[offset];
+    uint64_t v = node.version.load(std::memory_order_relaxed);
+    for (;;) {
+      if ((v & 1) != 0) {
+        std::this_thread::yield();
+        v = node.version.load(std::memory_order_relaxed);
+        continue;
+      }
+      if (node.version.compare_exchange_weak(v, v + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        break;
+      }
+    }
+    if (node.mutation_epoch.load(std::memory_order_acquire) <= last_published_epoch_.load(std::memory_order_acquire)) {
+      node.checkpointed_value = node.value;
+      node.checkpointed_state.store(node.state.load(std::memory_order_acquire), std::memory_order_relaxed);
+      node.mutation_epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_relaxed);
+    }
+    mutate(node.value);
+    node.version.store(v + 2, std::memory_order_release);
   }
 
   // No manifest means no checkpoint() ever completed — start fresh. Otherwise walk Level 0
   // from head, trusting nodes only while their creation epoch is <= the manifest's; the walk
   // stops and splices at the first untrusted node, and every allocated-but-unreached slot
-  // below high_water_mark becomes free. A trusted node's latest value may still be newer than
-  // the checkpoint (put() or remove(), indistinguishable here), so it's reverted to its shadow
-  // whenever mutation_epoch exceeds the threshold.
+  // below high_water_mark becomes free. A trusted node's latest value/state may still be newer
+  // than the checkpoint (put() or remove(), indistinguishable here), so both are reverted to
+  // their shadow whenever mutation_epoch exceeds the threshold.
   void recover() {
     const auto manifest = read_manifest(path_);
     if (!manifest.has_value()) {
@@ -273,7 +339,8 @@ class PSkipList {
         break;
       }
       if (nodes_[current].mutation_epoch.load(std::memory_order_relaxed) > threshold) {
-        nodes_[current].value.store(nodes_[current].checkpointed_value.load(std::memory_order_relaxed),
+        nodes_[current].value = nodes_[current].checkpointed_value;
+        nodes_[current].state.store(nodes_[current].checkpointed_state.load(std::memory_order_relaxed),
                                     std::memory_order_relaxed);
         nodes_[current].mutation_epoch.store(threshold, std::memory_order_relaxed);
       }
@@ -299,7 +366,7 @@ class PSkipList {
     Offset walk = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (walk != kTail) {
       const Offset next = forward_offset(nodes_[walk].forward0.load(std::memory_order_relaxed));
-      if (PackedValue(nodes_[walk].value.load(std::memory_order_relaxed)).state() == NodeState::kTombstonedLinked) {
+      if (nodes_[walk].state.load(std::memory_order_relaxed) == NodeState::kTombstonedLinked) {
         physically_unlink_best_effort(nodes_[walk].key, walk);
       }
       walk = next;
@@ -320,18 +387,6 @@ class PSkipList {
   }
 
   [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool { return !less_(a, b) && !less_(b, a); }
-
-  // Shared by put()'s existing-key branch and remove()'s tombstone transition, both in-place
-  // mutations to a possibly-already-checkpointed node. Only shadows on the first touch since
-  // the last checkpoint — once mutation_epoch is ahead of last_published_epoch_, an earlier
-  // mutation in this same window already captured the value recover() needs.
-  void shadow_if_first_touch_since_checkpoint(Offset offset, uint64_t expected_live_value) const {
-    if (nodes_[offset].mutation_epoch.load(std::memory_order_acquire) <=
-        last_published_epoch_.load(std::memory_order_acquire)) {
-      nodes_[offset].checkpointed_value.store(expected_live_value, std::memory_order_relaxed);
-      nodes_[offset].mutation_epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_release);
-    }
-  }
 
   // Traverses to the first node with key >= `key`, helping to physically unlink any marked
   // node along the way. `hint` (typically from the upper levels) seeds the first attempt in
@@ -417,11 +472,12 @@ class PSkipList {
   }
 
   void physically_unlink_best_effort(const Key &key, Offset node_offset) {
-    uint64_t expected = nodes_[node_offset].value.load(std::memory_order_acquire);
-    const PackedValue v(expected);
-    if (v.state() != NodeState::kTombstonedLinked) return;
-    const uint64_t desired = v.with_state(NodeState::kTombstonedUnlinked).raw();
-    if (!nodes_[node_offset].value.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+    NodeState expected = NodeState::kTombstonedLinked;
+    // A genuine state change (not a same-value CAS): a concurrent put() racing to resurrect
+    // this node holds `expected` from before this transition, so its own CAS correctly fails
+    // and retries instead of resurrecting a node this call just committed to splicing out.
+    if (!nodes_[node_offset].state.compare_exchange_strong(
+            expected, NodeState::kTombstonedUnlinked, std::memory_order_acq_rel)) {
       return;
     }
 
@@ -443,7 +499,7 @@ class PSkipList {
   // An UpperNode carries no deletion state of its own — it's nothing but a search hint for a
   // Level 0 record, so this borrows Level 0's tombstone state directly.
   [[nodiscard]] auto is_upper_node_dead(UpperNode *node) const -> bool {
-    return PackedValue(nodes_[node->durable_offset].value.load(std::memory_order_acquire)).state() != NodeState::kLive;
+    return nodes_[node->durable_offset].state.load(std::memory_order_acquire) != NodeState::kLive;
   }
 
   // Whoever's splice brings levels_remaining to 0 unlinked this node from its last list and
@@ -523,8 +579,7 @@ class PSkipList {
   }
 
   void link_upper_levels(Offset fresh, const Key &key, int height) {
-    const PackedValue v(nodes_[fresh].value.load(std::memory_order_acquire));
-    if (v.state() != NodeState::kLive) {
+    if (nodes_[fresh].state.load(std::memory_order_acquire) != NodeState::kLive) {
       // A concurrent remove() may have already tombstoned `fresh` before this runs. Skipping
       // the insert is safe: Level 0 still finds the key without an upper-level entry, and
       // is_upper_node_dead() backstops any rare entry that slips past this check anyway.
@@ -581,7 +636,7 @@ class PSkipList {
 
   std::filesystem::path path_;
   MmapFile file_;
-  DurableNode<Key> *nodes_;
+  DurableNode<Key, Value> *nodes_;
   size_t capacity_slots_;
   std::atomic<Offset> high_water_mark_{2};
   Compare less_{};

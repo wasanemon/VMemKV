@@ -23,6 +23,15 @@ tagged releases yet — everything below is unreleased.
 - A single generic lock-free "mark and help-splice" primitive shared by Level 0 and the
   upper levels, differing only in how each packs its node identity (array offset vs.
   pointer) into a marked word.
+- `Value` is a real template parameter (`PSkipList<Key, Value = uint64_t, Compare>`), any
+  trivially-copyable type — backed by a per-node seqlock, not a single CAS'd word, so there
+  are no reserved/forbidden payload values and no bit width limit.
+
+### Fixed
+
+- `link_upper_levels()` searched every level from that level's own head instead of cascading
+  from the level above, degenerating insert into O(N) at level 1 (where nearly every node
+  lives) instead of the intended O(log N).
 
 See [`high_level_design.md`](high_level_design.md) for the full design and
 [`README.md`](README.md) for usage.
