@@ -5,40 +5,20 @@
 
 namespace pskiplist {
 
-// A generic lock-free "find, helping to unlink any marked node along the way" search over a
-// singly-linked list whose nodes are addressed by `Identity` (an Offset into a fixed array
-// for Level 0, or a raw pointer for an upper level — see marked_offset.hpp / marked_pointer.hpp)
-// and whose per-node "next" pointer is packed together with a deletion mark bit into one
-// atomic<uint64_t> word (Traits::pack/value/is_marked). This is the one idea both layers
-// share: a single CAS on a predecessor's word simultaneously validates "the successor is
-// still what I read" and "the predecessor itself hasn't been marked out from under me",
-// because both facts live in the same word.
+// Generic lock-free "find, helping to unlink any marked node along the way" search over a
+// singly-linked list, shared by Level 0 (Identity = Offset) and the upper levels (Identity =
+// UpperNode*). Each node's "next" pointer is packed with a deletion mark bit into one
+// atomic<uint64_t> word (Traits::pack/value/is_marked), so a single CAS on a predecessor's
+// word validates both "the successor is still what I read" and "the predecessor itself
+// hasn't been marked out from under me".
 //
-// `start_id`/`start_word` is where the walk begins — typically a caller-supplied search hint
-// pointing past most of the list. If that word turns out to already be marked, its offset/
-// pointer bits can no longer be trusted at all (they may already have been repurposed for a
-// pending-reclaim queue by the time this reads them), so the walk restarts from
-// `fallback_id`/`fallback_word` instead — a caller-guaranteed-live anchor (a list head) —
-// rather than retrying the same possibly-permanently-marked start forever. Callers with no
-// meaningful hint (Level N's per-level searches always start at a list head, which is never
-// itself deleted) just pass the same id/word twice; the fallback path is then unreachable,
-// not merely harmless.
-//
-// `is_dead` is a second, independent deletion signal a node can carry *outside* its own
-// word — Level N has no per-node source of truth of its own (an UpperNode is nothing but a
-// search hint), so it borrows Level 0's tombstone state via this hook instead of maintaining
-// a redundant one; Level 0 has no such external signal, so it always passes a hook that
-// returns false. A node flagged dead this way but not yet structurally marked gets marked
-// right here (idempotent — a no-op if a concurrent caller already did) before falling into
-// the same help-splice-and-restart path as a node found already marked, so a zombie gets
-// caught by whichever search encounters it first, however late.
-//
-// On encountering a node whose own word is marked, this helps splice it out via one CAS on
-// its predecessor's word and, if that CAS wins, reports the removed identity via `on_splice`
-// — then restarts the whole walk from the start (not fallback), since the predecessor used up
-// to that point can no longer be trusted. Stops and returns the first node whose key is not
-// less than `key`, or Traits::null_id() if the list runs out first; `*out_pred` receives that
-// result's immediate predecessor.
+// `start_id`/`start_word` is where the walk begins (a search hint); if it's already marked,
+// the walk restarts from the guaranteed-live `fallback_id`/`fallback_word` (a list head)
+// instead. `is_dead` is an external deletion signal (the upper levels have none of their
+// own — an UpperNode borrows Level 0's tombstone state via this hook; Level 0 always passes
+// false). On finding a marked node, this helps splice it out, reports it via `on_splice` on a
+// winning CAS, and restarts from the start. Returns the first node with key >= `key`, or
+// Traits::null_id() if the list runs out; `*out_pred` receives its predecessor.
 template <typename Identity,
           typename Traits,
           typename Key,
@@ -100,10 +80,8 @@ template <typename Identity,
   }
 }
 
-// Marks `id`'s own word for logical deletion, preserving whatever successor it currently
-// names — the first half of removing a node, done once before any splice is attempted.
-// Retries against concurrent inserts that change the successor while leaving mark unset;
-// a no-op (mark already set) if another thread got there first.
+// Marks `id`'s own word for logical deletion, preserving its current successor — the first
+// half of removing a node, before any splice is attempted. No-op if already marked.
 template <typename Identity, typename Traits, typename OwnWordFn>
 void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
   uint64_t raw = own_word(id).load(std::memory_order_acquire);
@@ -115,14 +93,11 @@ void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
   }
 }
 
-// A plain lock-free Treiber stack push: `value` becomes the new head, linked to the old one
-// by `set_next(value, old_head)` — usually a direct store into `value`'s own dedicated "next"
-// word, but left as a callback rather than a word reference so a caller that repurposes an
-// existing word (packing in a mark bit, say) can do that instead. No pop is provided — every
-// user of this drains the whole stack at once via `head.exchange(...,
-// std::memory_order_acq_rel)` rather than popping items one at a time, so there's no ABA
-// hazard to guard against (unlike a free list, which needs marked_offset.hpp's tagged
-// pointer instead).
+// Lock-free Treiber stack push: `value` becomes the new head, linked via `set_next(value,
+// old_head)` (a callback rather than a plain word store, so a caller can repurpose an
+// existing word — e.g. packing in a mark bit). No pop: every user drains the whole stack at
+// once via `head.exchange(...)`, so there's no ABA hazard here (unlike the free list, which
+// needs marked_offset.hpp's tagged pointer).
 template <typename Identity, typename SetNextFn>
 void stack_push(std::atomic<Identity> &head, Identity value, SetNextFn set_next) {
   Identity old_head = head.load(std::memory_order_relaxed);

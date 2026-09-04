@@ -32,9 +32,8 @@ template <typename Key, typename Compare = std::less<Key>>
   requires SkipListKey<Key> && SkipListCompare<Compare, Key>
 class PSkipList {
  public:
-  // `capacity_bytes` is fixed for the lifetime of the mapping (2.6節) — sized generously
-  // up front, since a sparse file only consumes disk for pages actually written. The data
-  // file at `path` is mutated in place via MAP_SHARED; it is not rewritten on checkpoint.
+  // `capacity_bytes` is fixed for the mapping's lifetime; size generously — a sparse file
+  // only consumes disk for pages actually written.
   explicit PSkipList(const std::filesystem::path &path, size_t capacity_bytes)
       : path_(path),
         file_(path, capacity_bytes),
@@ -54,9 +53,6 @@ class PSkipList {
     }
   }
 
-  // The upper levels (2.4節) are plain heap objects with no owning smart pointer, so they
-  // need explicit cleanup. Single-threaded, like the rest of destruction (5章) — the
-  // caller guarantees no concurrent access by this point, so no EBR is needed here.
   ~PSkipList() {
     UpperNode *current = marked_ptr_value<UpperNode>(upper_heads_[0].load(std::memory_order_relaxed));
     while (current != nullptr) {
@@ -114,9 +110,7 @@ class PSkipList {
         nodes_[fresh].key = key;
         nodes_[fresh].value.store(PackedValue::live(payload).raw(), std::memory_order_relaxed);
         nodes_[fresh].epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_relaxed);
-        // A recycled slot may still carry a previous occupant's shadow — reset it to avoid
-        // any stale-data confusion, even though mutation_epoch (set fresh below) is what
-        // actually gates whether recover() ever looks at it.
+        // A reused slot may carry a previous occupant's shadow; clear it.
         nodes_[fresh].checkpointed_value.store(0, std::memory_order_relaxed);
         nodes_[fresh].mutation_epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_relaxed);
       }
@@ -149,10 +143,9 @@ class PSkipList {
       }
     }
 
-    unlink_upper_levels(key, current);  // upper levels are never persisted — no crash-safety concern
-    // Physical unlink (splice + slot reuse) waits for checkpoint() rather than happening now
-    // — reusing the slot before the removal is durably checkpointed would destroy data a
-    // crash-then-recover should still be able to fall back to.
+    unlink_upper_levels(key, current);
+    // Physical unlink (slot reuse) waits for checkpoint(): reusing the slot before this
+    // removal is durable would destroy data a crash-then-recover should still fall back to.
     enqueue_pending_checkpoint_unlink(current);
     return true;
   }
@@ -176,13 +169,11 @@ class PSkipList {
   void reclaim() {
     const std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
 
-    // Take exclusive ownership of every offset currently pending unlink; nothing else
-    // will touch these nodes' forward0 links until free_push() below repurposes them.
     Offset pending_head = drain_pending_unlinks();
     UpperNode *pending_upper = pending_upper_deletes_.exchange(nullptr, std::memory_order_acq_rel);
 
-    // Physical-reclaim safety needs every possible holder of a stale offset — reader or
-    // writer — to have drained, unlike checkpoint()'s writer-only wait (3章).
+    // Unlike checkpoint()'s writer-only wait, physical reclaim needs every reader or writer
+    // that could hold a stale offset to have drained first.
     const uint64_t old_parity = epoch_.load(std::memory_order_acquire) & 1;
     epoch_.fetch_add(1, std::memory_order_acq_rel);
     auto &old_slot = epoch_slots_[old_parity];
@@ -204,16 +195,12 @@ class PSkipList {
     }
   }
 
-  // Synchronous and blocking. Any put()/remove() that had already returned before this
-  // call started is durable once this returns true; whether one that started during the
-  // call is durable is unspecified. Concurrent checkpoint() calls are serialized on
-  // epoch_mutex_. Only writers are waited for — a long-running scan() never blocks this.
+  // Synchronous and blocking. Any put()/remove() that had already returned before this call
+  // started is durable once this returns true. Concurrent checkpoint() calls serialize on
+  // epoch_mutex_; only writers are waited for, so a long-running scan() never blocks this.
   [[nodiscard]] auto checkpoint() -> bool {
     const std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
 
-    // Snapshot before the epoch bump (same idiom as reclaim()'s drain_pending_unlinks): the
-    // writer-wait below guarantees everything captured here happened-before the manifest
-    // about to be published, so it's all safe to physically unlink once that's done.
     Offset pending_unlink = pending_checkpoint_unlink_.exchange(kNullOffset, std::memory_order_acq_rel);
 
     const uint64_t published_epoch = epoch_.load(std::memory_order_acquire);
@@ -225,13 +212,10 @@ class PSkipList {
 
     file_.sync();
     write_manifest(path_, published_epoch, high_water_mark_.load(std::memory_order_acquire));
-    // Only after the manifest is durably published — otherwise a concurrent put()/remove()
-    // could see "already checkpointed" before that's true and skip a shadow recover() needs.
+    // Only after the manifest is durable — otherwise a concurrent put()/remove() could see
+    // "already checkpointed" before that's true and skip a shadow recover() needs.
     last_published_epoch_.store(published_epoch, std::memory_order_release);
 
-    // physically_unlink_best_effort() is unchanged and already tolerates redundant calls, so
-    // resetting the queued flag before (not after) calling it is safe even if a concurrent
-    // resurrect-then-remove immediately re-queues the same offset.
     while (pending_unlink != kNullOffset) {
       const Offset next = nodes_[pending_unlink].next_checkpoint_unlink.load(std::memory_order_relaxed);
       nodes_[pending_unlink].pending_checkpoint_unlink_queued.store(false, std::memory_order_release);
@@ -245,8 +229,6 @@ class PSkipList {
   static constexpr Offset kHead = 0;
   static constexpr Offset kTail = 1;
 
-  // Traits for marked_list.hpp's generic algorithms, binding them to Offset identities and
-  // Level 0's existing (offset, mark bit) packing (marked_offset.hpp) unchanged.
   struct OffsetMarkedTraits {
     static constexpr auto pack(Offset id, bool marked) -> uint64_t { return pack_forward(id, marked); }
     static constexpr auto value(uint64_t raw) -> Offset { return forward_offset(raw); }
@@ -260,17 +242,12 @@ class PSkipList {
     nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
   }
 
-  // Called only when the backing file already had content. No manifest means no
-  // checkpoint() ever completed for this file, so nothing in it is trusted — start fresh
-  // exactly as a brand-new file would. Otherwise, walk Level 0 from head, trusting nodes
-  // in encounter order only while their epoch stamp is <= the manifest's: a node past
-  // that point may have been concurrently written by a writer checkpoint() didn't wait
-  // for, so neither it nor anything reachable only through it is trustworthy, and the
-  // walk stops there, splicing the chain to end at that point. Every allocated slot
-  // (2章) below the manifest's high_water_mark that the walk didn't reach — whether never
-  // linked in, or unlinked-but-not-yet-reclaimed before the crash — becomes free (2.3節's
-  // mark-and-sweep). high_water_mark_ rolls back to the manifest's value: any allocation
-  // racing the checkpoint that isn't captured by it is simply not recovered.
+  // No manifest means no checkpoint() ever completed — start fresh. Otherwise walk Level 0
+  // from head, trusting nodes only while their creation epoch is <= the manifest's; the walk
+  // stops and splices at the first untrusted node, and every allocated-but-unreached slot
+  // below high_water_mark becomes free. A trusted node's latest value may still be newer than
+  // the checkpoint (put() or remove(), indistinguishable here), so it's reverted to its shadow
+  // whenever mutation_epoch exceeds the threshold.
   void recover() {
     const auto manifest = read_manifest(path_);
     if (!manifest.has_value()) {
@@ -281,14 +258,10 @@ class PSkipList {
     const uint64_t threshold = manifest->epoch;
     const uint64_t recovered_high_water_mark = manifest->high_water_mark;
 
-    // epoch_ is a per-process counter, not persisted, and restarts at 0 on every reopen.
-    // Left unseeded, this session's checkpoints would publish epoch numbers below the
-    // previous session's, and a later recovery would then wrongly trim nodes this session
-    // already checkpointed (their epoch stamps would look "too new" against that lower
-    // threshold). Resume from threshold + 1 to keep numbering monotonic across restarts.
+    // epoch_ restarts at 0 every reopen; resuming from threshold + 1 keeps epoch numbers
+    // monotonic across restarts (otherwise a later recovery could wrongly trim nodes this
+    // session already checkpointed).
     epoch_.store(threshold + 1, std::memory_order_relaxed);
-    // Same reasoning as epoch_ above — shadow_if_first_touch_since_checkpoint() compares a
-    // node's mutation_epoch against this to decide whether it's already shadowed.
     last_published_epoch_.store(threshold, std::memory_order_relaxed);
 
     std::vector<bool> reached(recovered_high_water_mark, false);
@@ -299,9 +272,6 @@ class PSkipList {
         nodes_[pred].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
         break;
       }
-      // Existence is trusted (creation epoch <= threshold above), but the latest mutation —
-      // put() or remove(), shadow_if_first_touch_since_checkpoint() doesn't distinguish —
-      // might not be; revert to the shadow, which always holds the last-checkpointed value.
       if (nodes_[current].mutation_epoch.load(std::memory_order_relaxed) > threshold) {
         nodes_[current].value.store(nodes_[current].checkpointed_value.load(std::memory_order_relaxed),
                                     std::memory_order_relaxed);
@@ -321,13 +291,11 @@ class PSkipList {
 
     high_water_mark_.store(recovered_high_water_mark, std::memory_order_relaxed);
 
-    // A crash between checkpoint()'s manifest write and its (in-memory, so lost) drain of
-    // pending_checkpoint_unlink_ can leave a checkpointed removal (mutation_epoch <=
-    // threshold, so not reverted above) still TombstonedLinked and reachable — nothing at
-    // runtime will ever retry it, since remove() only enqueues on a fresh Live->Tombstoned
-    // transition. Complete it now (recovery is single-threaded, so this is safe) in its own
-    // pass rather than folded into the walk above — physically_unlink_best_effort()'s own
-    // find_at_or_after() splice would otherwise corrupt that walk's pred/current bookkeeping.
+    // A crash between checkpoint()'s manifest write and its (in-memory, lost) drain of
+    // pending_checkpoint_unlink_ can leave an already-durable removal still TombstonedLinked;
+    // nothing at runtime retries it, so finish it here in its own pass (recovery is
+    // single-threaded, so this is safe; folding it into the walk above would corrupt that
+    // walk's pred/current bookkeeping via find_at_or_after's own splicing).
     Offset walk = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (walk != kTail) {
       const Offset next = forward_offset(nodes_[walk].forward0.load(std::memory_order_relaxed));
@@ -340,13 +308,9 @@ class PSkipList {
     rebuild_upper_levels();
   }
 
-  // The upper levels are pure DRAM search hints (2.4節) — never persisted, so a process
-  // restart always starts them empty and rebuilds by walking the now-trusted Level 0 chain
-  // above, re-rolling each surviving node's height exactly as put() would for a fresh
-  // insert. Single-threaded (the constructor's caller guarantees no concurrent access yet,
-  // matching the destructor's assumption), so link_upper_levels's CAS retries are all
-  // uncontended — this is O(corpus) as noted in 7章's open-questions list, unavoidable
-  // without persisting the upper levels themselves (which 2.4節 deliberately avoids).
+  // Upper levels are pure DRAM search hints, never persisted, so every restart rebuilds them
+  // by re-linking each surviving Level 0 node exactly as put() would. O(corpus), unavoidable
+  // without persisting the upper levels themselves.
   void rebuild_upper_levels() {
     Offset current = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (current != kTail) {
@@ -357,12 +321,10 @@ class PSkipList {
 
   [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool { return !less_(a, b) && !less_(b, a); }
 
-  // Shared by put()'s existing-key branch and remove()'s tombstone transition — both are
-  // in-place mutations to a node that may already be checkpointed. `expected_live_value` is
-  // whatever the caller already read for its own CAS attempt, not re-read here, so the shadow
-  // and the CAS always agree on what "before" looked like. Only shadows on the first touch
-  // since the last checkpoint: once mutation_epoch is ahead of last_published_epoch_, an
-  // earlier mutation in this same window already captured the value recover() needs.
+  // Shared by put()'s existing-key branch and remove()'s tombstone transition, both in-place
+  // mutations to a possibly-already-checkpointed node. Only shadows on the first touch since
+  // the last checkpoint — once mutation_epoch is ahead of last_published_epoch_, an earlier
+  // mutation in this same window already captured the value recover() needs.
   void shadow_if_first_touch_since_checkpoint(Offset offset, uint64_t expected_live_value) const {
     if (nodes_[offset].mutation_epoch.load(std::memory_order_acquire) <=
         last_published_epoch_.load(std::memory_order_acquire)) {
@@ -371,18 +333,10 @@ class PSkipList {
     }
   }
 
-  // Traverses to the first node with key >= `key`, helping to physically unlink any
-  // marked (logically deleted) node it encounters along the way (4.2節). A helping CAS
-  // that wins pushes the unlinked node to the pending-unlink queue; on any CAS outcome
-  // touching a marked node the whole search restarts from head, since a stale predecessor
-  // can no longer be trusted.
-  //
-  // `hint` seeds the first attempt's starting point instead of kHead — typically a
-  // predecessor found via the upper levels (2.4節), letting this skip most of the Level 0
-  // scan. A hint's key is safe to trust as < `key` forever (keys never change once set),
-  // but it must be re-verified as still unmarked immediately before use: if it's since
-  // been unlinked, its forward0 no longer means "live successor" (4.2節), and any retry
-  // (from a restart below) always falls back to kHead.
+  // Traverses to the first node with key >= `key`, helping to physically unlink any marked
+  // node along the way. `hint` (typically from the upper levels) seeds the first attempt in
+  // place of kHead; it's safe to trust as < `key` forever, but is re-verified as still
+  // unmarked before use, falling back to kHead otherwise.
   [[nodiscard]] auto find_at_or_after(const Key &key, Offset *predecessor, Offset hint = kHead) const -> Offset {
     return marked_list_find<Offset, OffsetMarkedTraits>(
         hint,
@@ -398,15 +352,10 @@ class PSkipList {
         predecessor);
   }
 
-  // Lock-free multi-producer stack: any number of unlinkers push concurrently, and
-  // reclaim() drains the whole thing with a single atomic exchange. There's no per-item
-  // pop here, so there's no ABA hazard to guard against — unlike the free list below.
   void enqueue_pending_unlink(Offset offset) const {
     stack_push(pending_head_, offset, [this](Offset o, Offset next) {
-      // Keep the mark bit set: this word is already frozen against any stale unmarked-
-      // expecting CAS from a thread that read this node before it was ever removed (4.2節)
-      // — clearing it here would let such a CAS coincidentally match this repurposed
-      // "next pending" value and corrupt the chain.
+      // Mark bit stays set: clearing it would let a stale unmarked-expecting CAS from before
+      // this node was removed corrupt this now-repurposed "next pending" value.
       nodes_[o].forward0.store(pack_forward(next, true), std::memory_order_relaxed);
     });
   }
@@ -415,13 +364,10 @@ class PSkipList {
     return pending_head_.exchange(kNullOffset, std::memory_order_acq_rel);
   }
 
-  // Lock-free multi-producer stack of offsets awaiting checkpoint-gated physical unlink,
-  // linked via their own dedicated next_checkpoint_unlink field — never forward0, which must
-  // keep pointing at each node's real successor until checkpoint() confirms it's safe to
-  // splice out. Drained only by checkpoint() (same atomic-exchange idiom as
-  // drain_pending_unlinks above). A no-op if already queued: put() can resurrect a
-  // TombstonedLinked node straight back to Live (4.1節), and a later remove() re-tombstoning
-  // it must not push the same offset onto the stack twice.
+  // Linked via next_checkpoint_unlink, never forward0, which must keep pointing at each
+  // node's real successor until checkpoint() confirms the splice is safe. The queued flag
+  // guards against double-enqueue when put() resurrects a TombstonedLinked node and a later
+  // remove() re-tombstones it.
   void enqueue_pending_checkpoint_unlink(Offset offset) const {
     bool expected_unqueued = false;
     if (!nodes_[offset].pending_checkpoint_unlink_queued.compare_exchange_strong(
@@ -433,13 +379,10 @@ class PSkipList {
     });
   }
 
-  // Lock-free Treiber stack with a tagged head (marked_offset.hpp) to rule out ABA: a
-  // freed node's own forward0 becomes the "next free" link, safe to repurpose since
-  // nothing reaches it through the live chain anymore.
+  // Tagged head (marked_offset.hpp) rules out ABA on this Treiber stack.
   void free_push(Offset offset) {
     uint64_t old_head = free_head_.load(std::memory_order_relaxed);
     for (;;) {
-      // Marked for the same reason as enqueue_pending_unlink above.
       nodes_[offset].forward0.store(pack_forward(tagged_offset(old_head), true), std::memory_order_relaxed);
       const uint64_t new_head = pack_tagged(offset, tagged_generation(old_head) + 1);
       if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel, std::memory_order_relaxed)) {
@@ -493,62 +436,53 @@ class PSkipList {
     Offset level0_hint = kHead;
   };
 
-  // The word a predecessor's own successor at `level` lives in — the list head if there is
-  // no predecessor, its forwards[] entry otherwise. Every upper-level search/link/unlink
-  // deals in exactly this word.
   [[nodiscard]] auto upper_word(UpperNode *pred, int level) const -> std::atomic<uint64_t> & {
     return pred == nullptr ? upper_heads_[level - 1] : pred->forwards[level - 1];
   }
 
-  // Level N has no deletion signal of its own — an UpperNode is nothing but a search hint
-  // for a Level 0 record, so "is this entry logically gone" borrows Level 0's own tombstone
-  // state directly rather than duplicating it. See marked_list_find's `is_dead` parameter.
+  // An UpperNode carries no deletion state of its own — it's nothing but a search hint for a
+  // Level 0 record, so this borrows Level 0's tombstone state directly.
   [[nodiscard]] auto is_upper_node_dead(UpperNode *node) const -> bool {
     return PackedValue(nodes_[node->durable_offset].value.load(std::memory_order_acquire)).state() != NodeState::kLive;
   }
 
-  // The other half of an UpperNode's removal: whoever's splice brings levels_remaining to 0
-  // has just unlinked it from the last list it participated in, and is the one who hands it
-  // to the EBR registry shared with 3章 (a concurrent reader may still be mid-traversal
-  // through it). Called from marked_list_find's on_splice hook — for any level, from any
-  // thread's search, not just an explicit unlink_upper_levels() call — since a node can be
-  // helped off of each of its levels independently and by whoever gets there first.
+  // Whoever's splice brings levels_remaining to 0 unlinked this node from its last list and
+  // hands it to the reclaim queue (a concurrent reader may still be mid-traversal through it).
   void on_upper_splice(UpperNode *node) const {
     if (node->levels_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       enqueue_pending_upper_delete(node);
     }
   }
 
-  // Cascading top-down search across all upper levels (2.4節): starts at the highest
-  // level's head and, at each level, walks right as far as possible before dropping down
-  // one level from the same horizontal position — the standard skip-list search, built on
-  // marked_list_find (marked_list.hpp) once per level. Returns the durable_offset of the
-  // level-1 predecessor as a Level 0 search hint.
-  //
-  // `pred` carried over from the level above is exactly the same kind of thing as Level 0's
-  // find_at_or_after `hint`: usually a shortcut, but possibly marked by the time this level
-  // reads it. Its fallback is this level's own head, mirroring find_at_or_after's
-  // hint-falls-back-to-kHead.
-  [[nodiscard]] auto search_upper_levels(const Key &key) const -> UpperSearchResult {
-    UpperSearchResult result;
+  // Cascading top-down walk across all upper levels: at each level, positions from the
+  // predecessor found one level up rather than that level's own head. Returns the level-1
+  // predecessor. When `out_anchors` is non-null, also records each level <= `height`'s
+  // incoming predecessor into it — link_upper_levels()'s way of seeding every level it will
+  // insert into without re-walking from scratch per level.
+  auto cascade_upper_levels(const Key &key, UpperNode **out_anchors, int height) const -> UpperNode * {
     UpperNode *pred = nullptr;
     for (int level = kDefaultMaxLevel; level >= 1; --level) {
+      if (out_anchors != nullptr && level <= height) {
+        out_anchors[level - 1] = pred;
+      }
       UpperNode *found_pred = nullptr;
       static_cast<void>(find_upper_at_level_from(pred, key, level, &found_pred));
       pred = found_pred;
     }
-    if (pred != nullptr) {
+    return pred;
+  }
+
+  [[nodiscard]] auto search_upper_levels(const Key &key) const -> UpperSearchResult {
+    UpperSearchResult result;
+    if (UpperNode *pred = cascade_upper_levels(key, nullptr, 0); pred != nullptr) {
       result.level0_hint = pred->durable_offset;
     }
     return result;
   }
 
-  // The one-level search both search_upper_levels and link_upper_levels need: stops at the
-  // first node whose key is >= `key`, which is exactly where a new node with this key
-  // belongs. Both callers cascade — `start` is the predecessor found at the level above (or
-  // null at the top level / when there is none), never a fresh search from that level's own
-  // head. Wraps marked_list_find so both callers share the same next/key/is_dead/on_splice
-  // policies instead of repeating them.
+  // The one-level search cascade_upper_levels and link_upper_levels both need: stops at the
+  // first node whose key is >= `key`. `start` is the predecessor found one level up (or null),
+  // never a fresh search from this level's own head.
   [[nodiscard]] auto find_upper_at_level_from(UpperNode *start,
                                               const Key &key,
                                               int level,
@@ -568,12 +502,8 @@ class PSkipList {
   }
 
   // Single-level search for one specific durable_offset, not just any node with a matching
-  // key — remove()'s upper-level cleanup can't rely on key alone: an entirely different
-  // occurrence of the same key can already have been removed and reinserted, landing a
-  // different UpperNode at this same sorted position, so this scans past same-key entries
-  // until the offset matches (or the key strictly exceeds `key`). Marking doesn't touch a
-  // node's successor value (marked_list_mark_for_deletion), so it's safe to keep walking
-  // through a marked node here without helping it off — some other search will.
+  // key: remove()'s upper-level cleanup must target the exact occurrence, since a different
+  // occurrence of the same key can already have been removed and reinserted elsewhere.
   [[nodiscard]] auto find_upper_node_at_level(Offset target_offset,
                                               const Key &key,
                                               int level,
@@ -592,50 +522,21 @@ class PSkipList {
     return nullptr;
   }
 
-  // Bottom-up insert into levels 1..height (8章, ASCS insert order), lock-free: each level's
-  // CAS validates "the successor is still what I read" and "the predecessor isn't itself
-  // being marked out from under me" in one shot (marked_list.hpp), so a losing race just
-  // means retrying that level's positioning search, never data loss or corruption.
-  //
-  // put()'s Level 0 CAS makes `fresh` live and reachable before this runs, so a concurrent
-  // remove() on the same key can tombstone it before any of this has happened. Checking once
-  // up front skips the insert entirely in the common case — Level 0's O(N) fallback still
-  // finds the key correctly without an upper-level entry. It isn't airtight on its own
-  // (remove() could still win on the very last level, after this check passed): the backstop
-  // is is_upper_node_dead() above, which every future search checks for every node it visits
-  // regardless of who created it or when — so a rare entry that slips past this check is
-  // still guaranteed to be found, marked, and reclaimed by the next search that reaches it.
   void link_upper_levels(Offset fresh, const Key &key, int height) {
     const PackedValue v(nodes_[fresh].value.load(std::memory_order_acquire));
     if (v.state() != NodeState::kLive) {
+      // A concurrent remove() may have already tombstoned `fresh` before this runs. Skipping
+      // the insert is safe: Level 0 still finds the key without an upper-level entry, and
+      // is_upper_node_dead() backstops any rare entry that slips past this check anyway.
       return;
     }
     UpperNode *node = allocate_upper_node(fresh, height);
 
-    // Cascading top-down positioning pass (read-only, mirrors search_upper_levels): finds a
-    // same-height starting anchor for each level 1..height before any CAS runs. Without this,
-    // the insert loop below searched every level from that level's own head — since level 1
-    // holds almost every node (geometric level distribution), that turned every single insert
-    // into an O(N) walk at level 1, defeating the whole point of the upper levels. This only
-    // changes how each level's search is *seeded*, not the insert order itself.
     std::array<UpperNode *, kDefaultMaxLevel> anchors{};
-    UpperNode *pred = nullptr;
-    for (int level = kDefaultMaxLevel; level >= 1; --level) {
-      if (level <= height) {
-        anchors[static_cast<size_t>(level - 1)] = pred;
-      }
-      UpperNode *found_pred = nullptr;
-      static_cast<void>(find_upper_at_level_from(pred, key, level, &found_pred));
-      pred = found_pred;
-    }
+    cascade_upper_levels(key, anchors.data(), height);
 
-    // Bottom-up insert into levels 1..height (8章, ASCS insert order), lock-free: each level's
-    // CAS validates "the successor is still what I read" and "the predecessor isn't itself
-    // being marked out from under me" in one shot (marked_list.hpp), so a losing race just
-    // means retrying that level's positioning search, never data loss or corruption. The
-    // cached anchor from the cascade above is reused across retries at the same level exactly
-    // like Level 0's find_at_or_after hint — usually still a shortcut, and correct (if slower)
-    // even when a retry finds it stale.
+    // Bottom-up insert into levels 1..height (ASCS insert order), reusing each level's cached
+    // anchor across CAS retries — usually still a shortcut, correct even when stale.
     for (int level = 1; level <= height; ++level) {
       UpperNode *hint = anchors[static_cast<size_t>(level - 1)];
       for (;;) {
@@ -647,23 +548,19 @@ class PSkipList {
         if (upper_word(found_pred, level).compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
           break;
         }
-        // Predecessor changed (a racing insert/delete nearby, or it was itself just marked)
-        // — reposition at this level (from the same cached anchor) and retry.
       }
     }
   }
 
-  // Top-down eager cleanup of one specific node's upper-level entries (8章, ASCS delete
-  // order) — an optimization, not a correctness requirement: is_upper_node_dead() (above)
-  // guarantees any level this misses still gets marked, spliced, and reclaimed the next time
-  // any search passes through it, exactly as if this had never been called. `target_offset`
-  // identifies exactly which occurrence of `key` to remove — see find_upper_node_at_level().
+  // Eager top-down cleanup of one node's upper-level entries — an optimization, not a
+  // correctness requirement: is_upper_node_dead() guarantees any level this misses still gets
+  // marked, spliced, and reclaimed the next time a search passes through it.
   void unlink_upper_levels(const Key &key, Offset target_offset) {
     for (int level = kDefaultMaxLevel; level >= 1; --level) {
       UpperNode *pred = nullptr;
       UpperNode *current = find_upper_node_at_level(target_offset, key, level, &pred);
       if (current == nullptr) {
-        continue;  // this occurrence never reached this level
+        continue;
       }
       marked_list_mark_for_deletion<UpperNode *, PointerMarkedTraits<UpperNode>>(
           current, [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; });
@@ -673,14 +570,9 @@ class PSkipList {
       if (upper_word(pred, level).compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
         on_upper_splice(current);
       }
-      // A failed splice here just means a concurrent change beat us to it (possibly already
-      // helped by another search) — nothing to redo, the node is still marked either way.
     }
   }
 
-  // Lock-free stack of UpperNodes awaiting deallocation, linked via their own dedicated
-  // next_pending field (upper_node.hpp) — never forwards[], which a concurrent reader may
-  // still legitimately dereference after this node is unlinked (see there for why).
   void enqueue_pending_upper_delete(UpperNode *node) const {
     stack_push(pending_upper_deletes_, node, [](UpperNode *n, UpperNode *next) {
       n->next_pending.store(next, std::memory_order_relaxed);
@@ -694,10 +586,8 @@ class PSkipList {
   std::atomic<Offset> high_water_mark_{2};
   Compare less_{};
   LevelGenerator level_generator_;
-  // Both mutable: search functions are logically const (they only ever refine a hint) but
-  // physically mutate these via marked_list_find's helping splices and on_upper_splice's
-  // reclaim-queue push, exactly as Level 0's `nodes_` (a pointer, not const-propagated
-  // through `this`) already allows for forward0.
+  // mutable: search functions are logically const (they only ever refine a hint) but
+  // physically mutate these via helping splices and reclaim-queue pushes.
   mutable std::array<std::atomic<uint64_t>, kDefaultMaxLevel> upper_heads_{};
   mutable std::atomic<UpperNode *> pending_upper_deletes_{nullptr};
 
@@ -707,12 +597,9 @@ class PSkipList {
   mutable std::atomic<Offset> pending_head_{kNullOffset};
   std::atomic<uint64_t> free_head_{0};
 
-  // Epoch of the last successful checkpoint() — distinct from epoch_, which is also bumped
-  // by reclaim() for EBR purposes and so isn't 1:1 with "how many checkpoints have
-  // happened." See shadow_if_first_touch_since_checkpoint().
+  // Epoch of the last successful checkpoint() — distinct from epoch_, which reclaim() also
+  // bumps for EBR purposes.
   mutable std::atomic<uint64_t> last_published_epoch_{0};
-  // Offsets tombstoned by remove(), awaiting checkpoint()-gated physical unlink — see
-  // enqueue_pending_checkpoint_unlink().
   mutable std::atomic<Offset> pending_checkpoint_unlink_{kNullOffset};
 };
 

@@ -14,14 +14,9 @@ inline constexpr Offset kNullOffset = kForwardMarkBit - 1;
 [[nodiscard]] inline constexpr auto forward_offset(uint64_t raw) -> Offset { return raw & ~kForwardMarkBit; }
 [[nodiscard]] inline constexpr auto forward_marked(uint64_t raw) -> bool { return (raw & kForwardMarkBit) != 0; }
 
-// A tagged (offset, generation counter) pair packed into one word, for the free list's
-// Treiber stack head: the counter changes on every push and pop so a thread that stalls
-// mid-pop with a stale head value can never CAS it back in undetected, even if the exact
-// same offset has since been popped and pushed again (the classic ABA hazard for a plain
-// offset-only stack head). 24 bits of counter is generous — wrapping it back to a value
-// a stalled thread could still match would need that many free-list push/pop cycles to
-// land on the same offset again during a single stall, which isn't realistic. 40 bits of
-// offset is equally generous for node counts.
+// A tagged (offset, generation counter) word for the free list's Treiber stack head: the
+// counter changes on every push/pop, ruling out ABA for a thread that stalls mid-pop and
+// later CASes against a stale head that coincidentally names the same offset again.
 inline constexpr int kTaggedOffsetBits = 40;
 inline constexpr uint64_t kTaggedOffsetMask = (uint64_t{1} << kTaggedOffsetBits) - 1;
 inline constexpr Offset kMaxTaggedOffset = kTaggedOffsetMask;

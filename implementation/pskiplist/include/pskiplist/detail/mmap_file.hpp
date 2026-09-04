@@ -12,11 +12,9 @@
 
 namespace pskiplist {
 
-// RAII POSIX file opened, sized, and mapped MAP_SHARED for direct in-place mutation.
-// Sized once at construction and never grown (2.6節). A brand-new (empty) file is
-// zero-extended to size_bytes; an existing non-empty file's content is preserved as-is
-// (recovery, 3章, decides what in it to trust) and must already be exactly size_bytes —
-// a mismatch is a construction error, not something this class silently resolves.
+// RAII POSIX file opened, sized, and mapped MAP_SHARED for direct in-place mutation. Sized
+// once at construction and never grown. A brand-new file is zero-extended to size_bytes; an
+// existing one must already be exactly that size.
 class MmapFile {
  public:
   MmapFile(const std::filesystem::path &path, size_t size_bytes) : size_(size_bytes) {
