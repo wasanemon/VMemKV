@@ -26,10 +26,23 @@ struct EpochSlot {
 // advance vacated to drain treats anything observed under it as safe to act on.
 class EpochToken {
  public:
+  // Reading `epoch` and incrementing that parity's counter is not one atomic step: a thread
+  // can load `epoch`, then stall (preemption) before its fetch_add lands. reclaim() can drain
+  // that exact slot's count as 0 in the meantime, decide it's safe, and free memory this
+  // thread is about to walk into once it resumes. Guard against that by re-reading `epoch`
+  // after incrementing: if it moved, our registration raced reclaim() and may already be
+  // invisible to it, so undo it and retry under the parity that's current now — reclaim()
+  // can't have drained that one yet, since it hasn't started an old-parity wait for it.
   EpochToken(std::array<EpochSlot, 2> &slots, std::atomic<uint64_t> &epoch, EpochRole role)
       : slots_(slots), role_(role) {
-    parity_ = epoch.load(std::memory_order_acquire) & 1;
-    counter().fetch_add(1, std::memory_order_acq_rel);
+    for (;;) {
+      parity_ = epoch.load(std::memory_order_acquire) & 1;
+      counter().fetch_add(1, std::memory_order_acq_rel);
+      if ((epoch.load(std::memory_order_acquire) & 1) == parity_) {
+        break;
+      }
+      counter().fetch_sub(1, std::memory_order_acq_rel);
+    }
   }
   ~EpochToken() { counter().fetch_sub(1, std::memory_order_acq_rel); }
   EpochToken(const EpochToken &) = delete;

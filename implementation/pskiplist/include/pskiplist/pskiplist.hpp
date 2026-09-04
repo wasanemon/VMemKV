@@ -67,6 +67,144 @@ inline constexpr uint32_t kTaggedGenerationMask = (uint32_t{1} << (64 - kTaggedO
 
 namespace pskiplist {
 
+// Marks the low bit of a pointer to signal logical deletion — the same idea as
+// marked_offset.hpp's kForwardMarkBit for Offset, just applied to a pointer's bit 0 instead
+// of Offset's bit 63. Safe because every allocator this project uses (`::operator new`)
+// returns addresses aligned well beyond 2 bytes, so bit 0 of a live pointer is always 0.
+template <typename T>
+[[nodiscard]] inline auto pack_marked_ptr(T *ptr, bool marked) -> uintptr_t {
+  const auto value = reinterpret_cast<uintptr_t>(ptr);
+  return marked ? (value | uintptr_t{1}) : value;
+}
+
+template <typename T>
+[[nodiscard]] inline auto marked_ptr_value(uintptr_t raw) -> T * {
+  return reinterpret_cast<T *>(raw & ~uintptr_t{1});
+}
+
+[[nodiscard]] inline auto marked_ptr_marked(uintptr_t raw) -> bool { return (raw & uintptr_t{1}) != 0; }
+
+// Traits for marked_list.hpp's generic algorithms, binding them to pointer identities.
+// null_id() is nullptr — a pointer-based list's natural "no next" sentinel, unlike Level 0's
+// offset-based list where that role is played by a real node (kTail).
+template <typename T>
+struct PointerMarkedTraits {
+  static auto pack(T *id, bool marked) -> uint64_t { return pack_marked_ptr<T>(id, marked); }
+  static auto value(uint64_t raw) -> T * { return marked_ptr_value<T>(raw); }
+  static auto is_marked(uint64_t raw) -> bool { return marked_ptr_marked(raw); }
+  static auto null_id() -> T * { return nullptr; }
+};
+
+}  // namespace pskiplist
+
+#include <atomic>
+#include <cstdint>
+
+namespace pskiplist {
+
+// A generic lock-free "find, helping to unlink any marked node along the way" search over a
+// singly-linked list whose nodes are addressed by `Identity` (an Offset into a fixed array
+// for Level 0, or a raw pointer for an upper level — see marked_offset.hpp / marked_pointer.hpp)
+// and whose per-node "next" pointer is packed together with a deletion mark bit into one
+// atomic<uint64_t> word (Traits::pack/value/is_marked). This is the one idea both layers
+// share: a single CAS on a predecessor's word simultaneously validates "the successor is
+// still what I read" and "the predecessor itself hasn't been marked out from under me",
+// because both facts live in the same word.
+//
+// `start_id`/`start_word` is where the walk begins — typically a caller-supplied search hint
+// pointing past most of the list. If that word turns out to already be marked, its offset/
+// pointer bits can no longer be trusted at all (they may already have been repurposed for a
+// pending-reclaim queue by the time this reads them), so the walk restarts from
+// `fallback_id`/`fallback_word` instead — a caller-guaranteed-live anchor (a list head) —
+// rather than retrying the same possibly-permanently-marked start forever. Callers with no
+// meaningful hint (Level N's per-level searches always start at a list head, which is never
+// itself deleted) just pass the same id/word twice; the fallback path is then unreachable,
+// not merely harmless.
+//
+// `is_dead` is a second, independent deletion signal a node can carry *outside* its own
+// word — Level N has no per-node source of truth of its own (an UpperNode is nothing but a
+// search hint), so it borrows Level 0's tombstone state via this hook instead of maintaining
+// a redundant one; Level 0 has no such external signal, so it always passes a hook that
+// returns false. A node flagged dead this way but not yet structurally marked gets marked
+// right here (idempotent — a no-op if a concurrent caller already did) before falling into
+// the same help-splice-and-restart path as a node found already marked, so a zombie gets
+// caught by whichever search encounters it first, however late.
+//
+// On encountering a node whose own word is marked, this helps splice it out via one CAS on
+// its predecessor's word and, if that CAS wins, reports the removed identity via `on_splice`
+// — then restarts the whole walk from the start (not fallback), since the predecessor used up
+// to that point can no longer be trusted. Stops and returns the first node whose key is not
+// less than `key`, or Traits::null_id() if the list runs out first; `*out_pred` receives that
+// result's immediate predecessor.
+template <typename Identity, typename Traits, typename Key, typename Less, typename NextWordFn, typename KeyFn,
+          typename IsDeadFn, typename OnSpliceFn>
+[[nodiscard]] auto marked_list_find(Identity start_id, std::atomic<uint64_t> &start_word, Identity fallback_id,
+                                     std::atomic<uint64_t> &fallback_word, const Key &key, Less less,
+                                     NextWordFn next_word, KeyFn key_of, IsDeadFn is_dead, OnSpliceFn on_splice,
+                                     Identity *out_pred) -> Identity {
+  Identity anchor_id = start_id;
+  std::atomic<uint64_t> *anchor_word = &start_word;
+  for (;;) {
+    Identity pred = anchor_id;
+    std::atomic<uint64_t> *pred_word = anchor_word;
+    const uint64_t pred_raw = pred_word->load(std::memory_order_acquire);
+    if (Traits::is_marked(pred_raw)) {
+      anchor_id = fallback_id;
+      anchor_word = &fallback_word;
+      continue;
+    }
+    Identity current = Traits::value(pred_raw);
+    for (;;) {
+      if (current == Traits::null_id()) {
+        *out_pred = pred;
+        return current;
+      }
+      uint64_t current_raw = next_word(current).load(std::memory_order_acquire);
+      if (!Traits::is_marked(current_raw) && is_dead(current)) {
+        marked_list_mark_for_deletion<Identity, Traits>(current, next_word);
+        current_raw = next_word(current).load(std::memory_order_acquire);
+      }
+      if (Traits::is_marked(current_raw)) {
+        const Identity successor = Traits::value(current_raw);
+        uint64_t expected = Traits::pack(current, false);
+        const uint64_t desired = Traits::pack(successor, false);
+        if (pred_word->compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+          on_splice(current);
+        }
+        break;  // restart the whole walk from anchor_id/anchor_word — pred_word may now be stale
+      }
+      if (!less(key_of(current), key)) {
+        *out_pred = pred;
+        return current;
+      }
+      pred = current;
+      pred_word = &next_word(current);
+      current = Traits::value(current_raw);
+    }
+  }
+}
+
+// Marks `id`'s own word for logical deletion, preserving whatever successor it currently
+// names — the first half of removing a node, done once before any splice is attempted.
+// Retries against concurrent inserts that change the successor while leaving mark unset;
+// a no-op (mark already set) if another thread got there first.
+template <typename Identity, typename Traits, typename OwnWordFn>
+void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
+  uint64_t raw = own_word(id).load(std::memory_order_acquire);
+  while (!Traits::is_marked(raw)) {
+    const uint64_t desired = Traits::pack(Traits::value(raw), true);
+    if (own_word(id).compare_exchange_strong(raw, desired, std::memory_order_acq_rel)) {
+      break;
+    }
+  }
+}
+
+}  // namespace pskiplist
+
+#include <cstdint>
+
+namespace pskiplist {
+
 enum class NodeState : uint8_t {
   kLive = 0,
   kTombstonedLinked = 1,
@@ -137,10 +275,23 @@ struct EpochSlot {
 // advance vacated to drain treats anything observed under it as safe to act on.
 class EpochToken {
  public:
+  // Reading `epoch` and incrementing that parity's counter is not one atomic step: a thread
+  // can load `epoch`, then stall (preemption) before its fetch_add lands. reclaim() can drain
+  // that exact slot's count as 0 in the meantime, decide it's safe, and free memory this
+  // thread is about to walk into once it resumes. Guard against that by re-reading `epoch`
+  // after incrementing: if it moved, our registration raced reclaim() and may already be
+  // invisible to it, so undo it and retry under the parity that's current now — reclaim()
+  // can't have drained that one yet, since it hasn't started an old-parity wait for it.
   EpochToken(std::array<EpochSlot, 2> &slots, std::atomic<uint64_t> &epoch, EpochRole role)
       : slots_(slots), role_(role) {
-    parity_ = epoch.load(std::memory_order_acquire) & 1;
-    counter().fetch_add(1, std::memory_order_acq_rel);
+    for (;;) {
+      parity_ = epoch.load(std::memory_order_acquire) & 1;
+      counter().fetch_add(1, std::memory_order_acq_rel);
+      if ((epoch.load(std::memory_order_acquire) & 1) == parity_) {
+        break;
+      }
+      counter().fetch_sub(1, std::memory_order_acq_rel);
+    }
   }
   ~EpochToken() { counter().fetch_sub(1, std::memory_order_acq_rel); }
   EpochToken(const EpochToken &) = delete;
@@ -399,25 +550,44 @@ namespace pskiplist {
 // following the header rather than as `height` separate allocations (8章), so a search
 // descending through this node's levels stays in one cache-line neighborhood. Only ever
 // constructed via allocate_upper_node() below, which owns the combined allocation.
+//
+// Each `forwards[level]` packs (successor pointer, mark bit) into one atomic<uint64_t> via
+// marked_pointer.hpp — the same idea as Level 0's forward0 (marked_offset.hpp), letting a
+// single CAS on a predecessor's word validate both "the successor is still what I read" and
+// "the predecessor itself hasn't been marked out from under me" (see marked_list.hpp).
+//
+// `levels_remaining` counts down from `height` as each level's splice completes (marked_list.hpp's
+// on_splice callback); whoever brings it to 0 knows this node is gone from every list it
+// participated in and is the one who enqueues it for EBR reclaim (reclaim() in skiplist.hpp).
+//
+// `next_pending` is a dedicated field for that reclaim queue rather than reusing forwards[0]:
+// keeping it separate avoids coupling reclaim-queue linkage to level 1 specifically being the
+// last level spliced, which the levels_remaining counter alone doesn't guarantee ordering-wise.
 struct UpperNode {
   Offset durable_offset;
   int height;
-  std::atomic<UpperNode *> forwards[1];  // actually `height` entries — see allocate_upper_node()
+  std::atomic<int> levels_remaining{0};
+  std::atomic<UpperNode *> next_pending{nullptr};
+  std::atomic<uint64_t> forwards[1];  // actually `height` entries — see allocate_upper_node()
 };
 
 [[nodiscard]] inline auto allocate_upper_node(Offset durable_offset, int height) -> UpperNode * {
   void *memory =
-      ::operator new(sizeof(UpperNode) + sizeof(std::atomic<UpperNode *>) * static_cast<size_t>(height - 1));
+      ::operator new(sizeof(UpperNode) + sizeof(std::atomic<uint64_t>) * static_cast<size_t>(height - 1));
   auto *node = static_cast<UpperNode *>(memory);
   ::new (&node->durable_offset) Offset(durable_offset);
   ::new (&node->height) int(height);
+  ::new (&node->levels_remaining) std::atomic<int>(height);
+  ::new (&node->next_pending) std::atomic<UpperNode *>(nullptr);
   for (int level = 0; level < height; ++level) {
-    ::new (&node->forwards[level]) std::atomic<UpperNode *>(nullptr);
+    ::new (&node->forwards[level]) std::atomic<uint64_t>(pack_marked_ptr<UpperNode>(nullptr, false));
   }
   return node;
 }
 
 inline void deallocate_upper_node(UpperNode *node) {
+  node->next_pending.~atomic();
+  node->levels_remaining.~atomic();
   for (int level = 0; level < node->height; ++level) {
     node->forwards[level].~atomic();
   }
@@ -435,6 +605,7 @@ inline void deallocate_upper_node(UpperNode *node) {
 #include <mutex>
 #include <new>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -452,7 +623,8 @@ class PSkipList {
       : path_(path),
         file_(path, capacity_bytes),
         nodes_(static_cast<DurableNode<Key> *>(file_.data())),
-        capacity_slots_(file_.size() / sizeof(DurableNode<Key>)) {
+        capacity_slots_(file_.size() / sizeof(DurableNode<Key>)),
+        level_generator_(std::random_device{}()) {
     if (capacity_slots_ < 2) {
       throw std::invalid_argument("pskiplist: capacity_bytes too small to hold head/tail sentinels");
     }
@@ -466,13 +638,31 @@ class PSkipList {
     }
   }
 
+  // The upper levels (2.4節) are plain heap objects with no owning smart pointer, so they
+  // need explicit cleanup. Single-threaded, like the rest of destruction (5章) — the
+  // caller guarantees no concurrent access by this point, so no EBR is needed here.
+  ~PSkipList() {
+    UpperNode *current = marked_ptr_value<UpperNode>(upper_heads_[0].load(std::memory_order_relaxed));
+    while (current != nullptr) {
+      UpperNode *next = marked_ptr_value<UpperNode>(current->forwards[0].load(std::memory_order_relaxed));
+      deallocate_upper_node(current);
+      current = next;
+    }
+    UpperNode *pending = pending_upper_deletes_.load(std::memory_order_relaxed);
+    while (pending != nullptr) {
+      UpperNode *next = pending->next_pending.load(std::memory_order_relaxed);
+      deallocate_upper_node(pending);
+      pending = next;
+    }
+  }
+
   PSkipList(const PSkipList &) = delete;
   auto operator=(const PSkipList &) -> PSkipList & = delete;
 
   [[nodiscard]] auto get(const Key &key) const -> std::optional<uint64_t> {
     const EpochToken token(epoch_slots_, epoch_, EpochRole::kReader);
     Offset predecessor = kNullOffset;
-    const Offset current = find_at_or_after(key, &predecessor);
+    const Offset current = find_at_or_after(key, &predecessor, search_upper_levels(key).level0_hint);
     if (current == kNullOffset || current == kTail || !keys_equal(nodes_[current].key, key)) {
       return std::nullopt;
     }
@@ -483,10 +673,11 @@ class PSkipList {
 
   [[nodiscard]] auto put(const Key &key, uint64_t payload) -> bool {
     const EpochToken token(epoch_slots_, epoch_, EpochRole::kWriter);
+    const Offset hint = search_upper_levels(key).level0_hint;
     Offset fresh = kNullOffset;
     for (;;) {
       Offset predecessor = kNullOffset;
-      const Offset existing = find_at_or_after(key, &predecessor);
+      const Offset existing = find_at_or_after(key, &predecessor, hint);
       if (existing != kNullOffset && existing != kTail && keys_equal(nodes_[existing].key, key)) {
         uint64_t expected = nodes_[existing].value.load(std::memory_order_acquire);
         if (PackedValue(expected).state() == NodeState::kTombstonedUnlinked) {
@@ -512,6 +703,7 @@ class PSkipList {
       uint64_t expected_next = pack_forward(existing, false);
       const uint64_t desired_next = pack_forward(fresh, false);
       if (nodes_[predecessor].forward0.compare_exchange_strong(expected_next, desired_next, std::memory_order_acq_rel)) {
+        link_upper_levels(fresh, key, level_generator_.next_level());
         return true;
       }
     }
@@ -520,7 +712,7 @@ class PSkipList {
   [[nodiscard]] auto remove(const Key &key) -> bool {
     const EpochToken token(epoch_slots_, epoch_, EpochRole::kWriter);
     Offset predecessor = kNullOffset;
-    const Offset current = find_at_or_after(key, &predecessor);
+    const Offset current = find_at_or_after(key, &predecessor, search_upper_levels(key).level0_hint);
     if (current == kNullOffset || current == kTail || !keys_equal(nodes_[current].key, key)) return false;
 
     for (;;) {
@@ -533,6 +725,7 @@ class PSkipList {
       }
     }
 
+    unlink_upper_levels(key, current);
     physically_unlink_best_effort(key, current);
     return true;
   }
@@ -541,7 +734,7 @@ class PSkipList {
   void scan(const Key &begin, const Key &end, Callback &&callback) const {
     const EpochToken token(epoch_slots_, epoch_, EpochRole::kReader);
     Offset predecessor = kNullOffset;
-    Offset current = find_at_or_after(begin, &predecessor);
+    Offset current = find_at_or_after(begin, &predecessor, search_upper_levels(begin).level0_hint);
     while (current != kNullOffset && current != kTail) {
       const auto &node = nodes_[current];
       if (!less_(node.key, end)) break;
@@ -559,6 +752,7 @@ class PSkipList {
     // Take exclusive ownership of every offset currently pending unlink; nothing else
     // will touch these nodes' forward0 links until free_push() below repurposes them.
     Offset pending_head = drain_pending_unlinks();
+    UpperNode *pending_upper = pending_upper_deletes_.exchange(nullptr, std::memory_order_acq_rel);
 
     // Physical-reclaim safety needs every possible holder of a stale offset — reader or
     // writer — to have drained, unlike checkpoint()'s writer-only wait (3章).
@@ -574,6 +768,12 @@ class PSkipList {
       const Offset next = forward_offset(nodes_[pending_head].forward0.load(std::memory_order_relaxed));
       free_push(pending_head);
       pending_head = next;
+    }
+
+    while (pending_upper != nullptr) {
+      UpperNode *next = pending_upper->next_pending.load(std::memory_order_relaxed);
+      deallocate_upper_node(pending_upper);
+      pending_upper = next;
     }
   }
 
@@ -599,6 +799,15 @@ class PSkipList {
  private:
   static constexpr Offset kHead = 0;
   static constexpr Offset kTail = 1;
+
+  // Traits for marked_list.hpp's generic algorithms, binding them to Offset identities and
+  // Level 0's existing (offset, mark bit) packing (marked_offset.hpp) unchanged.
+  struct OffsetMarkedTraits {
+    static constexpr auto pack(Offset id, bool marked) -> uint64_t { return pack_forward(id, marked); }
+    static constexpr auto value(uint64_t raw) -> Offset { return forward_offset(raw); }
+    static constexpr auto is_marked(uint64_t raw) -> bool { return forward_marked(raw); }
+    static constexpr auto null_id() -> Offset { return kTail; }
+  };
 
   void initialize_fresh() {
     ::new (&nodes_[kHead]) DurableNode<Key>();
@@ -660,33 +869,19 @@ class PSkipList {
   // that wins pushes the unlinked node to the pending-unlink queue; on any CAS outcome
   // touching a marked node the whole search restarts from head, since a stale predecessor
   // can no longer be trusted.
-  [[nodiscard]] auto find_at_or_after(const Key &key, Offset *predecessor) const -> Offset {
-    for (;;) {
-      Offset pred = kHead;
-      Offset current = forward_offset(nodes_[pred].forward0.load(std::memory_order_acquire));
-      for (;;) {
-        if (current == kTail) {
-          *predecessor = pred;
-          return current;
-        }
-        const uint64_t current_raw = nodes_[current].forward0.load(std::memory_order_acquire);
-        if (forward_marked(current_raw)) {
-          const Offset successor = forward_offset(current_raw);
-          uint64_t expected = pack_forward(current, false);
-          const uint64_t desired = pack_forward(successor, false);
-          if (nodes_[pred].forward0.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
-            enqueue_pending_unlink(current);
-          }
-          break;  // restart the whole search from head
-        }
-        if (!less_(nodes_[current].key, key)) {
-          *predecessor = pred;
-          return current;
-        }
-        pred = current;
-        current = forward_offset(current_raw);
-      }
-    }
+  //
+  // `hint` seeds the first attempt's starting point instead of kHead — typically a
+  // predecessor found via the upper levels (2.4節), letting this skip most of the Level 0
+  // scan. A hint's key is safe to trust as < `key` forever (keys never change once set),
+  // but it must be re-verified as still unmarked immediately before use: if it's since
+  // been unlinked, its forward0 no longer means "live successor" (4.2節), and any retry
+  // (from a restart below) always falls back to kHead.
+  [[nodiscard]] auto find_at_or_after(const Key &key, Offset *predecessor, Offset hint = kHead) const -> Offset {
+    return marked_list_find<Offset, OffsetMarkedTraits>(
+        hint, nodes_[hint].forward0, kHead, nodes_[kHead].forward0, key, less_,
+        [this](Offset o) -> std::atomic<uint64_t> & { return nodes_[o].forward0; },
+        [this](Offset o) -> const Key & { return nodes_[o].key; }, [](Offset) { return false; },
+        [this](Offset o) { enqueue_pending_unlink(o); }, predecessor);
   }
 
   // Lock-free multi-producer stack: any number of unlinkers push concurrently, and
@@ -759,16 +954,176 @@ class PSkipList {
       return;
     }
 
-    uint64_t forward_raw = nodes_[node_offset].forward0.load(std::memory_order_acquire);
-    while (!forward_marked(forward_raw)) {
-      const uint64_t marked = pack_forward(forward_offset(forward_raw), true);
-      if (nodes_[node_offset].forward0.compare_exchange_strong(forward_raw, marked, std::memory_order_acq_rel)) {
-        break;
-      }
-    }
+    marked_list_mark_for_deletion<Offset, OffsetMarkedTraits>(
+        node_offset, [this](Offset o) -> std::atomic<uint64_t> & { return nodes_[o].forward0; });
 
     Offset predecessor = kNullOffset;
     static_cast<void>(find_at_or_after(key, &predecessor));
+  }
+
+  struct UpperSearchResult {
+    Offset level0_hint = kHead;
+  };
+
+  // Level N has no deletion signal of its own — an UpperNode is nothing but a search hint
+  // for a Level 0 record, so "is this entry logically gone" borrows Level 0's own tombstone
+  // state directly rather than duplicating it. See marked_list_find's `is_dead` parameter.
+  [[nodiscard]] auto is_upper_node_dead(UpperNode *node) const -> bool {
+    return PackedValue(nodes_[node->durable_offset].value.load(std::memory_order_acquire)).state() !=
+           NodeState::kLive;
+  }
+
+  // The other half of an UpperNode's removal: whoever's splice brings levels_remaining to 0
+  // has just unlinked it from the last list it participated in, and is the one who hands it
+  // to the EBR registry shared with 3章 (a concurrent reader may still be mid-traversal
+  // through it). Called from marked_list_find's on_splice hook — for any level, from any
+  // thread's search, not just an explicit unlink_upper_levels() call — since a node can be
+  // helped off of each of its levels independently and by whoever gets there first.
+  void on_upper_splice(UpperNode *node) const {
+    if (node->levels_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      enqueue_pending_upper_delete(node);
+    }
+  }
+
+  // Cascading top-down search across all upper levels (2.4節): starts at the highest
+  // level's head and, at each level, walks right as far as possible before dropping down
+  // one level from the same horizontal position — the standard skip-list search, built on
+  // marked_list_find (marked_list.hpp) once per level. Returns the durable_offset of the
+  // level-1 predecessor as a Level 0 search hint.
+  //
+  // `pred` carried over from the level above is exactly the same kind of thing as Level 0's
+  // find_at_or_after `hint`: usually a shortcut, but possibly marked by the time this level
+  // reads it. Its fallback can't be itself (unlike find_upper_at_level below, which always
+  // starts at a head and never needs one) — it must be this level's own head, mirroring
+  // find_at_or_after's hint-falls-back-to-kHead.
+  [[nodiscard]] auto search_upper_levels(const Key &key) const -> UpperSearchResult {
+    UpperSearchResult result;
+    UpperNode *pred = nullptr;
+    for (int level = kDefaultMaxLevel; level >= 1; --level) {
+      std::atomic<uint64_t> &word = pred == nullptr ? upper_heads_[level - 1] : pred->forwards[level - 1];
+      std::atomic<uint64_t> &head = upper_heads_[level - 1];
+      UpperNode *found_pred = nullptr;
+      static_cast<void>(marked_list_find<UpperNode *, PointerMarkedTraits<UpperNode>>(
+          pred, word, nullptr, head, key, less_,
+          [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; },
+          [this](UpperNode *n) -> const Key & { return nodes_[n->durable_offset].key; },
+          [this](UpperNode *n) { return is_upper_node_dead(n); }, [this](UpperNode *n) { on_upper_splice(n); },
+          &found_pred));
+      pred = found_pred;
+    }
+    if (pred != nullptr) {
+      result.level0_hint = pred->durable_offset;
+    }
+    return result;
+  }
+
+  // Single-level search, independent of any other level — used by link's own per-level
+  // positioning rather than the cascading multi-level search above. Stops at the first
+  // node whose key is >= `key`, which is exactly where a new node with this key belongs.
+  [[nodiscard]] auto find_upper_at_level(const Key &key, int level, UpperNode **out_pred) const -> UpperNode * {
+    std::atomic<uint64_t> &head = upper_heads_[level - 1];
+    return marked_list_find<UpperNode *, PointerMarkedTraits<UpperNode>>(
+        nullptr, head, nullptr, head, key, less_,
+        [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; },
+        [this](UpperNode *n) -> const Key & { return nodes_[n->durable_offset].key; },
+        [this](UpperNode *n) { return is_upper_node_dead(n); }, [this](UpperNode *n) { on_upper_splice(n); },
+        out_pred);
+  }
+
+  // Single-level search for one specific durable_offset, not just any node with a matching
+  // key — remove()'s upper-level cleanup can't rely on key alone: an entirely different
+  // occurrence of the same key can already have been removed and reinserted, landing a
+  // different UpperNode at this same sorted position, so this scans past same-key entries
+  // until the offset matches (or the key strictly exceeds `key`). Marking doesn't touch a
+  // node's successor value (marked_list_mark_for_deletion), so it's safe to keep walking
+  // through a marked node here without helping it off — some other search will.
+  [[nodiscard]] auto find_upper_node_at_level(Offset target_offset, const Key &key, int level,
+                                               UpperNode **out_pred) const -> UpperNode * {
+    UpperNode *pred = nullptr;
+    UpperNode *current = marked_ptr_value<UpperNode>(upper_heads_[level - 1].load(std::memory_order_acquire));
+    while (current != nullptr && !less_(key, nodes_[current->durable_offset].key)) {
+      if (current->durable_offset == target_offset) {
+        *out_pred = pred;
+        return current;
+      }
+      pred = current;
+      current = marked_ptr_value<UpperNode>(current->forwards[level - 1].load(std::memory_order_acquire));
+    }
+    *out_pred = pred;
+    return nullptr;
+  }
+
+  // Bottom-up insert into levels 1..height (8章, ASCS insert order), lock-free: each level's
+  // CAS validates "the successor is still what I read" and "the predecessor isn't itself
+  // being marked out from under me" in one shot (marked_list.hpp), so a losing race just
+  // means retrying that level's positioning search, never data loss or corruption.
+  //
+  // put()'s Level 0 CAS makes `fresh` live and reachable before this runs, so a concurrent
+  // remove() on the same key can tombstone it before any of this has happened. Checking once
+  // up front skips the insert entirely in the common case — Level 0's O(N) fallback still
+  // finds the key correctly without an upper-level entry. It isn't airtight on its own
+  // (remove() could still win on the very last level, after this check passed): the backstop
+  // is is_upper_node_dead() above, which every future search checks for every node it visits
+  // regardless of who created it or when — so a rare entry that slips past this check is
+  // still guaranteed to be found, marked, and reclaimed by the next search that reaches it.
+  void link_upper_levels(Offset fresh, const Key &key, int height) {
+    const PackedValue v(nodes_[fresh].value.load(std::memory_order_acquire));
+    if (v.state() != NodeState::kLive) {
+      return;
+    }
+    UpperNode *node = allocate_upper_node(fresh, height);
+    for (int level = 1; level <= height; ++level) {
+      for (;;) {
+        UpperNode *pred = nullptr;
+        UpperNode *successor = find_upper_at_level(key, level, &pred);
+        node->forwards[level - 1].store(pack_marked_ptr(successor, false), std::memory_order_relaxed);
+        std::atomic<uint64_t> &pred_word = pred == nullptr ? upper_heads_[level - 1] : pred->forwards[level - 1];
+        uint64_t expected = pack_marked_ptr(successor, false);
+        const uint64_t desired = pack_marked_ptr(node, false);
+        if (pred_word.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+          break;
+        }
+        // Predecessor changed (a racing insert/delete nearby, or it was itself just marked)
+        // — reposition at this level and retry.
+      }
+    }
+  }
+
+  // Top-down eager cleanup of one specific node's upper-level entries (8章, ASCS delete
+  // order) — an optimization, not a correctness requirement: is_upper_node_dead() (above)
+  // guarantees any level this misses still gets marked, spliced, and reclaimed the next time
+  // any search passes through it, exactly as if this had never been called. `target_offset`
+  // identifies exactly which occurrence of `key` to remove — see find_upper_node_at_level().
+  void unlink_upper_levels(const Key &key, Offset target_offset) {
+    for (int level = kDefaultMaxLevel; level >= 1; --level) {
+      UpperNode *pred = nullptr;
+      UpperNode *current = find_upper_node_at_level(target_offset, key, level, &pred);
+      if (current == nullptr) {
+        continue;  // this occurrence never reached this level
+      }
+      marked_list_mark_for_deletion<UpperNode *, PointerMarkedTraits<UpperNode>>(
+          current, [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; });
+      std::atomic<uint64_t> &pred_word = pred == nullptr ? upper_heads_[level - 1] : pred->forwards[level - 1];
+      const uint64_t successor_raw = current->forwards[level - 1].load(std::memory_order_acquire);
+      uint64_t expected = pack_marked_ptr(current, false);
+      const uint64_t desired = pack_marked_ptr(marked_ptr_value<UpperNode>(successor_raw), false);
+      if (pred_word.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+        on_upper_splice(current);
+      }
+      // A failed splice here just means a concurrent change beat us to it (possibly already
+      // helped by another search) — nothing to redo, the node is still marked either way.
+    }
+  }
+
+  // Lock-free stack of UpperNodes awaiting deallocation, linked via their own dedicated
+  // next_pending field (upper_node.hpp) — never forwards[], which a concurrent reader may
+  // still legitimately dereference after this node is unlinked (see there for why).
+  void enqueue_pending_upper_delete(UpperNode *node) const {
+    UpperNode *old_head = pending_upper_deletes_.load(std::memory_order_relaxed);
+    do {
+      node->next_pending.store(old_head, std::memory_order_relaxed);
+    } while (!pending_upper_deletes_.compare_exchange_weak(old_head, node, std::memory_order_acq_rel,
+                                                             std::memory_order_relaxed));
   }
 
   std::filesystem::path path_;
@@ -777,6 +1132,13 @@ class PSkipList {
   size_t capacity_slots_;
   std::atomic<Offset> high_water_mark_{2};
   Compare less_{};
+  LevelGenerator level_generator_;
+  // Both mutable: search functions are logically const (they only ever refine a hint) but
+  // physically mutate these via marked_list_find's helping splices and on_upper_splice's
+  // reclaim-queue push, exactly as Level 0's `nodes_` (a pointer, not const-propagated
+  // through `this`) already allows for forward0.
+  mutable std::array<std::atomic<uint64_t>, kDefaultMaxLevel> upper_heads_{};
+  mutable std::atomic<UpperNode *> pending_upper_deletes_{nullptr};
 
   mutable std::array<EpochSlot, 2> epoch_slots_{};
   mutable std::atomic<uint64_t> epoch_{0};
