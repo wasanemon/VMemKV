@@ -15,7 +15,7 @@ add_executable(test_pskiplist
   error/test_recovery.cpp
 )
 target_include_directories(test_pskiplist PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(test_pskiplist PRIVATE pskiplist pskiplist_warnings doctest::doctest)
+target_link_libraries(test_pskiplist PRIVATE pskiplist pskiplist_warnings pskiplist_sanitizers doctest::doctest)
 
 add_test(NAME test_pskiplist COMMAND test_pskiplist --duration=true)
 set_tests_properties(test_pskiplist PROPERTIES TIMEOUT 120)

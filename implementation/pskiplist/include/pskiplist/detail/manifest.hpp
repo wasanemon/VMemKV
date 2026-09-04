@@ -1,13 +1,13 @@
 #pragma once
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <system_error>
-
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace pskiplist {
 
@@ -20,9 +20,9 @@ struct ManifestHeader {
   uint32_t magic = kManifestMagic;
   uint8_t format_version = kManifestFormatVersion;
   uint8_t reserved[3] = {};
-  uint64_t epoch = 0;           // node epoch stamps <= this are trusted as durable
+  uint64_t epoch = 0;            // node epoch stamps <= this are trusted as durable
   uint64_t high_water_mark = 0;  // bump allocation's last reached offset
-  uint64_t checksum = 0;        // FNV-1a64 of this header with checksum itself zeroed
+  uint64_t checksum = 0;         // FNV-1a64 of this header with checksum itself zeroed
 };
 static_assert(sizeof(ManifestHeader) == 32);
 

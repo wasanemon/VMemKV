@@ -2,12 +2,6 @@
 // directly — edit the sources under detail/ and regenerate.
 #pragma once
 
-#define PSKIPLIST_VERSION_MAJOR 0
-#define PSKIPLIST_VERSION_MINOR 1
-#define PSKIPLIST_VERSION_PATCH 0
-#define PSKIPLIST_VERSION \
-  (PSKIPLIST_VERSION_MAJOR * 10000 + PSKIPLIST_VERSION_MINOR * 100 + PSKIPLIST_VERSION_PATCH)
-
 #include <concepts>
 #include <type_traits>
 
@@ -20,10 +14,12 @@ template <typename Key>
 concept SkipListKey = std::is_trivially_copyable_v<Key> && std::default_initializable<Key>;
 
 template <typename Compare, typename Key>
-concept SkipListCompare =
-    std::default_initializable<Compare> && std::predicate<Compare, const Key &, const Key &>;
+concept SkipListCompare = std::default_initializable<Compare> && std::predicate<Compare, const Key &, const Key &>;
 
 }  // namespace pskiplist
+
+#include <atomic>
+#include <cstdint>
 
 #include <cstdint>
 
@@ -62,196 +58,6 @@ inline constexpr uint32_t kTaggedGenerationMask = (uint32_t{1} << (64 - kTaggedO
 }
 
 }  // namespace pskiplist
-
-#include <cstdint>
-
-namespace pskiplist {
-
-// Marks the low bit of a pointer to signal logical deletion — the same idea as
-// marked_offset.hpp's kForwardMarkBit for Offset, just applied to a pointer's bit 0 instead
-// of Offset's bit 63. Safe because every allocator this project uses (`::operator new`)
-// returns addresses aligned well beyond 2 bytes, so bit 0 of a live pointer is always 0.
-template <typename T>
-[[nodiscard]] inline auto pack_marked_ptr(T *ptr, bool marked) -> uintptr_t {
-  const auto value = reinterpret_cast<uintptr_t>(ptr);
-  return marked ? (value | uintptr_t{1}) : value;
-}
-
-template <typename T>
-[[nodiscard]] inline auto marked_ptr_value(uintptr_t raw) -> T * {
-  return reinterpret_cast<T *>(raw & ~uintptr_t{1});
-}
-
-[[nodiscard]] inline auto marked_ptr_marked(uintptr_t raw) -> bool { return (raw & uintptr_t{1}) != 0; }
-
-// Traits for marked_list.hpp's generic algorithms, binding them to pointer identities.
-// null_id() is nullptr — a pointer-based list's natural "no next" sentinel, unlike Level 0's
-// offset-based list where that role is played by a real node (kTail).
-template <typename T>
-struct PointerMarkedTraits {
-  static auto pack(T *id, bool marked) -> uint64_t { return pack_marked_ptr<T>(id, marked); }
-  static auto value(uint64_t raw) -> T * { return marked_ptr_value<T>(raw); }
-  static auto is_marked(uint64_t raw) -> bool { return marked_ptr_marked(raw); }
-  static auto null_id() -> T * { return nullptr; }
-};
-
-}  // namespace pskiplist
-
-#include <atomic>
-#include <cstdint>
-
-namespace pskiplist {
-
-// A generic lock-free "find, helping to unlink any marked node along the way" search over a
-// singly-linked list whose nodes are addressed by `Identity` (an Offset into a fixed array
-// for Level 0, or a raw pointer for an upper level — see marked_offset.hpp / marked_pointer.hpp)
-// and whose per-node "next" pointer is packed together with a deletion mark bit into one
-// atomic<uint64_t> word (Traits::pack/value/is_marked). This is the one idea both layers
-// share: a single CAS on a predecessor's word simultaneously validates "the successor is
-// still what I read" and "the predecessor itself hasn't been marked out from under me",
-// because both facts live in the same word.
-//
-// `start_id`/`start_word` is where the walk begins — typically a caller-supplied search hint
-// pointing past most of the list. If that word turns out to already be marked, its offset/
-// pointer bits can no longer be trusted at all (they may already have been repurposed for a
-// pending-reclaim queue by the time this reads them), so the walk restarts from
-// `fallback_id`/`fallback_word` instead — a caller-guaranteed-live anchor (a list head) —
-// rather than retrying the same possibly-permanently-marked start forever. Callers with no
-// meaningful hint (Level N's per-level searches always start at a list head, which is never
-// itself deleted) just pass the same id/word twice; the fallback path is then unreachable,
-// not merely harmless.
-//
-// `is_dead` is a second, independent deletion signal a node can carry *outside* its own
-// word — Level N has no per-node source of truth of its own (an UpperNode is nothing but a
-// search hint), so it borrows Level 0's tombstone state via this hook instead of maintaining
-// a redundant one; Level 0 has no such external signal, so it always passes a hook that
-// returns false. A node flagged dead this way but not yet structurally marked gets marked
-// right here (idempotent — a no-op if a concurrent caller already did) before falling into
-// the same help-splice-and-restart path as a node found already marked, so a zombie gets
-// caught by whichever search encounters it first, however late.
-//
-// On encountering a node whose own word is marked, this helps splice it out via one CAS on
-// its predecessor's word and, if that CAS wins, reports the removed identity via `on_splice`
-// — then restarts the whole walk from the start (not fallback), since the predecessor used up
-// to that point can no longer be trusted. Stops and returns the first node whose key is not
-// less than `key`, or Traits::null_id() if the list runs out first; `*out_pred` receives that
-// result's immediate predecessor.
-template <typename Identity, typename Traits, typename Key, typename Less, typename NextWordFn, typename KeyFn,
-          typename IsDeadFn, typename OnSpliceFn>
-[[nodiscard]] auto marked_list_find(Identity start_id, std::atomic<uint64_t> &start_word, Identity fallback_id,
-                                     std::atomic<uint64_t> &fallback_word, const Key &key, Less less,
-                                     NextWordFn next_word, KeyFn key_of, IsDeadFn is_dead, OnSpliceFn on_splice,
-                                     Identity *out_pred) -> Identity {
-  Identity anchor_id = start_id;
-  std::atomic<uint64_t> *anchor_word = &start_word;
-  for (;;) {
-    Identity pred = anchor_id;
-    std::atomic<uint64_t> *pred_word = anchor_word;
-    const uint64_t pred_raw = pred_word->load(std::memory_order_acquire);
-    if (Traits::is_marked(pred_raw)) {
-      anchor_id = fallback_id;
-      anchor_word = &fallback_word;
-      continue;
-    }
-    Identity current = Traits::value(pred_raw);
-    for (;;) {
-      if (current == Traits::null_id()) {
-        *out_pred = pred;
-        return current;
-      }
-      uint64_t current_raw = next_word(current).load(std::memory_order_acquire);
-      if (!Traits::is_marked(current_raw) && is_dead(current)) {
-        marked_list_mark_for_deletion<Identity, Traits>(current, next_word);
-        current_raw = next_word(current).load(std::memory_order_acquire);
-      }
-      if (Traits::is_marked(current_raw)) {
-        const Identity successor = Traits::value(current_raw);
-        uint64_t expected = Traits::pack(current, false);
-        const uint64_t desired = Traits::pack(successor, false);
-        if (pred_word->compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
-          on_splice(current);
-        }
-        break;  // restart the whole walk from anchor_id/anchor_word — pred_word may now be stale
-      }
-      if (!less(key_of(current), key)) {
-        *out_pred = pred;
-        return current;
-      }
-      pred = current;
-      pred_word = &next_word(current);
-      current = Traits::value(current_raw);
-    }
-  }
-}
-
-// Marks `id`'s own word for logical deletion, preserving whatever successor it currently
-// names — the first half of removing a node, done once before any splice is attempted.
-// Retries against concurrent inserts that change the successor while leaving mark unset;
-// a no-op (mark already set) if another thread got there first.
-template <typename Identity, typename Traits, typename OwnWordFn>
-void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
-  uint64_t raw = own_word(id).load(std::memory_order_acquire);
-  while (!Traits::is_marked(raw)) {
-    const uint64_t desired = Traits::pack(Traits::value(raw), true);
-    if (own_word(id).compare_exchange_strong(raw, desired, std::memory_order_acq_rel)) {
-      break;
-    }
-  }
-}
-
-// A plain lock-free Treiber stack push: `value` becomes the new head, linked to the old one
-// by `set_next(value, old_head)` — usually a direct store into `value`'s own dedicated "next"
-// word, but left as a callback rather than a word reference so a caller that repurposes an
-// existing word (packing in a mark bit, say) can do that instead. No pop is provided — every
-// user of this drains the whole stack at once via `head.exchange(...,
-// std::memory_order_acq_rel)` rather than popping items one at a time, so there's no ABA
-// hazard to guard against (unlike a free list, which needs marked_offset.hpp's tagged
-// pointer instead).
-template <typename Identity, typename SetNextFn>
-void stack_push(std::atomic<Identity> &head, Identity value, SetNextFn set_next) {
-  Identity old_head = head.load(std::memory_order_relaxed);
-  do {
-    set_next(value, old_head);
-  } while (!head.compare_exchange_weak(old_head, value, std::memory_order_acq_rel, std::memory_order_relaxed));
-}
-
-}  // namespace pskiplist
-
-#include <cstdint>
-
-namespace pskiplist {
-
-enum class NodeState : uint8_t {
-  kLive = 0,
-  kTombstonedLinked = 1,
-  kTombstonedUnlinked = 2,
-};
-
-class PackedValue {
- public:
-  PackedValue() = default;
-  explicit PackedValue(uint64_t bits) : bits_(bits) {}
-  static auto live(uint64_t payload) -> PackedValue { return PackedValue(encode(NodeState::kLive, payload)); }
-
-  [[nodiscard]] auto state() const -> NodeState { return static_cast<NodeState>(bits_ >> kPayloadBits); }
-  [[nodiscard]] auto payload() const -> uint64_t { return bits_ & kPayloadMask; }
-  [[nodiscard]] auto raw() const -> uint64_t { return bits_; }
-  [[nodiscard]] auto with_state(NodeState state) const -> PackedValue { return PackedValue(encode(state, payload())); }
-
-  static constexpr int kPayloadBits = 62;
-  static constexpr uint64_t kPayloadMask = (uint64_t{1} << kPayloadBits) - 1;
-
- private:
-  static auto encode(NodeState state, uint64_t payload) -> uint64_t {
-    return (static_cast<uint64_t>(state) << kPayloadBits) | (payload & kPayloadMask);
-  }
-  uint64_t bits_ = 0;
-};
-
-}  // namespace pskiplist
-
-#include <atomic>
-#include <cstdint>
 
 namespace pskiplist {
 
@@ -353,8 +159,7 @@ inline constexpr int kDefaultMaxLevel = 32;
 // concurrent interleavings.
 class LevelGenerator {
  public:
-  explicit LevelGenerator(uint64_t seed, int max_level = kDefaultMaxLevel,
-                           double p = kDefaultLevelPromotionProbability)
+  explicit LevelGenerator(uint64_t seed, int max_level = kDefaultMaxLevel, double p = kDefaultLevelPromotionProbability)
       : seed_(seed), max_level_(max_level), p_(p) {}
 
   [[nodiscard]] auto next_level() const -> int {
@@ -375,14 +180,14 @@ class LevelGenerator {
 
 }  // namespace pskiplist
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <system_error>
-
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace pskiplist {
 
@@ -395,9 +200,9 @@ struct ManifestHeader {
   uint32_t magic = kManifestMagic;
   uint8_t format_version = kManifestFormatVersion;
   uint8_t reserved[3] = {};
-  uint64_t epoch = 0;           // node epoch stamps <= this are trusted as durable
+  uint64_t epoch = 0;            // node epoch stamps <= this are trusted as durable
   uint64_t high_water_mark = 0;  // bump allocation's last reached offset
-  uint64_t checksum = 0;        // FNV-1a64 of this header with checksum itself zeroed
+  uint64_t checksum = 0;         // FNV-1a64 of this header with checksum itself zeroed
 };
 static_assert(sizeof(ManifestHeader) == 32);
 
@@ -476,15 +281,182 @@ inline void write_manifest(const std::filesystem::path &data_path, uint64_t epoc
 
 }  // namespace pskiplist
 
-#include <cstddef>
-#include <filesystem>
-#include <stdexcept>
-#include <system_error>
+#include <atomic>
+#include <cstdint>
+
+namespace pskiplist {
+
+// A generic lock-free "find, helping to unlink any marked node along the way" search over a
+// singly-linked list whose nodes are addressed by `Identity` (an Offset into a fixed array
+// for Level 0, or a raw pointer for an upper level — see marked_offset.hpp / marked_pointer.hpp)
+// and whose per-node "next" pointer is packed together with a deletion mark bit into one
+// atomic<uint64_t> word (Traits::pack/value/is_marked). This is the one idea both layers
+// share: a single CAS on a predecessor's word simultaneously validates "the successor is
+// still what I read" and "the predecessor itself hasn't been marked out from under me",
+// because both facts live in the same word.
+//
+// `start_id`/`start_word` is where the walk begins — typically a caller-supplied search hint
+// pointing past most of the list. If that word turns out to already be marked, its offset/
+// pointer bits can no longer be trusted at all (they may already have been repurposed for a
+// pending-reclaim queue by the time this reads them), so the walk restarts from
+// `fallback_id`/`fallback_word` instead — a caller-guaranteed-live anchor (a list head) —
+// rather than retrying the same possibly-permanently-marked start forever. Callers with no
+// meaningful hint (Level N's per-level searches always start at a list head, which is never
+// itself deleted) just pass the same id/word twice; the fallback path is then unreachable,
+// not merely harmless.
+//
+// `is_dead` is a second, independent deletion signal a node can carry *outside* its own
+// word — Level N has no per-node source of truth of its own (an UpperNode is nothing but a
+// search hint), so it borrows Level 0's tombstone state via this hook instead of maintaining
+// a redundant one; Level 0 has no such external signal, so it always passes a hook that
+// returns false. A node flagged dead this way but not yet structurally marked gets marked
+// right here (idempotent — a no-op if a concurrent caller already did) before falling into
+// the same help-splice-and-restart path as a node found already marked, so a zombie gets
+// caught by whichever search encounters it first, however late.
+//
+// On encountering a node whose own word is marked, this helps splice it out via one CAS on
+// its predecessor's word and, if that CAS wins, reports the removed identity via `on_splice`
+// — then restarts the whole walk from the start (not fallback), since the predecessor used up
+// to that point can no longer be trusted. Stops and returns the first node whose key is not
+// less than `key`, or Traits::null_id() if the list runs out first; `*out_pred` receives that
+// result's immediate predecessor.
+template <typename Identity,
+          typename Traits,
+          typename Key,
+          typename Less,
+          typename NextWordFn,
+          typename KeyFn,
+          typename IsDeadFn,
+          typename OnSpliceFn>
+[[nodiscard]] auto marked_list_find(Identity start_id,
+                                    std::atomic<uint64_t> &start_word,
+                                    Identity fallback_id,
+                                    std::atomic<uint64_t> &fallback_word,
+                                    const Key &key,
+                                    Less less,
+                                    NextWordFn next_word,
+                                    KeyFn key_of,
+                                    IsDeadFn is_dead,
+                                    OnSpliceFn on_splice,
+                                    Identity *out_pred) -> Identity {
+  Identity anchor_id = start_id;
+  std::atomic<uint64_t> *anchor_word = &start_word;
+  for (;;) {
+    Identity pred = anchor_id;
+    std::atomic<uint64_t> *pred_word = anchor_word;
+    const uint64_t pred_raw = pred_word->load(std::memory_order_acquire);
+    if (Traits::is_marked(pred_raw)) {
+      anchor_id = fallback_id;
+      anchor_word = &fallback_word;
+      continue;
+    }
+    Identity current = Traits::value(pred_raw);
+    for (;;) {
+      if (current == Traits::null_id()) {
+        *out_pred = pred;
+        return current;
+      }
+      uint64_t current_raw = next_word(current).load(std::memory_order_acquire);
+      if (!Traits::is_marked(current_raw) && is_dead(current)) {
+        marked_list_mark_for_deletion<Identity, Traits>(current, next_word);
+        current_raw = next_word(current).load(std::memory_order_acquire);
+      }
+      if (Traits::is_marked(current_raw)) {
+        const Identity successor = Traits::value(current_raw);
+        uint64_t expected = Traits::pack(current, false);
+        const uint64_t desired = Traits::pack(successor, false);
+        if (pred_word->compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+          on_splice(current);
+        }
+        break;  // restart the whole walk from anchor_id/anchor_word — pred_word may now be stale
+      }
+      if (!less(key_of(current), key)) {
+        *out_pred = pred;
+        return current;
+      }
+      pred = current;
+      pred_word = &next_word(current);
+      current = Traits::value(current_raw);
+    }
+  }
+}
+
+// Marks `id`'s own word for logical deletion, preserving whatever successor it currently
+// names — the first half of removing a node, done once before any splice is attempted.
+// Retries against concurrent inserts that change the successor while leaving mark unset;
+// a no-op (mark already set) if another thread got there first.
+template <typename Identity, typename Traits, typename OwnWordFn>
+void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
+  uint64_t raw = own_word(id).load(std::memory_order_acquire);
+  while (!Traits::is_marked(raw)) {
+    const uint64_t desired = Traits::pack(Traits::value(raw), true);
+    if (own_word(id).compare_exchange_strong(raw, desired, std::memory_order_acq_rel)) {
+      break;
+    }
+  }
+}
+
+// A plain lock-free Treiber stack push: `value` becomes the new head, linked to the old one
+// by `set_next(value, old_head)` — usually a direct store into `value`'s own dedicated "next"
+// word, but left as a callback rather than a word reference so a caller that repurposes an
+// existing word (packing in a mark bit, say) can do that instead. No pop is provided — every
+// user of this drains the whole stack at once via `head.exchange(...,
+// std::memory_order_acq_rel)` rather than popping items one at a time, so there's no ABA
+// hazard to guard against (unlike a free list, which needs marked_offset.hpp's tagged
+// pointer instead).
+template <typename Identity, typename SetNextFn>
+void stack_push(std::atomic<Identity> &head, Identity value, SetNextFn set_next) {
+  Identity old_head = head.load(std::memory_order_relaxed);
+  do {
+    set_next(value, old_head);
+  } while (!head.compare_exchange_weak(old_head, value, std::memory_order_acq_rel, std::memory_order_relaxed));
+}
+
+}  // namespace pskiplist
+
+#include <cstdint>
+
+namespace pskiplist {
+
+// Marks the low bit of a pointer to signal logical deletion — the same idea as
+// marked_offset.hpp's kForwardMarkBit for Offset, just applied to a pointer's bit 0 instead
+// of Offset's bit 63. Safe because every allocator this project uses (`::operator new`)
+// returns addresses aligned well beyond 2 bytes, so bit 0 of a live pointer is always 0.
+template <typename T>
+[[nodiscard]] inline auto pack_marked_ptr(T *ptr, bool marked) -> uintptr_t {
+  const auto value = reinterpret_cast<uintptr_t>(ptr);
+  return marked ? (value | uintptr_t{1}) : value;
+}
+
+template <typename T>
+[[nodiscard]] inline auto marked_ptr_value(uintptr_t raw) -> T * {
+  return reinterpret_cast<T *>(raw & ~uintptr_t{1});
+}
+
+[[nodiscard]] inline auto marked_ptr_marked(uintptr_t raw) -> bool { return (raw & uintptr_t{1}) != 0; }
+
+// Traits for marked_list.hpp's generic algorithms, binding them to pointer identities.
+// null_id() is nullptr — a pointer-based list's natural "no next" sentinel, unlike Level 0's
+// offset-based list where that role is played by a real node (kTail).
+template <typename T>
+struct PointerMarkedTraits {
+  static auto pack(T *id, bool marked) -> uint64_t { return pack_marked_ptr<T>(id, marked); }
+  static auto value(uint64_t raw) -> T * { return marked_ptr_value<T>(raw); }
+  static auto is_marked(uint64_t raw) -> bool { return marked_ptr_marked(raw); }
+  static auto null_id() -> T * { return nullptr; }
+};
+
+}  // namespace pskiplist
 
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <cstddef>
+#include <filesystem>
+#include <stdexcept>
+#include <system_error>
 
 namespace pskiplist {
 
@@ -518,7 +490,8 @@ class MmapFile {
       reused_ = true;
       if (static_cast<size_t>(st.st_size) != size_) {
         ::close(fd_);
-        throw std::invalid_argument("pskiplist: " + path.string() + " exists with a size that does not match capacity_bytes");
+        throw std::invalid_argument("pskiplist: " + path.string() +
+                                    " exists with a size that does not match capacity_bytes");
       }
     }
 
@@ -564,6 +537,53 @@ class MmapFile {
 
 }  // namespace pskiplist
 
+#include <cstdint>
+
+namespace pskiplist {
+
+enum class NodeState : uint8_t {
+  kLive = 0,
+  kTombstonedLinked = 1,
+  kTombstonedUnlinked = 2,
+};
+
+class PackedValue {
+ public:
+  PackedValue() = default;
+  explicit PackedValue(uint64_t bits) : bits_(bits) {}
+  static auto live(uint64_t payload) -> PackedValue { return PackedValue(encode(NodeState::kLive, payload)); }
+
+  [[nodiscard]] auto state() const -> NodeState { return static_cast<NodeState>(bits_ >> kPayloadBits); }
+  [[nodiscard]] auto payload() const -> uint64_t { return bits_ & kPayloadMask; }
+  [[nodiscard]] auto raw() const -> uint64_t { return bits_; }
+  [[nodiscard]] auto with_state(NodeState state) const -> PackedValue { return PackedValue(encode(state, payload())); }
+
+  static constexpr int kPayloadBits = 62;
+  static constexpr uint64_t kPayloadMask = (uint64_t{1} << kPayloadBits) - 1;
+
+ private:
+  static auto encode(NodeState state, uint64_t payload) -> uint64_t {
+    return (static_cast<uint64_t>(state) << kPayloadBits) | (payload & kPayloadMask);
+  }
+  uint64_t bits_ = 0;
+};
+
+}  // namespace pskiplist
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <mutex>
+#include <new>
+#include <optional>
+#include <random>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
 #include <atomic>
 #include <cstddef>
 #include <new>
@@ -597,8 +617,7 @@ struct UpperNode {
 };
 
 [[nodiscard]] inline auto allocate_upper_node(Offset durable_offset, int height) -> UpperNode * {
-  void *memory =
-      ::operator new(sizeof(UpperNode) + sizeof(std::atomic<uint64_t>) * static_cast<size_t>(height - 1));
+  void *memory = ::operator new(sizeof(UpperNode) + sizeof(std::atomic<uint64_t>) * static_cast<size_t>(height - 1));
   auto *node = static_cast<UpperNode *>(memory);
   ::new (&node->durable_offset) Offset(durable_offset);
   ::new (&node->height) int(height);
@@ -620,20 +639,6 @@ inline void deallocate_upper_node(UpperNode *node) {
 }
 
 }  // namespace pskiplist
-
-#include <array>
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <filesystem>
-#include <functional>
-#include <mutex>
-#include <new>
-#include <optional>
-#include <random>
-#include <stdexcept>
-#include <thread>
-#include <vector>
 
 namespace pskiplist {
 
@@ -733,7 +738,8 @@ class PSkipList {
 
       uint64_t expected_next = pack_forward(existing, false);
       const uint64_t desired_next = pack_forward(fresh, false);
-      if (nodes_[predecessor].forward0.compare_exchange_strong(expected_next, desired_next, std::memory_order_acq_rel)) {
+      if (nodes_[predecessor].forward0.compare_exchange_strong(
+              expected_next, desired_next, std::memory_order_acq_rel)) {
         link_upper_levels(fresh, key, level_generator_.next_level());
         return true;
       }
@@ -903,8 +909,7 @@ class PSkipList {
     Offset pred = kHead;
     Offset current = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (current != kTail) {
-      if (current >= recovered_high_water_mark ||
-          nodes_[current].epoch.load(std::memory_order_relaxed) > threshold) {
+      if (current >= recovered_high_water_mark || nodes_[current].epoch.load(std::memory_order_relaxed) > threshold) {
         nodes_[pred].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
         break;
       }
@@ -913,7 +918,7 @@ class PSkipList {
       // might not be; revert to the shadow, which always holds the last-checkpointed value.
       if (nodes_[current].mutation_epoch.load(std::memory_order_relaxed) > threshold) {
         nodes_[current].value.store(nodes_[current].checkpointed_value.load(std::memory_order_relaxed),
-                                     std::memory_order_relaxed);
+                                    std::memory_order_relaxed);
         nodes_[current].mutation_epoch.store(threshold, std::memory_order_relaxed);
       }
       reached[current] = true;
@@ -940,8 +945,7 @@ class PSkipList {
     Offset walk = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (walk != kTail) {
       const Offset next = forward_offset(nodes_[walk].forward0.load(std::memory_order_relaxed));
-      if (PackedValue(nodes_[walk].value.load(std::memory_order_relaxed)).state() ==
-          NodeState::kTombstonedLinked) {
+      if (PackedValue(nodes_[walk].value.load(std::memory_order_relaxed)).state() == NodeState::kTombstonedLinked) {
         physically_unlink_best_effort(nodes_[walk].key, walk);
       }
       walk = next;
@@ -965,9 +969,7 @@ class PSkipList {
     }
   }
 
-  [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool {
-    return !less_(a, b) && !less_(b, a);
-  }
+  [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool { return !less_(a, b) && !less_(b, a); }
 
   // Shared by put()'s existing-key branch and remove()'s tombstone transition — both are
   // in-place mutations to a node that may already be checkpointed. `expected_live_value` is
@@ -997,10 +999,17 @@ class PSkipList {
   // (from a restart below) always falls back to kHead.
   [[nodiscard]] auto find_at_or_after(const Key &key, Offset *predecessor, Offset hint = kHead) const -> Offset {
     return marked_list_find<Offset, OffsetMarkedTraits>(
-        hint, nodes_[hint].forward0, kHead, nodes_[kHead].forward0, key, less_,
+        hint,
+        nodes_[hint].forward0,
+        kHead,
+        nodes_[kHead].forward0,
+        key,
+        less_,
         [this](Offset o) -> std::atomic<uint64_t> & { return nodes_[o].forward0; },
-        [this](Offset o) -> const Key & { return nodes_[o].key; }, [](Offset) { return false; },
-        [this](Offset o) { enqueue_pending_unlink(o); }, predecessor);
+        [this](Offset o) -> const Key & { return nodes_[o].key; },
+        [](Offset) { return false; },
+        [this](Offset o) { enqueue_pending_unlink(o); },
+        predecessor);
   }
 
   // Lock-free multi-producer stack: any number of unlinkers push concurrently, and
@@ -1047,8 +1056,7 @@ class PSkipList {
       // Marked for the same reason as enqueue_pending_unlink above.
       nodes_[offset].forward0.store(pack_forward(tagged_offset(old_head), true), std::memory_order_relaxed);
       const uint64_t new_head = pack_tagged(offset, tagged_generation(old_head) + 1);
-      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel,
-                                            std::memory_order_relaxed)) {
+      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         return;
       }
     }
@@ -1061,8 +1069,7 @@ class PSkipList {
       if (offset == 0) return kNullOffset;  // empty: offset 0 (kHead) is never freed
       const Offset next = forward_offset(nodes_[offset].forward0.load(std::memory_order_relaxed));
       const uint64_t new_head = pack_tagged(next, tagged_generation(old_head) + 1);
-      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel,
-                                            std::memory_order_relaxed)) {
+      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         return offset;
       }
     }
@@ -1111,8 +1118,7 @@ class PSkipList {
   // for a Level 0 record, so "is this entry logically gone" borrows Level 0's own tombstone
   // state directly rather than duplicating it. See marked_list_find's `is_dead` parameter.
   [[nodiscard]] auto is_upper_node_dead(UpperNode *node) const -> bool {
-    return PackedValue(nodes_[node->durable_offset].value.load(std::memory_order_acquire)).state() !=
-           NodeState::kLive;
+    return PackedValue(nodes_[node->durable_offset].value.load(std::memory_order_acquire)).state() != NodeState::kLive;
   }
 
   // The other half of an UpperNode's removal: whoever's splice brings levels_remaining to 0
@@ -1157,13 +1163,21 @@ class PSkipList {
   // positioning search per level) need: stops at the first node whose key is >= `key`, which
   // is exactly where a new node with this key belongs. Wraps marked_list_find so both
   // callers share the same next/key/is_dead/on_splice policies instead of repeating them.
-  [[nodiscard]] auto find_upper_at_level_from(UpperNode *start, const Key &key, int level,
-                                               UpperNode **out_pred) const -> UpperNode * {
+  [[nodiscard]] auto find_upper_at_level_from(UpperNode *start,
+                                              const Key &key,
+                                              int level,
+                                              UpperNode **out_pred) const -> UpperNode * {
     return marked_list_find<UpperNode *, PointerMarkedTraits<UpperNode>>(
-        start, upper_word(start, level), nullptr, upper_heads_[level - 1], key, less_,
+        start,
+        upper_word(start, level),
+        nullptr,
+        upper_heads_[level - 1],
+        key,
+        less_,
         [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; },
         [this](UpperNode *n) -> const Key & { return nodes_[n->durable_offset].key; },
-        [this](UpperNode *n) { return is_upper_node_dead(n); }, [this](UpperNode *n) { on_upper_splice(n); },
+        [this](UpperNode *n) { return is_upper_node_dead(n); },
+        [this](UpperNode *n) { on_upper_splice(n); },
         out_pred);
   }
 
@@ -1178,8 +1192,10 @@ class PSkipList {
   // until the offset matches (or the key strictly exceeds `key`). Marking doesn't touch a
   // node's successor value (marked_list_mark_for_deletion), so it's safe to keep walking
   // through a marked node here without helping it off — some other search will.
-  [[nodiscard]] auto find_upper_node_at_level(Offset target_offset, const Key &key, int level,
-                                               UpperNode **out_pred) const -> UpperNode * {
+  [[nodiscard]] auto find_upper_node_at_level(Offset target_offset,
+                                              const Key &key,
+                                              int level,
+                                              UpperNode **out_pred) const -> UpperNode * {
     UpperNode *pred = nullptr;
     UpperNode *current = marked_ptr_value<UpperNode>(upper_heads_[level - 1].load(std::memory_order_acquire));
     while (current != nullptr && !less_(key, nodes_[current->durable_offset].key)) {
@@ -1258,8 +1274,9 @@ class PSkipList {
   // next_pending field (upper_node.hpp) — never forwards[], which a concurrent reader may
   // still legitimately dereference after this node is unlinked (see there for why).
   void enqueue_pending_upper_delete(UpperNode *node) const {
-    stack_push(pending_upper_deletes_, node,
-               [](UpperNode *n, UpperNode *next) { n->next_pending.store(next, std::memory_order_relaxed); });
+    stack_push(pending_upper_deletes_, node, [](UpperNode *n, UpperNode *next) {
+      n->next_pending.store(next, std::memory_order_relaxed);
+    });
   }
 
   std::filesystem::path path_;
@@ -1292,4 +1309,9 @@ class PSkipList {
 };
 
 }  // namespace pskiplist
+
+#define PSKIPLIST_VERSION_MAJOR 0
+#define PSKIPLIST_VERSION_MINOR 1
+#define PSKIPLIST_VERSION_PATCH 0
+#define PSKIPLIST_VERSION (PSKIPLIST_VERSION_MAJOR * 10000 + PSKIPLIST_VERSION_MINOR * 100 + PSKIPLIST_VERSION_PATCH)
 

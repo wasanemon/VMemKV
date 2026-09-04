@@ -1,12 +1,11 @@
 #include <doctest/doctest.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <cstddef>
 #include <filesystem>
 #include <pskiplist/pskiplist.hpp>
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 #include "support/temp_file.hpp"
 

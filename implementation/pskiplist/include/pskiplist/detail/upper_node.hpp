@@ -36,8 +36,7 @@ struct UpperNode {
 };
 
 [[nodiscard]] inline auto allocate_upper_node(Offset durable_offset, int height) -> UpperNode * {
-  void *memory =
-      ::operator new(sizeof(UpperNode) + sizeof(std::atomic<uint64_t>) * static_cast<size_t>(height - 1));
+  void *memory = ::operator new(sizeof(UpperNode) + sizeof(std::atomic<uint64_t>) * static_cast<size_t>(height - 1));
   auto *node = static_cast<UpperNode *>(memory);
   ::new (&node->durable_offset) Offset(durable_offset);
   ::new (&node->height) int(height);

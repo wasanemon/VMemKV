@@ -39,12 +39,25 @@ namespace pskiplist {
 // to that point can no longer be trusted. Stops and returns the first node whose key is not
 // less than `key`, or Traits::null_id() if the list runs out first; `*out_pred` receives that
 // result's immediate predecessor.
-template <typename Identity, typename Traits, typename Key, typename Less, typename NextWordFn, typename KeyFn,
-          typename IsDeadFn, typename OnSpliceFn>
-[[nodiscard]] auto marked_list_find(Identity start_id, std::atomic<uint64_t> &start_word, Identity fallback_id,
-                                     std::atomic<uint64_t> &fallback_word, const Key &key, Less less,
-                                     NextWordFn next_word, KeyFn key_of, IsDeadFn is_dead, OnSpliceFn on_splice,
-                                     Identity *out_pred) -> Identity {
+template <typename Identity,
+          typename Traits,
+          typename Key,
+          typename Less,
+          typename NextWordFn,
+          typename KeyFn,
+          typename IsDeadFn,
+          typename OnSpliceFn>
+[[nodiscard]] auto marked_list_find(Identity start_id,
+                                    std::atomic<uint64_t> &start_word,
+                                    Identity fallback_id,
+                                    std::atomic<uint64_t> &fallback_word,
+                                    const Key &key,
+                                    Less less,
+                                    NextWordFn next_word,
+                                    KeyFn key_of,
+                                    IsDeadFn is_dead,
+                                    OnSpliceFn on_splice,
+                                    Identity *out_pred) -> Identity {
   Identity anchor_id = start_id;
   std::atomic<uint64_t> *anchor_word = &start_word;
   for (;;) {

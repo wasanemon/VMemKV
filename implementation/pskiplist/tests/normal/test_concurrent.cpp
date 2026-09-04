@@ -19,7 +19,7 @@ TEST_CASE("concurrent put with disjoint key ranges all land correctly") {
   constexpr int kThreads = 8;
   constexpr int kKeysPerThread = 500;
   TempFile tmp("disjoint_put");
-  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(kThreads * kKeysPerThread));
+  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(static_cast<size_t>(kThreads) * kKeysPerThread));
 
   std::vector<std::thread> workers;
   for (int t = 0; t < kThreads; ++t) {
@@ -54,7 +54,8 @@ TEST_CASE("concurrent put/remove on shared keys keeps get() and scan() consisten
   constexpr int kSharedKeys = 8;
   constexpr int kIterationsPerThread = 2000;
   TempFile tmp("shared_keys");
-  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(kThreads * kIterationsPerThread));
+  PSkipList<int> skiplist(tmp.path(),
+                          capacity_bytes_for_nodes<int>(static_cast<size_t>(kThreads) * kIterationsPerThread));
 
   std::atomic<bool> failed{false};
   std::vector<std::thread> workers;
@@ -92,7 +93,8 @@ TEST_CASE("reclaim() running concurrently with put/remove/get stays consistent")
   constexpr int kSharedKeys = 8;
   constexpr int kIterationsPerThread = 3000;
   TempFile tmp("reclaim_concurrent");
-  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(kThreads * kIterationsPerThread));
+  PSkipList<int> skiplist(tmp.path(),
+                          capacity_bytes_for_nodes<int>(static_cast<size_t>(kThreads) * kIterationsPerThread));
 
   std::atomic<bool> stop{false};
   std::thread reclaimer([&skiplist, &stop] {

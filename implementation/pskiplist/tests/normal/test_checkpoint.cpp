@@ -89,7 +89,8 @@ TEST_CASE("concurrent put/remove/checkpoint from multiple threads stays consiste
   constexpr int kSharedKeys = 8;
   constexpr int kIterationsPerThread = 1500;
   TempFile tmp("checkpoint_concurrent");
-  PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(kThreads * kIterationsPerThread));
+  PSkipList<int> skiplist(tmp.path(),
+                          capacity_bytes_for_nodes<int>(static_cast<size_t>(kThreads) * kIterationsPerThread));
 
   std::atomic<bool> stop{false};
   std::thread checkpointer([&] {

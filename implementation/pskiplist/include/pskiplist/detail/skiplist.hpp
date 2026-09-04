@@ -124,7 +124,8 @@ class PSkipList {
 
       uint64_t expected_next = pack_forward(existing, false);
       const uint64_t desired_next = pack_forward(fresh, false);
-      if (nodes_[predecessor].forward0.compare_exchange_strong(expected_next, desired_next, std::memory_order_acq_rel)) {
+      if (nodes_[predecessor].forward0.compare_exchange_strong(
+              expected_next, desired_next, std::memory_order_acq_rel)) {
         link_upper_levels(fresh, key, level_generator_.next_level());
         return true;
       }
@@ -294,8 +295,7 @@ class PSkipList {
     Offset pred = kHead;
     Offset current = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (current != kTail) {
-      if (current >= recovered_high_water_mark ||
-          nodes_[current].epoch.load(std::memory_order_relaxed) > threshold) {
+      if (current >= recovered_high_water_mark || nodes_[current].epoch.load(std::memory_order_relaxed) > threshold) {
         nodes_[pred].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
         break;
       }
@@ -304,7 +304,7 @@ class PSkipList {
       // might not be; revert to the shadow, which always holds the last-checkpointed value.
       if (nodes_[current].mutation_epoch.load(std::memory_order_relaxed) > threshold) {
         nodes_[current].value.store(nodes_[current].checkpointed_value.load(std::memory_order_relaxed),
-                                     std::memory_order_relaxed);
+                                    std::memory_order_relaxed);
         nodes_[current].mutation_epoch.store(threshold, std::memory_order_relaxed);
       }
       reached[current] = true;
@@ -331,8 +331,7 @@ class PSkipList {
     Offset walk = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (walk != kTail) {
       const Offset next = forward_offset(nodes_[walk].forward0.load(std::memory_order_relaxed));
-      if (PackedValue(nodes_[walk].value.load(std::memory_order_relaxed)).state() ==
-          NodeState::kTombstonedLinked) {
+      if (PackedValue(nodes_[walk].value.load(std::memory_order_relaxed)).state() == NodeState::kTombstonedLinked) {
         physically_unlink_best_effort(nodes_[walk].key, walk);
       }
       walk = next;
@@ -356,9 +355,7 @@ class PSkipList {
     }
   }
 
-  [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool {
-    return !less_(a, b) && !less_(b, a);
-  }
+  [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool { return !less_(a, b) && !less_(b, a); }
 
   // Shared by put()'s existing-key branch and remove()'s tombstone transition — both are
   // in-place mutations to a node that may already be checkpointed. `expected_live_value` is
@@ -388,10 +385,17 @@ class PSkipList {
   // (from a restart below) always falls back to kHead.
   [[nodiscard]] auto find_at_or_after(const Key &key, Offset *predecessor, Offset hint = kHead) const -> Offset {
     return marked_list_find<Offset, OffsetMarkedTraits>(
-        hint, nodes_[hint].forward0, kHead, nodes_[kHead].forward0, key, less_,
+        hint,
+        nodes_[hint].forward0,
+        kHead,
+        nodes_[kHead].forward0,
+        key,
+        less_,
         [this](Offset o) -> std::atomic<uint64_t> & { return nodes_[o].forward0; },
-        [this](Offset o) -> const Key & { return nodes_[o].key; }, [](Offset) { return false; },
-        [this](Offset o) { enqueue_pending_unlink(o); }, predecessor);
+        [this](Offset o) -> const Key & { return nodes_[o].key; },
+        [](Offset) { return false; },
+        [this](Offset o) { enqueue_pending_unlink(o); },
+        predecessor);
   }
 
   // Lock-free multi-producer stack: any number of unlinkers push concurrently, and
@@ -438,8 +442,7 @@ class PSkipList {
       // Marked for the same reason as enqueue_pending_unlink above.
       nodes_[offset].forward0.store(pack_forward(tagged_offset(old_head), true), std::memory_order_relaxed);
       const uint64_t new_head = pack_tagged(offset, tagged_generation(old_head) + 1);
-      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel,
-                                            std::memory_order_relaxed)) {
+      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         return;
       }
     }
@@ -452,8 +455,7 @@ class PSkipList {
       if (offset == 0) return kNullOffset;  // empty: offset 0 (kHead) is never freed
       const Offset next = forward_offset(nodes_[offset].forward0.load(std::memory_order_relaxed));
       const uint64_t new_head = pack_tagged(next, tagged_generation(old_head) + 1);
-      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel,
-                                            std::memory_order_relaxed)) {
+      if (free_head_.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         return offset;
       }
     }
@@ -502,8 +504,7 @@ class PSkipList {
   // for a Level 0 record, so "is this entry logically gone" borrows Level 0's own tombstone
   // state directly rather than duplicating it. See marked_list_find's `is_dead` parameter.
   [[nodiscard]] auto is_upper_node_dead(UpperNode *node) const -> bool {
-    return PackedValue(nodes_[node->durable_offset].value.load(std::memory_order_acquire)).state() !=
-           NodeState::kLive;
+    return PackedValue(nodes_[node->durable_offset].value.load(std::memory_order_acquire)).state() != NodeState::kLive;
   }
 
   // The other half of an UpperNode's removal: whoever's splice brings levels_remaining to 0
@@ -548,13 +549,21 @@ class PSkipList {
   // positioning search per level) need: stops at the first node whose key is >= `key`, which
   // is exactly where a new node with this key belongs. Wraps marked_list_find so both
   // callers share the same next/key/is_dead/on_splice policies instead of repeating them.
-  [[nodiscard]] auto find_upper_at_level_from(UpperNode *start, const Key &key, int level,
-                                               UpperNode **out_pred) const -> UpperNode * {
+  [[nodiscard]] auto find_upper_at_level_from(UpperNode *start,
+                                              const Key &key,
+                                              int level,
+                                              UpperNode **out_pred) const -> UpperNode * {
     return marked_list_find<UpperNode *, PointerMarkedTraits<UpperNode>>(
-        start, upper_word(start, level), nullptr, upper_heads_[level - 1], key, less_,
+        start,
+        upper_word(start, level),
+        nullptr,
+        upper_heads_[level - 1],
+        key,
+        less_,
         [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; },
         [this](UpperNode *n) -> const Key & { return nodes_[n->durable_offset].key; },
-        [this](UpperNode *n) { return is_upper_node_dead(n); }, [this](UpperNode *n) { on_upper_splice(n); },
+        [this](UpperNode *n) { return is_upper_node_dead(n); },
+        [this](UpperNode *n) { on_upper_splice(n); },
         out_pred);
   }
 
@@ -569,8 +578,10 @@ class PSkipList {
   // until the offset matches (or the key strictly exceeds `key`). Marking doesn't touch a
   // node's successor value (marked_list_mark_for_deletion), so it's safe to keep walking
   // through a marked node here without helping it off — some other search will.
-  [[nodiscard]] auto find_upper_node_at_level(Offset target_offset, const Key &key, int level,
-                                               UpperNode **out_pred) const -> UpperNode * {
+  [[nodiscard]] auto find_upper_node_at_level(Offset target_offset,
+                                              const Key &key,
+                                              int level,
+                                              UpperNode **out_pred) const -> UpperNode * {
     UpperNode *pred = nullptr;
     UpperNode *current = marked_ptr_value<UpperNode>(upper_heads_[level - 1].load(std::memory_order_acquire));
     while (current != nullptr && !less_(key, nodes_[current->durable_offset].key)) {
@@ -649,8 +660,9 @@ class PSkipList {
   // next_pending field (upper_node.hpp) — never forwards[], which a concurrent reader may
   // still legitimately dereference after this node is unlinked (see there for why).
   void enqueue_pending_upper_delete(UpperNode *node) const {
-    stack_push(pending_upper_deletes_, node,
-               [](UpperNode *n, UpperNode *next) { n->next_pending.store(next, std::memory_order_relaxed); });
+    stack_push(pending_upper_deletes_, node, [](UpperNode *n, UpperNode *next) {
+      n->next_pending.store(next, std::memory_order_relaxed);
+    });
   }
 
   std::filesystem::path path_;

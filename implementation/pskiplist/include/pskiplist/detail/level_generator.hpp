@@ -19,8 +19,7 @@ inline constexpr int kDefaultMaxLevel = 32;
 // concurrent interleavings.
 class LevelGenerator {
  public:
-  explicit LevelGenerator(uint64_t seed, int max_level = kDefaultMaxLevel,
-                           double p = kDefaultLevelPromotionProbability)
+  explicit LevelGenerator(uint64_t seed, int max_level = kDefaultMaxLevel, double p = kDefaultLevelPromotionProbability)
       : seed_(seed), max_level_(max_level), p_(p) {}
 
   [[nodiscard]] auto next_level() const -> int {

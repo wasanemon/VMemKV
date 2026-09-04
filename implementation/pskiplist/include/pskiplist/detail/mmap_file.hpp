@@ -1,14 +1,14 @@
 #pragma once
 
-#include <cstddef>
-#include <filesystem>
-#include <stdexcept>
-#include <system_error>
-
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <cstddef>
+#include <filesystem>
+#include <stdexcept>
+#include <system_error>
 
 namespace pskiplist {
 
@@ -42,7 +42,8 @@ class MmapFile {
       reused_ = true;
       if (static_cast<size_t>(st.st_size) != size_) {
         ::close(fd_);
-        throw std::invalid_argument("pskiplist: " + path.string() + " exists with a size that does not match capacity_bytes");
+        throw std::invalid_argument("pskiplist: " + path.string() +
+                                    " exists with a size that does not match capacity_bytes");
       }
     }
 

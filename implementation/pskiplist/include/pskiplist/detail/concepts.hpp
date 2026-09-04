@@ -12,7 +12,6 @@ template <typename Key>
 concept SkipListKey = std::is_trivially_copyable_v<Key> && std::default_initializable<Key>;
 
 template <typename Compare, typename Key>
-concept SkipListCompare =
-    std::default_initializable<Compare> && std::predicate<Compare, const Key &, const Key &>;
+concept SkipListCompare = std::default_initializable<Compare> && std::predicate<Compare, const Key &, const Key &>;
 
 }  // namespace pskiplist

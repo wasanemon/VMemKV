@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
 add_executable(pskiplist_basic_usage basic_usage.cpp)
-target_link_libraries(pskiplist_basic_usage PRIVATE pskiplist pskiplist_warnings)
+target_link_libraries(pskiplist_basic_usage PRIVATE pskiplist pskiplist_warnings pskiplist_sanitizers)
 
 add_test(NAME pskiplist_basic_usage COMMAND pskiplist_basic_usage)
