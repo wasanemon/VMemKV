@@ -45,6 +45,36 @@ TEST_CASE("writes after the last checkpoint are not recovered") {
   CHECK_FALSE(reopened.get(2).has_value());
 }
 
+TEST_CASE("an in-place update to an existing key after the last checkpoint is not recovered") {
+  TempFile tmp("recover_update_not_checkpointed");
+  const size_t bytes = capacity_bytes_for_nodes<int>(64);
+  {
+    PSkipList<int> skiplist(tmp.path(), bytes);
+    REQUIRE(skiplist.put(1, 100));
+    REQUIRE(skiplist.checkpoint());
+    REQUIRE(skiplist.put(1, 999));  // updates the existing key — never checkpointed
+  }
+
+  PSkipList<int> reopened(tmp.path(), bytes);
+  CHECK(reopened.get(1) == 100);
+}
+
+TEST_CASE("removing a checkpointed key and reusing its slot doesn't lose it if never checkpointed") {
+  TempFile tmp("recover_remove_reuse_not_checkpointed");
+  const size_t bytes = capacity_bytes_for_nodes<int>(64);
+  {
+    PSkipList<int> skiplist(tmp.path(), bytes);
+    REQUIRE(skiplist.put(1, 100));
+    REQUIRE(skiplist.checkpoint());
+    REQUIRE(skiplist.remove(1));    // never checkpointed after this
+    REQUIRE(skiplist.put(2, 200));  // may reuse key 1's freed slot — also never checkpointed
+  }
+
+  PSkipList<int> reopened(tmp.path(), bytes);
+  CHECK(reopened.get(1) == 100);
+  CHECK_FALSE(reopened.get(2).has_value());
+}
+
 TEST_CASE("data checkpointed under a high epoch survives a later session with a lower one") {
   // epoch_ is an in-process counter that starts at 0 every time the file is reopened; it
   // must resume from the manifest's published epoch, not restart from zero, or a later

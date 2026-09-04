@@ -169,6 +169,9 @@ TEST_CASE("concurrent remove of a dense adjacent key range fully reclaims capaci
   skiplist.scan(0, kKeys, [&](int key, uint64_t) { scanned.push_back(key); });
   CHECK(scanned.empty());
 
+  // Physical unlink is deferred until checkpoint() confirms the removals are durable — see
+  // the "put after remove, checkpoint, and reclaim" test in test_functional.cpp.
+  REQUIRE(skiplist.checkpoint());
   skiplist.reclaim();
 
   for (int i = 0; i < kKeys; ++i) {

@@ -241,10 +241,19 @@ namespace pskiplist {
 
 template <typename Key>
 struct DurableNode {
-  std::atomic<uint64_t> epoch{0};
+  std::atomic<uint64_t> epoch{0};  // creation epoch — never touched again after allocation
   Key key{};
   std::atomic<uint64_t> value{0};
+  // Shadow of `value` as of the last checkpoint that covers it, and the epoch of the most
+  // recent mutation — see skiplist.hpp's shadow_if_first_touch_since_checkpoint() and
+  // recover().
+  std::atomic<uint64_t> checkpointed_value{0};
+  std::atomic<uint64_t> mutation_epoch{0};
   mutable std::atomic<uint64_t> forward0{pack_forward(kNullOffset, false)};
+  // Linkage and dedup guard for the checkpoint-gated physical-unlink queue — see
+  // enqueue_pending_checkpoint_unlink() in skiplist.hpp.
+  std::atomic<Offset> next_checkpoint_unlink{kNullOffset};
+  std::atomic<bool> pending_checkpoint_unlink_queued{false};
 };
 
 }  // namespace pskiplist
@@ -684,6 +693,7 @@ class PSkipList {
           std::this_thread::yield();
           continue;
         }
+        shadow_if_first_touch_since_checkpoint(existing, expected);
         const uint64_t desired = PackedValue::live(payload).raw();
         if (nodes_[existing].value.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
           return true;
@@ -697,6 +707,11 @@ class PSkipList {
         nodes_[fresh].key = key;
         nodes_[fresh].value.store(PackedValue::live(payload).raw(), std::memory_order_relaxed);
         nodes_[fresh].epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_relaxed);
+        // A recycled slot may still carry a previous occupant's shadow — reset it to avoid
+        // any stale-data confusion, even though mutation_epoch (set fresh below) is what
+        // actually gates whether recover() ever looks at it.
+        nodes_[fresh].checkpointed_value.store(0, std::memory_order_relaxed);
+        nodes_[fresh].mutation_epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_relaxed);
       }
       nodes_[fresh].forward0.store(pack_forward(existing, false), std::memory_order_relaxed);
 
@@ -719,14 +734,18 @@ class PSkipList {
       uint64_t expected = nodes_[current].value.load(std::memory_order_acquire);
       const PackedValue v(expected);
       if (v.state() != NodeState::kLive) return false;
+      shadow_if_first_touch_since_checkpoint(current, expected);
       const uint64_t desired = v.with_state(NodeState::kTombstonedLinked).raw();
       if (nodes_[current].value.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
         break;
       }
     }
 
-    unlink_upper_levels(key, current);
-    physically_unlink_best_effort(key, current);
+    unlink_upper_levels(key, current);  // upper levels are never persisted — no crash-safety concern
+    // Physical unlink (splice + slot reuse) waits for checkpoint() rather than happening now
+    // — reusing the slot before the removal is durably checkpointed would destroy data a
+    // crash-then-recover should still be able to fall back to.
+    enqueue_pending_checkpoint_unlink(current);
     return true;
   }
 
@@ -784,6 +803,11 @@ class PSkipList {
   [[nodiscard]] auto checkpoint() -> bool {
     const std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
 
+    // Snapshot before the epoch bump (same idiom as reclaim()'s drain_pending_unlinks): the
+    // writer-wait below guarantees everything captured here happened-before the manifest
+    // about to be published, so it's all safe to physically unlink once that's done.
+    Offset pending_unlink = pending_checkpoint_unlink_.exchange(kNullOffset, std::memory_order_acq_rel);
+
     const uint64_t published_epoch = epoch_.load(std::memory_order_acquire);
     epoch_.fetch_add(1, std::memory_order_acq_rel);
     auto &old_slot = epoch_slots_[published_epoch & 1];
@@ -793,6 +817,19 @@ class PSkipList {
 
     file_.sync();
     write_manifest(path_, published_epoch, high_water_mark_.load(std::memory_order_acquire));
+    // Only after the manifest is durably published — otherwise a concurrent put()/remove()
+    // could see "already checkpointed" before that's true and skip a shadow recover() needs.
+    last_published_epoch_.store(published_epoch, std::memory_order_release);
+
+    // physically_unlink_best_effort() is unchanged and already tolerates redundant calls, so
+    // resetting the queued flag before (not after) calling it is safe even if a concurrent
+    // resurrect-then-remove immediately re-queues the same offset.
+    while (pending_unlink != kNullOffset) {
+      const Offset next = nodes_[pending_unlink].next_checkpoint_unlink.load(std::memory_order_relaxed);
+      nodes_[pending_unlink].pending_checkpoint_unlink_queued.store(false, std::memory_order_release);
+      physically_unlink_best_effort(nodes_[pending_unlink].key, pending_unlink);
+      pending_unlink = next;
+    }
     return true;
   }
 
@@ -842,6 +879,9 @@ class PSkipList {
     // already checkpointed (their epoch stamps would look "too new" against that lower
     // threshold). Resume from threshold + 1 to keep numbering monotonic across restarts.
     epoch_.store(threshold + 1, std::memory_order_relaxed);
+    // Same reasoning as epoch_ above — shadow_if_first_touch_since_checkpoint() compares a
+    // node's mutation_epoch against this to decide whether it's already shadowed.
+    last_published_epoch_.store(threshold, std::memory_order_relaxed);
 
     std::vector<bool> reached(recovered_high_water_mark, false);
     Offset pred = kHead;
@@ -851,6 +891,14 @@ class PSkipList {
           nodes_[current].epoch.load(std::memory_order_relaxed) > threshold) {
         nodes_[pred].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
         break;
+      }
+      // Existence is trusted (creation epoch <= threshold above), but the latest mutation —
+      // put() or remove(), shadow_if_first_touch_since_checkpoint() doesn't distinguish —
+      // might not be; revert to the shadow, which always holds the last-checkpointed value.
+      if (nodes_[current].mutation_epoch.load(std::memory_order_relaxed) > threshold) {
+        nodes_[current].value.store(nodes_[current].checkpointed_value.load(std::memory_order_relaxed),
+                                     std::memory_order_relaxed);
+        nodes_[current].mutation_epoch.store(threshold, std::memory_order_relaxed);
       }
       reached[current] = true;
       pred = current;
@@ -865,6 +913,24 @@ class PSkipList {
     }
 
     high_water_mark_.store(recovered_high_water_mark, std::memory_order_relaxed);
+
+    // A crash between checkpoint()'s manifest write and its (in-memory, so lost) drain of
+    // pending_checkpoint_unlink_ can leave a checkpointed removal (mutation_epoch <=
+    // threshold, so not reverted above) still TombstonedLinked and reachable — nothing at
+    // runtime will ever retry it, since remove() only enqueues on a fresh Live->Tombstoned
+    // transition. Complete it now (recovery is single-threaded, so this is safe) in its own
+    // pass rather than folded into the walk above — physically_unlink_best_effort()'s own
+    // find_at_or_after() splice would otherwise corrupt that walk's pred/current bookkeeping.
+    Offset walk = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
+    while (walk != kTail) {
+      const Offset next = forward_offset(nodes_[walk].forward0.load(std::memory_order_relaxed));
+      if (PackedValue(nodes_[walk].value.load(std::memory_order_relaxed)).state() ==
+          NodeState::kTombstonedLinked) {
+        physically_unlink_best_effort(nodes_[walk].key, walk);
+      }
+      walk = next;
+    }
+
     rebuild_upper_levels();
   }
 
@@ -885,6 +951,20 @@ class PSkipList {
 
   [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool {
     return !less_(a, b) && !less_(b, a);
+  }
+
+  // Shared by put()'s existing-key branch and remove()'s tombstone transition — both are
+  // in-place mutations to a node that may already be checkpointed. `expected_live_value` is
+  // whatever the caller already read for its own CAS attempt, not re-read here, so the shadow
+  // and the CAS always agree on what "before" looked like. Only shadows on the first touch
+  // since the last checkpoint: once mutation_epoch is ahead of last_published_epoch_, an
+  // earlier mutation in this same window already captured the value recover() needs.
+  void shadow_if_first_touch_since_checkpoint(Offset offset, uint64_t expected_live_value) const {
+    if (nodes_[offset].mutation_epoch.load(std::memory_order_acquire) <=
+        last_published_epoch_.load(std::memory_order_acquire)) {
+      nodes_[offset].checkpointed_value.store(expected_live_value, std::memory_order_relaxed);
+      nodes_[offset].mutation_epoch.store(epoch_.load(std::memory_order_acquire), std::memory_order_release);
+    }
   }
 
   // Traverses to the first node with key >= `key`, helping to physically unlink any
@@ -924,6 +1004,26 @@ class PSkipList {
 
   [[nodiscard]] auto drain_pending_unlinks() const -> Offset {
     return pending_head_.exchange(kNullOffset, std::memory_order_acq_rel);
+  }
+
+  // Lock-free multi-producer stack of offsets awaiting checkpoint-gated physical unlink,
+  // linked via their own dedicated next_checkpoint_unlink field — never forward0, which must
+  // keep pointing at each node's real successor until checkpoint() confirms it's safe to
+  // splice out. Drained only by checkpoint() (same atomic-exchange idiom as
+  // drain_pending_unlinks above). A no-op if already queued: put() can resurrect a
+  // TombstonedLinked node straight back to Live (4.1節), and a later remove() re-tombstoning
+  // it must not push the same offset onto the stack twice.
+  void enqueue_pending_checkpoint_unlink(Offset offset) const {
+    bool expected_unqueued = false;
+    if (!nodes_[offset].pending_checkpoint_unlink_queued.compare_exchange_strong(
+            expected_unqueued, true, std::memory_order_acq_rel)) {
+      return;
+    }
+    Offset old_head = pending_checkpoint_unlink_.load(std::memory_order_relaxed);
+    do {
+      nodes_[offset].next_checkpoint_unlink.store(old_head, std::memory_order_relaxed);
+    } while (!pending_checkpoint_unlink_.compare_exchange_weak(old_head, offset, std::memory_order_acq_rel,
+                                                                 std::memory_order_relaxed));
   }
 
   // Lock-free Treiber stack with a tagged head (marked_offset.hpp) to rule out ABA: a
@@ -1168,6 +1268,14 @@ class PSkipList {
   std::mutex epoch_mutex_;
   mutable std::atomic<Offset> pending_head_{kNullOffset};
   std::atomic<uint64_t> free_head_{0};
+
+  // Epoch of the last successful checkpoint() — distinct from epoch_, which is also bumped
+  // by reclaim() for EBR purposes and so isn't 1:1 with "how many checkpoints have
+  // happened." See shadow_if_first_touch_since_checkpoint().
+  mutable std::atomic<uint64_t> last_published_epoch_{0};
+  // Offsets tombstoned by remove(), awaiting checkpoint()-gated physical unlink — see
+  // enqueue_pending_checkpoint_unlink().
+  mutable std::atomic<Offset> pending_checkpoint_unlink_{kNullOffset};
 };
 
 }  // namespace pskiplist

@@ -82,11 +82,16 @@ TEST_CASE("scan skips tombstoned entries") {
   CHECK(seen == std::vector<int>{10, 30, 40});
 }
 
-TEST_CASE("put after remove and reclaim of a different key reuses the slot") {
+TEST_CASE("put after remove, checkpoint, and reclaim of a different key reuses the slot") {
+  // Physical unlink is deferred until checkpoint() confirms the removal is durable (crash-
+  // consistency: reusing the slot any earlier could destroy a still-checkpointed value a
+  // crash-then-recover should be able to fall back to) — so checkpoint() must run between
+  // remove() and reclaim() for the slot to become reusable.
   TempFile tmp("reclaim_reuses_slot");
   PSkipList<int> skiplist(tmp.path(), capacity_bytes_for_nodes<int>(1));
   REQUIRE(skiplist.put(1, 10));
   REQUIRE(skiplist.remove(1));
+  REQUIRE(skiplist.checkpoint());
   skiplist.reclaim();
   CHECK(skiplist.put(2, 20));
   CHECK(skiplist.get(2) == 20);
