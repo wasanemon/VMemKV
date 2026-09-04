@@ -1141,9 +1141,8 @@ class PSkipList {
   //
   // `pred` carried over from the level above is exactly the same kind of thing as Level 0's
   // find_at_or_after `hint`: usually a shortcut, but possibly marked by the time this level
-  // reads it. Its fallback can't be itself (unlike find_upper_at_level below, which always
-  // starts at a head and never needs one) — it must be this level's own head, mirroring
-  // find_at_or_after's hint-falls-back-to-kHead.
+  // reads it. Its fallback is this level's own head, mirroring find_at_or_after's
+  // hint-falls-back-to-kHead.
   [[nodiscard]] auto search_upper_levels(const Key &key) const -> UpperSearchResult {
     UpperSearchResult result;
     UpperNode *pred = nullptr;
@@ -1158,11 +1157,12 @@ class PSkipList {
     return result;
   }
 
-  // The one-level search both search_upper_levels (cascading, `start` carried down from the
-  // level above) and link_upper_levels (single-level, `start` always null — a fresh
-  // positioning search per level) need: stops at the first node whose key is >= `key`, which
-  // is exactly where a new node with this key belongs. Wraps marked_list_find so both
-  // callers share the same next/key/is_dead/on_splice policies instead of repeating them.
+  // The one-level search both search_upper_levels and link_upper_levels need: stops at the
+  // first node whose key is >= `key`, which is exactly where a new node with this key
+  // belongs. Both callers cascade — `start` is the predecessor found at the level above (or
+  // null at the top level / when there is none), never a fresh search from that level's own
+  // head. Wraps marked_list_find so both callers share the same next/key/is_dead/on_splice
+  // policies instead of repeating them.
   [[nodiscard]] auto find_upper_at_level_from(UpperNode *start,
                                               const Key &key,
                                               int level,
@@ -1179,10 +1179,6 @@ class PSkipList {
         [this](UpperNode *n) { return is_upper_node_dead(n); },
         [this](UpperNode *n) { on_upper_splice(n); },
         out_pred);
-  }
-
-  [[nodiscard]] auto find_upper_at_level(const Key &key, int level, UpperNode **out_pred) const -> UpperNode * {
-    return find_upper_at_level_from(nullptr, key, level, out_pred);
   }
 
   // Single-level search for one specific durable_offset, not just any node with a matching
@@ -1229,18 +1225,44 @@ class PSkipList {
       return;
     }
     UpperNode *node = allocate_upper_node(fresh, height);
+
+    // Cascading top-down positioning pass (read-only, mirrors search_upper_levels): finds a
+    // same-height starting anchor for each level 1..height before any CAS runs. Without this,
+    // the insert loop below searched every level from that level's own head — since level 1
+    // holds almost every node (geometric level distribution), that turned every single insert
+    // into an O(N) walk at level 1, defeating the whole point of the upper levels. This only
+    // changes how each level's search is *seeded*, not the insert order itself.
+    std::array<UpperNode *, kDefaultMaxLevel> anchors{};
+    UpperNode *pred = nullptr;
+    for (int level = kDefaultMaxLevel; level >= 1; --level) {
+      if (level <= height) {
+        anchors[static_cast<size_t>(level - 1)] = pred;
+      }
+      UpperNode *found_pred = nullptr;
+      static_cast<void>(find_upper_at_level_from(pred, key, level, &found_pred));
+      pred = found_pred;
+    }
+
+    // Bottom-up insert into levels 1..height (8章, ASCS insert order), lock-free: each level's
+    // CAS validates "the successor is still what I read" and "the predecessor isn't itself
+    // being marked out from under me" in one shot (marked_list.hpp), so a losing race just
+    // means retrying that level's positioning search, never data loss or corruption. The
+    // cached anchor from the cascade above is reused across retries at the same level exactly
+    // like Level 0's find_at_or_after hint — usually still a shortcut, and correct (if slower)
+    // even when a retry finds it stale.
     for (int level = 1; level <= height; ++level) {
+      UpperNode *hint = anchors[static_cast<size_t>(level - 1)];
       for (;;) {
-        UpperNode *pred = nullptr;
-        UpperNode *successor = find_upper_at_level(key, level, &pred);
+        UpperNode *found_pred = nullptr;
+        UpperNode *successor = find_upper_at_level_from(hint, key, level, &found_pred);
         node->forwards[level - 1].store(pack_marked_ptr(successor, false), std::memory_order_relaxed);
         uint64_t expected = pack_marked_ptr(successor, false);
         const uint64_t desired = pack_marked_ptr(node, false);
-        if (upper_word(pred, level).compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+        if (upper_word(found_pred, level).compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
           break;
         }
         // Predecessor changed (a racing insert/delete nearby, or it was itself just marked)
-        // — reposition at this level and retry.
+        // — reposition at this level (from the same cached anchor) and retry.
       }
     }
   }
