@@ -102,4 +102,20 @@ void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
   }
 }
 
+// A plain lock-free Treiber stack push: `value` becomes the new head, linked to the old one
+// by `set_next(value, old_head)` — usually a direct store into `value`'s own dedicated "next"
+// word, but left as a callback rather than a word reference so a caller that repurposes an
+// existing word (packing in a mark bit, say) can do that instead. No pop is provided — every
+// user of this drains the whole stack at once via `head.exchange(...,
+// std::memory_order_acq_rel)` rather than popping items one at a time, so there's no ABA
+// hazard to guard against (unlike a free list, which needs marked_offset.hpp's tagged
+// pointer instead).
+template <typename Identity, typename SetNextFn>
+void stack_push(std::atomic<Identity> &head, Identity value, SetNextFn set_next) {
+  Identity old_head = head.load(std::memory_order_relaxed);
+  do {
+    set_next(value, old_head);
+  } while (!head.compare_exchange_weak(old_head, value, std::memory_order_acq_rel, std::memory_order_relaxed));
+}
+
 }  // namespace pskiplist

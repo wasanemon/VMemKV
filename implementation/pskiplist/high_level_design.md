@@ -30,11 +30,15 @@ flowchart LR
 
 ```c++
 struct DurableNode {
-    std::atomic<uint64_t> epoch;    // 作成時のグローバルepoch（crash-safety用）
+    std::atomic<uint64_t> epoch;              // 作成時のグローバルepoch（crash-safety用、不変）
     Key key;
-    Value value;                     // 状態(live/tombstoned-linked/tombstoned-unlinked)を
-                                      // value内の専用ビットで表現(4章)
-    std::atomic<Offset> forward0;    // Level 0の次ノードへのoffset + 論理削除markビット(4.2節)
+    Value value;                              // 状態(live/tombstoned-linked/tombstoned-unlinked)を
+                                               // value内の専用ビットで表現(4章)
+    std::atomic<uint64_t> checkpointed_value; // valueのshadow。checkpoint境界を跨いだ
+                                               // in-place変更の巻き戻しに使う(4.1節)
+    std::atomic<uint64_t> mutation_epoch;     // valueへの直近の変更のepoch
+    std::atomic<Offset> forward0;             // Level 0の次ノードへのoffset + 論理削除markビット(4.2節)
+    std::atomic<Offset> next_checkpoint_unlink; // checkpoint待ちの物理unlinkキュー専用リンク(2.3節)
 };
 ```
 
@@ -60,25 +64,28 @@ struct DurableNode {
 - **上位レベル**は検索高速化のためだけの構造で、正しさには無関係。durableである必要は
   なく、recovery時にLevel 0を辿って再構築する。
 
-### 2.3 フリーリスト
+### 2.3 物理回収(2段階)とフリーリスト
 
 全ノードが固定サイズなので、フリーリストは単純な等間隔スロット配列に対する
-mark-and-sweepで済む。フリーリスト自体は永続化しない(フリーリストのレコードが
-torn writeの対象になる問題を回避するため)——起動時と稼働中で、補充のされ方が異なる。
+mark-and-sweepで済む。永続化はしない——起動時と稼働中で補充のされ方が異なる。
 
-- **起動時**: recovery時にLevel 0を辿るrecovery walk(2.2節)の副産物として一括導出する
-  ——到達できたoffsetの集合が「生存ノード」、確保済み範囲のうちそれ以外が「フリー」。
-- **稼働中**: ノードの状態が`tombstoned-unlinked`に遷移し、かつpredecessorの実ポインタも
-  物理的に付け替え済みになったら(4.2節)、いったんin-memoryの「unlink待ちキュー」に
-  (offset, unlink_epoch)として積む。checkpoint()が新しいepoch`E`をpublishした後、
-  このキューを掃き、`unlink_epoch <= E`(3章)かつ、そのunlink epoch以下で登録した
-  readerが残っていないものをフリーリストへ移す。reader確認はcheckpoint()の本体とは
-  非同期に行う(3章)——これがないと、recoveryを跨がない限りdeleteされた領域が一切
-  再利用されず、物理回収(1章)が実質機能しなくなる。
+物理回収は独立な2段階の待ち合わせを経る:
 
-unlink待ちキューもフリーリストも永続化しない——クラッシュで中身が消えても、次回起動時の
-recovery walkが「Level 0から到達不能な確保済み領域」を独立に全部見つけ直すため、何も
-失われない。
+1. **checkpoint()待ち**: `remove()`はtombstone化のCAS(4.1節)のみ行い、チェーンからの
+   物理的な切り離しはcheckpoint()に委ねる——削除がcheckpointされる前にスロットが別キーに
+   再利用されると、checkpoint済みだった旧データが失われるため。checkpoint()はmanifest
+   確定後、それまでに溜まった削除をまとめて物理unlink(4.2節のhelpingと同じ手順)する。
+2. **EBR quiescence待ち**: 物理的に切り離された直後のノードは、そのunlink時点で
+   登録されていたreaderが全員解除するまでフリーリストに入らない(3章)——1.とは独立な、
+   concurrency-safetyのための待ち合わせ。
+
+- **起動時**: recovery walk(2.2節)の副産物として一括導出する——到達できたoffsetの集合が
+  「生存ノード」、確保済み範囲のうちそれ以外が「フリー」。checkpoint確定後・物理unlink
+  未完了のまま残ったtombstoned-linkedなノードも、この時点で物理unlinkまで完了させる。
+
+上記2つのキュー(checkpoint待ち・EBR待ち)はどちらも永続化しない——クラッシュで中身が
+消えても、次回起動時のrecovery walkが独立に全部見つけ直すため、失われるのは容量の
+再利用機会だけである。
 
 ### 2.4 上位レベル(volatile)
 
@@ -159,17 +166,21 @@ crash-safety(checkpoint境界)を**同時に**担う。get/scan/put/removeはす
   reader(get/scan)は何も書き換えないため、msync()と競合しても内容が古いだけで
   torn writeの原因にはならず、quiescence確認の対象に含めない。長時間のscanが
   checkpoint()自体をブロックすることはない。
-- **concurrency-safety(物理回収の安全性)**: unlinkされたノードの物理回収(2.3節)は、
-  crash-safetyとは独立に、そのunlink epoch以下で登録したreaderが残っていないかを
-  非同期に確認してから行う。
+- **concurrency-safety(物理回収の安全性)**: 物理的に切り離された直後のノードは、
+  crash-safetyとは独立に、その時点で登録されていたreaderが残っていないかを非同期に
+  確認してから初めてフリーリストに入る。
 
-**物理回収の条件は2つ**: `unlink_epoch <= 最後にpublishされたmanifest epoch`
-(crash-safety)、かつそのunlink epoch以下で登録したreaderが残っていないこと
-(concurrency-safety)。前者はcheckpoint()完了時点で確定するが、後者は独立に確認する
-必要がある——長時間のreaderが残っている間は、その範囲のノードの回収だけが遅れる。
+**物理回収**はcheckpoint()完了(crash-safety)とEBR quiescence(concurrency-safety、上記)
+という独立な2つの待ち合わせを経て初めて起こる——詳細と2段階の関係は2.3節。
 
-**recovery**: manifestのepoch `E`を読み、node epoch stamp `> E`のノードは
-「durableである保証がない」として無条件に破棄する。
+`epoch`カウンタ自体はプロセスごとの`std::atomic<uint64_t>`で永続化しない。再起動時は
+manifestのepochから再開する(0から数え直すと、次のcheckpoint()が前セッションより低い
+epochをpublishしてしまい、そのセッションが既にcheckpoint済みのデータを新しいrecoveryが
+誤って破棄しかねない)。
+
+**recovery**: manifestのepoch `E`を読み、node epoch stamp(作成時、不変)`> E`のノードは
+「存在自体がdurableである保証がない」として無条件に破棄する。既に存在が確認できた
+ノードでも、直近の変更(4.1節)が`E`を跨いでいれば、その変更だけを同様に巻き戻す。
 
 **manifestフォーマット**: magic/format_version/checksumを持つ32Bの固定ヘッダとする。
 
@@ -202,25 +213,7 @@ linearization pointには影響しない。削除後の物理unlink(predecessor�
 付け替え)だけは別枠で扱う——linearization pointを動かすものではないが、隣接ノードの
 同時unlinkに対するメモリ安全性を独自に確保する必要があり、4.2節で扱う。
 
-put(42)のlinearization point通過**直後**のスナップショット:
-
-```mermaid
-flowchart LR
-    subgraph L1["Level 1 — まだ42は繋がっていない（探索が1段遅いだけで、間違いではない）"]
-        direction LR
-        h1((head)) --> a1[18] --> b1[57] --> t1((tail))
-    end
-    subgraph L0["Level 0 — 42が繋がっている（★ put(42) の linearization point）"]
-        direction LR
-        h0((head)) --> a0[18] -->|CAS| n0((42)) --> b0[57] --> t0((tail))
-    end
-```
-
-Level 1にはまだ`42`が繋がっていないが、これは正しい状態である(2.2節: 上位レベルは
-探索高速化のためだけの構造)。この瞬間に他スレッドが`get(42)`すると、Level 0だけを
-辿るので必ず`42`を見つける。
-
-このタイミングを、2つのスレッドの視点で表すと次のようになる:
+put(42)のlinearization pointを2つのスレッドの視点で表すと次のようになる:
 
 ```mermaid
 sequenceDiagram
@@ -231,7 +224,7 @@ sequenceDiagram
     A->>L0: ノード42の本体を書く（まだpredecessorから未リンク、他スレッドからは不可視）
     B->>L0: predecessorから探索を開始
     A->>L0: predecessorのforward[0]をCASでノード42にリンク
-    Note over A,L0: ★ put(42) の linearization point（上のflowchartの瞬間）
+    Note over A,L0: ★ put(42) の linearization point
     B->>L0: forward[0]を辿ってノード42に到達
     B-->>B: found(42) を返す
 ```
@@ -272,10 +265,21 @@ unlinkが先に成功していればput()は「このノードはもう存在し
 やり直せばよい。事後に到達可能性を別途確認する手順は不要——CASの成否そのものが
 判定になる。
 
+**checkpoint境界を跨いだ巻き戻し**: put/removeいずれも、対象ノードのvalueが最後に
+checkpointされた時点のもの(=このcheckpoint区間で初めて触る)であれば、CASの直前に
+現在のLive値を`checkpointed_value`(2.1節)へ退避し、`mutation_epoch`を現在epochへ
+更新する。`recover()`は、到達したノードの`mutation_epoch`がmanifestのepochより新しければ
+一律`checkpointed_value`へ差し戻す——putの新しい値もremoveのtombstone化も同じ1ワードへの
+CASなので、退避すべき「直前の値」は常に同じ形で表現でき、update由来かremove由来かを
+区別する必要がない。
+
 ### 4.2 物理unlinkのhelping
 
-Level 0からの物理unlink(4.1節の第一歩の後)は、`get`/`put`/`remove`/`scan`が共有する
-探索処理(`find`)の中で、lock-freeなhelpingとして完了する。専用のロックは持たない。
+物理unlinkの第一歩(4.1節)自体は`remove()`から直接ではなく、checkpoint()がmanifestを
+確定させた後にまとめて起動する(2.3節)——削除もupdateと同じく「checkpoint境界を跨いで
+はじめて確定する変更」として扱うため。起動されたそれ以降の物理unlinkは、
+`get`/`put`/`remove`/`scan`が共有する探索処理(`find`)の中で、lock-freeなhelpingとして
+完了する。専用のロックは持たない。
 
 - 物理unlinkの第一歩(`value`をtombstoned-unlinkedへCAS)に成功した直後、対象ノード
   自身の`forward0`に対して、現在のsuccessorを保ったままmarkビット(2.1節)を立てる
@@ -316,14 +320,15 @@ class PSkipList {
   auto get(const Key &key) const -> std::optional<Value>;
 
   // Insert/Update: O(log N) expected。新規ノードはepoch stampを持ってpublishされる。
+  // 既存キーへの上書きは、checkpoint境界を跨いだ巻き戻しのためのshadow退避(4.1節)を
+  // 経てからvalueをCASする。
   // 戻り値: 容量不足(2.6節)でノードを確保できなかった場合はfalse。
   [[nodiscard]] auto put(const Key &key, const Value &value) -> bool;
 
-  // Delete: O(log N) expected。ノード自身の状態をlive→tombstoned-linkedへCASする
-  // (linearization point、4.1節) → ノード自身の状態をtombstoned-linked→
-  // tombstoned-unlinkedへCAS → forward0へのmark+predecessorの付け替え(4.2節、
-  // lock-free helping) → 上位レベルのunlinkはvolatile側のbest-effort(2.4節)
-  // → 後日(EBR + checkpoint epochの条件を満たしてから)物理回収。
+  // Delete: O(log N) expected。shadow退避(4.1節)の後、ノード自身の状態をlive→
+  // tombstoned-linkedへCASする(linearization point)→上位レベルのunlinkはvolatile側の
+  // best-effort(2.4節)で即座に行う。物理unlink(4.1節第一歩以降、4.2節)はcheckpoint()
+  // まで遅延する(2.3節)。
   // 戻り値: 対象キーが存在し、削除できた場合はtrue。存在しなかった場合はfalse。
   [[nodiscard]] auto remove(const Key &key) -> bool;
 
@@ -331,7 +336,8 @@ class PSkipList {
   // liveでないノードはcallbackを呼ばずskipする(get()と同じ判定基準)。
   void scan(const Key &begin, const Key &end, std::function<void(const Key &, const Value &)> callback) const;
 
-  // Checkpoint: 同期・blocking。epoch番号やmanifest形式は一切外部に公開しない。
+  // Checkpoint: 同期・blocking。epoch番号やmanifest形式は一切外部に公開しない。manifest
+  // 確定に加え、それまでに溜まった削除の物理unlink(2.3節)もこの呼び出し内でまとめて行う。
   // 保証: 呼び出し開始前に完了していたput()/remove()は、成功して返れば必ずdurable。
   // 呼び出し実行中に開始したput()/remove()がdurableに含まれるかは未規定。
   // 複数スレッドが同時に呼んだ場合は`std::mutex`で単一実行に直列化する——先着した
@@ -395,7 +401,7 @@ msync()と競合するケースまで)網羅しようとすると組み合わせ
 
 | 設計要素 | 採用元 | 内容 |
 | --- | --- | --- |
-| 並行アルゴリズムの土台(各レベルを独立したlock-free listとして扱う) | Herlihy, M., Shavit, N. のlock-free skip list(*The Art of Multiprocessor Programming*) | 論理削除(mark)と物理unlink(helping)を分離する基本設計。論理状態はノード自身の3値の状態(2.1節/4.1節)に単純化しつつ、物理unlink自体は原典どおりforward0へのmark+helping(4.2節)で行う — Level 0のみが正しさの根拠という前提があるからこそ、markの対象を各レベルのポインタではなく単一のforward0に絞り込める |
+| 並行アルゴリズムの土台(各レベルを独立したlock-free listとして扱う) | Herlihy, M., Shavit, N. のlock-free skip list(*The Art of Multiprocessor Programming*) | 論理削除(mark)と物理unlink(helping)を分離する基本設計。論理状態はノード自身の3値の状態(2.1節/4.1節)に単純化。mark+helpingの仕組み自体はLevel 0・上位レベル(2.4節)で同一の汎用実装を共有し、両者の違いはidentityの型(offset vs ポインタ)とそのpack方法だけに切り詰めてある |
 | offsetベースのノード参照 | UPSkipList(RIVスタイルのoffsetエンコーディング) / LMDB系のmmap+offset設計 | mmap先の仮想アドレスがプロセスごとに変わっても構造が壊れない |
 | Level 0のみが正しさの根拠、上位レベルはDRAM専用・recovery時に再構築 | ASCS / NV-Skiplist(独立に同じ結論) | 複数レベルのポインタ更新にまたがるtorn writeの問題を、上位レベルを永続化対象から外すことで回避する |
 | insertの書き込み順序(新規ノード本体→自ノードのforwardポインタ→predecessorのCAS、bottom-up) | ASCS(Atomic Skiplistの挿入アルゴリズム) | ログなしでfailure-atomicな挿入を実現する具体的な手順 |

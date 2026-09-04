@@ -199,6 +199,22 @@ void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
   }
 }
 
+// A plain lock-free Treiber stack push: `value` becomes the new head, linked to the old one
+// by `set_next(value, old_head)` — usually a direct store into `value`'s own dedicated "next"
+// word, but left as a callback rather than a word reference so a caller that repurposes an
+// existing word (packing in a mark bit, say) can do that instead. No pop is provided — every
+// user of this drains the whole stack at once via `head.exchange(...,
+// std::memory_order_acq_rel)` rather than popping items one at a time, so there's no ABA
+// hazard to guard against (unlike a free list, which needs marked_offset.hpp's tagged
+// pointer instead).
+template <typename Identity, typename SetNextFn>
+void stack_push(std::atomic<Identity> &head, Identity value, SetNextFn set_next) {
+  Identity old_head = head.load(std::memory_order_relaxed);
+  do {
+    set_next(value, old_head);
+  } while (!head.compare_exchange_weak(old_head, value, std::memory_order_acq_rel, std::memory_order_relaxed));
+}
+
 }  // namespace pskiplist
 
 #include <cstdint>
@@ -991,15 +1007,13 @@ class PSkipList {
   // reclaim() drains the whole thing with a single atomic exchange. There's no per-item
   // pop here, so there's no ABA hazard to guard against — unlike the free list below.
   void enqueue_pending_unlink(Offset offset) const {
-    Offset old_head = pending_head_.load(std::memory_order_relaxed);
-    do {
+    stack_push(pending_head_, offset, [this](Offset o, Offset next) {
       // Keep the mark bit set: this word is already frozen against any stale unmarked-
       // expecting CAS from a thread that read this node before it was ever removed (4.2節)
       // — clearing it here would let such a CAS coincidentally match this repurposed
       // "next pending" value and corrupt the chain.
-      nodes_[offset].forward0.store(pack_forward(old_head, true), std::memory_order_relaxed);
-    } while (!pending_head_.compare_exchange_weak(old_head, offset, std::memory_order_acq_rel,
-                                                   std::memory_order_relaxed));
+      nodes_[o].forward0.store(pack_forward(next, true), std::memory_order_relaxed);
+    });
   }
 
   [[nodiscard]] auto drain_pending_unlinks() const -> Offset {
@@ -1019,11 +1033,9 @@ class PSkipList {
             expected_unqueued, true, std::memory_order_acq_rel)) {
       return;
     }
-    Offset old_head = pending_checkpoint_unlink_.load(std::memory_order_relaxed);
-    do {
-      nodes_[offset].next_checkpoint_unlink.store(old_head, std::memory_order_relaxed);
-    } while (!pending_checkpoint_unlink_.compare_exchange_weak(old_head, offset, std::memory_order_acq_rel,
-                                                                 std::memory_order_relaxed));
+    stack_push(pending_checkpoint_unlink_, offset, [this](Offset o, Offset next) {
+      nodes_[o].next_checkpoint_unlink.store(next, std::memory_order_relaxed);
+    });
   }
 
   // Lock-free Treiber stack with a tagged head (marked_offset.hpp) to rule out ABA: a
@@ -1088,6 +1100,13 @@ class PSkipList {
     Offset level0_hint = kHead;
   };
 
+  // The word a predecessor's own successor at `level` lives in — the list head if there is
+  // no predecessor, its forwards[] entry otherwise. Every upper-level search/link/unlink
+  // deals in exactly this word.
+  [[nodiscard]] auto upper_word(UpperNode *pred, int level) const -> std::atomic<uint64_t> & {
+    return pred == nullptr ? upper_heads_[level - 1] : pred->forwards[level - 1];
+  }
+
   // Level N has no deletion signal of its own — an UpperNode is nothing but a search hint
   // for a Level 0 record, so "is this entry logically gone" borrows Level 0's own tombstone
   // state directly rather than duplicating it. See marked_list_find's `is_dead` parameter.
@@ -1123,15 +1142,8 @@ class PSkipList {
     UpperSearchResult result;
     UpperNode *pred = nullptr;
     for (int level = kDefaultMaxLevel; level >= 1; --level) {
-      std::atomic<uint64_t> &word = pred == nullptr ? upper_heads_[level - 1] : pred->forwards[level - 1];
-      std::atomic<uint64_t> &head = upper_heads_[level - 1];
       UpperNode *found_pred = nullptr;
-      static_cast<void>(marked_list_find<UpperNode *, PointerMarkedTraits<UpperNode>>(
-          pred, word, nullptr, head, key, less_,
-          [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; },
-          [this](UpperNode *n) -> const Key & { return nodes_[n->durable_offset].key; },
-          [this](UpperNode *n) { return is_upper_node_dead(n); }, [this](UpperNode *n) { on_upper_splice(n); },
-          &found_pred));
+      static_cast<void>(find_upper_at_level_from(pred, key, level, &found_pred));
       pred = found_pred;
     }
     if (pred != nullptr) {
@@ -1140,17 +1152,23 @@ class PSkipList {
     return result;
   }
 
-  // Single-level search, independent of any other level — used by link's own per-level
-  // positioning rather than the cascading multi-level search above. Stops at the first
-  // node whose key is >= `key`, which is exactly where a new node with this key belongs.
-  [[nodiscard]] auto find_upper_at_level(const Key &key, int level, UpperNode **out_pred) const -> UpperNode * {
-    std::atomic<uint64_t> &head = upper_heads_[level - 1];
+  // The one-level search both search_upper_levels (cascading, `start` carried down from the
+  // level above) and link_upper_levels (single-level, `start` always null — a fresh
+  // positioning search per level) need: stops at the first node whose key is >= `key`, which
+  // is exactly where a new node with this key belongs. Wraps marked_list_find so both
+  // callers share the same next/key/is_dead/on_splice policies instead of repeating them.
+  [[nodiscard]] auto find_upper_at_level_from(UpperNode *start, const Key &key, int level,
+                                               UpperNode **out_pred) const -> UpperNode * {
     return marked_list_find<UpperNode *, PointerMarkedTraits<UpperNode>>(
-        nullptr, head, nullptr, head, key, less_,
+        start, upper_word(start, level), nullptr, upper_heads_[level - 1], key, less_,
         [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; },
         [this](UpperNode *n) -> const Key & { return nodes_[n->durable_offset].key; },
         [this](UpperNode *n) { return is_upper_node_dead(n); }, [this](UpperNode *n) { on_upper_splice(n); },
         out_pred);
+  }
+
+  [[nodiscard]] auto find_upper_at_level(const Key &key, int level, UpperNode **out_pred) const -> UpperNode * {
+    return find_upper_at_level_from(nullptr, key, level, out_pred);
   }
 
   // Single-level search for one specific durable_offset, not just any node with a matching
@@ -1200,10 +1218,9 @@ class PSkipList {
         UpperNode *pred = nullptr;
         UpperNode *successor = find_upper_at_level(key, level, &pred);
         node->forwards[level - 1].store(pack_marked_ptr(successor, false), std::memory_order_relaxed);
-        std::atomic<uint64_t> &pred_word = pred == nullptr ? upper_heads_[level - 1] : pred->forwards[level - 1];
         uint64_t expected = pack_marked_ptr(successor, false);
         const uint64_t desired = pack_marked_ptr(node, false);
-        if (pred_word.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+        if (upper_word(pred, level).compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
           break;
         }
         // Predecessor changed (a racing insert/delete nearby, or it was itself just marked)
@@ -1226,11 +1243,10 @@ class PSkipList {
       }
       marked_list_mark_for_deletion<UpperNode *, PointerMarkedTraits<UpperNode>>(
           current, [level](UpperNode *n) -> std::atomic<uint64_t> & { return n->forwards[level - 1]; });
-      std::atomic<uint64_t> &pred_word = pred == nullptr ? upper_heads_[level - 1] : pred->forwards[level - 1];
       const uint64_t successor_raw = current->forwards[level - 1].load(std::memory_order_acquire);
       uint64_t expected = pack_marked_ptr(current, false);
       const uint64_t desired = pack_marked_ptr(marked_ptr_value<UpperNode>(successor_raw), false);
-      if (pred_word.compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
+      if (upper_word(pred, level).compare_exchange_strong(expected, desired, std::memory_order_acq_rel)) {
         on_upper_splice(current);
       }
       // A failed splice here just means a concurrent change beat us to it (possibly already
@@ -1242,11 +1258,8 @@ class PSkipList {
   // next_pending field (upper_node.hpp) — never forwards[], which a concurrent reader may
   // still legitimately dereference after this node is unlinked (see there for why).
   void enqueue_pending_upper_delete(UpperNode *node) const {
-    UpperNode *old_head = pending_upper_deletes_.load(std::memory_order_relaxed);
-    do {
-      node->next_pending.store(old_head, std::memory_order_relaxed);
-    } while (!pending_upper_deletes_.compare_exchange_weak(old_head, node, std::memory_order_acq_rel,
-                                                             std::memory_order_relaxed));
+    stack_push(pending_upper_deletes_, node,
+               [](UpperNode *n, UpperNode *next) { n->next_pending.store(next, std::memory_order_relaxed); });
   }
 
   std::filesystem::path path_;
