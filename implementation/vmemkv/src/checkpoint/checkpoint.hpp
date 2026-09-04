@@ -160,6 +160,12 @@ inline auto derive_manifest_path(const std::filesystem::path &t2_path) -> std::f
 inline auto derive_t1_chk_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
   return {t2_path.string() + ".t1chk"};
 }
+// T1's own mmap'd, directly-durable data file (pskiplist-backed) -- distinct from the legacy
+// derive_t1_chk_path() above, whose file is a different format (a full-dump snapshot, not a
+// live mmap'd structure) that a pskiplist-backed T1 no longer produces.
+inline auto derive_t1_pskiplist_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
+  return {t2_path.string() + ".t1pskip"};
+}
 inline auto derive_t2_chk_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
   return {t2_path.string() + ".t2chk"};
 }

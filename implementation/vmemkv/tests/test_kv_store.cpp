@@ -122,6 +122,10 @@ struct VMemKVDeleter {
 template <typename Impl>
 struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
   static constexpr uint64_t kCapacityBytes = 8U << 20;  // 8 MiB
+  // T1's own (pskiplist-backed) capacity: VMemKVImpl defaults this to a production-scale 4TB,
+  // which is wasteful and slow to construct hundreds of times over in a test binary -- override
+  // to something proportional to this factory's own tiny kCapacityBytes instead.
+  static constexpr uint64_t kT1CapacityBytes = 16U << 20;  // 16 MiB
 
   static auto make() -> std::unique_ptr<vmemkv::StoreAdapter<Impl>, VMemKVDeleter<Impl>> {
     std::filesystem::path path = reserve_temp_path();
@@ -132,7 +136,7 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
       auto *store = new vmemkv::StoreAdapter<Impl>(path.string());
       return std::unique_ptr<vmemkv::StoreAdapter<Impl>, VMemKVDeleter<Impl>>(store, VMemKVDeleter<Impl>{path});
     } else {
-      auto *store = new vmemkv::StoreAdapter<Impl>(path, kCapacityBytes);
+      auto *store = new vmemkv::StoreAdapter<Impl>(path, kCapacityBytes, kT1CapacityBytes);
       return std::unique_ptr<vmemkv::StoreAdapter<Impl>, VMemKVDeleter<Impl>>(store, VMemKVDeleter<Impl>{path});
     }
   }
@@ -1213,7 +1217,7 @@ void publish_straggler_entry(StorePtr &store,
       uint64_t aligned_len = vmemkv::align_up(sizeof(ValueRecordHeader) + key_bytes.size() + val_bytes.size());
       uint64_t block_count = aligned_len / ImplT::kBlockAlignment;
       uint64_t encoded_payload = offset | (block_count << ImplT::kSizeEmbeddingShift);
-      REQUIRE(store->impl().t1().put(key_bytes, encoded_payload, false, 0) == ImplT::T1IndexT::PutResult::Applied);
+      REQUIRE(store->impl().t1().put(vmemkv::prepare_t1_key(key_bytes), vmemkv::T1Value{encoded_payload, false, 0}));
     });
   });
 }

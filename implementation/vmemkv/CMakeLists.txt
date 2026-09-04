@@ -17,9 +17,10 @@ endif()
 option(ENABLE_ROCKSDB "Build with RocksDB backend" ON)
 option(ENABLE_LMDB "Build with LMDB backend" ON)
 add_library(vmemkv_headers INTERFACE)
-target_include_directories(vmemkv_headers INTERFACE 
+target_include_directories(vmemkv_headers INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../pskiplist/include
 )
 
 add_library(vmemkv_warnings INTERFACE)

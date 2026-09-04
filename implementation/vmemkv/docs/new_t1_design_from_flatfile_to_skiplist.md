@@ -70,6 +70,28 @@
   O(log N)のポインタ更新を払う(方向性④の検討により、これは削減ではなく必須コストとして
   受け入れる)。
 
+## `capacity_bytes`の初期値: 4TB、成長機構は実装しない
+
+pskiplistプロトタイプの現行実装は`capacity_bytes`(mmap'dファイルサイズ)を構築時固定とし、
+リオープン時も完全一致を要求する(成長機構なし)。T1移行後もこの制約を受け入れ、事前に
+十分なマージンを確保する方針とする。
+
+- ノード1件(`DurableNode<T1Key>`, 16byteプレフィックス+8byteハッシュのcomposite key、
+  epoch/value/shadow/checkpoint-unlink linkage込み)は実測80byte。
+- 4TB ÷ 80byte ≈ 500億キー。直近AWSで検証済みの最大規模(10億キー、
+  `docs/reorganize_optimizations.md`のAWS 1B-entry/32-core検証)の50倍のマージン。
+- mmapのオーバーサイズは実測上ほぼ無料——`msync()`のコストはマッピングサイズでなく
+  dirtyページ数に比例し(1GB書込み・1GBぴったりのファイル vs 8TBオーバーサイズのファイルで
+  msync時間はどちらも約0.16-0.2秒、ほぼ同じ)、`ftruncate`はsparse fileなので実ディスク
+  消費は書いた分だけ。pskiplistの`recover()`も`capacity_bytes`全体でなく
+  `high_water_mark`までしかスキャンしないため、オーバーサイズは起動時間にも影響しない。
+- ただしファイルシステムの理論上限ぎりぎりまで振ることはしない。ext4のデフォルト4Kブロック
+  構成では1ファイル16TBが上限で、実測でも15TBはftruncate成功・16TBは失敗(`File too large`)
+  だった。この境界は`mkfs`オプション/カーネルバージョン依存で移植性がなく、狙って得られる
+  追加マージンに対して「本番投入時に境界をまたいで起動失敗する」リスクの方が大きい。
+- Offsetのfree-list用tagged encoding上限(`marked_offset.hpp`の`kMaxTaggedOffset` =
+  2^40 ≈ 1.1兆ノード)は4TBでは使用率4.5%程度で無関係。
+
 ## checkpoint設計: epoch + msync + zero-fill(議論の到達点)
 
 - 各書き込みは、その時点のグローバルepochに属する。ノードのepoch stampは1ワード
