@@ -40,9 +40,6 @@ void cleanup_store_files(const std::filesystem::path &t2_path) {
   std::filesystem::remove(vmemkv::derive_manifest_path(t2_path), ignored);
   std::filesystem::remove(vmemkv::derive_t1_chk_path(t2_path), ignored);
   std::filesystem::remove(vmemkv::derive_t2_chk_path(t2_path), ignored);
-  const auto t1_pskiplist_path = vmemkv::derive_t1_pskiplist_path(t2_path);
-  std::filesystem::remove(t1_pskiplist_path, ignored);
-  std::filesystem::remove(pskiplist::manifest_path(t1_pskiplist_path), ignored);
 }
 
 // Values are always >= 9 bytes so T1InlineValue's <=8B inlining never applies,
@@ -105,11 +102,6 @@ void corrupt_record_checksum(const std::filesystem::path &t2_path, uint64_t reco
 }
 
 constexpr uint64_t kStoreCapacityBytes = 64ULL * 1024 * 1024;
-// T1's own (pskiplist-backed) capacity: VMemKVImpl defaults this to a production-scale 4TB,
-// wasteful and slow to construct repeatedly (this file rebuilds a store per test, some many
-// times over for restart simulations) -- override to something proportional to this file's own
-// tiny T2 capacities instead.
-constexpr uint64_t kTinyT1CapacityBytes = 16ULL * 1024 * 1024;
 
 }  // namespace
 
@@ -118,9 +110,9 @@ constexpr uint64_t kTinyT1CapacityBytes = 16ULL * 1024 * 1024;
 
 TEST_CASE_TEMPLATE("crash recovery: clean restart, empty store stays empty", Store, CRASH_RECOVERY_STORE_TYPES) {
   const auto path = reserve_crash_temp_path();
-  { auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes); }
+  { auto store = std::make_unique<Store>(path, kStoreCapacityBytes); }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     CHECK_FALSE(get_bytes(store, "anything").has_value());
     CHECK(store->insert("k", make_value(0)));
   }
@@ -131,13 +123,13 @@ TEST_CASE_TEMPLATE("crash recovery: clean restart recovers 100 inserted keys", S
   const auto path = reserve_crash_temp_path();
   constexpr int kKeyCount = 100;
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
   }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
@@ -152,13 +144,13 @@ TEST_CASE_TEMPLATE("crash recovery: update then restart persists only the latest
                    CRASH_RECOVERY_STORE_TYPES) {
   const auto path = reserve_crash_temp_path();
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     REQUIRE(store->insert("k", make_value(0)));
     REQUIRE(store->update("k", make_value(1)));
     REQUIRE(store->update("k", make_value(2)));
   }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     const auto val = get_bytes(store, "k");
     REQUIRE(val.has_value());
     CHECK(*val == make_value(2));
@@ -171,12 +163,12 @@ TEST_CASE_TEMPLATE("crash recovery: delete then restart tombstone is durable, re
                    CRASH_RECOVERY_STORE_TYPES) {
   const auto path = reserve_crash_temp_path();
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     REQUIRE(store->insert("k", make_value(0)));
     REQUIRE(store->remove("k"));
   }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     CHECK_FALSE(get_bytes(store, "k").has_value());
     REQUIRE(store->insert("k", make_value(1)));
     const auto val = get_bytes(store, "k");
@@ -191,14 +183,14 @@ TEST_CASE_TEMPLATE("crash recovery: insert-delete-reinsert-update replays to fin
                    CRASH_RECOVERY_STORE_TYPES) {
   const auto path = reserve_crash_temp_path();
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     REQUIRE(store->insert("k", make_value(0)));
     REQUIRE(store->remove("k"));
     REQUIRE(store->insert("k", make_value(1)));
     REQUIRE(store->update("k", make_value(2)));
   }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     const auto val = get_bytes(store, "k");
     REQUIRE(val.has_value());
     CHECK(*val == make_value(2));
@@ -212,14 +204,14 @@ TEST_CASE_TEMPLATE("crash recovery: torn trailing partial header discarded, prio
   const auto path = reserve_crash_temp_path();
   constexpr int kKeyCount = 20;
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
   }
   append_torn_header_bytes(path);
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
@@ -240,14 +232,14 @@ TEST_CASE_TEMPLATE(
   const auto path = reserve_crash_temp_path();
   constexpr int kKeyCount = 20;
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
   }
   append_torn_payload_bytes(path);
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
@@ -268,7 +260,7 @@ TEST_CASE_TEMPLATE("crash recovery: corrupted checksum on last record discarded,
   constexpr int kKeyCount = 10;
   uint64_t offset_before_last = 0;
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
@@ -279,7 +271,7 @@ TEST_CASE_TEMPLATE("crash recovery: corrupted checksum on last record discarded,
   }
   corrupt_record_checksum(path, offset_before_last);
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
@@ -297,13 +289,13 @@ TEST_CASE_TEMPLATE("crash recovery: writes after recovery remain durable across 
   constexpr int kFirstBatch = 20;
   constexpr int kSecondBatch = 20;
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
       REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
     }
   }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
       REQUIRE(get_bytes(store, "a" + std::to_string(i)).has_value());
     }
@@ -312,7 +304,7 @@ TEST_CASE_TEMPLATE("crash recovery: writes after recovery remain durable across 
     }
   }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
       const auto val = get_bytes(store, "a" + std::to_string(i));
       REQUIRE(val.has_value());
@@ -334,7 +326,7 @@ TEST_CASE_TEMPLATE("crash recovery: concurrent inserts before crash all recover"
   constexpr int kPerThread = 200;
   std::atomic<bool> all_inserts_ok{true};
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     std::vector<std::thread> threads;
     threads.reserve(kThreadCount);
     for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
@@ -354,7 +346,7 @@ TEST_CASE_TEMPLATE("crash recovery: concurrent inserts before crash all recover"
   CHECK(all_inserts_ok.load());
 
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
       for (int i = 0; i < kPerThread; ++i) {
         const std::string key = "t" + std::to_string(thread_index) + "_" + std::to_string(i);
@@ -374,7 +366,7 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
   constexpr int kInsertCount = 100;
   constexpr int kRemoveCount = 50;
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kInsertCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
@@ -383,7 +375,7 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
     }
   }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     int live_count = 0;
     for (int i = 0; i < kInsertCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
@@ -428,13 +420,13 @@ TEST_CASE("crash recovery: recovery under tiny T1 append-region capacity does no
   const auto path = reserve_crash_temp_path();
   constexpr int kKeyCount = 5000;
   {
-    auto store = std::make_unique<VMemKV_TinyAppend>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<VMemKV_TinyAppend>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
   }
   {
-    auto store = std::make_unique<VMemKV_TinyAppend>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<VMemKV_TinyAppend>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
@@ -460,7 +452,7 @@ TEST_CASE("crash recovery: insert failing on T2 capacity exceeded leaves no phan
 
   bool insert_threw = false;
   {
-    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity);
     for (int i = 0; i < 3; ++i) {
       REQUIRE(store->insert(capacity_test_key(i), std::string("01234567")));
     }
@@ -474,7 +466,7 @@ TEST_CASE("crash recovery: insert failing on T2 capacity exceeded leaves no phan
 
   // Restarting with the same capacity must succeed outright (no phantom WAL record to replay
   // for the key whose insert() threw), and that key must be absent from the recovered store.
-  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity, kTinyT1CapacityBytes);
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity);
   for (int i = 0; i < 3; ++i) {
     const auto val = get_bytes(store, capacity_test_key(i));
     REQUIRE(val.has_value());
@@ -493,7 +485,7 @@ TEST_CASE("crash recovery: update failing on T2 capacity exceeded leaves no phan
 
   bool update_threw = false;
   {
-    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity);
     REQUIRE(store->insert(capacity_test_key(0), std::string("01234567")));
     REQUIRE(store->insert(capacity_test_key(1), std::string("01234567")));
     try {
@@ -506,7 +498,7 @@ TEST_CASE("crash recovery: update failing on T2 capacity exceeded leaves no phan
 
   // Restarting must succeed, and key 0 must still hold its pre-update value (the failed update
   // left no phantom WAL record to replay).
-  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity, kTinyT1CapacityBytes);
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity);
   const auto val0 = get_bytes(store, capacity_test_key(0));
   REQUIRE(val0.has_value());
   CHECK(*val0 == "01234567");
@@ -528,7 +520,7 @@ TEST_CASE_TEMPLATE("checkpoint: explicit checkpoint() persists a manifest and su
   const auto path = reserve_crash_temp_path();
   constexpr int kKeyCount = 50;
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
@@ -536,7 +528,7 @@ TEST_CASE_TEMPLATE("checkpoint: explicit checkpoint() persists a manifest and su
     CHECK(std::filesystem::exists(vmemkv::derive_manifest_path(path)));
   }
   {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
@@ -549,8 +541,7 @@ TEST_CASE_TEMPLATE("checkpoint: explicit checkpoint() persists a manifest and su
 TEST_CASE("checkpoint: rolls the WAL onto a fresh, empty active segment") {
   const auto path = reserve_crash_temp_path();
   constexpr int kKeyCount = 200;
-  auto store =
-      std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < kKeyCount; ++i) {
     REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
   }
@@ -570,19 +561,18 @@ TEST_CASE("checkpoint: rolls the WAL onto a fresh, empty active segment") {
   cleanup_store_files(path);
 }
 
-TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 data files") {
+TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 checkpoint files") {
   const auto path = reserve_crash_temp_path();
-  auto store =
-      std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < 20; ++i) {
     REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
   }
   store->impl().checkpoint();
   const auto manifest1 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest1.has_value());
-  const auto t1_path = vmemkv::derive_t1_pskiplist_path(path);
+  const auto t1_chk_path = vmemkv::derive_t1_chk_path(path);
   const auto t2_chk_path = vmemkv::derive_t2_chk_path(path);
-  REQUIRE(std::filesystem::exists(t1_path));
+  REQUIRE(std::filesystem::exists(t1_chk_path));
   REQUIRE(std::filesystem::exists(t2_chk_path));
 
   for (int i = 0; i < 20; ++i) {
@@ -593,9 +583,9 @@ TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 data files") {
   REQUIRE(manifest2.has_value());
   CHECK(manifest2->generation != manifest1->generation);  // checkpoint_lsn still advances...
 
-  // ...but the data files themselves are the same paths every cycle -- both T1 (pskiplist's own
-  // mmap'd file) and T2 durabilize in place rather than building a new file per generation.
-  CHECK(std::filesystem::exists(t1_path));
+  // ...but the checkpoint files themselves are the same paths every cycle -- checkpoint_internal()
+  // durabilizes in place rather than building a new file per generation.
+  CHECK(std::filesystem::exists(t1_chk_path));
   CHECK(std::filesystem::exists(t2_chk_path));
 
   cleanup_store_files(path);
@@ -605,8 +595,7 @@ TEST_CASE("checkpoint: deletes and updates after a checkpoint are correctly refl
   const auto path = reserve_crash_temp_path();
   constexpr int kKeyCount = 30;
   {
-    auto store =
-        std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
     }
@@ -621,8 +610,7 @@ TEST_CASE("checkpoint: deletes and updates after a checkpoint are correctly refl
     }
   }
   {
-    auto store =
-        std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount / 2; ++i) {
       CHECK_FALSE(get_bytes(store, "k" + std::to_string(i)).has_value());
     }
@@ -640,8 +628,7 @@ TEST_CASE("checkpoint: insert/checkpoint/insert-more/restart preserves both pre-
   constexpr int kFirstBatch = 20;
   constexpr int kSecondBatch = 20;
   {
-    auto store =
-        std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
       REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
     }
@@ -651,8 +638,7 @@ TEST_CASE("checkpoint: insert/checkpoint/insert-more/restart preserves both pre-
     }
   }
   {
-    auto store =
-        std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
       const auto val = get_bytes(store, "a" + std::to_string(i));
       REQUIRE(val.has_value());
@@ -667,23 +653,21 @@ TEST_CASE("checkpoint: insert/checkpoint/insert-more/restart preserves both pre-
   cleanup_store_files(path);
 }
 
-TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 data file fails construction loudly") {
+TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file fails construction loudly") {
   const auto path = reserve_crash_temp_path();
   {
-    auto store =
-        std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     REQUIRE(store->insert("k", make_value(0)));
     store->impl().checkpoint();
   }
   const auto manifest = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest.has_value());
-  // Simulate loss/corruption of T1's own data file. Since the WAL has already been rotated down
-  // to the tail, falling back to full replay would silently lose the pre-checkpoint key --
+  // Simulate loss/corruption of the T1 checkpoint file. Since the WAL has already been rotated
+  // down to the tail, falling back to full replay would silently lose the pre-checkpoint key --
   // construction must fail loudly instead (see load_checkpoint_if_present).
-  std::filesystem::remove(vmemkv::derive_t1_pskiplist_path(path));
+  std::filesystem::remove(vmemkv::derive_t1_chk_path(path));
 
-  CHECK_THROWS(
-      std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes));
+  CHECK_THROWS(std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes));
 
   cleanup_store_files(path);
 }
@@ -700,8 +684,7 @@ TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 data file fails
 // fixed -- so a tiny override here used to be silently inert rather than actually racy).
 TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint file") {
   const auto path = reserve_crash_temp_path();
-  auto store =
-      std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < 200; ++i) {
     REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
   }
@@ -729,8 +712,7 @@ TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint f
 // override would make this test's exact checkpoint_count assertion race auto-triggered cycles.
 TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survive restart") {
   const auto path = reserve_crash_temp_path();
-  auto store =
-      std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+  auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
 
   REQUIRE(store->insert("seed", make_value(-1)));
   store->impl().checkpoint();
@@ -764,8 +746,7 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
 
   // A genuine restart adopts the final checkpoint correctly.
   store.reset();
-  auto restarted =
-      std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+  auto restarted = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   CHECK(get_bytes(restarted, "seed").has_value());
   for (int cycle = 0; cycle < kCycles; ++cycle) {
     for (int i = 0; i < kKeysPerCycle; ++i) {
@@ -799,8 +780,7 @@ TEST_CASE("checkpoint: in-place updates racing concurrent checkpoint() stay corr
 
   std::array<std::string, kKeyCount> last_written;
   {
-    auto store =
-        std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert(key_for(i), value_for(i, 0)));
     }
@@ -842,8 +822,7 @@ TEST_CASE("checkpoint: in-place updates racing concurrent checkpoint() stay corr
   // Restart without a final checkpoint: recovery must reach the same state via WAL replay,
   // regardless of what any racing checkpoint cycle durabilized.
   {
-    auto store =
-        std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes, kTinyT1CapacityBytes);
+    auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
       const auto val = get_bytes(store, key_for(i));
       REQUIRE(val.has_value());

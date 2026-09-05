@@ -812,11 +812,7 @@ static auto make_vmemkv_fresh(const std::string &path,
   std::filesystem::remove(path, error_code);
   vmemkv::remove_wal_segments(vmemkv::derive_wal_path(path));
   std::filesystem::remove(vmemkv::derive_manifest_path(path), error_code);
-  {
-    const auto t1_pskiplist_path = vmemkv::derive_t1_pskiplist_path(path);
-    std::filesystem::remove(t1_pskiplist_path, error_code);
-    std::filesystem::remove(t1_pskiplist_path.string() + ".manifest", error_code);
-  }
+  std::filesystem::remove(vmemkv::derive_t1_chk_path(path), error_code);
   std::filesystem::remove(vmemkv::derive_t2_chk_path(path), error_code);
 
   return constructor();
@@ -878,76 +874,19 @@ static void copy_t2_checkpoint_sparse(const std::filesystem::path &source,
   }
 }
 
-// Copies `source` to `dest` (creating/truncating `dest` first) preserving holes, using
-// SEEK_DATA/SEEK_HOLE to find and copy only the allocated extents -- unlike
-// copy_t2_checkpoint_sparse() above, this needs no externally-known "live bytes" boundary, so it
-// works for any sparse file (in particular T1's pskiplist-backed data file below, whose live
-// region isn't available to this generic benchmark harness the way T2's manifest-tracked
-// t2_bytes_used is).
-static void copy_sparse_file_generic(const std::filesystem::path &source, const std::filesystem::path &dest) {
-  const int src_fd = ::open(source.c_str(), O_RDONLY);
-  if (src_fd < 0) {
-    throw std::runtime_error("Failed to open source for sparse clone: " + source.string());
-  }
-  struct FDGuard {
-    int fd;
-    ~FDGuard() {
-      if (fd >= 0) ::close(fd);
-    }
-  } src_guard{src_fd};
-
-  struct stat source_stat {};
-  if (::fstat(src_fd, &source_stat) != 0) {
-    throw std::runtime_error("Failed to stat source for sparse clone: " + source.string());
-  }
-  const auto logical_size = static_cast<uint64_t>(source_stat.st_size);
-
-  const int dst_fd = ::open(dest.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-  if (dst_fd < 0) {
-    throw std::runtime_error("Failed to create sparse clone: " + dest.string());
-  }
-  FDGuard dst_guard{dst_fd};
-  if (::ftruncate(dst_fd, static_cast<off_t>(logical_size)) != 0) {
-    throw std::runtime_error("Failed to size sparse clone: " + dest.string());
-  }
-
-  std::vector<std::byte> buffer(4ULL * 1024 * 1024);
-  off_t pos = 0;
-  while (static_cast<uint64_t>(pos) < logical_size) {
-    const off_t data_start = ::lseek(src_fd, pos, SEEK_DATA);
-    if (data_start < 0) {
-      if (errno == ENXIO) break;  // No more data extents.
-      throw std::runtime_error("SEEK_DATA failed on sparse clone source: " + source.string());
-    }
-    off_t hole_start = ::lseek(src_fd, data_start, SEEK_HOLE);
-    if (hole_start < 0) {
-      hole_start = static_cast<off_t>(logical_size);
-    }
-    off_t offset = data_start;
-    while (offset < hole_start) {
-      const size_t chunk = static_cast<size_t>(std::min<off_t>(buffer.size(), hole_start - offset));
-      const ssize_t bytes_read = ::pread(src_fd, buffer.data(), chunk, offset);
-      if (bytes_read <= 0) break;
-      if (::pwrite(dst_fd, buffer.data(), static_cast<size_t>(bytes_read), offset) != bytes_read) {
-        throw std::runtime_error("Failed to write sparse clone: " + dest.string());
-      }
-      offset += bytes_read;
-    }
-    pos = hole_start;
-  }
-}
-
 // Builds (once) a VMemKV checkpoint at `master_path` -- a real populate() + checkpoint() -- if
 // one isn't already there, then clones it into a fresh instance path and writing a matching
 // manifest, with *no* WAL at the new path -- so constructing a VMemKVImpl there fast-boots
 // straight from the checkpoint with nothing to replay.
 //
-// Both T1 and T2's checkpoint files are copied rather than hardlinked: both are live,
-// directly-durable persistent files that checkpoint_internal() mutates in place (T1's
-// pskiplist-backed data file via its own checkpoint()/reclaim(), T2's tail via pwrite()) -- a
-// hardlinked file would let the clone's own later mutations corrupt the master (and any other
-// clone sharing that inode). T1 uses copy_sparse_file_generic() (its live region isn't tracked by
-// this harness the way T2's manifest t2_bytes_used is); T2 uses copy_t2_checkpoint_sparse().
+// The T1 checkpoint file is hardlinked (checkpoint.hpp's write_t1_checkpoint(): always written to
+// a temp path and rename()'d onto the final one, so a later cycle on the clone replaces the
+// clone's directory entry with a fresh inode rather than mutating the one still shared with the
+// master -- exactly like RocksDB's SST files, see RocksDBStore::clone_from()'s comment for the
+// same reasoning). The T2 checkpoint file cannot use the same trick: checkpoint_internal()
+// durabilizes T2's tail via pwrite() directly into the persistent file, in place, so a hardlinked
+// T2 file would let the clone's own later checkpoint cycles corrupt the master (and any other
+// clone sharing that inode) -- it's copied instead (see copy_t2_checkpoint_sparse() above).
 //
 // This is what lets Get/Update/Delete/YCSB-E/Scan (see their registrations below) all get a
 // fresh, fully-populated, fully-reorganized instance on every construction without paying
@@ -997,20 +936,17 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
   vmemkv::remove_wal_segments(vmemkv::derive_wal_path(instance_path));
   std::filesystem::remove(vmemkv::derive_manifest_path(instance_path), ignored);
 
-  const auto master_t1 = vmemkv::derive_t1_pskiplist_path(master_path);
-  const auto master_t1_manifest = master_t1.string() + ".manifest";
+  const auto master_t1 = vmemkv::derive_t1_chk_path(master_path);
   const auto master_t2 = vmemkv::derive_t2_chk_path(master_path);
-  const auto instance_t1 = vmemkv::derive_t1_pskiplist_path(instance_path);
-  const auto instance_t1_manifest = instance_t1.string() + ".manifest";
+  const auto instance_t1 = vmemkv::derive_t1_chk_path(instance_path);
   const auto instance_t2 = vmemkv::derive_t2_chk_path(instance_path);
   std::filesystem::remove(instance_t1, ignored);
-  std::filesystem::remove(instance_t1_manifest, ignored);
   std::filesystem::remove(instance_t2, ignored);
-  // T1's pskiplist manifest gates whether PSkipList::recover() trusts the cloned data file at
-  // all (see recover()'s "no manifest means no checkpoint() ever completed -- start fresh"
-  // comment) -- it must be cloned alongside the data file, not just the data file itself.
-  copy_sparse_file_generic(master_t1, instance_t1);
-  std::filesystem::copy_file(master_t1_manifest, instance_t1_manifest);
+  std::error_code link_error;
+  std::filesystem::create_hard_link(master_t1, instance_t1, link_error);
+  if (link_error) {
+    throw std::runtime_error("Failed to hardlink T1 checkpoint for clone: " + link_error.message());
+  }
   copy_t2_checkpoint_sparse(master_t2, instance_t2, manifest->t2_bytes_used);
   vmemkv::write_manifest(vmemkv::derive_manifest_path(instance_path), manifest->generation, manifest->t2_bytes_used);
 
