@@ -9,17 +9,10 @@
 
 namespace pskiplist {
 
-// Bump-pointer block arena backing UpperNode allocations (upper_node.hpp), mirroring RocksDB's
-// memtable Arena (memory/arena.h). Upper levels are pure DRAM search hints, fully rebuilt from
-// Level 0 on every recovery (PSkipList::rebuild_upper_levels()) -- unlike Level 0 they need no
-// persistence or crash-safety story, only fast, densely-packed allocation. Individual nodes are
-// never freed one at a time: instead each block tracks how many of its nodes are still live
-// (`live_count`), and the block's underlying buffer is only actually freed once that count
-// reaches zero *and* the block has been retired (superseded as the bump-allocation target) --
-// see release()/maybe_queue_for_free(). Because rebuild_upper_levels() walks Level 0 in sorted
-// key order, nodes allocated during a rebuild land in the arena in that same order, giving
-// nearby keys' UpperNodes real physical locality that a plain per-node `::operator new` has no
-// way to offer.
+// Bump-pointer block arena backing UpperChunk allocations, mirroring RocksDB's memtable Arena
+// (see high_level_design.md 2.4.2). Blocks are never freed one node at a time: each tracks how
+// many nodes are still live, and its buffer is freed only once that count hits zero and the
+// block has been retired (superseded as the bump target) -- see release().
 class UpperArena {
  public:
   struct Block {
@@ -28,9 +21,7 @@ class UpperArena {
     std::atomic<size_t> bump_offset{0};
     std::atomic<int> live_count{0};
     std::atomic<bool> retired{false};
-    // Guards against release() and install_new_block() both observing "retired && live_count ==
-    // 0" for the same block and queueing it for a free twice.
-    std::atomic<bool> queued_for_free{false};
+    std::atomic<bool> queued_for_free{false};  // guards against queueing the same block twice
   };
 
   static constexpr size_t kDefaultBlockSize = 1 << 20;  // 1MB
@@ -40,10 +31,8 @@ class UpperArena {
   }
 
   ~UpperArena() {
-    // The whole PSkipList (and this arena along with it) is being destroyed -- no concurrent
-    // access is possible any more, so every block ever created is freed unconditionally here,
-    // regardless of whether drain_pending_blocks() already got to it (a block whose buffer was
-    // already freed has `data == nullptr`; deleting a null array is a no-op).
+    // No concurrent access is possible once the whole PSkipList is being destroyed, so every
+    // block is freed unconditionally (deleting an already-null `data` is a no-op).
     for (Block *block : all_blocks_) {
       delete[] block->data;
       delete block;
@@ -53,14 +42,9 @@ class UpperArena {
   UpperArena(const UpperArena &) = delete;
   auto operator=(const UpperArena &) -> UpperArena & = delete;
 
-  // Bump-allocates `bytes` from the current block (rounded up to kAlignUnit so every allocation
-  // is at least std::max_align_t-aligned, sufficient for the std::atomic<uint64_t> forward-
-  // pointer array placed inside it). Installs a fresh block if the current one doesn't fit it,
-  // or -- if `bytes` alone exceeds a normal block -- an "irregular" block sized exactly to it,
-  // mirroring RocksDB's Arena. Thread-safe: lock-free on the common path; only the (rare) thread
-  // that actually loses the race to fill a block pays the blocks_mutex_ cost of installing the
-  // next one. Returns the raw memory and, via `out_block`, the block it came from -- callers
-  // must pass that same block to release() exactly once when the allocation is retired.
+  // Bump-allocates `bytes` (rounded up to kAlignUnit) from the current block, installing a new
+  // one if it doesn't fit. Lock-free on the common path. Returns the memory and, via `out_block`,
+  // the block it came from -- pass that to release() exactly once when done.
   [[nodiscard]] auto allocate(size_t bytes, Block **out_block) -> std::byte * {
     bytes = align_up(bytes);
     for (;;) {
@@ -81,25 +65,17 @@ class UpperArena {
     }
   }
 
-  // Decrements `block`'s live count. If this was the last live node in a block that has already
-  // been retired, queues the block's buffer for freeing -- NOT freed immediately: a writer that
-  // read `current_` just before retirement could still be mid-CAS against this block's (still
-  // valid) memory, so actually freeing it here would race that straggler. The caller (PSkipList::
-  // reclaim(), which already runs an epoch-based-reclamation drain proving no such straggler
-  // remains active) must call drain_pending_blocks() after that drain to actually free anything
-  // queued here.
+  // Decrements `block`'s live count; if it was the last one on an already-retired block, queues
+  // the buffer for freeing -- not immediately, since a writer may still be mid-CAS against it.
+  // The caller must call drain_pending_blocks() only after an EBR drain proves that's safe.
   void release(Block *block) {
     if (block->live_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       maybe_queue_for_free(block);
     }
   }
 
-  // Actually frees every block queued by release()/install_new_block() so far. Safe to call only
-  // after the caller has independently established (via EBR or an equivalent drain) that no
-  // writer still holds a `current_`-derived reference to a retired block -- see release()'s
-  // comment. Not called from allocate()/release() themselves, deliberately: freeing must be
-  // externally paced by PSkipList::reclaim()'s own epoch drain, not by whichever thread happens
-  // to observe a block's live_count hit zero.
+  // Actually frees blocks queued by release()/install_new_block() -- see release()'s comment
+  // for why this must be paced by the caller's own EBR drain, not called from allocate()/release().
   void drain_pending_blocks() {
     std::vector<Block *> to_free;
     {
@@ -116,8 +92,7 @@ class UpperArena {
   static constexpr size_t kAlignUnit = alignof(std::max_align_t);
   static auto align_up(size_t n) -> size_t { return (n + kAlignUnit - 1) & ~(kAlignUnit - 1); }
 
-  // Not locked itself -- called either before any concurrency exists (constructor) or by a
-  // caller already holding blocks_mutex_ (install_new_block()).
+  // Unlocked: called only before concurrency exists, or while already holding blocks_mutex_.
   auto new_block(size_t size) -> Block * {
     auto *block = new Block();
     block->data = new std::byte[size];
@@ -126,10 +101,8 @@ class UpperArena {
     return block;
   }
 
-  // Installs a fresh block as the new bump-allocation target and retires `old_current`. Only the
-  // thread that wins blocks_mutex_ actually installs one; every other thread racing to fill the
-  // same block just finds current_ already updated on its next outer-loop iteration and retries
-  // against the fresh block.
+  // Installs a fresh bump target and retires `old_current`. Only the thread winning
+  // blocks_mutex_ installs one; others retry against the already-updated current_.
   void install_new_block(Block *old_current, size_t min_bytes) {
     const std::lock_guard<std::mutex> lock(blocks_mutex_);
     if (current_.load(std::memory_order_acquire) != old_current) {

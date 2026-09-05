@@ -10,13 +10,10 @@ namespace pskiplist {
 inline constexpr double kDefaultLevelPromotionProbability = 0.25;
 inline constexpr int kDefaultMaxLevel = 32;
 
-// Assigns each new node's participation height via a geometric distribution (2.5節):
-// starting at level 1, promotes to the next level with probability `p` until it stops or
-// reaches `max_level`. RNG state is thread-local, seeded once per thread from `seed`
-// combined with the calling thread's id — concurrent callers never synchronize on a
-// shared generator, and a fixed `seed` gives a reproducible sequence for single-threaded
-// use (6章's fault-injection tests), without claiming exact reproducibility across
-// concurrent interleavings.
+// Assigns each new chunk's height via a geometric distribution (high_level_design.md 2.5):
+// promotes from level 1 with probability `p` until it stops or reaches `max_level`. RNG state
+// is thread-local (seeded from `seed` + thread id), so a fixed `seed` reproduces single-threaded
+// sequences without claiming bit-exact reproducibility across concurrent interleavings.
 class LevelGenerator {
  public:
   explicit LevelGenerator(uint64_t seed, int max_level = kDefaultMaxLevel, double p = kDefaultLevelPromotionProbability)

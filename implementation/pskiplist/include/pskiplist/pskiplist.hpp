@@ -83,21 +83,15 @@ struct DurableNode {
   std::atomic<uint64_t> epoch{0};  // creation epoch, set once at allocation
   Key key{};
   std::atomic<NodeState> state{NodeState::kLive};
-  // Shadow of `state`/`value` as of the last checkpoint, and the epoch of the most recent
-  // mutation — see skiplist.hpp's write_value_locked() / recover(). checkpointed_state exists
-  // because reverting `value` alone during recover() no longer implies reverting state too, now
-  // that they're separate fields instead of one packed word.
+  // Shadow of state as of the last checkpoint (high_level_design.md 4.1).
   std::atomic<NodeState> checkpointed_state{NodeState::kLive};
-  // Seqlock guarding `value`: even = stable, odd = a write is in flight. Also doubles as the
-  // write-side mutual exclusion (CAS even->odd) for concurrent put()s targeting this node — see
-  // skiplist.hpp's write_value_locked()/read_value().
+  // Seqlock guarding `value`: even = stable, odd = write in flight (also the write-side mutex).
   mutable std::atomic<uint64_t> version{0};
   Value value{};
   Value checkpointed_value{};
   std::atomic<uint64_t> mutation_epoch{0};
   mutable std::atomic<uint64_t> forward0{pack_forward(kNullOffset, false)};
-  // Checkpoint-gated physical-unlink queue linkage — see enqueue_pending_checkpoint_unlink().
-  std::atomic<Offset> next_checkpoint_unlink{kNullOffset};
+  std::atomic<Offset> next_checkpoint_unlink{kNullOffset};  // checkpoint-gated unlink queue link
   std::atomic<bool> pending_checkpoint_unlink_queued{false};
 };
 
@@ -127,10 +121,8 @@ struct EpochSlot {
 // vacated to drain treats anything observed under it as safe to act on.
 class EpochToken {
  public:
-  // Load-then-increment isn't atomic: a thread can read `epoch`, stall, and have reclaim()
-  // drain that exact slot to 0 and free memory before the fetch_add lands. Re-reading `epoch`
-  // after incrementing catches this — if it moved, undo and retry under the now-current
-  // parity, which reclaim() can't have started draining yet.
+  // Load-then-increment isn't atomic, so re-check `epoch` after incrementing: if it moved,
+  // reclaim() may have already drained the slot we just registered under -- undo and retry.
   EpochToken(std::array<EpochSlot, 2> &slots, std::atomic<uint64_t> &epoch, EpochRole role)
       : slots_(slots), role_(role) {
     for (;;) {
@@ -168,13 +160,10 @@ namespace pskiplist {
 inline constexpr double kDefaultLevelPromotionProbability = 0.25;
 inline constexpr int kDefaultMaxLevel = 32;
 
-// Assigns each new node's participation height via a geometric distribution (2.5節):
-// starting at level 1, promotes to the next level with probability `p` until it stops or
-// reaches `max_level`. RNG state is thread-local, seeded once per thread from `seed`
-// combined with the calling thread's id — concurrent callers never synchronize on a
-// shared generator, and a fixed `seed` gives a reproducible sequence for single-threaded
-// use (6章's fault-injection tests), without claiming exact reproducibility across
-// concurrent interleavings.
+// Assigns each new chunk's height via a geometric distribution (high_level_design.md 2.5):
+// promotes from level 1 with probability `p` until it stops or reaches `max_level`. RNG state
+// is thread-local (seeded from `seed` + thread id), so a fixed `seed` reproduces single-threaded
+// sequences without claiming bit-exact reproducibility across concurrent interleavings.
 class LevelGenerator {
  public:
   explicit LevelGenerator(uint64_t seed, int max_level = kDefaultMaxLevel, double p = kDefaultLevelPromotionProbability)
@@ -304,23 +293,13 @@ inline void write_manifest(const std::filesystem::path &data_path, uint64_t epoc
 
 namespace pskiplist {
 
-// Generic lock-free "find, helping to unlink any marked node along the way" search over a
-// singly-linked list, shared by Level 0 (Identity = Offset) and the upper levels (Identity =
-// UpperNode*). Each node's "next" pointer is packed with a deletion mark bit into one
-// atomic<uint64_t> word (Traits::pack/value/is_marked), so a single CAS on a predecessor's
-// word validates both "the successor is still what I read" and "the predecessor itself
-// hasn't been marked out from under me".
-//
-// `start_id`/`start_word` is where the walk begins (a search hint); if it's already marked,
-// the walk restarts from the guaranteed-live `fallback_id`/`fallback_word` (a list head)
-// instead. Marking a node for deletion is entirely the caller's job (remove()'s
-// unlink_upper_levels()/physically_unlink_best_effort() do this directly, with a
-// retry-until-success loop — see marked_list_mark_for_deletion below) — this function only
-// ever *discovers* an already-marked node (via `Traits::is_marked`, read straight off the
-// node's own next-word, no other node touched) and helps splice it out, reporting the splice
-// via `on_splice` on a winning CAS, then restarts from the start. Returns the first node with
-// key >= `key`, or Traits::null_id() if the list runs out; `*out_pred` receives its
-// predecessor.
+// Generic lock-free "find, helping to unlink any marked node along the way" search, shared by
+// Level 0 (Identity = Offset) and the upper levels (Identity = UpperChunk*). Each node's "next"
+// pointer packs a deletion mark bit into one atomic<uint64_t> word, so a single predecessor CAS
+// validates both "the successor is still what I read" and "the predecessor isn't marked". This
+// function only discovers already-marked nodes and helps splice them out via `on_splice` --
+// marking itself is the caller's job (see marked_list_mark_for_deletion). Returns the first node
+// with key >= `key`, or Traits::null_id(); `*out_pred` receives its predecessor.
 template <typename Identity,
           typename Traits,
           typename Key,
@@ -376,8 +355,7 @@ template <typename Identity,
   }
 }
 
-// Marks `id`'s own word for logical deletion, preserving its current successor — the first
-// half of removing a node, before any splice is attempted. No-op if already marked.
+// Marks `id`'s own word for logical deletion, preserving its successor. No-op if already marked.
 template <typename Identity, typename Traits, typename OwnWordFn>
 void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
   uint64_t raw = own_word(id).load(std::memory_order_acquire);
@@ -389,11 +367,8 @@ void marked_list_mark_for_deletion(Identity id, OwnWordFn own_word) {
   }
 }
 
-// Lock-free Treiber stack push: `value` becomes the new head, linked via `set_next(value,
-// old_head)` (a callback rather than a plain word store, so a caller can repurpose an
-// existing word — e.g. packing in a mark bit). No pop: every user drains the whole stack at
-// once via `head.exchange(...)`, so there's no ABA hazard here (unlike the free list, which
-// needs marked_offset.hpp's tagged pointer).
+// Lock-free Treiber stack push (`set_next` is a callback so a caller can repurpose an existing
+// word). No pop: every user drains the whole stack via `head.exchange(...)`, so no ABA hazard.
 template <typename Identity, typename SetNextFn>
 void stack_push(std::atomic<Identity> &head, Identity value, SetNextFn set_next) {
   Identity old_head = head.load(std::memory_order_relaxed);
@@ -548,17 +523,10 @@ class MmapFile {
 
 namespace pskiplist {
 
-// Bump-pointer block arena backing UpperNode allocations (upper_node.hpp), mirroring RocksDB's
-// memtable Arena (memory/arena.h). Upper levels are pure DRAM search hints, fully rebuilt from
-// Level 0 on every recovery (PSkipList::rebuild_upper_levels()) -- unlike Level 0 they need no
-// persistence or crash-safety story, only fast, densely-packed allocation. Individual nodes are
-// never freed one at a time: instead each block tracks how many of its nodes are still live
-// (`live_count`), and the block's underlying buffer is only actually freed once that count
-// reaches zero *and* the block has been retired (superseded as the bump-allocation target) --
-// see release()/maybe_queue_for_free(). Because rebuild_upper_levels() walks Level 0 in sorted
-// key order, nodes allocated during a rebuild land in the arena in that same order, giving
-// nearby keys' UpperNodes real physical locality that a plain per-node `::operator new` has no
-// way to offer.
+// Bump-pointer block arena backing UpperChunk allocations, mirroring RocksDB's memtable Arena
+// (see high_level_design.md 2.4.2). Blocks are never freed one node at a time: each tracks how
+// many nodes are still live, and its buffer is freed only once that count hits zero and the
+// block has been retired (superseded as the bump target) -- see release().
 class UpperArena {
  public:
   struct Block {
@@ -567,9 +535,7 @@ class UpperArena {
     std::atomic<size_t> bump_offset{0};
     std::atomic<int> live_count{0};
     std::atomic<bool> retired{false};
-    // Guards against release() and install_new_block() both observing "retired && live_count ==
-    // 0" for the same block and queueing it for a free twice.
-    std::atomic<bool> queued_for_free{false};
+    std::atomic<bool> queued_for_free{false};  // guards against queueing the same block twice
   };
 
   static constexpr size_t kDefaultBlockSize = 1 << 20;  // 1MB
@@ -579,10 +545,8 @@ class UpperArena {
   }
 
   ~UpperArena() {
-    // The whole PSkipList (and this arena along with it) is being destroyed -- no concurrent
-    // access is possible any more, so every block ever created is freed unconditionally here,
-    // regardless of whether drain_pending_blocks() already got to it (a block whose buffer was
-    // already freed has `data == nullptr`; deleting a null array is a no-op).
+    // No concurrent access is possible once the whole PSkipList is being destroyed, so every
+    // block is freed unconditionally (deleting an already-null `data` is a no-op).
     for (Block *block : all_blocks_) {
       delete[] block->data;
       delete block;
@@ -592,14 +556,9 @@ class UpperArena {
   UpperArena(const UpperArena &) = delete;
   auto operator=(const UpperArena &) -> UpperArena & = delete;
 
-  // Bump-allocates `bytes` from the current block (rounded up to kAlignUnit so every allocation
-  // is at least std::max_align_t-aligned, sufficient for the std::atomic<uint64_t> forward-
-  // pointer array placed inside it). Installs a fresh block if the current one doesn't fit it,
-  // or -- if `bytes` alone exceeds a normal block -- an "irregular" block sized exactly to it,
-  // mirroring RocksDB's Arena. Thread-safe: lock-free on the common path; only the (rare) thread
-  // that actually loses the race to fill a block pays the blocks_mutex_ cost of installing the
-  // next one. Returns the raw memory and, via `out_block`, the block it came from -- callers
-  // must pass that same block to release() exactly once when the allocation is retired.
+  // Bump-allocates `bytes` (rounded up to kAlignUnit) from the current block, installing a new
+  // one if it doesn't fit. Lock-free on the common path. Returns the memory and, via `out_block`,
+  // the block it came from -- pass that to release() exactly once when done.
   [[nodiscard]] auto allocate(size_t bytes, Block **out_block) -> std::byte * {
     bytes = align_up(bytes);
     for (;;) {
@@ -620,25 +579,17 @@ class UpperArena {
     }
   }
 
-  // Decrements `block`'s live count. If this was the last live node in a block that has already
-  // been retired, queues the block's buffer for freeing -- NOT freed immediately: a writer that
-  // read `current_` just before retirement could still be mid-CAS against this block's (still
-  // valid) memory, so actually freeing it here would race that straggler. The caller (PSkipList::
-  // reclaim(), which already runs an epoch-based-reclamation drain proving no such straggler
-  // remains active) must call drain_pending_blocks() after that drain to actually free anything
-  // queued here.
+  // Decrements `block`'s live count; if it was the last one on an already-retired block, queues
+  // the buffer for freeing -- not immediately, since a writer may still be mid-CAS against it.
+  // The caller must call drain_pending_blocks() only after an EBR drain proves that's safe.
   void release(Block *block) {
     if (block->live_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       maybe_queue_for_free(block);
     }
   }
 
-  // Actually frees every block queued by release()/install_new_block() so far. Safe to call only
-  // after the caller has independently established (via EBR or an equivalent drain) that no
-  // writer still holds a `current_`-derived reference to a retired block -- see release()'s
-  // comment. Not called from allocate()/release() themselves, deliberately: freeing must be
-  // externally paced by PSkipList::reclaim()'s own epoch drain, not by whichever thread happens
-  // to observe a block's live_count hit zero.
+  // Actually frees blocks queued by release()/install_new_block() -- see release()'s comment
+  // for why this must be paced by the caller's own EBR drain, not called from allocate()/release().
   void drain_pending_blocks() {
     std::vector<Block *> to_free;
     {
@@ -655,8 +606,7 @@ class UpperArena {
   static constexpr size_t kAlignUnit = alignof(std::max_align_t);
   static auto align_up(size_t n) -> size_t { return (n + kAlignUnit - 1) & ~(kAlignUnit - 1); }
 
-  // Not locked itself -- called either before any concurrency exists (constructor) or by a
-  // caller already holding blocks_mutex_ (install_new_block()).
+  // Unlocked: called only before concurrency exists, or while already holding blocks_mutex_.
   auto new_block(size_t size) -> Block * {
     auto *block = new Block();
     block->data = new std::byte[size];
@@ -665,10 +615,8 @@ class UpperArena {
     return block;
   }
 
-  // Installs a fresh block as the new bump-allocation target and retires `old_current`. Only the
-  // thread that wins blocks_mutex_ actually installs one; every other thread racing to fill the
-  // same block just finds current_ already updated on its next outer-loop iteration and retries
-  // against the fresh block.
+  // Installs a fresh bump target and retires `old_current`. Only the thread winning
+  // blocks_mutex_ installs one; others retry against the already-updated current_.
   void install_new_block(Block *old_current, size_t min_bytes) {
     const std::lock_guard<std::mutex> lock(blocks_mutex_);
     if (current_.load(std::memory_order_acquire) != old_current) {
@@ -716,26 +664,10 @@ class UpperArena {
 namespace pskiplist {
 
 // A volatile, DRAM-only skip-list node holding up to kCapacity (key, durable_offset) entries
-// clustered around the same region of key space, instead of the classic "one node per key"
-// skip-list design: a plain one-key-per-node skip list pays one random, likely cache-cold
-// memory access per hop, which dominates Get/Scan cost at scale (measured: ~40+ such accesses
-// per Get at 5M keys, even after moving the node's own memory into an arena -- see
-// upper_arena.hpp -- since arena-allocation order only correlates with key order for a sorted
-// bulk load, not for steady-state random-order inserts). Packing several nearby keys into one
-// arena-resident, contiguous chunk turns most of those hops into a single cache-friendly linear
-// scan over already-fetched memory instead.
-//
-// No splits or merges: `primary_key`/`primary_offset` fix a chunk's position in the outer
-// linked list for its entire lifetime (see skiplist.hpp's cascade_upper_levels(), which compares
-// chunks by `primary_key` exactly as it used to compare single-key nodes). Every key whose
-// value falls in this chunk's "territory" -- between its primary_key and the next chunk's --
-// is packed into one of its remaining entry slots via a lock-free claim (try_insert_into_chunk()
-// in skiplist.hpp), no linked-list mutation needed. Once a chunk's capacity is exhausted, the
-// next key in its territory instead gets its own brand new chunk, spliced in via the same
-// CAS-based per-level insertion a fresh chunk always uses -- which incidentally subdivides the
-// full chunk's territory going forward. Older entries already packed into the full chunk are
-// never rebalanced or moved. This means chunk occupancy is uneven over time under heavy
-// churn -- an accepted tradeoff for never needing an in-place split/merge algorithm.
+// clustered around one region of key space, instead of one node per key -- see
+// high_level_design.md 2.4.1 for why. No splits or merges: `primary_key`/`primary_offset` fix
+// a chunk's outer-linked-list position for its entire lifetime; a full chunk's overflow just
+// gets a new chunk spliced in beside it, subdividing its territory going forward.
 template <typename Key>
 struct UpperChunk {
   static constexpr int kCapacity = 32;
@@ -743,19 +675,13 @@ struct UpperChunk {
   struct Entry {
     Key key{};
     Offset durable_offset{kNullOffset};
-    // published: separates a slot's claim (an atomic fetch_add on `claimed`) from making it
-    // visible to readers -- a reader only trusts an entry once it observes published == true
-    // (acquire); by that point the plain (non-atomic) key/durable_offset writes that happened
-    // before the release store are guaranteed visible. `live` starts false and is set true only
-    // once published; it flips back to false on removal but the slot itself is never reclaimed
-    // individually -- see UpperChunk's own live_count for whole-chunk reclaim.
+    // published separates slot claim from visibility: readers trust an entry only once they
+    // observe published == true (acquire). live tracks removal; slots are never freed individually.
     std::atomic<bool> published{false};
     std::atomic<bool> live{false};
   };
 
-  // Fixed at chunk creation, for this chunk's entire lifetime, independent of whether that
-  // specific key is later removed -- this is purely a routing coordinate for the outer linked
-  // list, not a claim that the primary entry is still live.
+  // Fixed at chunk creation for its whole lifetime -- a routing coordinate, not a liveness claim.
   Key primary_key{};
   Offset primary_offset{kNullOffset};
 
@@ -800,11 +726,8 @@ template <typename Key>
   return chunk;
 }
 
-// Arena-backed chunks are never individually destructed -- every field is a trivially
-// destructible atomic or a trivially-copyable Key/Offset (see concepts.hpp's SkipListKey), so
-// releasing the owning block's reference count (which may, once it hits zero on an
-// already-retired block, queue that block's whole buffer for freeing -- see
-// UpperArena::release()) is the entire cleanup this needs.
+// Chunks are never individually destructed (every field is trivially destructible); releasing
+// the owning block's refcount is the entire cleanup needed (see UpperArena::release()).
 template <typename Key>
 inline void deallocate_upper_chunk(UpperArena &arena, UpperChunk<Key> *chunk) {
   arena.release(chunk->owning_block);
@@ -840,12 +763,8 @@ class PSkipList {
   }
 
   ~PSkipList() {
-    // Individual deallocate_upper_chunk() calls below just decrement each node's owning arena
-    // block's live_count (see upper_arena.hpp) -- upper_arena_'s own destructor (a member,
-    // destroyed after this body runs) unconditionally frees every block's buffer regardless of
-    // live_count, so walking these lists here is about correctness of *use* (nothing else may
-    // still be touching these nodes, since the whole PSkipList is being destroyed) rather than
-    // about reclaiming memory that would otherwise leak.
+    // upper_arena_'s own destructor (runs after this body) frees every block unconditionally,
+    // so deallocate_upper_chunk() below is just refcount bookkeeping, not the real free.
     UpperChunk<Key> *current = marked_ptr_value<UpperChunk<Key>>(upper_heads_[0].load(std::memory_order_relaxed));
     while (current != nullptr) {
       UpperChunk<Key> *next = marked_ptr_value<UpperChunk<Key>>(current->forwards[0].load(std::memory_order_relaxed));
@@ -869,9 +788,8 @@ class PSkipList {
     return found->second;
   }
 
-  // Like get(), but also returns the matched node's actual stored key — not merely `key` itself.
-  // Useful when Compare/keys_equal treats keys as equal despite differing in some payload-carrying
-  // bits Compare ignores (e.g. metadata packed into otherwise-unordered bits of a composite key).
+  // Like get(), but also returns the matched node's own stored key (useful when Compare treats
+  // keys as equal despite differing in some payload-carrying bits it ignores).
   [[nodiscard]] auto get_with_key(const Key &key) const -> std::optional<std::pair<Key, Value>> {
     const EpochToken token(epoch_slots_, epoch_, EpochRole::kReader);
     Offset predecessor = kNullOffset;
@@ -902,9 +820,7 @@ class PSkipList {
         if (state == NodeState::kTombstonedLinked) {
           NodeState expected = NodeState::kTombstonedLinked;
           if (!nodes_[existing].state.compare_exchange_strong(expected, NodeState::kLive, std::memory_order_acq_rel)) {
-            // Lost the resurrect race to a concurrent physically_unlink_best_effort(), which
-            // just committed to permanently retiring this offset -- the value write above is
-            // harmless waste on a node that's about to be spliced out. Retry from the top.
+            // Lost the resurrect race to a concurrent physically_unlink_best_effort(); retry.
             continue;
           }
         }
@@ -983,8 +899,7 @@ class PSkipList {
     Offset pending_head = drain_pending_unlinks();
     UpperChunk<Key> *pending_upper = pending_upper_deletes_.exchange(nullptr, std::memory_order_acq_rel);
 
-    // Unlike checkpoint()'s writer-only wait, physical reclaim needs every reader or writer
-    // that could hold a stale offset to have drained first.
+    // Unlike checkpoint(), physical reclaim must wait for readers too, not just writers.
     const uint64_t old_parity = epoch_.load(std::memory_order_acquire) & 1;
     epoch_.fetch_add(1, std::memory_order_acq_rel);
     auto &old_slot = epoch_slots_[old_parity];
@@ -1005,10 +920,7 @@ class PSkipList {
       pending_upper = next;
     }
 
-    // Only now -- after the epoch drain above has proven no writer still holds a `current_`-
-    // derived reference into a since-retired arena block -- is it safe to actually free any
-    // block whose live_count reached zero (see UpperArena::release()'s comment for the race
-    // this ordering closes).
+    // Safe only after the epoch drain above (see UpperArena::release()'s comment).
     upper_arena_.drain_pending_blocks();
   }
 
@@ -1029,8 +941,7 @@ class PSkipList {
 
     file_.sync();
     write_manifest(path_, published_epoch, high_water_mark_.load(std::memory_order_acquire));
-    // Only after the manifest is durable — otherwise a concurrent put()/remove() could see
-    // "already checkpointed" before that's true and skip a shadow recover() needs.
+    // Only after the manifest is durable, or a concurrent writer could skip a shadow recover() needs.
     last_published_epoch_.store(published_epoch, std::memory_order_release);
 
     while (pending_unlink != kNullOffset) {
@@ -1076,11 +987,9 @@ class PSkipList {
     }
   }
 
-  // Claims exclusive write access to `offset`'s value (version even->odd CAS — this doubles as
-  // write-side mutual exclusion against other concurrent writers of the same node, not just a
-  // reader-tear guard), shadows the pre-mutation value+state on first touch since the last
-  // checkpoint, runs `mutate(value)`, then releases (version -> v+2). Used by both put() (real
-  // mutation) and remove() (no-op mutation — it only needs the shadow capture).
+  // Seqlock write: claims exclusive access (version even->odd), shadows value/state on first
+  // touch since the last checkpoint, runs `mutate`, releases (version -> v+2). See high_level_
+  // design.md 4.1. remove() passes a no-op mutate — it only needs the shadow capture.
   template <typename MutateFn>
   void write_value_locked(Offset offset, MutateFn &&mutate) {
     auto &node = nodes_[offset];
@@ -1104,12 +1013,9 @@ class PSkipList {
     node.version.store(v + 2, std::memory_order_release);
   }
 
-  // No manifest means no checkpoint() ever completed — start fresh. Otherwise walk Level 0
-  // from head, trusting nodes only while their creation epoch is <= the manifest's; the walk
-  // stops and splices at the first untrusted node, and every allocated-but-unreached slot
-  // below high_water_mark becomes free. A trusted node's latest value/state may still be newer
-  // than the checkpoint (put() or remove(), indistinguishable here), so both are reverted to
-  // their shadow whenever mutation_epoch exceeds the threshold.
+  // No manifest means no checkpoint() ever completed — start fresh. Otherwise walk Level 0,
+  // trusting nodes only while their creation epoch is <= the manifest's; stop and splice at the
+  // first untrusted node. See high_level_design.md 2.2/4.1 for the shadow-revert rule.
   void recover() {
     const auto manifest = read_manifest(path_);
     if (!manifest.has_value()) {
@@ -1120,9 +1026,7 @@ class PSkipList {
     const uint64_t threshold = manifest->epoch;
     const uint64_t recovered_high_water_mark = manifest->high_water_mark;
 
-    // epoch_ restarts at 0 every reopen; resuming from threshold + 1 keeps epoch numbers
-    // monotonic across restarts (otherwise a later recovery could wrongly trim nodes this
-    // session already checkpointed).
+    // Resume from threshold + 1 (not 0) to keep epoch numbers monotonic across restarts.
     epoch_.store(threshold + 1, std::memory_order_relaxed);
     last_published_epoch_.store(threshold, std::memory_order_relaxed);
 
@@ -1154,11 +1058,9 @@ class PSkipList {
 
     high_water_mark_.store(recovered_high_water_mark, std::memory_order_relaxed);
 
-    // A crash between checkpoint()'s manifest write and its (in-memory, lost) drain of
-    // pending_checkpoint_unlink_ can leave an already-durable removal still TombstonedLinked;
-    // nothing at runtime retries it, so finish it here in its own pass (recovery is
-    // single-threaded, so this is safe; folding it into the walk above would corrupt that
-    // walk's pred/current bookkeeping via find_at_or_after's own splicing).
+    // Finishes any physical unlink left incomplete by a crash right after checkpoint()'s
+    // manifest write (see high_level_design.md 7). A separate pass since recovery's single-
+    // threaded: folding it into the walk above would corrupt that walk's own bookkeeping.
     Offset walk = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (walk != kTail) {
       const Offset next = forward_offset(nodes_[walk].forward0.load(std::memory_order_relaxed));
@@ -1171,9 +1073,7 @@ class PSkipList {
     rebuild_upper_levels();
   }
 
-  // Upper levels are pure DRAM search hints, never persisted, so every restart rebuilds them
-  // by re-linking each surviving Level 0 node exactly as put() would. O(corpus), unavoidable
-  // without persisting the upper levels themselves.
+  // Upper levels are pure DRAM search hints, so every restart rebuilds them from Level 0. O(corpus).
   void rebuild_upper_levels() {
     Offset current = forward_offset(nodes_[kHead].forward0.load(std::memory_order_relaxed));
     while (current != kTail) {
@@ -1184,10 +1084,8 @@ class PSkipList {
 
   [[nodiscard]] auto keys_equal(const Key &a, const Key &b) const -> bool { return !less_(a, b) && !less_(b, a); }
 
-  // Traverses to the first node with key >= `key`, helping to physically unlink any marked
-  // node along the way. `hint` (typically from the upper levels) seeds the first attempt in
-  // place of kHead; it's safe to trust as < `key` forever, but is re-verified as still
-  // unmarked before use, falling back to kHead otherwise.
+  // First node with key >= `key`, helping physically unlink any marked node along the way.
+  // `hint` seeds the search in place of kHead; falls back to kHead if it's since been marked.
   [[nodiscard]] auto find_at_or_after(const Key &key, Offset *predecessor, Offset hint = kHead) const -> Offset {
     return marked_list_find<Offset, OffsetMarkedTraits>(
         hint,
@@ -1214,10 +1112,9 @@ class PSkipList {
     return pending_head_.exchange(kNullOffset, std::memory_order_acq_rel);
   }
 
-  // Linked via next_checkpoint_unlink, never forward0, which must keep pointing at each
-  // node's real successor until checkpoint() confirms the splice is safe. The queued flag
-  // guards against double-enqueue when put() resurrects a TombstonedLinked node and a later
-  // remove() re-tombstones it.
+  // Linked via next_checkpoint_unlink (not forward0, which must stay pointing at the real
+  // successor until checkpoint() confirms the splice is safe). The queued flag guards against
+  // double-enqueue when a resurrect and a later re-remove both target the same node.
   void enqueue_pending_checkpoint_unlink(Offset offset) const {
     bool expected_unqueued = false;
     if (!nodes_[offset].pending_checkpoint_unlink_queued.compare_exchange_strong(
@@ -1268,9 +1165,7 @@ class PSkipList {
 
   void physically_unlink_best_effort(const Key &key, Offset node_offset) {
     NodeState expected = NodeState::kTombstonedLinked;
-    // A genuine state change (not a same-value CAS): a concurrent put() racing to resurrect
-    // this node holds `expected` from before this transition, so its own CAS correctly fails
-    // and retries instead of resurrecting a node this call just committed to splicing out.
+    // A concurrent resurrect racing on the same expected value correctly loses and retries.
     if (!nodes_[node_offset].state.compare_exchange_strong(
             expected, NodeState::kTombstonedUnlinked, std::memory_order_acq_rel)) {
       return;
@@ -1299,20 +1194,12 @@ class PSkipList {
     }
   }
 
-  // Cascading top-down walk across all upper levels, comparing chunks by their immutable
-  // primary_key (set once at chunk creation — see upper_chunk.hpp): at each level, positions
-  // from the predecessor found one level up rather than that level's own head. Returns the
-  // level-1 predecessor: the chunk with the largest primary_key strictly less than `key`, or
-  // nullptr if no chunk's primary_key is < `key`. This is the read-path *hint* predecessor
-  // (its offset must never be >= `key`, since find_at_or_after only ever walks forward from a
-  // hint) -- it is NOT the same thing as "the chunk owning key's territory" when `key` happens
-  // to equal some chunk's own primary_key exactly; see find_owning_chunk() for that. When
-  // `out_anchors` is non-null, also records each level <= `height`'s incoming predecessor into
-  // it — link_upper_levels()'s way of seeding every level a brand new chunk will insert into
-  // without re-walking from scratch per level. When `out_current` is non-null, receives the
-  // level-1 search's own return value (the first chunk found with primary_key >= `key`, or
-  // nullptr) -- find_owning_chunk() uses this to detect an exact primary_key match without a
-  // second traversal.
+  // Cascading top-down walk comparing chunks by primary_key (see high_level_design.md 2.4.1):
+  // each level starts from the predecessor found one level up. Returns the level-1 predecessor
+  // (largest primary_key < `key`, or nullptr) -- a read-path *hint*, not necessarily the chunk
+  // owning `key`'s territory (see find_owning_chunk()). `out_anchors` records each level's
+  // incoming predecessor for link_upper_levels(); `out_current` returns the level-1 search's
+  // own result so find_owning_chunk() can check for an exact primary_key match for free.
   auto cascade_upper_levels(const Key &key,
                             UpperChunk<Key> **out_anchors,
                             int height,
@@ -1333,13 +1220,9 @@ class PSkipList {
     return pred;
   }
 
-  // Finds the chunk that owns `key`'s territory for insertion/removal purposes: either a chunk
-  // whose primary_key exactly equals `key` (key was itself the first key ever routed to this
-  // territory), or -- if none -- the predecessor chunk whose primary_key is the largest one
-  // still less than `key`. Distinct from cascade_upper_levels()'s own return value, which read
-  // paths need to stay strictly less than `key` for use as a Level 0 search hint; insertion and
-  // removal instead need the territory match itself, including the boundary case where `key`
-  // *is* the territory's own anchor.
+  // The chunk owning `key`'s territory: an exact primary_key match if one exists, else the
+  // predecessor. Unlike cascade_upper_levels()'s own return value, this may equal `key` itself
+  // -- needed for insertion/removal, where the territory's own anchor key is a valid target.
   [[nodiscard]] auto find_owning_chunk(const Key &key) const -> UpperChunk<Key> * {
     UpperChunk<Key> *current = nullptr;
     UpperChunk<Key> *pred = cascade_upper_levels(key, nullptr, 0, &current);
@@ -1349,14 +1232,10 @@ class PSkipList {
     return pred;
   }
 
-  // Scans `chunk`'s up-to-kCapacity entries for the tightest usable Level 0 hint: the largest
-  // published, still-live entry key strictly less than `key`. cascade_upper_levels() guarantees
-  // chunk->primary_key < key (that's what makes `chunk` the returned predecessor in the first
-  // place), so the primary entry is always a valid fallback candidate and this never returns
-  // kNullOffset for a non-null chunk. Only `live` entries are considered: a dead entry's
-  // durable_offset may already have been physically reclaimed and reused for an unrelated key
-  // once its removal is checkpointed durable, so it is not safe as a hint even though its
-  // (immutable) key value would still compare correctly.
+  // The tightest usable Level 0 hint in `chunk`: the largest published, still-live entry key
+  // strictly less than `key` (the primary entry is always a fallback candidate, so this never
+  // returns kNullOffset). Dead entries are excluded: their durable_offset may already have been
+  // reclaimed and reused for an unrelated key once checkpointed durable.
   [[nodiscard]] auto best_hint_in_chunk(UpperChunk<Key> *chunk, const Key &key) const -> Offset {
     Offset best_offset = chunk->primary_offset;
     const Key *best_key = &chunk->primary_key;
@@ -1427,11 +1306,8 @@ class PSkipList {
     return nullptr;
   }
 
-  // Tries to pack (offset, key) into an existing chunk's remaining capacity -- the fast, common
-  // path for a key whose territory already has a chunk with room: an atomic slot claim and a
-  // published write, no linked-list mutation at all. Returns false if `chunk` is already full
-  // (every slot already claimed), in which case the caller must fall back to creating and
-  // splicing in a brand new chunk.
+  // Fast path: packs (offset, key) into an existing chunk via an atomic slot claim, no
+  // linked-list mutation. Returns false if `chunk` is full, so the caller must splice in a new one.
   [[nodiscard]] auto try_insert_into_chunk(UpperChunk<Key> *chunk, Offset offset, const Key &key) -> bool {
     const int slot = chunk->claimed.fetch_add(1, std::memory_order_acq_rel);
     if (slot >= UpperChunk<Key>::kCapacity) {
@@ -1445,12 +1321,9 @@ class PSkipList {
     entry.live.store(true, std::memory_order_relaxed);
     entry.published.store(true, std::memory_order_release);
 
-    // Mirrors link_upper_levels()'s own self-heal below: a concurrent remove() may have
-    // tombstoned `offset` while this call was still claiming/publishing its slot, and (since
-    // this entry didn't exist in any chunk until the publish store above) that remove()'s own
-    // scan of this chunk could not have found it yet. If so, retire this one entry ourselves --
-    // the CAS ensures only one of {this self-heal, a genuinely concurrent remove() that now
-    // finds the freshly published entry} actually decrements live_count.
+    // Self-heal: a concurrent remove() may have tombstoned `offset` before this entry was
+    // published, so it could not have found it. The CAS ensures only one of {this, a genuinely
+    // concurrent remove() now finding the entry} decrements live_count.
     if (nodes_[offset].state.load(std::memory_order_acquire) != NodeState::kLive) {
       bool expected_live = true;
       if (entry.live.compare_exchange_strong(expected_live, false, std::memory_order_acq_rel) &&
@@ -1473,11 +1346,8 @@ class PSkipList {
       }
     }
 
-    // Slow path: the predecessor's chunk (if any) is full, or there is no chunk at all yet for
-    // this territory -- create a fresh chunk seeded with just this one key and splice it into
-    // the outer linked list, exactly as the original one-key-per-node design always did. This
-    // incidentally subdivides whatever territory it lands in going forward; older entries
-    // already packed into a full chunk are never rebalanced (see upper_chunk.hpp).
+    // Slow path: no chunk owns this territory yet, or it's full. Splice in a fresh chunk
+    // seeded with just this key (see upper_chunk.hpp: no split/rebalance, ever).
     const int height = level_generator_.next_level();
     UpperChunk<Key> *chunk = allocate_upper_chunk(upper_arena_, fresh, key, height);
 
@@ -1500,14 +1370,10 @@ class PSkipList {
       }
     }
 
-    // A concurrent remove() may have tombstoned `fresh` at any point during the insertion loop
-    // above; its own unlink attempt (unlink_from_upper_levels(), which needs to find this
-    // chunk via the same cascade_upper_levels() search) could not have found a chunk that
-    // hadn't finished being spliced in yet. Re-checking state now and self-healing closes that
-    // race without needing any liveness signal cached separately: whichever of {this call,
-    // remove()'s own call} finishes last is guaranteed to observe every level already inserted
-    // (this call's insertion loop has just finished them all), so it alone is enough to catch
-    // anything the other missed.
+    // Self-heal: a concurrent remove() may have tombstoned `fresh` mid-splice, before
+    // unlink_from_upper_levels() could find a chunk still being inserted. Whichever of {this
+    // call, that remove()} finishes last observes every level already inserted, so it alone
+    // is enough to catch what the other missed.
     if (nodes_[fresh].state.load(std::memory_order_acquire) != NodeState::kLive) {
       bool expected_live = true;
       if (chunk->entries[0].live.compare_exchange_strong(expected_live, false, std::memory_order_acq_rel) &&
@@ -1517,16 +1383,12 @@ class PSkipList {
     }
   }
 
-  // Marks one specific entry (matched by durable_offset) inside the chunk responsible for
-  // `key`'s territory as no longer live. A chunk's primary_key never changes, so the same
-  // find_owning_chunk() routing link_upper_levels() used to place this key will always find the
-  // same chunk. Once a chunk's last live entry is gone, retires the whole chunk from every level
-  // it participates in (retire_chunk()) and queues it for EBR reclaim.
+  // Marks the entry (matched by durable_offset) in `key`'s territory chunk as no longer live;
+  // once a chunk's last live entry is gone, retires it (retire_chunk()) and queues it for reclaim.
   void unlink_from_upper_levels(const Key &key, Offset target_offset) {
     UpperChunk<Key> *chunk = find_owning_chunk(key);
     if (chunk == nullptr) {
-      return;  // defensive: every live key's chunk is found by the exact routing it was
-               // inserted with, so this should not happen in practice.
+      return;  // defensive: should not happen, since insertion used the same routing.
     }
     const int claimed_count = std::min(chunk->claimed.load(std::memory_order_acquire), UpperChunk<Key>::kCapacity);
     for (int i = 0; i < claimed_count; ++i) {
@@ -1543,11 +1405,8 @@ class PSkipList {
     }
   }
 
-  // Eager top-down splice of one whole chunk's outer-linked-list entries, called once every
-  // entry it ever held has been removed (from unlink_from_upper_levels()/try_insert_into_chunk()/
-  // link_upper_levels()'s self-heal, whichever happens to decrement live_count to 0). Idempotent
-  // against a level another caller already spliced -- find_upper_chunk_at_level() simply won't
-  // find it there any more.
+  // Eager top-down splice of a chunk once its last entry has been removed. Idempotent against
+  // a level already spliced by another caller -- find_upper_chunk_at_level() won't find it there.
   void retire_chunk(UpperChunk<Key> *target, const Key &key) {
     for (int level = kDefaultMaxLevel; level >= 1; --level) {
       UpperChunk<Key> *pred = nullptr;
@@ -1583,9 +1442,7 @@ class PSkipList {
   // physically mutate these via helping splices and reclaim-queue pushes.
   mutable std::array<std::atomic<uint64_t>, kDefaultMaxLevel> upper_heads_{};
   mutable std::atomic<UpperChunk<Key> *> pending_upper_deletes_{nullptr};
-  // Backs every UpperNode allocation (see upper_arena.hpp) -- only ever touched from mutating
-  // contexts (link_upper_levels(), the destructor, reclaim()), so unlike the members above this
-  // needs no `mutable`.
+  // Backs every UpperChunk allocation (upper_arena.hpp); only touched from mutating contexts.
   UpperArena upper_arena_;
 
   mutable std::array<EpochSlot, 2> epoch_slots_{};

@@ -24,10 +24,8 @@ struct EpochSlot {
 // vacated to drain treats anything observed under it as safe to act on.
 class EpochToken {
  public:
-  // Load-then-increment isn't atomic: a thread can read `epoch`, stall, and have reclaim()
-  // drain that exact slot to 0 and free memory before the fetch_add lands. Re-reading `epoch`
-  // after incrementing catches this — if it moved, undo and retry under the now-current
-  // parity, which reclaim() can't have started draining yet.
+  // Load-then-increment isn't atomic, so re-check `epoch` after incrementing: if it moved,
+  // reclaim() may have already drained the slot we just registered under -- undo and retry.
   EpochToken(std::array<EpochSlot, 2> &slots, std::atomic<uint64_t> &epoch, EpochRole role)
       : slots_(slots), role_(role) {
     for (;;) {
