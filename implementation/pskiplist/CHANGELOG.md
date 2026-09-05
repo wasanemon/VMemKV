@@ -26,6 +26,16 @@ tagged releases yet — everything below is unreleased.
 - `Value` is a real template parameter (`PSkipList<Key, Value = uint64_t, Compare>`), any
   trivially-copyable type — backed by a per-node seqlock, not a single CAS'd word, so there
   are no reserved/forbidden payload values and no bit width limit.
+- Upper levels are chunked: each DRAM search node (`UpperChunk`) holds up to 32 (key,
+  durable_offset) entries clustered around the same region of key space instead of exactly
+  one, cutting the number of random-access hops a search pays per level. Entries are packed
+  into an existing chunk via a lock-free slot claim whenever one has room; a chunk that fills
+  up is never split or rebalanced — the next key in its territory just gets its own new chunk,
+  spliced in beside it. Chunk (and, before that, plain single-key node) memory is bump-allocated
+  from a block arena (`UpperArena`) rather than individual `::operator new`/`delete` calls,
+  mirroring RocksDB's memtable `Arena`; a block's buffer is only actually freed once every node
+  it holds has been retired and `reclaim()`'s own epoch-based drain confirms no writer could
+  still hold a stale reference into it.
 
 ### Fixed
 

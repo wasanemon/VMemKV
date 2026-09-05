@@ -14,18 +14,20 @@ namespace pskiplist {
 //
 // `start_id`/`start_word` is where the walk begins (a search hint); if it's already marked,
 // the walk restarts from the guaranteed-live `fallback_id`/`fallback_word` (a list head)
-// instead. `is_dead` is an external deletion signal (the upper levels have none of their
-// own — an UpperNode borrows Level 0's tombstone state via this hook; Level 0 always passes
-// false). On finding a marked node, this helps splice it out, reports it via `on_splice` on a
-// winning CAS, and restarts from the start. Returns the first node with key >= `key`, or
-// Traits::null_id() if the list runs out; `*out_pred` receives its predecessor.
+// instead. Marking a node for deletion is entirely the caller's job (remove()'s
+// unlink_upper_levels()/physically_unlink_best_effort() do this directly, with a
+// retry-until-success loop — see marked_list_mark_for_deletion below) — this function only
+// ever *discovers* an already-marked node (via `Traits::is_marked`, read straight off the
+// node's own next-word, no other node touched) and helps splice it out, reporting the splice
+// via `on_splice` on a winning CAS, then restarts from the start. Returns the first node with
+// key >= `key`, or Traits::null_id() if the list runs out; `*out_pred` receives its
+// predecessor.
 template <typename Identity,
           typename Traits,
           typename Key,
           typename Less,
           typename NextWordFn,
           typename KeyFn,
-          typename IsDeadFn,
           typename OnSpliceFn>
 [[nodiscard]] auto marked_list_find(Identity start_id,
                                     std::atomic<uint64_t> &start_word,
@@ -35,7 +37,6 @@ template <typename Identity,
                                     Less less,
                                     NextWordFn next_word,
                                     KeyFn key_of,
-                                    IsDeadFn is_dead,
                                     OnSpliceFn on_splice,
                                     Identity *out_pred) -> Identity {
   Identity anchor_id = start_id;
@@ -55,11 +56,7 @@ template <typename Identity,
         *out_pred = pred;
         return current;
       }
-      uint64_t current_raw = next_word(current).load(std::memory_order_acquire);
-      if (!Traits::is_marked(current_raw) && is_dead(current)) {
-        marked_list_mark_for_deletion<Identity, Traits>(current, next_word);
-        current_raw = next_word(current).load(std::memory_order_acquire);
-      }
+      const uint64_t current_raw = next_word(current).load(std::memory_order_acquire);
       if (Traits::is_marked(current_raw)) {
         const Identity successor = Traits::value(current_raw);
         uint64_t expected = Traits::pack(current, false);

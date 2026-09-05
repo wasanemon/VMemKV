@@ -11,5 +11,6 @@
 #include "pskiplist/detail/mmap_file.hpp"
 #include "pskiplist/detail/skiplist.hpp"
 #include "pskiplist/detail/tombstone.hpp"
-#include "pskiplist/detail/upper_node.hpp"
+#include "pskiplist/detail/upper_arena.hpp"
+#include "pskiplist/detail/upper_chunk.hpp"
 #include "pskiplist/detail/version.hpp"
