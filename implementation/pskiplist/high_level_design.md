@@ -12,15 +12,15 @@ listライブラリである。特定のKVSに依存しない独立したライ�
 
 ```mermaid
 flowchart LR
-    subgraph L2["Level 2 — DRAM only（探索高速化用、recovery時にLevel 0から再構築）"]
+    subgraph L2["Level 2 — DRAM only、チャンク単位（探索高速化用、recovery時にLevel 0から再構築）"]
         direction LR
-        h2((head)) --> a2[5] --> c2[42] --> t2((tail))
+        h2((head)) --> a2["chunk(primary=5)<br/>{5}"] --> t2((tail))
     end
-    subgraph L1["Level 1 — DRAM only"]
+    subgraph L1["Level 1 — DRAM only、チャンク単位(2.4.1節)"]
         direction LR
-        h1((head)) --> a1[5] --> b1[18] --> c1[42] --> t1((tail))
+        h1((head)) --> a1["chunk(primary=5)<br/>{5, 18}"] --> c1["chunk(primary=42)<br/>{42}"] --> t1((tail))
     end
-    subgraph L0["Level 0 — durable・offsetベース（正しさの唯一の根拠）"]
+    subgraph L0["Level 0 — durable・offsetベース、1ノード1キー（正しさの唯一の根拠）"]
         direction LR
         h0((head)) --> a0[5] --> b0[18] --> c0[42] --> d0[57] --> t0((tail))
     end
@@ -30,15 +30,17 @@ flowchart LR
 
 ```c++
 struct DurableNode {
-    std::atomic<uint64_t> epoch;              // 作成時のグローバルepoch（crash-safety用、不変）
+    std::atomic<uint64_t> epoch;                 // 作成時のグローバルepoch（crash-safety用、不変）
     Key key;
-    Value value;                              // 状態(live/tombstoned-linked/tombstoned-unlinked)を
-                                               // value内の専用ビットで表現(4章)
-    std::atomic<uint64_t> checkpointed_value; // valueのshadow。checkpoint境界を跨いだ
-                                               // in-place変更の巻き戻しに使う(4.1節)
-    std::atomic<uint64_t> mutation_epoch;     // valueへの直近の変更のepoch
-    std::atomic<Offset> forward0;             // Level 0の次ノードへのoffset + 論理削除markビット(4.2節)
-    std::atomic<Offset> next_checkpoint_unlink; // checkpoint待ちの物理unlinkキュー専用リンク(2.3節)
+    std::atomic<NodeState> state;                // live / tombstoned-linked / tombstoned-unlinked(4章)
+    std::atomic<NodeState> checkpointed_state;   // stateのshadow(4.1節)
+    std::atomic<uint64_t> version;               // valueを保護するseqlock。偶数=安定、奇数=書き込み中(4.1節)
+    Value value;                                 // 呼び出し側が指定する型。plainフィールド(非atomic)
+    Value checkpointed_value;                    // valueのshadow(4.1節)
+    std::atomic<uint64_t> mutation_epoch;        // value/stateへの直近の変更のepoch
+    std::atomic<Offset> forward0;                // Level 0の次ノードへのoffset + 論理削除markビット(4.2節)
+    std::atomic<Offset> next_checkpoint_unlink;  // checkpoint待ちの物理unlinkキュー専用リンク(2.3節)
+    std::atomic<bool> pending_checkpoint_unlink_queued; // 上記キューへの二重登録防止フラグ
 };
 ```
 
@@ -50,12 +52,12 @@ struct DurableNode {
 - `Offset`の最上位ビット(bit 63)は、物理unlinkのhelping(4.2節)が使うmarkビットとして
   予約する。実際に表現できるoffset値は下位63ビットの範囲(`kNullOffset`もこの範囲に
   収まるsentinel値)であり、ノード数の実用上の上限に対して十分すぎるほど余裕がある。
-- **`Value`は64bit以下の、単語1つでアトミックに書き換えられる型に限る**(`Key`も同様に
-  固定長)。より大きなデータを扱いたい場合は、`Value`に呼び出し側管理の外部ストレージへの
-  offsetやポインタを自分で埋め込む(pskiplist自身はその先の中身を一切関知しない)。この
-  制約が4章の並行アルゴリズムの単純さを直接支えている。
-- `value`は実データに加えて**3値の状態(live / tombstoned-linked / tombstoned-unlinked)**
-  を専用ビットで持つ。この状態遷移がput/remove/物理unlinkの調停点になる(4章)。
+- **`Value`はテンプレートパラメータであり、trivially-copyableであれば任意の型・任意サイズを
+  受け付ける**(`Key`も同様の制約)。単一ワードへのCASでは表現できないため、`value`自体は
+  plainフィールドとし、専用のseqlock(`version`)で読み書きを保護する(4.1節)。
+- **状態(live / tombstoned-linked / tombstoned-unlinked)は`value`とは独立した専用フィールド
+  `state`が持つ**。この状態遷移がput/remove/物理unlinkの調停点になる(4章)。`checkpointed_state`
+  は`checkpointed_value`と対になるshadowで、両者を同時に退避・巻き戻しする理由は4.1節を参照。
 
 ### 2.2 Level 0が正しさの唯一の根拠
 
@@ -90,16 +92,71 @@ mark-and-sweepで済む。永続化はしない——起動時と稼働中で補
 ### 2.4 上位レベル(volatile)
 
 各レベル(Level 1以降)を、それぞれ独立したlock-free listとして持つ。skip list全体は
-これらのlock-free listの集まりとして構成される。put()は対象ノードが参加する各レベルの
-lock-free listへ、bottom-up(Level 0から順に上位へ)でリンクしていく。
+これらのlock-free listの集まりとして構成される。
 
 - Level 1以降は純粋なDRAM構造で、mmap'dファイルには一切存在しない。プロセス再起動の
   たびにrecovery時のLevel 0走査から作り直す(2.2節)。
 - offsetではなく通常のポインタでよい——ASLR安全性やoffsetエンコーディングはLevel 0
   のみの関心事であり、上位レベルには適用されない。
-- 確保・解放は通常のC++アロケータでよい(`new`等)。crashをまたいで生存する必要が
-  ないため、可変長データ特有のfragmentation・回収問題を心配する必要がない。
-- メモリ安全性(reclaim)は3章と同じEBRレジストリを流用する。新しいepochカウンタは
+
+#### 2.4.1 チャンク化: 1ノードに複数キーを持たせる
+
+各レベルのlock-free listのノード(`UpperChunk`)は、**1キーではなく、同じ領域のkeyを
+最大32件クラスタ化して**持つ。1キーごとに独立したノードを作る古典的な設計は、ノード数分の
+ポインタチェイシングを探索のたびに強いる——ノード自体を数十件束ねることで、この
+ランダムアクセス回数を削減する。
+
+```c++
+struct UpperChunk {
+    static constexpr int kCapacity = 32;
+    struct Entry {
+        Key key;
+        Offset durable_offset;
+        std::atomic<bool> published;  // スロット確保と公開を分離するフラグ
+        std::atomic<bool> live;       // 個別エントリの削除フラグ
+    };
+    Key primary_key;                  // このチャンクの outer list 上の位置を決める、不変のルーティングキー
+    Offset primary_offset;
+    std::atomic<int> claimed;         // 次に払い出すエントリスロットのインデックス
+    std::atomic<int> live_count;      // 生きているエントリ数。0になったらチャンク全体を回収する
+    Entry entries[kCapacity];
+    std::atomic<uint64_t> forwards[/* height */];
+};
+```
+
+- `primary_key`/`primary_offset`はチャンク生成時に一度だけ決まり、生存期間を通じて不変
+  ——このチャンクのouter listにおける「位置」そのものであり、対応するキーの生死とは独立。
+- 新規キーの挿入は、`primary_key`比較でouter listを辿って見つけた担当チャンクへ、
+  `claimed`のfetch-addによるロックフリーなスロット確保で追加する(**fast path**)。
+  outer listへの変更は一切発生しない。
+- チャンクが満杯(`claimed >= kCapacity`)なら、そのキー自身を`primary_key`とする新しい
+  チャンクを、既存の1キー1ノード設計と同じCASベースの各レベル挿入でouter listに繋ぐ
+  (**slow path**)。これは満杯チャンクの担当領域を暗黙に分割することになるが、
+  **split/mergeは一切行わない**——既存エントリの再配置・再バランスは発生しない。
+- 削除は該当エントリの`live`をfalseにするCASのみ。`live_count`が0になった時点で、
+  そのチャンク全体をouter listの全レベルからmark-and-help-splice(4.2節と同じ機構)で
+  切り離し、EBR経由でアレナへ返す。
+- 探索(`primary_key < target`となる直近のチャンクを辿った後、そのチャンクの最大
+  kCapacity件のエントリを線形スキャンして「target未満で最大のkey」を選ぶ)は、
+  outer listのcascade top-downウォーク自体は1キー1ノード時代と同じ形のまま
+  (`primary_key`で比較する)。ノード自体の生死確認は、専用の生存確認関数を持たず、
+  outer listの各ノード固有のforward wordのmarkビットのみに一本化されている——
+  markされていないノードは無条件に「探索対象」として扱われ、tombstone化との整合性は
+  4.2節のhelping機構が保証する。
+
+#### 2.4.2 アレナ割り当て
+
+`UpperChunk`(および、チャンク化以前は1キー1ノードだった頃のノード)は個別の`new`ではなく、
+ブロック単位のbump-pointerアレナ(`UpperArena`)から確保する。
+
+- アレナは固定サイズのブロックを順に確保し、各ブロック内はatomicなbump offsetで
+  スロットを払い出す。ブロックが埋まったら新しいブロックを設置し、古いブロックは
+  「retired」とマークする。
+- ブロックの実際の解放(`delete[]`)は、そのブロックから確保された全ノードが回収され
+  (`live_count`が0になり)、かつブロックがretired済みになった後、**さらに`reclaim()`の
+  EBR quiescence確認(3章)を経てから**行う——`current_`ポインタを読んだ直後にプリエンプト
+  されたwriterが、retired済みのブロックへ古い参照でCASを試みる可能性を排除するため。
+  メモリ安全性(reclaim)自体は3章と同じEBRレジストリを流用し、新しいepochカウンタは
   不要。
 
 ### 2.5 レベル生成パラメータ
@@ -233,10 +290,10 @@ put/get/removeの呼び出し区間は互いに重なってよいが、結果は
 矛盾しない。その一瞬(linearization point)は以下の通り:
 
 - **put(新規キー)**: predecessorのforward[0]をノードへリンクするCAS。
-- **put(既存ノードへの書き込み)**: ノード自身の`value`を、読み取った現在の状態を期待値と
-  するCASで`live`+新valueへ書き換える(4.1節)。
-- **remove**: ノード自身の状態を`live`から`tombstoned-linked`へ書き換えるCAS
-  (期待値=現在のvalue、失敗したら読み直して再試行)。Level 0からの物理unlinkは
+- **put(既存ノードへの書き込み)**: ノード自身の`value`をseqlock経由で新しい値へ書き換える、
+  その解放ストア(`version`を`+2`)の瞬間(4.1節)。
+- **remove**: ノード自身の`state`を`live`から`tombstoned-linked`へ書き換えるCAS
+  (期待値=`live`、失敗したら読み直して再試行)。Level 0からの物理unlinkは
   この後の別イベントであり、linearization pointには影響しないが、reclaim(2.3節)の
   安全性のためには4.2節の手順で正しく完了させる必要がある。
 - **get/scan**: Level 0の該当区間を読み終えた時点。
@@ -245,33 +302,49 @@ put/get/removeの呼び出し区間は互いに重なってよいが、結果は
 見つけている。もしリンクより前に到達していれば、`42`はまだ存在しないものとして
 「not found」を返す——どちらも正しい(実際の実行順序のどこかと矛盾しない)。
 
-### 4.1 ノード状態(live / tombstoned-linked / tombstoned-unlinked)の遷移
+### 4.1 ノード状態(live / tombstoned-linked / tombstoned-unlinked)の遷移とvalueの読み書き
 
-`value`が持つ3値の状態(2.1節)への書き込みは、すべて同じ1ワードに対するCASとして
-表現され、競合はCASの成否だけで調停される。
+状態(2.1節の`state`)とvalueは別々のフィールドであり、調停の仕組みも異なる。
 
-- **put(既存ノードへの書き込み)**: 期待値=読み取った現在の状態、望む値=`live`+新value。
-- **remove**: 期待値=`live`+現在のvalue、望む値=`tombstoned-linked`+同じvalue。
+**状態遷移**はすべて`state`フィールド単体へのCASとして表現され、競合はCASの成否だけで
+調停される。
+
+- **remove**: 期待値=`live`、望む値=`tombstoned-linked`。
+- **resurrect**(put()が既存のtombstoned-linkedノードへ書き込む場合): 期待値=
+  `tombstoned-linked`、望む値=`live`。
 - **物理unlinkの第一歩**: 期待値=`tombstoned-linked`、望む値=`tombstoned-unlinked`。
   predecessorの実ポインタを書き換えるのはこの後の別ステップ(4.2節)であり、
   `find()`/`get()`/`scan()`はいずれも辿り着いたノード自身の状態を見て判定するため、
   predecessorのポインタが多少古くても読み取り結果は正しい。ただし物理回収(2.3節)の
   安全性のためには、4.2節の手順でこの物理unlinkを正しく完了させる必要がある。
 
-put(既存ノードへの書き込み)と物理unlinkの第一歩は、同じノードの同じワードに対して
-異なる期待値でCASを試みる関係になる。どちらか一方が成功すれば、他方のCASは期待値
-不一致で自動的に失敗する——resurrectが先に成功していればunlinkは何もせず諦めればよく、
-unlinkが先に成功していればput()は「このノードはもう存在しない」と判定して`find()`から
-やり直せばよい。事後に到達可能性を別途確認する手順は不要——CASの成否そのものが
-判定になる。
+resurrectと物理unlinkの第一歩は、同じノードの同じ`state`フィールドに対して異なる
+期待値でCASを試みる関係になる。どちらか一方が成功すれば、他方のCASは期待値不一致で
+自動的に失敗する——resurrectが先に成功していればunlinkは何もせず諦めればよく、unlinkが
+先に成功していればput()は「このノードはもう存在しない」と判定して`find()`からやり直せば
+よい。事後に到達可能性を別途確認する手順は不要——CASの成否そのものが判定になる。
 
-**checkpoint境界を跨いだ巻き戻し**: put/removeいずれも、対象ノードのvalueが最後に
-checkpointされた時点のもの(=このcheckpoint区間で初めて触る)であれば、CASの直前に
-現在のLive値を`checkpointed_value`(2.1節)へ退避し、`mutation_epoch`を現在epochへ
-更新する。`recover()`は、到達したノードの`mutation_epoch`がmanifestのepochより新しければ
-一律`checkpointed_value`へ差し戻す——putの新しい値もremoveのtombstone化も同じ1ワードへの
-CASなので、退避すべき「直前の値」は常に同じ形で表現でき、update由来かremove由来かを
-区別する必要がない。
+**valueの読み書きはseqlock**(`version`、2.1節)で保護する。単一ワードのCASでは表現
+できない任意サイズのValueを安全に読み書きするための仕組みで、状態遷移のCASとは独立に
+動作する。
+
+- **書き込み側**(put()の値更新、remove()のshadow退避のみの呼び出し): `version`を偶数→
+  奇数へCASして排他権を得る→(下記のshadow退避)→plainフィールドの`value`を書き換える→
+  `version`を`+2`してstoreし解放する。
+- **読み取り側**(get/scan): `version`をacquireでロードし、奇数(書き込み中)ならyieldして
+  リトライ。偶数なら`value`をplainに読み、acquire fenceの後もう一度`version`を読んで
+  最初の値と一致するか確認する——不一致なら書き込みと競合したとみなし最初からリトライする
+  (古典的なseqlock read-retryパターン)。
+
+**checkpoint境界を跨いだ巻き戻し**: 書き込み側が排他権を得た直後、対象ノードの
+`mutation_epoch`がまだ直近のcheckpoint epoch以下(=このcheckpoint区間で初めて触る)
+であれば、現在の`value`/`state`をそれぞれ`checkpointed_value`/`checkpointed_state`
+(2.1節)へ退避してから`mutation_epoch`を現在epochへ更新する。`recover()`は、到達した
+ノードの`mutation_epoch`がmanifestのepochより新しければ、`value`と`state`を一律shadowへ
+差し戻す。**valueとstateを両方まとめて退避・巻き戻す**のは、片方だけでは不整合が
+起こり得るため——例えば削除→checkpoint→resurrectの途中でcrashした場合、valueだけを
+巻き戻すとstateがtombstoned-linkedのまま残り、正しく復元されたはずのlive valueが
+recover()の後始末パス(7章)によって誤って物理unlinkされてしまう。
 
 ### 4.2 物理unlinkのhelping
 
@@ -281,7 +354,7 @@ CASなので、退避すべき「直前の値」は常に同じ形で表現で�
 `get`/`put`/`remove`/`scan`が共有する探索処理(`find`)の中で、lock-freeなhelpingとして
 完了する。専用のロックは持たない。
 
-- 物理unlinkの第一歩(`value`をtombstoned-unlinkedへCAS)に成功した直後、対象ノード
+- 物理unlinkの第一歩(`state`をtombstoned-unlinkedへCAS)に成功した直後、対象ノード
   自身の`forward0`に対して、現在のsuccessorを保ったままmarkビット(2.1節)を立てる
   CASを行う。successorが他の並行insertによって変わっていれば、最新のsuccessorで
   読み直して再試行する。
@@ -374,8 +447,13 @@ msync()と競合するケースまで)網羅しようとすると組み合わせ
   crash注入・並行アクセステストで実証することが最初のマイルストーンである。
 - **上位レベルのrecoveryコスト**: Level 0権威(2.2節)によりtorn writeは回避できるが、
   recovery時の上位レベル再構築はO(corpus)でデータサイズに比例して増える。
-- **キャッシュ局所性**: flat arrayのbinary searchと比べ、skip listはポインタ(offset)
-  チェイスなのでキャッシュミスが増える。2.1節のノードレイアウト以外の対策は未検討。
+- **キャッシュ局所性**: 上位レベルのチャンク化・アレナ割り当て(2.4節)により、ポインタ
+  チェイス1回あたりのコストと総ホップ数はともに素朴な1ノード1キー設計より改善したが、
+  なおflat arrayのbinary searchより遅い——各ホップは依存関係のあるランダムメモリアクセス
+  であり、配列添字の計算のように先読みで隠せない。加えてLevel 0自体のノード配置は
+  挿入順のoffsetであり、key順ではない。`scan()`のようにLevel 0を連続してkey順に辿る
+  操作では、この配置自体がボトルネックになり得る——range partitioningのような、
+  Level 0自体の物理配置をkey順に近づける設計は未着手。
 - **checkpoint()の同時呼び出しの効率化**: 現状は`std::mutex`による直列実行(5章)。
   nbMontageは複数の`sync()`呼び出しを、共有epochカウンタを目標値まで押し上げる
   協調的な1回の操作にまとめる設計(データを直近2 epoch分保持するバッファを前提とする)
@@ -411,6 +489,7 @@ msync()と競合するケースまで)網羅しようとすると組み合わせ
 | 上位レベル(volatile)のノードで、forwardポインタ群を1つの連続領域に確保する(2.4節) | Tickiのブログ(UPSkipList論文が引用) | レベルを跨ぐ探索でのキャッシュミス削減。durableなノード(2.1節)はforward0の1本のみなので対象外 |
 | なぜRECIPEをそのまま使わないか | RECIPE(Lee et al.) | Herlihy系lock-free skip listのnon-blocking・non-repairing writeはRECIPEの3条件いずれにも合致せず、直接は変換できない(UPSkipList論文の分析による) |
 | 固定容量+sparse fileでの余裕を持ったサイジング(2.6節) | LMDB | 稼働中の容量拡張非対応という同じ制約を持ちながら実運用されている前例 |
+| 上位レベルノードのブロック単位bump-pointerアレナ割り当て(2.4.2節) | RocksDBのmemtable `Arena` | 個別`new`/`delete`をブロック単位の確保に置き換え、局所性と確保コストを改善する設計。ブロックの解放タイミングをEBR quiescenceに委ねる部分は本ライブラリ独自の拡張 |
 
 ## 9. 参考文献
 
@@ -440,3 +519,7 @@ msync()と競合するケースまで)網羅しようとすると組み合わせ
   concurrent skip list(Dick et al.のrotating skip list)にdelete込みで適用・実測済み。
   `pretire`/`pdetach`によるanti-node方式で、構造自身のSMRとcrash-safeな自動回収を
   組み合わせる——3章のepoch設計の直接の先行例。)
+- RocksDB `memory/arena.h`/`memtable/skiplist.h`.
+  <https://github.com/facebook/rocksdb/blob/main/memory/arena.h>
+  (memtableのskip listノードをブロック単位のbump-pointerアレナから確保する設計。
+  2.4.2節のUpperArenaの直接の参照元。)
