@@ -14,7 +14,7 @@ namespace pskiplist {
 inline constexpr uint32_t kManifestMagic = 0x504b4c31;  // "PKL1"
 inline constexpr uint8_t kManifestFormatVersion = 1;
 
-// 32B fixed manifest header (3章). A mismatched format_version is treated identically to
+// 32B fixed manifest header (§3). A mismatched format_version is treated identically to
 // a missing manifest — no migration is implemented.
 struct ManifestHeader {
   uint32_t magic = kManifestMagic;
@@ -44,7 +44,7 @@ static_assert(sizeof(ManifestHeader) == 32);
   return path;
 }
 
-// Writes the manifest for `data_path` via temp file + fsync + atomic rename (3章), so a
+// Writes the manifest for `data_path` via temp file + fsync + atomic rename (§3), so a
 // reader never observes a partially-written manifest.
 inline void write_manifest(const std::filesystem::path &data_path, uint64_t epoch, uint64_t high_water_mark) {
   ManifestHeader header;

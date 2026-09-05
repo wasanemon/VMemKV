@@ -31,7 +31,7 @@ constexpr uint64_t kUncheckpointedValue = 111;
 // report it cleanly instead of letting it escape uncaught.
 auto run() -> int {
   // PSkipList is backed by a single mmap'd file, MAP_SHARED, mutated in place.
-  // capacity_bytes is fixed for the mapping's lifetime (see high_level_design.md 2.6節);
+  // capacity_bytes is fixed for the mapping's lifetime (see high_level_design.md §2.6);
   // here it's sized for 1000 usable nodes plus the head/tail sentinels. Reopening later
   // must use this exact same capacity_bytes.
   const auto path = std::filesystem::temp_directory_path() / "pskiplist_basic_usage_example.dat";

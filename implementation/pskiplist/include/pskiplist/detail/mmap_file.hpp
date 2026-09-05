@@ -71,7 +71,7 @@ class MmapFile {
   // PSkipList uses this to decide whether to run recovery instead of a fresh init.
   [[nodiscard]] auto reused() const -> bool { return reused_; }
 
-  // Blocks until the mapping's dirty pages are durable on the underlying storage (3章).
+  // Blocks until the mapping's dirty pages are durable on the underlying storage (§3).
   void sync() const {
     if (::msync(data_, size_, MS_SYNC) != 0) {
       throw std::system_error(errno, std::generic_category(), "msync");

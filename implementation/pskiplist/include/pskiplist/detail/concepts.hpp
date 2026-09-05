@@ -5,7 +5,7 @@
 
 namespace pskiplist {
 
-// Key is stored as raw bytes directly in the mmap'd file (2.1節) and is never
+// Key is stored as raw bytes directly in the mmap'd file (§2.1) and is never
 // placement-new constructed slot-by-slot — only trivially copyable types can be safely
 // read from and overwritten onto memory that was never explicitly constructed.
 template <typename Key>

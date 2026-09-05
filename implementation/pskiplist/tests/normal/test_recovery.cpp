@@ -180,7 +180,7 @@ TEST_CASE("recovered state can be extended with further writes and checkpoints")
 }
 
 // Large enough that the geometric level distribution (p=1/4) all but guarantees many nodes
-// reach level 2+, exercising recover()'s upper-level rebuild (2.4節) over a non-trivial
+// reach level 2+, exercising recover()'s upper-level rebuild (§2.4) over a non-trivial
 // chain rather than just the 1-2 node cases above.
 TEST_CASE("reopening a large corpus recovers every live key and stays queryable") {
   TempFile tmp("recover_large_corpus");
