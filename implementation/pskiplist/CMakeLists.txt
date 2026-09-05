@@ -58,11 +58,11 @@ add_subdirectory(examples)
 # Header-only library, so there's nothing to analyze directly — instead this analyzes
 # the detail/ headers as reached transitively through examples/basic_usage.cpp
 # (HeaderFilterRegex below keeps reported findings scoped to detail/). Deliberately not
-# the tests/ .cpp files, unlike vmemkv's clang-tidy-check target: the library's public
-# API surface is fully exercised by the example alone (including a checkpoint + a
-# recovery), so nothing is lost by not also treating the tests themselves as driver
-# files — and doing so would mean checks like readability-magic-numbers and
-# readability-identifier-length firing constantly on ordinary test assertions.
+# the tests/ .cpp files: the library's public API surface is fully exercised by the example
+# alone (including a checkpoint + a recovery), so nothing is lost by not also treating the
+# tests themselves as driver files — and doing so would mean checks like
+# readability-magic-numbers and readability-identifier-length firing constantly on ordinary
+# test assertions.
 find_program(CLANG_TIDY_PROGRAM clang-tidy)
 if(CLANG_TIDY_PROGRAM)
   add_custom_target(clang-tidy-check

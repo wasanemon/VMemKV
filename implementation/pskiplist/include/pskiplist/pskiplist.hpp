@@ -1059,8 +1059,7 @@ class PSkipList {
     nodes_[kHead].forward0.store(pack_forward(kTail, false), std::memory_order_relaxed);
   }
 
-  // Seqlock read of `value`, mirroring the classic read-retry pattern (load version, read data,
-  // fence, re-check version unchanged) — same idea as vmemkv's own T2FlatFile record seqlock.
+  // Classic seqlock read: load version, read data, fence, re-check version unchanged.
   [[nodiscard]] auto read_value(Offset offset) const -> Value {
     const auto &node = nodes_[offset];
     for (;;) {

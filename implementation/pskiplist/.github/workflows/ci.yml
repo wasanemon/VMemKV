@@ -1,16 +1,10 @@
-name: pskiplist CI
+name: CI
 
 on:
   push:
     branches: [ main, master ]
-    paths: [ 'implementation/pskiplist/**', '.github/workflows/pskiplist-ci.yml' ]
   pull_request:
     branches: [ main, master ]
-    paths: [ 'implementation/pskiplist/**', '.github/workflows/pskiplist-ci.yml' ]
-
-defaults:
-  run:
-    working-directory: implementation/pskiplist
 
 jobs:
   build-and-test:
@@ -80,4 +74,4 @@ jobs:
       # tsan_suppressions.txt: read_value()/write_value_locked()'s seqlock does a plain
       # (non-atomic) read/write of each node's value, by design -- see that file's own comment.
       # No effect on the address,undefined job (TSAN_OPTIONS is simply unused there).
-      run: TSAN_OPTIONS="suppressions=${{ github.workspace }}/implementation/pskiplist/tsan_suppressions.txt" ctest --test-dir build --output-on-failure
+      run: TSAN_OPTIONS="suppressions=${{ github.workspace }}/tsan_suppressions.txt" ctest --test-dir build --output-on-failure
