@@ -137,6 +137,13 @@ class StoreAdapter {
   // T1-only in-memory merge. Never touches T2, never persists a checkpoint. Rival backends
   // define their own no-op reorganize() (they self-manage compaction), so this delegates
   // unconditionally rather than needing an is_rival_store_v branch.
+  //
+  // Forces every T1 shard through a full synchronous merge, so cost is O(total corpus), not O(one
+  // shard) -- the automatic per-shard background maintenance in ShardedT1Index already keeps
+  // steady-state maintenance cost bounded regardless of corpus size, so production code should
+  // rely on that rather than call this. This method exists for callers that need every entry
+  // deterministically merged right now (tests asserting exact post-merge state, or benchmarks
+  // deliberately measuring the cost of a full forced maintenance pass).
   void reorganize() { impl_.reorganize(); }
 
   // Always persists a checkpoint via the cheapest available path (see VMemKVImpl::checkpoint()).

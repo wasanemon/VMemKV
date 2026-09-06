@@ -37,6 +37,14 @@ concept KVStore = requires(Store store, std::span<const std::byte> key, std::spa
   // StoreAdapter::bulk_load()'s own doc comment for its (weaker than insert/update)
   // durability contract.
   store.bulk_load(std::size_t{0}, [](std::size_t) { return std::string{}; }, [](std::size_t) { return std::string{}; });
+
+  // Maintenance/introspection surface. StoreAdapter provides all three unconditionally for every
+  // backend -- reorganize() because each rival defines its own no-op, checkpoint()/get_statistics()
+  // via StoreAdapter's own is_rival_store_v branch -- so requiring them here just makes that
+  // already-uniform guarantee explicit and catches a future rival that forgets its no-op.
+  { store.reorganize() } -> std::same_as<void>;
+  { store.checkpoint() } -> std::same_as<void>;
+  { store.get_statistics() } -> std::same_as<VMemKVStatistics>;
 };
 
 // ─── Production Recommended Store ──────────────────────────────────────────

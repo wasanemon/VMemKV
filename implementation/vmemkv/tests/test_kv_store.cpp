@@ -896,7 +896,7 @@ TEST_CASE("VMemKV: checkpoint preserves correctness across garbage from update/r
   CHECK_FALSE(test_util::get_bytes_sync(store, "k1").has_value());
   auto got = test_util::get_bytes_sync(store, "k2");
   if (!got.has_value()) {
-    FAIL("missing k2 after reorganize");
+    FAIL("missing k2 after checkpoint");
   }
   CHECK(as_string(*got) == val2);  // NOLINT(bugprone-unchecked-optional-access)
 }
@@ -910,9 +910,8 @@ TEST_CASE_TEMPLATE("scan with integral keys verifies lexicographical ordering", 
   store->insert(kScanTen, kScanTen);
   store->insert(2U, 2U);
 
-  // reorganize() moves append_region to sorted_region, required for ordered scan results.
-  store->reorganize();
-
+  // No reorganize() here on purpose: scan() merges the sorted and append regions live and sorts
+  // the combined result, so ordering holds regardless of which region each key currently sits in.
   std::vector<uint64_t> keys;
   const size_t scan_count =
       store->scan(kScanStart,

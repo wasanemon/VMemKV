@@ -352,6 +352,24 @@ T2とWALは既存どおりグローバル(シャード非依存)のまま維持�
   見られる。根本原因未特定(次のステップ参照)。`tests/test_sharded_t1_index.cpp`の該当テストは
   この極端な設定でのデータ整合性チェックを意図的に含めていない。
 
+- 済: シャーディング後の公開API整理。`KVStore`コンセプト(`include/vmemkv/vmemkv.hpp`)に
+  `reorganize()`/`checkpoint()`/`get_statistics()`を追加(いずれも`StoreAdapter`が全バックエンド
+  向けに無条件で提供済み——`reorganize()`は各rivalが自前no-opを持つため、`checkpoint()`/
+  `get_statistics()`は`StoreAdapter`側の`is_rival_store_v`分岐によるため、コンセプトへの追加は
+  既存の保証を型レベルで明示するだけで済んだ)。`store_adapter.hpp`の`reorganize()`の
+  doc commentに、これがシャーディング後は依然O(全コーパス)であり(`checkpoint_all_shards()`で
+  全シャードを強制同期マージするため)、本番の定常的なメンテナンスはシャードごとの自動背景
+  ワーカーに任せるべきで、このメソッドはテストの決定的な検証や、意図的に重い強制メンテナンス
+  ジョブを計測するベンチマーク向けの用途として残していることを明記。`bench_kv.cpp`が
+  カスタムコンテキストとして出力していた`T1ReorganizeSoftThresholdPercent`/
+  `T1ReorganizeHardThresholdPercent`(シャーディング後は`t1_index.hpp`/`sharded_t1_index.hpp`
+  のどこからも参照されない死んだ設定値)を、実際に発火条件を制御する
+  `T1ShardTargetSizeEntries`/`T1ShardSplitThresholdPercent`の出力に置き換え。
+  `tests/test_kv_store.cpp`の「scan with integral keys verifies lexicographical ordering」
+  から不要な`reorganize()`呼び出しを削除(`scan()`が既にsorted/append両リージョンをライブに
+  マージ・ソートするため、順序保証にreorganize()は不要——コメントは削除前の実装を反映した
+  記述だった)。
+
 ## 未実装/次のステップ
 
 - 極端に小さいtarget_shard_size+高並行度+継続的な既存キー更新(cycling)の組み合わせで残る

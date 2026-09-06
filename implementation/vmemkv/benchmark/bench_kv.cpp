@@ -507,10 +507,10 @@ static void register_benchmark_context() {
   add_custom_context_from_env("memo", "VMEMKV_CONTEXT_memo");
   benchmark::AddCustomContext("t1_append_capacity_log2", std::to_string(vmemkv::Config<>::T1AppendCapacityLog2));
   benchmark::AddCustomContext("t1_append_capacity_entries", std::to_string(vmemkv::Config<>::T1AppendCapacityEntries));
-  benchmark::AddCustomContext("t1_reorganize_soft_threshold_percent",
-                              std::to_string(vmemkv::Config<>::T1ReorganizeSoftThresholdPercent));
-  benchmark::AddCustomContext("t1_reorganize_hard_threshold_percent",
-                              std::to_string(vmemkv::Config<>::T1ReorganizeHardThresholdPercent));
+  benchmark::AddCustomContext("t1_shard_target_size_entries",
+                              std::to_string(vmemkv::Config<>::T1ShardTargetSizeEntries));
+  benchmark::AddCustomContext("t1_shard_split_threshold_percent",
+                              std::to_string(vmemkv::Config<>::T1ShardSplitThresholdPercent));
 }
 
 class BenchmarkContextRegistrar {
