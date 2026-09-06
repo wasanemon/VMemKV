@@ -531,26 +531,32 @@ class VMemKVImpl {
 
   // Bounded poll, not an unconditional atomic::wait(): same rationale as reorg_worker_loop()'s
   // idle wait (see its comment) -- std::atomic<bool>::wait/notify's real-world guarantee doesn't
-  // rule out a missed wakeup, and this has no timed overload to bound it directly. Both call
-  // sites below only reach this while an actual reorganize is already in flight (either a manual
-  // reorganize()/checkpoint() call found one running, or insert/update/delete hit
-  // the hard backpressure limit), so the wait is inherently on the order of a reorganize's own
-  // duration (milliseconds to seconds) already -- kIdlePollInterval's latency is not perceptible
-  // against that, unlike a genuinely hot per-call path.
+  // rule out a missed wakeup, and this has no timed overload to bound it directly. Its only caller
+  // (run_reorganize(), below) only reaches this while another reorganize/checkpoint cycle
+  // (organic or another explicit caller's) is already in flight, so the wait is inherently on the
+  // order of a reorganize's own duration (milliseconds to seconds) already -- kIdlePollInterval's
+  // latency is not perceptible against that, unlike a genuinely hot per-call path.
+  //
+  // insert/update/delete never call this: T1's old append-region hard threshold used to block
+  // writers here directly, but that's gone now that ShardedT1Index handles its own per-shard
+  // backpressure internally (see request_maintenance_if_needed()/run_maintenance() in
+  // sharded_t1_index.hpp) -- this function now only serializes explicit reorganize()/checkpoint()
+  // callers (run_reorganize()'s single-flight-per-cycle contract) against a concurrently running
+  // cycle, whatever triggered it.
   void wait_until_reorg_not_running() const {
     constexpr auto kIdlePollInterval = std::chrono::milliseconds(10);
     const auto wait_start = std::chrono::steady_clock::now();
     while (reorg_running_.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(kIdlePollInterval);
     }
-    // Total wall-clock time writer threads spend genuinely blocked here, summed across all
-    // callers -- the actual QPS cost a checkpoint/reorg cycle imposes on writers, as opposed to
-    // checkpoint_internal()'s own wall-clock duration (most of which overlaps unblocked writer
-    // progress -- checkpoint_internal() resumes writers via WriterResumeGuard immediately after
-    // capturing its target, well before msync()/t1_.reorganize()/wal_.rotate_segment() run).
+    // Total wall-clock time explicit reorganize()/checkpoint() callers spent here waiting for a
+    // concurrent cycle to finish, summed across all callers -- as opposed to checkpoint_internal()
+    // 's own wall-clock duration (most of which overlaps unblocked writer progress --
+    // checkpoint_internal() resumes writers via WriterResumeGuard immediately after capturing its
+    // target, well before msync()/t1_.reorganize()/wal_.rotate_segment() run).
     const auto waited_us =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start).count();
-    total_hard_stall_duration_us_.fetch_add(static_cast<uint64_t>(waited_us), std::memory_order_relaxed);
+    total_reorganize_wait_duration_us_.fetch_add(static_cast<uint64_t>(waited_us), std::memory_order_relaxed);
   }
 
   // Shared wait/CAS/run/retry loop for the two public methods below. `mode` also decides
@@ -629,7 +635,7 @@ class VMemKVImpl {
             last_checkpoint_wal_rotate_leader_wait_us_.load(std::memory_order_relaxed),
         .last_checkpoint_bytes_synced = last_checkpoint_bytes_synced_.load(std::memory_order_relaxed),
         .last_checkpoint_corpus_bytes = last_checkpoint_corpus_bytes_.load(std::memory_order_relaxed),
-        .total_hard_stall_duration_us = total_hard_stall_duration_us_.load(std::memory_order_relaxed),
+        .total_reorganize_wait_duration_us = total_reorganize_wait_duration_us_.load(std::memory_order_relaxed),
         .append_region_live_count = t1_.append_region_live_count(),
         .append_region_peak_count = t1_.append_region_peak_count()};
   }
@@ -1464,7 +1470,7 @@ class VMemKVImpl {
   vmemkv::Wal wal_;
   std::atomic<uint64_t> checkpoint_count_{0};
   // See wait_until_reorg_not_running()'s own comment.
-  mutable std::atomic<uint64_t> total_hard_stall_duration_us_{0};
+  mutable std::atomic<uint64_t> total_reorganize_wait_duration_us_{0};
 
   bool recovering_ = false;  // True only during the constructor's initial WAL replay.
 

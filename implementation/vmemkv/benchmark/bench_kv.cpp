@@ -1150,8 +1150,8 @@ static void record_store_statistics(benchmark::State &state, StoreHolder<StorePt
       benchmark::Counter(static_cast<double>(stats.t1_split_count), benchmark::Counter::kDefaults);
   state.counters["Checkpoints"] =
       benchmark::Counter(static_cast<double>(stats.checkpoint_count), benchmark::Counter::kDefaults);
-  state.counters["Hard_Stall_Duration_us"] =
-      benchmark::Counter(static_cast<double>(stats.total_hard_stall_duration_us), benchmark::Counter::kDefaults);
+  state.counters["Reorganize_Wait_Duration_us"] =
+      benchmark::Counter(static_cast<double>(stats.total_reorganize_wait_duration_us), benchmark::Counter::kDefaults);
   state.counters["Append_Region_Live"] =
       benchmark::Counter(static_cast<double>(stats.append_region_live_count), benchmark::Counter::kDefaults);
   state.counters["Append_Region_Peak"] =

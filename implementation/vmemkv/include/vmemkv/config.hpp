@@ -130,11 +130,11 @@ struct VMemKVStatistics {
   uint64_t last_checkpoint_bytes_synced = 0;  // target - old_base_boundary: the msync()'d delta.
   uint64_t last_checkpoint_corpus_bytes = 0;  // target: total T2 footprint as of this cycle.
 
-  // Cumulative wall-clock time, summed across all writer threads, actually spent blocked in
-  // wait_until_reorg_not_running() (hard backpressure) -- the real writer-facing cost of a
-  // reorg/checkpoint cycle, as opposed to that cycle's own wall-clock duration (most of which
-  // overlaps unblocked writer progress).
-  uint64_t total_hard_stall_duration_us = 0;
+  // Cumulative wall-clock time, summed across all explicit reorganize()/checkpoint() callers,
+  // actually spent blocked in wait_until_reorg_not_running() waiting for a concurrently running
+  // cycle (organic or another explicit caller's) to finish -- as opposed to that cycle's own
+  // wall-clock duration (most of which overlaps unblocked writer progress).
+  uint64_t total_reorganize_wait_duration_us = 0;
 
   // T1Index::AppendRegion instances currently resident, and the high-water mark across this
   // store's lifetime. See T1Index::append_region_live_count()'s own comment: each carries a

@@ -383,9 +383,23 @@ T2とWALは既存どおりグローバル(シャード非依存)のまま維持�
   atomicとその2箇所の加算は削除)。あわせて、`maybe_reorganize_if_needed()`のT1閾値ロジック
   削除以来ずっと常に0だった`hard_stall_count`(`hard_stall_count_`atomic含め)も削除——
   「常に0を返すAPI互換目的の値」として残す判断は本番リリース前の現段階では不要と判断。
-  `total_hard_stall_duration_us`(`wait_until_reorg_not_running()`経由で今も生きている)は
-  変更なし。`bench_kv.cpp`のベンチマークカウンタ名も実体に合わせて`Reorgs_T1`→`T1_Splits`、
+  `bench_kv.cpp`のベンチマークカウンタ名も実体に合わせて`Reorgs_T1`→`T1_Splits`、
   `Reorgs_T2`→`Checkpoints`に変更し、常に0だった`Hard_Stalls`カウンタは削除。
+
+  `total_hard_stall_duration_us`(`wait_until_reorg_not_running()`経由)自体は生きた値だが、
+  その実装コメントとフィールドコメントは「insert/update/delete hit the hard backpressure
+  limit」「summed across all writer threads」など、旧T1のappend領域ハードスレッショルドが
+  書き込みを直接ブロックしていた頃の記述のまま残っていた。実際の呼び出し元を洗い直したところ
+  `run_reorganize()`内の1箇所のみで、書き込みパスからの直接呼び出しは(上記の閾値ロジック削除に
+  伴い)既に存在しない——コメントの「Both call sites below」は嘘になっていた。実態は「明示的な
+  `reorganize()`/`checkpoint()`呼び出しが、並行する別サイクル(organicまたは別の明示呼び出し)の
+  完了をどれだけ待たされたか」のみを表すため、`total_hard_stall_duration_us`を
+  `total_reorganize_wait_duration_us`に改名し、コメントを実態に合わせて修正
+  (`wait_until_reorg_not_running()`という関数名自体は変更不要——文字通り「reorgが実行中でなく
+  なるまで待つ」という動作を正しく表しているため)。機構自体(この待機)は
+  `run_reorganize()`の「呼んだら必ず1サイクル完了してから返る」という契約に必要なため削除
+  できない。`bench_kv.cpp`の対応するカウンタ名も`Hard_Stall_Duration_us`→
+  `Reorganize_Wait_Duration_us`に変更。
 
 - 済: YCSB-Eベンチマーク(`bench_kv.cpp`の`register_ycsb_e_benchmark()`)の強制トリガー
   スケジュールから`reorganize()`(t=5s)を撤去。従来のコメントは「known-cheap control」
