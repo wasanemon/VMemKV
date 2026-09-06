@@ -1,0 +1,2 @@
+{"job":"reorganize","scenario":"in_memory","value_size":1024,"key_count":10000000,"writer_threads":32,"job_elapsed_sec":1.48205,"insert_degradation_pct":50.862812,"update_degradation_pct":-4.271321,"scan_degradation_pct":14.557086,"timed_out":false}
+{"job":"checkpoint","scenario":"in_memory","value_size":1024,"key_count":10000000,"writer_threads":32,"job_elapsed_sec":3.72665,"insert_degradation_pct":48.644832,"update_degradation_pct":9.075694,"scan_degradation_pct":17.834162,"timed_out":false}

@@ -66,6 +66,23 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-09-07</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026090700_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i x5 (09/07)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <p class="mb-1.5">(<a href="2026090301_charts.html" class="text-indigo-600 hover:underline">09/03</a>時点比):</p>
+                <ul class="list-disc pl-4 space-y-1">
+                  <li><code>ShardedT1Index</code>(T1のrange-sharding、reorganize/checkpointコストのO(コーパスサイズ)問題を解消する設計)を<code>VMemKVImpl</code>へ結線し、split protocolの3件のバグ(重複キュー投入によるsplit中断でシャードが無制限肥大化、abortパスのリセット順序による永久stuck、split境界を跨ぐstraggler書き込みの実データ損失)を発見・修正した上での初のフルCRUDマトリクス+background jobs probe計測。</li>
+                  <li><code>KVStore</code>コンセプトに<code>reorganize</code>/<code>checkpoint</code>/<code>get_statistics</code>を追加。T1の統計を(シャーディング後は自動split経路を一切捕捉できていなかった)<code>t1_reorg_count</code>から実際のsplit回数を数える<code>T1_Splits</code>へ刷新。死んでいた<code>hard_stall_count</code>を削除し、<code>total_hard_stall_duration_us</code>は実態(明示的reorganize/checkpoint呼び出し同士の排他待ち時間)に合わせ<code>total_reorganize_wait_duration_us</code>に改名。YCSB-Eの強制reorganize()トリガーを撤去(シャーディング後は全シャード同期マージでO(コーパス)化しており、"軽量な対照"ではなくなった上、background-jobs-probeと計測が重複していたため)。</li>
+                  <li>Background Jobs計測結果(1KB&times;1,000万件、in_memory/ltm): reorganize() in_memory 1.482秒(Scan劣化15%)、ltm 14.082秒(Scan劣化2%) -- 09/03時点ではltmが60秒タイムアウトで未完了、in_memoryのScan劣化は83%だった。シャーディング導入前に問題視されていた「コーパス増大に伴うreorganize/checkpointコスト増大」が、実測ベースで解消したことを裏付ける結果。</li>
+                  <li>この計測自体は久しぶりのAWSフルベンチ実行だったため、monorepoが<code>implementation/vmemkv</code>へ再編されて以降放置されていたオーケストレーションスクリプトのパスバグを3件発見・修正(rsync同期先が<code>~/faultkv/vmemkv</code>ではなく<code>~/faultkv/implementation/vmemkv</code>を前提にしていた、NVMeデバイス検出がインデックス依存でルートボリュームを誤検出しうる、結果ダウンロード先<code>RESULTS_DIR</code>が同じ<code>REPO_ROOT</code>計算ミスで二重パス化していた)。</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
               <td class="py-4 pr-4 text-slate-400">2026-09-03</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026090301_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
