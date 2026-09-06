@@ -344,21 +344,21 @@ install_remote_dependencies() {
 prepare_remote_storage() {
   echo "Locating and mounting local NVMe SSD..."
   ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "
-    # Excludes whichever nvme*n1 device actually backs / or /boot (checked by mountpoint, not by
-    # assuming it's always nvme0n1) -- on i4i instances the root EBS volume and the local
-    # instance-store NVMe can enumerate in either order, and a fixed index picked the root volume
-    # on at least one observed launch, corrupting /boot via a bind-mount and failing later with
-    # \"not enough free space for a swapfile\" once /boot's small filesystem filled up.
-    ROOT_DEVS=\$(lsblk -no PKNAME,MOUNTPOINT | awk '\$2 == \"/\" || \$2 == \"/boot\" || \$2 == \"/boot/efi\" {print \$1}' | sort -u)
-    DEV=\"\"
-    for CAND in \$(lsblk -dno NAME | grep -E '^nvme[0-9]+n1'); do
-      if ! echo \"\$ROOT_DEVS\" | grep -qx \"\$CAND\"; then
-        DEV=\"/dev/\$CAND\"
-        break
-      fi
-    done
-    if [ -z \"\$DEV\" ]; then
-      echo \"[ERROR] Local NVMe SSD not found! A physical local NVMe is strictly required to run LTM / Swap benchmarks.\" >&2
+    # Picks the *largest* nvme*n1 device rather than assuming a fixed index (nvme0n1 = root,
+    # nvme1n1 = local NVMe): on i4i instances the root EBS volume and the local instance-store NVMe
+    # can enumerate in either order, and a fixed index picked the root volume on at least one
+    # observed launch, corrupting /boot via a bind-mount and failing later with \"not enough free
+    # space for a swapfile\" once /boot's small filesystem filled up. Size is a robust discriminator
+    # regardless of enumeration order or partition layout: i4i's instance-store NVMe is multiple
+    # TB, dwarfing any plausible root EBS volume (tens of GB) -- a prior mountpoint-based exclusion
+    # attempt (matching PKNAME against / /boot /boot/efi) missed a whole-disk-mounted root (no
+    # partition, so no PKNAME) because lsblk -no PKNAME,MOUNTPOINT's empty PKNAME field shifts the
+    # mountpoint into the wrong awk column when field-split on whitespace.
+    DEV=\$(lsblk -dbno NAME,SIZE | grep -E '^nvme[0-9]+n1' | sort -k2 -n -r | head -n1 | awk '{print \"/dev/\"\$1}')
+    DEV_SIZE_BYTES=\$(lsblk -dbno SIZE \"\$DEV\" 2>/dev/null || echo 0)
+    MIN_EXPECTED_BYTES=\$((100 * 1024 * 1024 * 1024))
+    if [ -z \"\$DEV\" ] || [ \"\$DEV_SIZE_BYTES\" -lt \"\$MIN_EXPECTED_BYTES\" ]; then
+      echo \"[ERROR] Local NVMe SSD not found (or suspiciously small: \$DEV_SIZE_BYTES bytes)! A physical local NVMe is strictly required to run LTM / Swap benchmarks.\" >&2
       exit 1
     fi
 
