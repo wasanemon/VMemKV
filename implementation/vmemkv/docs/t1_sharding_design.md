@@ -422,6 +422,31 @@ T2とWALは既存どおりグローバル(シャード非依存)のまま維持�
   ため、コストだけが残る形になっている。RocksDB比のwin ratioはこの区間でも1.59x〜5.00xと
   依然優位だが、シャーディング導入の定量化された副作用として記録しておく。
 
+- 済: ベンチマークプローブを2種に分離。`run_background_jobs_probe.sh`(既存)が測る
+  `reorganize()`/`checkpoint()`は全シャードを1回の呼び出しで同期的にマージする手動の
+  エスケープハッチであり、本番の定常運用で実際に起きるメンテナンス(シャードごとの自動
+  背景ワーカーによる、独立した増分的なsplit)を代表しない——background_jobs_probeの
+  Insert QPS劣化(約50%)がジョブ所要時間(in_memoryで1.5〜3.7秒、ltmで4.1〜14.1秒)の
+  短い窓でのみ発生するのに対し、この所要時間自体は`harness_new_incremental_scaling.cpp`等が
+  測った「1シャードの所要時間」(0.6〜1.0秒、コーパス総量に依存せず一定)とは別物(全シャード分の
+  合計、あるいはswap圧の影響を受けたもの)であるため、本当に気にすべき「organicなper-shard
+  splitがQPSに与える定常的な影響」を答えていなかった。新設の`run_organic_split_probe.sh`
+  (`bench_kv.cpp`の`run_organic_split_probe()`、`--mode=organic_split_probe`)は、空の
+  ストアに実際の背景ワーカーを起動した状態で単調増加キーを90秒間挿入し続け、
+  `get_statistics().t1_split_count`を100ms間隔でポーリングしてorganicなsplit完了を検出、
+  各splitイベント直前(このイベント固有のローカルなベースライン——定常QPSはコーパス成長に
+  伴って緩やかに変化するため、グローバル平均を使うと後発のイベントほど不利になる)と
+  split中(重なる約1.2秒の窓)のInsert QPSを比較する。ロジックは小さい`target_shard_size`を
+  使った独立のスタンドアロン検証で確認済み(8シャードへの成長で7回のsplit検出、期待通り一致)。
+  `run_bench_aws_c6id.sh`に`--organic-split-probe`フラグを追加し、`run_5parallel_bench.sh`の
+  5番目の専用インスタンスで`--background-jobs-probe`と併走させる形にした。
+  `run_background_jobs_probe.sh`側のcheckpoint()測定にも、`VMemKVStatistics`の既存フェーズ
+  内訳(`last_checkpoint_t1_reorganize_duration_us`等)を使ってT1マージ/WAL rotate/msyncの
+  内訳を追加。`generate_report.py`は"Background Jobs"セクションの説明文を「強制・全シャード」
+  である旨を明記する形に更新し、新設の"Organic Per-Shard Splits"セクション(split数・
+  ベースライン/split中QPS・劣化率をイベントごとに表示、shard数が増えるほど劣化率が下がる
+  傾向が見えるはず)を追加。まだAWS実測待ち(次回フルベンチで結果を確認)。
+
 ## 未実装/次のステップ
 
 - 上記の「単一シャード時ルーティング税」——小コーパス(splitが一度も起きない規模)×高並行度

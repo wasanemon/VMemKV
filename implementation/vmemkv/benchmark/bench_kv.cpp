@@ -1803,7 +1803,14 @@ void register_all_benchmarks() {
 //     -- reachable directly via this CLI for ad-hoc use.
 //   background_job_probe (run_background_job_probe(), below): fixed 10,000,000-record corpus;
 //     measures one reorganize()/checkpoint() call's own duration plus the QPS degradation it
-//     causes to concurrent Insert/Update/Scan workloads -- see run_background_jobs_probe.sh.
+//     causes to concurrent Insert/Update/Scan workloads -- see run_background_jobs_probe.sh. This
+//     is a forced, whole-store operation (every shard synchronously merged in one call) -- not
+//     what happens during ordinary operation, where ShardedT1Index's own background workers
+//     maintain each shard independently and incrementally. See organic_split_probe below for that.
+//   organic_split_probe (run_organic_split_probe(), below): starts from an empty store with real
+//     background workers running (not the forced calls above) and inserts continuously, polling
+//     for each organic per-shard split as it completes and comparing Insert QPS just before it to
+//     Insert QPS during it -- see run_organic_split_probe.sh.
 namespace reorg_probe {
 
 constexpr int kReorgTimeoutSecondsDefault = 60;
@@ -1826,6 +1833,7 @@ enum class ProbeMode {
   kT1T2,
   kT1T2Steady,
   kBackgroundJobProbe,
+  kOrganicSplitProbe,
 };
 
 struct ProbeArgs {
@@ -1888,6 +1896,8 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
         args.mode = ProbeMode::kT1T2Steady;
       } else if (value == "background_job_probe") {
         args.mode = ProbeMode::kBackgroundJobProbe;
+      } else if (value == "organic_split_probe") {
+        args.mode = ProbeMode::kOrganicSplitProbe;
       } else {
         fail("unknown --mode: " + std::string(value));
       }
@@ -1907,7 +1917,7 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
-        "--mode=<t1only|t1t2|t1t2_steady|background_job_probe> "
+        "--mode=<t1only|t1t2|t1t2_steady|background_job_probe|organic_split_probe> "
         "--ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>] "
         "[--job=<reorganize|checkpoint>]");
   }
@@ -1966,6 +1976,9 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
       break;
     case ProbeMode::kBackgroundJobProbe:
       mode_name = "background_job_probe";  // Unreachable: this mode reports via its own print, below.
+      break;
+    case ProbeMode::kOrganicSplitProbe:
+      mode_name = "organic_split_probe";  // Unreachable: this mode reports via its own print, below.
       break;
   }
   // churn_ratio only means anything for t1t2_steady (run_steady() is the only mode that applies
@@ -2302,14 +2315,148 @@ constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
   }
 
   auto pct_json = [](std::optional<double> v) -> std::string { return v.has_value() ? std::to_string(*v) : "null"; };
+  // Phase breakdown: only meaningful for job=="checkpoint" (reorganize()'s T1Only path never runs
+  // checkpoint_internal(), so these fields would just be stale/zero) -- last_checkpoint_* reflects
+  // whichever of the 3 measure_workload_degradation() calls above most recently ran checkpoint(),
+  // representative since corpus size barely changes call to call.
+  std::optional<double> t1_reorganize_ms;
+  std::optional<double> wal_rotate_ms;
+  std::optional<double> msync_ms;
+  if (!any_timed_out && args.job == "checkpoint") {
+    const auto stats = store->get_statistics();
+    t1_reorganize_ms = stats.last_checkpoint_t1_reorganize_duration_us / 1000.0;
+    wal_rotate_ms = stats.last_checkpoint_wal_rotate_duration_us / 1000.0;
+    msync_ms = stats.last_checkpoint_msync_duration_us / 1000.0;
+  }
   std::cout << "{\"job\":\"" << args.job << "\"," << "\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\","
             << "\"value_size\":" << args.val_size << "," << "\"key_count\":" << key_count << ","
             << "\"writer_threads\":" << resolved_writer_threads << "," << "\"job_elapsed_sec\":" << reported_elapsed_sec
             << "," << "\"insert_degradation_pct\":" << pct_json(insert_pct) << ","
             << "\"update_degradation_pct\":" << pct_json(update_pct) << ","
             << "\"scan_degradation_pct\":" << pct_json(scan_pct) << ","
+            << "\"t1_reorganize_phase_ms\":" << pct_json(t1_reorganize_ms) << ","
+            << "\"wal_rotate_phase_ms\":" << pct_json(wal_rotate_ms) << ","
+            << "\"msync_phase_ms\":" << pct_json(msync_ms) << ","
             << "\"timed_out\":" << (any_timed_out ? "true" : "false") << "}" << std::endl;
   std::_Exit(any_timed_out ? 124 : 0);
+}
+
+// Organic per-shard split probe: unlike run_background_job_probe() above (a forced, whole-store
+// reorganize()/checkpoint() call), this measures the Insert-QPS impact of ShardedT1Index's own
+// automatic background splitting under sustained write load -- the maintenance path that actually
+// runs during ordinary operation. Starts from an empty store with real background workers active
+// and inserts continuously with monotonically increasing keys (so essentially all new writes land
+// in whichever shard currently owns the tail of the keyspace, the same access pattern
+// harness_new_incremental_scaling.cpp used to confirm one shard's own split cost stays flat
+// regardless of total corpus size -- see docs/t1_sharding_design.md), polling
+// get_statistics().t1_split_count at a fine interval to detect each split as it completes. For
+// every observed split, compares this event's own local Insert QPS just before it (not a single
+// global average -- steady-state QPS drifts slowly as the corpus grows, which would bias a global
+// baseline against later events) to Insert QPS in the window overlapping the split.
+constexpr int kOrganicSplitProbeDurationSec = 90;
+constexpr auto kOrganicSplitPollInterval = std::chrono::milliseconds(100);
+// Wide enough to fully cover one shard's own reorganize/split cost (observed flat at ~0.6-1.0s
+// regardless of corpus size, see docs/t1_sharding_design.md) without averaging too much
+// surrounding steady-state activity into the "during" window.
+constexpr double kOrganicSplitWindowSec = 1.2;
+
+[[noreturn]] void run_organic_split_probe(const ProbeArgs &args) {
+  using Store = vmemkv::variants::VMemKVStore;
+
+  const std::string path = reorg_probe_path(args, "organic_split");
+  const std::size_t writer_threads = resolve_writer_threads();
+
+  auto store = make_vmemkv_fresh(
+      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
+
+  std::atomic<std::size_t> next_key{0};
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> workers;
+  workers.reserve(writer_threads);
+  for (std::size_t t = 0; t < writer_threads; ++t) {
+    workers.emplace_back([&]() {
+      while (!stop.load(std::memory_order_relaxed)) {
+        const std::size_t idx = next_key.fetch_add(1, std::memory_order_relaxed);
+        store->insert(make_key(idx), make_value_for_key(idx, args.val_size));
+      }
+    });
+  }
+
+  struct Sample {
+    double t_sec;
+    std::size_t inserted;
+    uint64_t split_count;
+  };
+  std::vector<Sample> samples;
+  const auto t0 = std::chrono::steady_clock::now();
+  auto elapsed_sec = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+  while (elapsed_sec() < kOrganicSplitProbeDurationSec) {
+    const auto stats = store->get_statistics();
+    samples.push_back({elapsed_sec(), next_key.load(std::memory_order_relaxed), stats.t1_split_count});
+    std::this_thread::sleep_for(kOrganicSplitPollInterval);
+  }
+  stop.store(true, std::memory_order_relaxed);
+  for (auto &w : workers) {
+    w.join();
+  }
+  const uint64_t final_split_count = store->get_statistics().t1_split_count;
+
+  // Nearest sample at or before `t_sec` (clamped to the first sample if `t_sec` predates the run).
+  auto sample_at_or_before = [&](double t_sec) -> const Sample & {
+    auto it = std::upper_bound(
+        samples.begin(), samples.end(), t_sec, [](double t, const Sample &s) { return t < s.t_sec; });
+    if (it == samples.begin()) {
+      return samples.front();
+    }
+    return *std::prev(it);
+  };
+  auto qps_between = [&](double from_sec, double to_sec) -> std::optional<double> {
+    if (from_sec < samples.front().t_sec) {
+      return std::nullopt;
+    }
+    const Sample &a = sample_at_or_before(from_sec);
+    const Sample &b = sample_at_or_before(to_sec);
+    const double dt = b.t_sec - a.t_sec;
+    if (dt <= 0.0 || b.inserted <= a.inserted) {
+      return std::nullopt;
+    }
+    return static_cast<double>(b.inserted - a.inserted) / dt;
+  };
+
+  struct SplitEvent {
+    double at_sec;
+    uint64_t shard_count_after;
+    double baseline_qps;
+    double during_qps;
+  };
+  std::vector<SplitEvent> events;
+  for (std::size_t i = 1; i < samples.size(); ++i) {
+    if (samples[i].split_count <= samples[i - 1].split_count) {
+      continue;
+    }
+    const double at = samples[i].t_sec;
+    const auto baseline = qps_between(at - kOrganicSplitWindowSec, at);
+    const auto during = qps_between(at, std::min(at + kOrganicSplitWindowSec, samples.back().t_sec));
+    if (!baseline.has_value() || !during.has_value() || *baseline <= 0.0) {
+      continue;
+    }
+    events.push_back({at, samples[i].split_count + 1, *baseline, *during});
+  }
+
+  std::cout << "{\"job\":\"organic_split\",\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\","
+            << "\"value_size\":" << args.val_size << ",\"writer_threads\":" << writer_threads << ","
+            << "\"duration_sec\":" << kOrganicSplitProbeDurationSec << ","
+            << "\"total_inserted\":" << next_key.load(std::memory_order_relaxed) << ","
+            << "\"final_shard_count\":" << (final_split_count + 1) << ",\"splits\":[";
+  for (std::size_t i = 0; i < events.size(); ++i) {
+    const auto &e = events[i];
+    const double degradation_pct = (1.0 - e.during_qps / e.baseline_qps) * 100.0;
+    std::cout << (i > 0 ? "," : "") << "{\"at_sec\":" << e.at_sec << ",\"shard_count_after\":" << e.shard_count_after
+              << ",\"baseline_qps\":" << e.baseline_qps << ",\"during_qps\":" << e.during_qps
+              << ",\"degradation_pct\":" << degradation_pct << "}";
+  }
+  std::cout << "],\"timed_out\":false}" << std::endl;
+  std::_Exit(0);
 }
 
 [[noreturn]] void run(const ProbeArgs &args) {
@@ -2327,6 +2474,8 @@ constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
     run_steady(args);
   } else if (args.mode == ProbeMode::kBackgroundJobProbe) {
     run_background_job_probe(args);
+  } else if (args.mode == ProbeMode::kOrganicSplitProbe) {
+    run_organic_split_probe(args);
   } else {
     run_bootstrap(args);
   }

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # run_5parallel_bench.sh - Wrapper to run 5 parallel AWS spot benchmarks: the 4 CRUD-matrix
-# combos (as run_4parallel_bench.sh, renamed, used to) plus a 5th dedicated instance for the
-# background-jobs probe (reorganize()/checkpoint() own duration + Insert/Update/Scan QPS
-# degradation, fixed 1KB/10,000,000-record corpus -- see run_background_jobs_probe.sh). The 5th
+# combos (as run_4parallel_bench.sh, renamed, used to) plus a 5th dedicated instance for two
+# background-maintenance probes: background-jobs (reorganize()/checkpoint()'s own duration +
+# Insert/Update/Scan QPS degradation while a forced, whole-store call runs -- see
+# run_background_jobs_probe.sh) and organic-split (the same QPS-degradation question, but for
+# ShardedT1Index's own automatic per-shard splitting under sustained write load, the maintenance
+# path that actually runs during ordinary operation -- see run_organic_split_probe.sh). The 5th
 # task gets its own instance (--skip-matrix, no --scenario/--value-size) rather than riding along
-# on one of the other 4: the probe's fixed corpus is unrelated to any one (scenario, value_size)
-# combo, and both its own in_memory and ltm points run there, so it would not partition cleanly
-# onto one of the 4 combo-scoped instances the way the retired reorg-scaling/checkpoint-throughput/
-# maintenance-contention probes used to.
+# on one of the other 4: both probes' corpora are unrelated to any one (scenario, value_size)
+# combo, and each runs both its own in_memory and ltm points there, so neither would partition
+# cleanly onto one of the 4 combo-scoped instances the way the retired reorg-scaling/checkpoint-
+# throughput/maintenance-contention probes used to.
 
 set -euo pipefail
 
@@ -64,12 +67,14 @@ for task in "${TASKS[@]}"; do
   sleep 12
 done
 
-# 5th task: dedicated background-jobs-probe instance (own scenario loop covers both in_memory and
-# ltm internally -- see run_background_jobs_probe.sh), no CRUD matrix.
-echo "Launching Instance for: Background Jobs Probe (Log: /tmp/vmemkv_parallel_bgjobs.log)"
+# 5th task: dedicated background-maintenance-probes instance (each probe's own scenario loop
+# covers both in_memory and ltm internally -- see run_background_jobs_probe.sh/
+# run_organic_split_probe.sh), no CRUD matrix.
+echo "Launching Instance for: Background Jobs + Organic Split Probes (Log: /tmp/vmemkv_parallel_bgjobs.log)"
 "$SCRIPT_DIR/run_bench_aws_c6id.sh" \
   --skip-matrix \
   --background-jobs-probe \
+  --organic-split-probe \
   > "/tmp/vmemkv_parallel_bgjobs.log" 2>&1 &
 pids+=($!)
 TASKS+=("- - bgjobs")

@@ -31,7 +31,14 @@ show_help() {
   echo "                   reorganize()/checkpoint() (fixed 1KB/10,000,000-record corpus): each"
   echo "                   job's own duration plus the QPS degradation it causes to concurrent"
   echo "                   Insert/Update/Scan on the same instance via"
-  echo "                   run_background_jobs_probe.sh and download its JSONL output."
+  echo "                   run_background_jobs_probe.sh and download its JSONL output. This is a"
+  echo "                   forced, whole-store operation -- not what happens during ordinary"
+  echo "                   operation; see --organic-split-probe for that."
+  echo "  --organic-split-probe  After the normal matrix, additionally measure the Insert-QPS"
+  echo "                   impact of ShardedT1Index's own automatic per-shard background"
+  echo "                   splitting under sustained write load (the maintenance path that"
+  echo "                   actually runs during ordinary operation) via"
+  echo "                   run_organic_split_probe.sh and download its JSONL output."
   echo "  --skip-matrix    Skip the main Google Benchmark-registered CRUD/Scan/YCSB-E matrix"
   echo "                   entirely (and its results download) -- provision/build the instance"
   echo "                   and run only the *-probe flags passed alongside this one."
@@ -49,6 +56,7 @@ show_help() {
 SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
 BACKGROUND_JOBS_PROBE=false
+ORGANIC_SPLIT_PROBE=false
 SKIP_MATRIX=false
 WITHOUT_RIVALS=false
 
@@ -80,6 +88,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --background-jobs-probe)
       BACKGROUND_JOBS_PROBE=true
+      shift
+      ;;
+    --organic-split-probe)
+      ORGANIC_SPLIT_PROBE=true
       shift
       ;;
     --skip-matrix)
@@ -975,4 +987,13 @@ if [[ "$BACKGROUND_JOBS_PROBE" == "true" ]]; then
   # A failure here is logged but does not fail the whole run -- unlike the matrix above, this is a
   # supplementary measurement, not the main deliverable.
   run_remote_probe "run_background_jobs_probe.sh" "background_jobs" "vmemkv_background_jobs_probe" "background-jobs-probe"
+fi
+
+if [[ "$ORGANIC_SPLIT_PROBE" == "true" ]]; then
+  # Additive extra measurement (Insert-QPS impact of ShardedT1Index's own automatic per-shard
+  # background splitting under sustained write load) on top of the normal matrix just run above --
+  # complements background-jobs-probe above (which measures a forced, whole-store call, not what
+  # happens during ordinary operation) rather than replacing it. Same ltm-cgroup-wrap/
+  # VALUE_SIZE_LIMIT-ignoring/non-fatal-failure conventions as that call, see its own comment.
+  run_remote_probe "run_organic_split_probe.sh" "organic_split" "vmemkv_organic_split_probe" "organic-split-probe"
 fi

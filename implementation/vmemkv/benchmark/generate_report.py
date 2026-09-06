@@ -184,6 +184,72 @@ def build_background_jobs_data(report_dir):
     return data
 
 
+def build_organic_split_data(report_dir):
+    """Reads organic_split_in_memory.jsonl / organic_split_ltm.jsonl (run_organic_split_probe.sh
+    via run_bench_aws_c6id.sh's run_remote_probe()) into {scenario: rec}. Each rec's "splits" list
+    holds one entry per organic per-shard split observed during a fixed 90s sustained-insert run,
+    see render_organic_split_summary_html()."""
+    data = {}
+    for fname in ["organic_split_in_memory.jsonl", "organic_split_ltm.jsonl"]:
+        path = report_dir / fname
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            # Same reasoning as build_background_jobs_data(): a synthesized outer-timeout fallback
+            # record lacks "scenario" -- skip rather than KeyError, renders as n/a like a missing file.
+            if "scenario" not in rec:
+                continue
+            data[rec["scenario"]] = rec
+    return data
+
+
+def render_organic_split_summary_html(organic_split_data):
+    """One block per scenario (in_memory, ltm): a summary line (splits observed, final shard
+    count, total inserted) followed by one row per observed split (shard count right after that
+    split, baseline/during Insert QPS, degradation %%) -- see build_organic_split_data()."""
+    if not organic_split_data:
+        return ""
+    scenario_labels = {"in_memory": "in-memory", "ltm": "LTM"}
+    out = []
+    for scenario in ["in_memory", "ltm"]:
+        rec = organic_split_data.get(scenario)
+        out.append(f'<h4 class="text-xs font-bold text-slate-600 mt-3 first:mt-0">{scenario_labels[scenario]}</h4>')
+        if not rec:
+            out.append('<p class="text-xs text-slate-300">n/a</p>')
+            continue
+        if rec.get("timed_out"):
+            out.append('<p class="text-xs text-rose-600 font-semibold">did not complete (timeout)</p>')
+            continue
+        splits = rec.get("splits", [])
+        out.append(f'<p class="text-[11px] text-slate-500 mb-1">{len(splits)} split(s) observed over '
+                    f'{rec.get("duration_sec", "?")}s &middot; {rec.get("total_inserted", 0):,} total inserted '
+                    f'&middot; ended at {rec.get("final_shard_count", "?")} shards</p>')
+        if not splits:
+            out.append('<p class="text-xs text-slate-400">No split observed in this window (corpus never '
+                        'crossed a shard\'s split threshold) -- not evidence of a problem, just a run where '
+                        'growth stayed within one shard.</p>')
+            continue
+        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
+                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
+                    '<th class="py-1.5 px-3 font-bold text-slate-700">Shard count after</th>'
+                    '<th class="py-1.5 px-3 font-bold text-slate-700">Baseline Insert QPS</th>'
+                    '<th class="py-1.5 px-3 font-bold text-slate-700">During-split Insert QPS</th>'
+                    '<th class="py-1.5 px-3 font-bold text-slate-700">Degradation</th>'
+                    '</tr></thead><tbody class="divide-y divide-slate-100">')
+        for split in splits:
+            pct = split["degradation_pct"]
+            out.append(f'<tr><td class="py-1.5 px-3">{split["shard_count_after"]}</td>'
+                        f'<td class="py-1.5 px-3">{split["baseline_qps"]:,.0f}/s</td>'
+                        f'<td class="py-1.5 px-3">{split["during_qps"]:,.0f}/s</td>'
+                        f'<td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded '
+                        f'text-[10px] border {_badge_for_slowdown(pct)} font-bold w-fit">{pct:.0f}%</span></td></tr>')
+        out.append("</tbody></table></div>")
+    return "\n".join(out)
+
+
 def compute_winners_matrix(raw_data):
     rows = []
     for workload in WORKLOADS:
@@ -284,7 +350,10 @@ def render_background_jobs_summary_html(background_jobs_data):
     concurrent writers/readers while it runs), not to reproduce the CRUD matrix."""
     if not background_jobs_data:
         return ""
-    job_labels = {"reorganize": "reorganize()", "checkpoint": "checkpoint()"}
+    job_labels = {
+        "reorganize": "reorganize() (forced, all shards)",
+        "checkpoint": "checkpoint()",
+    }
     scenario_labels = {"in_memory": "in-memory", "ltm": "LTM"}
     out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
            '<thead><tr class="border-b border-slate-200 bg-slate-50/50">',
@@ -308,6 +377,13 @@ def render_background_jobs_summary_html(background_jobs_data):
                             f'did not complete (timeout)</span></td></tr>')
                 continue
             duration_cell = f'{rec["job_elapsed_sec"]:.3f}s'
+            # Phase breakdown: only present for job=="checkpoint" (see bench_kv.cpp's
+            # run_background_job_probe() -- reorganize()'s T1Only path never runs
+            # checkpoint_internal(), so these fields are simply absent for that job).
+            t1_ms, wal_ms, msync_ms = rec.get("t1_reorganize_phase_ms"), rec.get("wal_rotate_phase_ms"), rec.get("msync_phase_ms")
+            if job == "checkpoint" and None not in (t1_ms, wal_ms, msync_ms):
+                duration_cell += (f'<div class="text-[10px] text-slate-400 font-normal">T1 merge {t1_ms:.0f}ms &middot; '
+                                  f'WAL rotate {wal_ms:.0f}ms &middot; msync {msync_ms:.0f}ms</div>')
             cells = [duration_cell]
             for key in ["insert_degradation_pct", "update_degradation_pct", "scan_degradation_pct"]:
                 pct = rec.get(key)
@@ -340,6 +416,7 @@ def main():
     timeline_data = build_timeline_data(args.report_dir)
     forced_events_data = build_forced_events_data(args.report_dir)
     background_jobs_data = build_background_jobs_data(args.report_dir)
+    organic_split_data = build_organic_split_data(args.report_dir)
     winners_rows = compute_winners_matrix(raw_data)
 
     html = html.replace(args.template_id, args.report_id)
@@ -428,6 +505,15 @@ def main():
     # otherwise insert a fresh section right after the Workload Winners section closes.
     section_open_marker = '<section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">'
 
+    # heading is matched as a bare substring (see html.find(heading) below) against the *entire*
+    # document, not scoped to an <h3> tag -- so no other upsert_section call's title/description
+    # text (in this function or any other section already in the template) may contain another
+    # section's heading string verbatim, or that other section's own body gets matched and
+    # clobbered instead of inserting a new section. Confirmed the hard way: an early draft of the
+    # Organic Per-Shard Splits section's own description cross-referenced "Organic Per-Shard
+    # Splits" by name from within the Background Jobs section's description, and this function
+    # dutifully replaced Background Jobs' own section with a fresh (empty of Background Jobs
+    # content) Organic Per-Shard Splits one.
     def upsert_section(html, heading, icon_bg, icon_text, icon_name, title, description_html, table_html):
         if not table_html:
             return html
@@ -472,9 +558,31 @@ def main():
             "not swept across the CRUD matrix's 4 scenario/value-size combos. Duration is a "
             "single call in isolation; the three degradation columns are the percentage drop in "
             "concurrent Insert/Update/Scan QPS while that one call runs, measured over a "
-            "matched-duration window on both sides (see run_background_jobs_probe.sh)."
+            "matched-duration window on both sides (see run_background_jobs_probe.sh). "
+            "reorganize() forces every shard through a synchronous merge in one call -- a manual "
+            "escape hatch (pre-backup flush, capacity planning), not what happens during ordinary "
+            "operation. See the organic per-shard split measurement below for that."
         ),
         table_html=render_background_jobs_summary_html(background_jobs_data),
+    )
+
+    html = upsert_section(
+        html,
+        heading="Organic Per-Shard Splits",
+        icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="split",
+        title="Organic Per-Shard Splits",
+        description_html=(
+            "What actually happens during ordinary operation, as opposed to the forced whole-store "
+            "reorganize() above: starting from an empty store with real background workers active, "
+            "insert continuously for 90s (fixed 1KB values, monotonically increasing keys) and "
+            "detect each automatic per-shard split as ShardedT1Index's own background worker pool "
+            "completes it. Each row is one observed split; baseline/during QPS are this event's own "
+            "local Insert QPS just before it and QPS in the ~1.2s window overlapping it (see "
+            "run_organic_split_probe.sh). Watch whether degradation shrinks as shard count grows -- "
+            "only one shard pauses per split, so its share of total keyspace (and thus of total "
+            "QPS) should fall as more shards exist."
+        ),
+        table_html=render_organic_split_summary_html(organic_split_data),
     )
 
 
