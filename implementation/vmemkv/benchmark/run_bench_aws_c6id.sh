@@ -925,7 +925,7 @@ if [[ "$SKIP_MATRIX" != "true" ]]; then
 fi
 
 # ── Retrieve Results & Save ───────────────────────────────────────────────
-RESULTS_DIR="${REPO_ROOT}/implementation/vmemkv/benchmark/logs"
+RESULTS_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "$RESULTS_DIR"
 
 if [[ "$SKIP_MATRIX" != "true" ]]; then
