@@ -13,7 +13,8 @@ flat arrayより遅くなる。この差はskip list側の実装をどれだけ�
 
 `reorganize()`/`checkpoint()`のO(corpus)コストが再び問題になった場合、次に検討すべき方向は
 ポインタ構造への転換ではなく、範囲シャーディング(T1Indexを独立した複数シャードに分割し、
-`reorganize()`をシャード単位に局所化する)である。
+`reorganize()`をシャード単位に局所化する)である。設計は
+[`t1_sharding_design.md`](t1_sharding_design.md)を参照。
 
 ## 関連コード
 

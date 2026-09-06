@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <checkpoint/checkpoint.hpp>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
@@ -427,6 +428,48 @@ TEST_CASE("crash recovery: recovery under tiny T1 append-region capacity does no
   }
   {
     auto store = std::make_unique<VMemKV_TinyAppend>(path, kStoreCapacityBytes);
+    for (int i = 0; i < kKeyCount; ++i) {
+      const auto val = get_bytes(store, "k" + std::to_string(i));
+      REQUIRE(val.has_value());
+      CHECK(*val == make_value(i));
+    }
+  }
+  cleanup_store_files(path);
+}
+
+namespace {
+struct TinyShardConfig : vmemkv::Config<> {
+  static constexpr size_t T1AppendCapacityLog2 = 10;  // 1024-entry append region.
+  static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
+  static constexpr size_t T1ShardTargetSizeEntries = 50;  // Forces splits well before kKeyCount below.
+};
+using VMemKV_TinyShard = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyShardConfig>>;
+}  // namespace
+
+// Sharding-specific round trip: forces ShardedT1Index to actually split (via TinyShardConfig's
+// small target size) before checkpointing, so checkpoint_all_shards()/ShardedT1CheckpointWriter
+// and load_from_checkpoint()/ShardedT1CheckpointFile are exercised with more than one shard, not
+// just the K=1 case every other test in this file happens to stay within.
+TEST_CASE("checkpoint: sharded T1 survives checkpoint and restart with multiple shards") {
+  const auto path = reserve_crash_temp_path();
+  constexpr int kKeyCount = 2000;
+  size_t shard_count_before_restart = 0;
+  {
+    auto store = std::make_unique<VMemKV_TinyShard>(path, kStoreCapacityBytes);
+    for (int i = 0; i < kKeyCount; ++i) {
+      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+    }
+    // Give the background worker pool time to notice and split.
+    for (int attempt = 0; attempt < 200 && store->impl().t1().shard_count() == 1; ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    shard_count_before_restart = store->impl().t1().shard_count();
+    REQUIRE(shard_count_before_restart > 1);
+    store->checkpoint();
+  }
+  {
+    auto store = std::make_unique<VMemKV_TinyShard>(path, kStoreCapacityBytes);
+    CHECK(store->impl().t1().shard_count() == shard_count_before_restart);
     for (int i = 0; i < kKeyCount; ++i) {
       const auto val = get_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());

@@ -75,6 +75,13 @@ struct Config {
   static constexpr size_t T1AppendCapacityLog2 = 21;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
 
+  // Target live-entry count per shard for ShardedT1Index (src/t1_index/sharded_t1_index.hpp).
+  // A shard's background maintenance reorganize() triggers a split once its live entry count
+  // reaches T1ShardSplitThresholdPercent% of this target. See docs/t1_sharding_design.md's
+  // "APPEND_CAPのスケーリング" section for how this and T1AppendCapacityEntries relate.
+  static constexpr size_t T1ShardTargetSizeEntries = size_t{1} << 20;
+  static constexpr size_t T1ShardSplitThresholdPercent = 200;
+
   // Default Tier 2 (T2) file storage capacity: 1 TiB.
   static constexpr size_t DefaultT2CapacityBytes = 1ULL << 40;
 

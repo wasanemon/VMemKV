@@ -580,7 +580,13 @@ void Wal::rotate_segment() {
   flushing_.store(false, std::memory_order_release);
   flushing_.notify_all();
 
-  ::close(old_fd);
+  // See size_bytes()'s own comment: this lock is what actually prevents fstat(old_fd) there from
+  // racing this close(old_fd) -- fd_ already pointing at new_fd by this point doesn't, since a
+  // concurrent size_bytes() call may have snapshotted old_fd before the store above.
+  {
+    std::lock_guard<std::mutex> lock(fd_close_mu_);
+    ::close(old_fd);
+  }
 
   // Safe even if generation (new_generation - 2) doesn't exist (first two cycles) or was already
   // deleted by an interrupted prior cycle -- see this function's own doc comment.
@@ -593,8 +599,17 @@ void Wal::rotate_segment() {
 auto Wal::next_lsn() const noexcept -> uint64_t { return next_lsn_.load(std::memory_order_relaxed); }
 
 auto Wal::size_bytes() const -> uint64_t {
+  // fd_close_mu_ pairs with rotate_segment()'s own lock around close(old_fd): without it, this
+  // fstat() can race the close() of the exact fd it just loaded (fd_ being updated to new_fd
+  // first doesn't help -- the snapshot here can still be the outgoing one). That's a real TOCTOU,
+  // not just a lint: fstat-after-close throws EBADF, or, in the rarer case another open()
+  // elsewhere already reused the fd number, silently reports an unrelated file's size. Contention
+  // is negligible -- rotate_segment() takes this lock only around the close() call itself, and
+  // size_bytes() is already sampled every kWalCheckStride writes, not per-write.
+  std::lock_guard<std::mutex> lock(fd_close_mu_);
+  const int fd = fd_.load(std::memory_order_acquire);
   struct stat file_stat {};
-  if (::fstat(fd_.load(std::memory_order_acquire), &file_stat) != 0) {
+  if (::fstat(fd, &file_stat) != 0) {
     throw std::system_error(errno, std::generic_category(), "fstat wal (size_bytes)");
   }
   return static_cast<uint64_t>(file_stat.st_size);

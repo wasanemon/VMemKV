@@ -62,7 +62,7 @@
 
 #include "checkpoint/checkpoint.hpp"
 #include "core/reference_tracker.hpp"
-#include "t1_index/t1_index.hpp"
+#include "t1_index/sharded_t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
 #include "wal/wal.hpp"
 
@@ -70,8 +70,6 @@ inline constexpr std::size_t kCacheLineAlignment = 64;
 
 struct alignas(kCacheLineAlignment) AlignedMutex {
   std::mutex mu;
-  std::atomic<uint64_t> live_count{0};
-  std::atomic<uint64_t> delete_count{0};
 };
 
 namespace vmemkv {
@@ -209,17 +207,31 @@ class VMemKVImpl {
     return result;
   }
 
-  using T1IndexT = vmemkv::T1Index<ConfigT>;
+  using T1IndexT = vmemkv::ShardedT1Index<ConfigT>;
 
   // T2's live mmap is MAP_SHARED (T2FlatFile's constructor); on-disk bytes below the manifest's
   // committed boundary are trustworthy, everything above it is not (low_level_design.md 5.1/5.3).
   // T1/T2 are wiped and rebuilt by replaying the WAL, unless a committed checkpoint (manifest) is
   // found, in which case T2FlatFile adopts its data file directly and T1 is fast-loaded from the
   // paired T1 checkpoint file, leaving only the rotated-down WAL tail to replay.
+  //
+  // t1_ is constructed with worker_threads=0 (deferred start): load_checkpoint_if_present()
+  // below (single-threaded, safe) may wholesale-replace t1_'s initial shard via
+  // load_from_checkpoint(), which is only safe before any other thread -- including t1_'s own
+  // background maintenance workers -- could be touching this instance. t1_.start_workers() is
+  // called right after that, *before* recover_from_wal(): replay calls put() same as live
+  // traffic does, and needs a running worker pool backing its own AppendRegionFull retry/
+  // backpressure to avoid livelocking with no worker to drain a full shard (see
+  // recover_from_wal()'s own comment -- this is a deliberate change from t1_'s own worker
+  // pool starting only after recovery finishes, which was the only option when T1 was a single,
+  // unsharded instance with no maintenance pool of its own).
   VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity)
-      : t2_(t2_path, t2_bytes_capacity, adopted_t2_bytes_used(t2_path)), wal_(vmemkv::derive_wal_path(t2_path)) {
+      : t1_(ConfigT::T1AppendCapacityEntries, ConfigT::T1ShardTargetSizeEntries, /*worker_threads=*/0),
+        t2_(t2_path, t2_bytes_capacity, adopted_t2_bytes_used(t2_path)),
+        wal_(vmemkv::derive_wal_path(t2_path)) {
     recovering_ = true;
     load_checkpoint_if_present(t2_path);
+    t1_.start_workers();
     recover_from_wal();
     recovering_ = false;
     reorg_worker_ = std::jthread(&VMemKVImpl::reorg_worker_loop, this);  // Started after recovery completes.
@@ -269,14 +281,15 @@ class VMemKVImpl {
         break;
       case ReorgMode::T1Only:
         // T1-only reorganize (zero I/O): T2 isn't touched, so the mapper leaves every entry's
-        // payload untouched.
-        t1_.reorganize([](std::span<typename T1IndexT::EntrySnapshot> /*merged*/) {},
-                       typename T1IndexT::NoOpChkWriter{});
+        // payload untouched. checkpoint_all_shards() with a no-op per-shard writer gives the
+        // same synchronous, deterministic "every shard fully merged before this call returns"
+        // contract a bare reorganize() had on the old, unsharded T1Index -- callers relying on
+        // that (e.g. tests asserting scan order right after reorganize()) see no behavior change.
+        t1_.checkpoint_all_shards([](std::span<typename T1IndexT::EntrySnapshot> /*merged*/) {},
+                                  [](std::span<const typename T1IndexT::EntrySnapshot> /*merged*/) {});
         reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
-        reset_tombstone_counters();
         break;
     }
-    scan_active_.store(false, std::memory_order_relaxed);
   }
 
  private:
@@ -309,9 +322,11 @@ class VMemKVImpl {
     using EntrySnapshot = typename T1IndexT::EntrySnapshot;
     // Phase-breakdown timing (see VMemKVStatistics::last_checkpoint_*) -- measures where
     // checkpoint_internal()'s wall-clock cost actually goes: msync() (should scale with the
-    // synced delta, i.e. with trigger frequency) vs t1_.reorganize() (always O(total corpus),
-    // independent of trigger frequency). Only touched here, single-flight via reorg_running_, so
-    // plain local variables suffice; published to the atomics below once, at the very end.
+    // synced delta, i.e. with trigger frequency) vs t1_.checkpoint_all_shards() (bounded per
+    // shard by ShardedT1Index's split threshold, not O(total corpus) as a single unsplittable
+    // operation -- see docs/t1_sharding_design.md). Only touched here, single-flight via
+    // reorg_running_, so plain local variables suffice; published to the atomics below once, at
+    // the very end.
     const auto fn_start = std::chrono::steady_clock::now();
     std::chrono::steady_clock::duration msync_duration{0};
     std::chrono::steady_clock::duration t1_reorganize_duration{0};
@@ -382,15 +397,19 @@ class VMemKVImpl {
 
       // The only place T1 gets published this cycle. No record's payload_bits ever changes here --
       // checkpoint never relocates a record, so there is nothing for the offset_mapper to
-      // restamp; T1's own reorganize() still merges append_region into sorted_region and writes
-      // the T1 checkpoint file (5.4 節) regardless.
+      // restamp; each shard's own reorganize() still merges its append_region into its
+      // sorted_region regardless. checkpoint_all_shards() forces every shard through this in
+      // ascending key order and streams each shard's merged entries into the checkpoint writer as
+      // it goes (never materializing the whole corpus at once), then hands back the directory's
+      // boundary keys once every shard is done -- written as the writer's trailer in finish()
+      // (see ShardedT1CheckpointWriter's own comment for why boundaries can only be written last).
       auto offset_mapper_fn = [](std::span<EntrySnapshot> /*merged*/) {};
-      auto chk_writer_fn = [&](std::span<const EntrySnapshot> merged) {
-        vmemkv::write_t1_checkpoint(vmemkv::derive_t1_chk_path(t2_path()), merged);
-      };
+      vmemkv::ShardedT1CheckpointWriter t1_chk_writer(vmemkv::derive_t1_chk_path(t2_path()));
+      auto chk_writer_fn = [&](std::span<const EntrySnapshot> merged) { t1_chk_writer.add_shard(merged); };
       const auto t1_reorganize_start = std::chrono::steady_clock::now();
-      t1_.reorganize(offset_mapper_fn, chk_writer_fn);
+      const auto t1_boundaries = t1_.checkpoint_all_shards(offset_mapper_fn, chk_writer_fn);
       t1_reorganize_duration = std::chrono::steady_clock::now() - t1_reorganize_start;
+      t1_chk_writer.finish(t1_boundaries);
 
       vmemkv::write_manifest(vmemkv::derive_manifest_path(t2_path()), checkpoint_lsn, target);
     } catch (...) {
@@ -414,7 +433,6 @@ class VMemKVImpl {
 
     reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
     checkpoint_count_.fetch_add(1, std::memory_order_relaxed);
-    reset_tombstone_counters();
     // Published last (after checkpoint_count_ above), so a poller that wakes on checkpoint_count_
     // changing always sees this cycle's own numbers, never a torn mix with the next cycle's.
     {
@@ -700,7 +718,6 @@ class VMemKVImpl {
 
       if (write_entry_lockfree(full_key, value)) {
         pending = wal_.reserve_insert(full_key, value);
-        stripe_state(full_key).live_count.fetch_add(1, std::memory_order_relaxed);
         inserted = true;
       }
     }
@@ -1070,15 +1087,12 @@ class VMemKVImpl {
 
       if (t1_.put(full_key, vmemkv::STORE_NOT_FOUND) == T1IndexT::PutResult::Applied) {
         pending = wal_.reserve_delete(full_key);
-        stripe.live_count.fetch_sub(1, std::memory_order_relaxed);
-        stripe.delete_count.fetch_add(1, std::memory_order_relaxed);
       } else {
         return false;
       }
     }
 
     wal_.await_durable(pending);
-    maybe_reorganize_if_needed_for_delete(stripe);
     return true;
   }
 
@@ -1107,10 +1121,6 @@ class VMemKVImpl {
   auto scan_impl(std::span<const std::byte> lower_bound,
                  std::span<const std::byte> upper_bound,
                  Callback callback) const -> size_t {
-    if (!scan_active_.load(std::memory_order_relaxed)) {
-      scan_active_.store(true, std::memory_order_relaxed);
-    }
-
     size_t total_count = 0;
 
     t1_.scan(lower_bound,
@@ -1238,40 +1248,51 @@ class VMemKVImpl {
       return;
     }
 
-    vmemkv::T1CheckpointFile t1_chk(vmemkv::derive_t1_chk_path(t2_path));
+    vmemkv::ShardedT1CheckpointFile t1_chk(vmemkv::derive_t1_chk_path(t2_path));
 
     // O(N) memcpy-shaped conversion (on-disk order -> EntrySnapshot order), no hashing or
-    // per-key insertion -- what makes fast boot fast (low_level_design.md 5.4).
+    // per-key insertion -- what makes fast boot fast (low_level_design.md 5.4), done once per
+    // shard. Runs before t1_.start_workers() (see the constructor's own comment), so this is the
+    // single-threaded window load_from_checkpoint()'s own contract requires.
     using EntrySnapshot = typename T1IndexT::EntrySnapshot;
-    std::vector<EntrySnapshot> entries;
-    entries.reserve(t1_chk.entries().size());
-    for (const auto &on_disk : t1_chk.entries()) {
-      entries.push_back(EntrySnapshot{on_disk.key_prefix, on_disk.payload_bits, on_disk.hash});
+    std::vector<std::vector<EntrySnapshot>> per_shard_entries;
+    per_shard_entries.reserve(t1_chk.shard_count());
+    for (size_t shard_index = 0; shard_index < t1_chk.shard_count(); ++shard_index) {
+      std::vector<EntrySnapshot> entries;
+      const auto on_disk_entries = t1_chk.shard_entries(shard_index);
+      entries.reserve(on_disk_entries.size());
+      for (const auto &on_disk : on_disk_entries) {
+        entries.push_back(EntrySnapshot{on_disk.key_prefix, on_disk.payload_bits, on_disk.hash});
+      }
+      per_shard_entries.push_back(std::move(entries));
     }
 
-    t1_.load_sorted_region_from_checkpoint(entries);
+    t1_.load_from_checkpoint(t1_chk.boundaries(), per_shard_entries);
   }
 
   // Replays the current contents of wal_ into T1 (and, via write_entry_lockfree, T2) -- whether
   // that's the full history or just the post-checkpoint tail is transparent here. Runs before
-  // reorg_worker_ is started (constructor order: recovering_=true; ...; recover_from_wal();
-  // recovering_=false; *then* reorg_worker_ is move-assigned a real thread), so no other thread
-  // can be touching reorg_running_/t1_/t2_ yet -- calls reorganize_internal() directly rather than
-  // through the public reorg_running_ CAS/wait wrappers, which would be redundant synchronization
-  // against a competitor that cannot exist at this point. Always ReorgMode::T1Only (checkpointing
-  // mid-replay would deadlock, see reorganize_internal()'s own assert): this is a T1-only merge,
-  // purely to reclaim T1 append-region capacity. Without the explicit capacity check below, a WAL
-  // with more live distinct keys than one append region holds would livelock inside
-  // write_entry_lockfree, which can only escape AppendRegionFull by waiting on a worker that
-  // doesn't exist yet.
+  // reorg_worker_ (VMemKVImpl's own, Checkpoint-triggering worker) is started (constructor order:
+  // recovering_=true; ...; recover_from_wal(); recovering_=false; *then* reorg_worker_ is
+  // move-assigned a real thread), so no other VMemKVImpl-level thread can be touching
+  // reorg_running_/t2_ yet -- calls reorganize_internal() directly rather than through the public
+  // reorg_running_ CAS/wait wrappers, which would be redundant synchronization against a
+  // competitor that cannot exist at this point.
+  //
+  // t1_'s *own* background worker pool, in contrast, is already running by this point (started
+  // right after load_checkpoint_if_present(), before this call -- see the constructor's own
+  // comment): write_entry_lockfree()/t1_.put() below rely on it to drain a shard's append region
+  // if replay pushes it toward AppendRegionFull, the same way live traffic does. This replaces
+  // the old unsharded design's explicit `t1_.append_size() + 1 >= t1_.append_capacity()` check
+  // (which forced a synchronous reorganize mid-replay specifically because no worker existed yet
+  // at this point) -- that check no longer applies (append_size()/append_capacity() aren't even
+  // whole-store concepts anymore), and isn't needed: ShardedT1Index::put() already retries
+  // AppendRegionFull internally against its own running worker pool.
   void recover_from_wal() {
     wal_.replay([&](vmemkv::WalRecordType type,
                     std::span<const std::byte> key,
                     std::span<const std::byte> value,
                     uint64_t /*lsn*/) {
-      if (t1_.append_size() + 1 >= T1IndexT::APPEND_CAP) {
-        reorganize_internal(ReorgMode::T1Only);
-      }
       switch (type) {
         case vmemkv::WalRecordType::Insert:
         case vmemkv::WalRecordType::Update:
@@ -1351,8 +1372,8 @@ class VMemKVImpl {
   }
 
   // Lets a caller (via setenv/unsetenv) suppress reorg_worker_loop()'s auto-triggered Checkpoint
-  // for a bounded window, without affecting a manually requested reorganize()/checkpoint() call or
-  // T1Only auto-triggering. Checked fresh every wakeup, not cached.
+  // for a bounded window, without affecting a manually requested reorganize()/checkpoint() call.
+  // Checked fresh every wakeup, not cached.
   static auto auto_reorg_suppressed() noexcept -> bool { return std::getenv("VMEMKV_SUPPRESS_AUTO_REORG") != nullptr; }
 
   void reorg_worker_loop(std::stop_token stop_token) {
@@ -1382,18 +1403,16 @@ class VMemKVImpl {
         continue;
       }
       try {
-        // Runs a Checkpoint cycle if WAL pressure demands it, otherwise a plain T1Only merge.
-        // Note reorg_requested_ (this wakeup's trigger) only ever fires on append-region/delete
-        // pressure (see maybe_reorganize_if_needed()) -- WAL-size changes never themselves cause a
-        // wakeup, so this only checks it "while already awake anyway."
-        //
-        // auto_reorg_suppressed() gates only this Checkpoint branch, never T1Only: T1's append
-        // region has a hard capacity, so some reorg must keep draining it or
-        // write_entry_lockfree()'s AppendRegionFull retry loop spins forever.
+        // reorg_requested_ only ever fires on WAL-size pressure now (see
+        // maybe_reorganize_if_needed()) -- T1 append-region maintenance is ShardedT1Index's own
+        // responsibility (its background worker pool), not something this loop needs to drive
+        // anymore. Re-check wal_over_threshold() at consumption time rather than trusting the
+        // flag alone: it could have already resolved (e.g. a concurrent manual checkpoint() call
+        // already rotated the WAL). auto_reorg_suppressed() lets a benchmark driver suppress this
+        // for a bounded window (see its own comment) -- with nothing else for this trigger to do
+        // instead, suppressed just means skip this round.
         if (wal_over_threshold() && !auto_reorg_suppressed()) {
           reorganize_internal(ReorgMode::Checkpoint);
-        } else {
-          reorganize_internal(ReorgMode::T1Only);
         }
       } catch (...) {
         // safe recovery in background
@@ -1402,71 +1421,25 @@ class VMemKVImpl {
     }
   }
 
+  // Soft/hard append-region threshold triggering (T1-only reorganize) used to live here too, but
+  // that's now ShardedT1Index's own responsibility, handled internally per shard (see
+  // request_maintenance_if_needed()/run_maintenance() in sharded_t1_index.hpp) -- t1_ has no
+  // whole-store append_size()/append_capacity() notion to threshold against anymore, and doesn't
+  // need VMemKVImpl to drive its maintenance. What's left here is purely about *checkpointing*
+  // (durabilizing T2 + WAL rotation), which only VMemKVImpl knows anything about.
+  //
+  // Known follow-up, not ported here (see docs/t1_sharding_design.md): the old version's
+  // scan_active_-driven dynamic soft-threshold lowering (kept T1's append region L2-cache-sized
+  // during active scans) and stripe-local delete-pressure triggering
+  // (maybe_reorganize_if_needed_for_delete(), removed) have no ShardedT1Index equivalent yet.
   void maybe_reorganize_if_needed() {
-    // reorg_requested_ is the only thing that wakes reorg_worker_loop() out of its idle poll to
-    // evaluate wal_over_threshold(); the two entry-count thresholds below set it independently of
-    // WAL bytes accumulated, so a large-value workload that rarely crosses either entry-count
-    // threshold still gets a periodic wakeup to check the byte-based trigger.
-    //
-    // wal_over_threshold() -> Wal::size_bytes() does an fstat() -- unlike append_size/tail_size
-    // below (plain atomic loads), that's a real syscall, too expensive to pay on every single
-    // write. Sampled once every kWalCheckStride writes instead: the resulting delay past the
-    // intended byte threshold is bounded by kWalCheckStride writes' worth of bytes, a rounding
-    // error against the threshold itself.
+    // wal_over_threshold() -> Wal::size_bytes() does an fstat(), too expensive to pay on every
+    // single write. Sampled once every kWalCheckStride writes instead: the resulting delay past
+    // the intended byte threshold is bounded by kWalCheckStride writes' worth of bytes, a
+    // rounding error against the threshold itself.
     constexpr uint64_t kWalCheckStride = 64;
     if (wal_check_counter_.fetch_add(1, std::memory_order_relaxed) % kWalCheckStride == 0) {
       if (wal_over_threshold()) {
-        reorg_requested_.store(true, std::memory_order_release);
-      }
-    }
-
-    const size_t append_size = t1_.append_size();
-    const size_t append_capacity = T1IndexT::APPEND_CAP;
-
-    // Dynamically calculate the soft threshold based on workload state
-    size_t soft_limit;
-    if (scan_active_.load(std::memory_order_relaxed)) {
-      // Scale-derived L2 cache capacity threshold (1MB / APPEND_SLOT_SIZE)
-      // This keeps linear scanning bounded within private L2 caches.
-      constexpr size_t kL2CacheSizeBytes = 1024 * 1024;  // 1MB
-      constexpr size_t kL2SlotCapacity = kL2CacheSizeBytes / T1IndexT::APPEND_SLOT_SIZE;
-
-      soft_limit = std::min(kL2SlotCapacity, (append_capacity * ConfigT::T1ReorganizeSoftThresholdPercent) / 100);
-    } else {
-      // Pure insert mode: allow append region to scale up to conservative capacity threshold
-      soft_limit = (append_capacity * ConfigT::T1ReorganizeSoftThresholdPercent) / 100;
-    }
-    const size_t hard_limit = (append_capacity * ConfigT::T1ReorganizeHardThresholdPercent) / 100;
-
-    if (append_size >= soft_limit) {
-      reorg_requested_.store(true, std::memory_order_release);
-    }
-
-    if (append_size >= hard_limit || append_size >= append_capacity) {
-      if (reorg_running_.load(std::memory_order_acquire)) {
-        hard_stall_count_.fetch_add(1, std::memory_order_relaxed);
-      }
-      wait_until_reorg_not_running();
-    }
-  }
-
-  // Stripe-local delete pressure, not a global tombstone ratio -- kept lightweight and read
-  // outside the critical section so Delete stays short and contention-friendly.
-  void maybe_reorganize_if_needed_for_delete(const AlignedMutex &stripe) {
-    const uint64_t live_count = stripe.live_count.load(std::memory_order_relaxed);
-    const uint64_t delete_count = stripe.delete_count.load(std::memory_order_relaxed);
-    if (live_count == 0) {
-      return;
-    }
-
-    constexpr uint64_t kMinLiveCount =
-        T1IndexT::APPEND_CAP / kKeyStripeCount / 16;  // Scale-derived lower bound to avoid tiny-sample thrash.
-    if (live_count < kMinLiveCount) {
-      return;
-    }
-
-    if (delete_count >= live_count) {
-      if (!reorg_running_.load(std::memory_order_acquire)) {
         reorg_requested_.store(true, std::memory_order_release);
       }
     }
@@ -1475,7 +1448,6 @@ class VMemKVImpl {
   std::jthread reorg_worker_;
   std::atomic<bool> reorg_requested_{false};
   std::atomic<bool> reorg_running_{false};
-  mutable std::atomic<bool> scan_active_{false};
 
   // Mutex striping based on key hash. Splitting into 256 stripes prevents lock contention
   // on concurrent writes without the overhead of dynamic allocation for individual key locks.
@@ -1490,18 +1462,15 @@ class VMemKVImpl {
     return write_stripes_[hash & (kKeyStripeCount - 1)];
   }
 
-  void reset_tombstone_counters() noexcept {
-    for (auto &stripe : write_stripes_) {
-      stripe.live_count.store(0, std::memory_order_relaxed);
-      stripe.delete_count.store(0, std::memory_order_relaxed);
-    }
-  }
-
   T1IndexT t1_;
   vmemkv::T2FlatFile t2_;
   vmemkv::Wal wal_;
   std::atomic<uint64_t> reorg_t1_count_{0};
   std::atomic<uint64_t> checkpoint_count_{0};
+  // Never incremented anymore: its only trigger was maybe_reorganize_if_needed()'s old
+  // append-region hard-threshold check, removed now that ShardedT1Index handles its own
+  // per-shard backpressure internally. Kept (always reads 0) for VMemKVStatistics/benchmark
+  // driver API compatibility (see bench_kv.cpp) rather than removing the field outright.
   std::atomic<uint64_t> hard_stall_count_{0};
   // See wait_until_reorg_not_running()'s own comment.
   mutable std::atomic<uint64_t> total_hard_stall_duration_us_{0};

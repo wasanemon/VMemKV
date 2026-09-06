@@ -199,6 +199,132 @@ TEST_CASE("Manifest: truncated file reads as nullopt") {
   std::filesystem::remove(path);
 }
 
+TEST_CASE("Sharded T1 checkpoint: write then read round-trips multiple shards and boundaries") {
+  const auto path = reserve_checkpoint_path();
+  const std::vector<FakeEntrySnapshot> shard0 = {{make_key("aaa"), 1, 0x11}, {make_key("bbb"), 2, 0x22}};
+  const std::vector<FakeEntrySnapshot> shard1 = {{make_key("ccc"), 3, 0x33}};
+  const std::vector<vmemkv::T1ChkKeyPrefix> boundaries = {make_key("ccc")};
+
+  {
+    vmemkv::ShardedT1CheckpointWriter writer(path);
+    writer.add_shard(std::span<const FakeEntrySnapshot>(shard0));
+    writer.add_shard(std::span<const FakeEntrySnapshot>(shard1));
+    writer.finish(boundaries);
+  }
+
+  vmemkv::ShardedT1CheckpointFile loaded(path);
+  REQUIRE(loaded.shard_count() == 2);
+  REQUIRE(loaded.boundaries().size() == 1);
+  CHECK(loaded.boundaries()[0] == make_key("ccc"));
+
+  const auto loaded_shard0 = loaded.shard_entries(0);
+  REQUIRE(loaded_shard0.size() == 2);
+  CHECK(loaded_shard0[0].key_prefix == make_key("aaa"));
+  CHECK(loaded_shard0[1].key_prefix == make_key("bbb"));
+
+  const auto loaded_shard1 = loaded.shard_entries(1);
+  REQUIRE(loaded_shard1.size() == 1);
+  CHECK(loaded_shard1[0].key_prefix == make_key("ccc"));
+  CHECK(loaded_shard1[0].payload_bits == 3);
+
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("Sharded T1 checkpoint: single shard, zero boundaries round-trips (K=1 case)") {
+  const auto path = reserve_checkpoint_path();
+  const std::vector<FakeEntrySnapshot> shard0 = {{make_key("a"), 1, 1}};
+
+  {
+    vmemkv::ShardedT1CheckpointWriter writer(path);
+    writer.add_shard(std::span<const FakeEntrySnapshot>(shard0));
+    writer.finish({});
+  }
+
+  vmemkv::ShardedT1CheckpointFile loaded(path);
+  CHECK(loaded.shard_count() == 1);
+  CHECK(loaded.boundaries().empty());
+  REQUIRE(loaded.shard_entries(0).size() == 1);
+  CHECK(loaded.shard_entries(0)[0].key_prefix == make_key("a"));
+
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("Sharded T1 checkpoint: a shard with zero live entries round-trips") {
+  const auto path = reserve_checkpoint_path();
+  const std::vector<FakeEntrySnapshot> empty_shard;
+  const std::vector<FakeEntrySnapshot> shard1 = {{make_key("z"), 9, 9}};
+
+  {
+    vmemkv::ShardedT1CheckpointWriter writer(path);
+    writer.add_shard(std::span<const FakeEntrySnapshot>(empty_shard));
+    writer.add_shard(std::span<const FakeEntrySnapshot>(shard1));
+    const std::vector<vmemkv::T1ChkKeyPrefix> boundaries = {make_key("z")};
+    writer.finish(boundaries);
+  }
+
+  vmemkv::ShardedT1CheckpointFile loaded(path);
+  REQUIRE(loaded.shard_count() == 2);
+  CHECK(loaded.shard_entries(0).empty());
+  REQUIRE(loaded.shard_entries(1).size() == 1);
+
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("Sharded T1 checkpoint: missing file throws") {
+  const auto path = reserve_checkpoint_path();
+  CHECK_THROWS(vmemkv::ShardedT1CheckpointFile(path));
+}
+
+TEST_CASE("Sharded T1 checkpoint: destroying the writer without calling finish() leaves no file") {
+  const auto path = reserve_checkpoint_path();
+  {
+    vmemkv::ShardedT1CheckpointWriter writer(path);
+    writer.add_shard(std::span<const FakeEntrySnapshot>(std::vector<FakeEntrySnapshot>{{make_key("a"), 1, 1}}));
+    // No finish() call -- destructor must discard the temp file, never touching `path`.
+  }
+  CHECK_FALSE(std::filesystem::exists(path));
+}
+
+TEST_CASE("Sharded T1 checkpoint: corrupted checksum is detected") {
+  const auto path = reserve_checkpoint_path();
+  {
+    vmemkv::ShardedT1CheckpointWriter writer(path);
+    writer.add_shard(std::span<const FakeEntrySnapshot>(std::vector<FakeEntrySnapshot>{{make_key("k"), 1, 1}}));
+    writer.finish({});
+  }
+
+  // Flip a byte inside the entry payload, well before the trailer -- magic/version/layout checks
+  // alone would not catch this; only the checksum can.
+  {
+    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    constexpr std::streamoff kEntryCountBytes = 8;
+    file.seekg(kEntryCountBytes);
+    char original = 0;
+    file.read(&original, 1);
+    const char flipped = static_cast<char>(~original);
+    file.seekp(kEntryCountBytes);
+    file.write(&flipped, 1);
+  }
+
+  CHECK_THROWS(vmemkv::ShardedT1CheckpointFile(path));
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("Sharded T1 checkpoint: truncated file is detected") {
+  const auto path = reserve_checkpoint_path();
+  {
+    vmemkv::ShardedT1CheckpointWriter writer(path);
+    writer.add_shard(std::span<const FakeEntrySnapshot>(std::vector<FakeEntrySnapshot>{{make_key("k"), 1, 1}}));
+    writer.finish({});
+  }
+
+  const auto full_size = std::filesystem::file_size(path);
+  std::filesystem::resize_file(path, full_size - 4);
+
+  CHECK_THROWS(vmemkv::ShardedT1CheckpointFile(path));
+  std::filesystem::remove(path);
+}
+
 TEST_CASE("Path derivation: manifest/t1chk/t2chk paths are distinct and stable") {
   const std::filesystem::path t2_path = "/tmp/some_store";
 

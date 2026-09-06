@@ -96,15 +96,16 @@ TEST_CASE("T1Index: put with STORE_NOT_FOUND tombstones the key") {
 
 TEST_CASE("T1Index: append region reports AppendRegionFull once capacity is exhausted") {
   auto idx = make_index();
+  const size_t append_cap = idx->append_capacity();
   size_t applied = 0;
-  for (size_t i = 0; i < TestIndex::APPEND_CAP + 1; ++i) {
+  for (size_t i = 0; i < append_cap + 1; ++i) {
     const std::string key = "k" + std::to_string(i);
     if (idx->put(to_span(key), static_cast<uint64_t>(i)) == TestIndex::PutResult::AppendRegionFull) {
       break;
     }
     ++applied;
   }
-  CHECK(applied == TestIndex::APPEND_CAP);
+  CHECK(applied == append_cap);
 }
 
 TEST_CASE("T1Index: reorganize merges append region into sorted region, keeps live entries readable") {
@@ -363,6 +364,69 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
   for (int i = 0; i < key_count; ++i) {
     CHECK(idx->get(to_span("k" + std::to_string(i))) != vmemkv::STORE_NOT_FOUND);
   }
+}
+
+// Regression test: resolve() returns "not found" for two unrelated reasons -- a key that's
+// genuinely absent, and a deliberate bypass signal when the key's slot lives in a region a
+// concurrent reorganize() just froze (see resolve()'s own comment on the immutable/sorted-frozen
+// bypass). put()'s existing-key update path used to treat both identically: after a successful
+// in-place write, if a second resolve() came back empty for *either* reason, it tombstoned its
+// own just-written value before falling back to a bypass insert. For the frozen-region reason,
+// that tombstone briefly and incorrectly made get()/scan() report a live key as absent, for the
+// window between the tombstone and the bypass insert landing -- self-healing (never a permanent
+// loss), but a real, observable correctness gap unlike the "different slot found" case (a genuine
+// append-region hash-collision displacement), where tombstoning the orphaned original is correct.
+// A dedicated reader thread polling get() is required to catch this: checking only after every
+// writer/reorganizer thread joins (as the sibling "survive racing reorganize" tests above do)
+// never observes the transient window.
+TEST_CASE("T1Index: get() never observes a live key as absent while a concurrent update races reorganize") {
+  auto idx = make_index();
+  constexpr int key_count = 64;
+  for (int i = 0; i < key_count; ++i) {
+    REQUIRE(idx->put(to_span("k" + std::to_string(i)), 0) == TestIndex::PutResult::Applied);
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> saw_missing{false};
+
+  std::thread reorganizer([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
+    }
+  });
+
+  std::thread writer([&]() {
+    uint64_t value = 1;
+    while (!stop.load(std::memory_order_relaxed)) {
+      for (int i = 0; i < key_count; ++i) {
+        idx->put(to_span("k" + std::to_string(i)), value);
+      }
+      ++value;
+    }
+  });
+
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 4; ++r) {
+    readers.emplace_back([&]() {
+      while (!stop.load(std::memory_order_relaxed)) {
+        for (int i = 0; i < key_count; ++i) {
+          if (idx->get(to_span("k" + std::to_string(i))) == vmemkv::STORE_NOT_FOUND) {
+            saw_missing.store(true, std::memory_order_relaxed);
+          }
+        }
+      }
+    });
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  stop.store(true, std::memory_order_relaxed);
+  writer.join();
+  reorganizer.join();
+  for (auto &reader : readers) {
+    reader.join();
+  }
+
+  CHECK_FALSE(saw_missing.load());
 }
 
 // Regression test for a Lost Update in reorganize()'s merge: put()'s in-place path used to

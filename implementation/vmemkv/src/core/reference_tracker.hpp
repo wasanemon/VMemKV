@@ -1,10 +1,11 @@
 // reference_tracker.hpp — Thread-local reference tracking for lock-free memory reclamation (SMR)
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
-#include <deque>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 #include "core/spin_backoff.hpp"
@@ -39,16 +40,21 @@ class GlobalThreadId {
 // without the atomic cache-bouncing overhead of shared_ptr reference counting.
 // Elements are cacheline-aligned (alignas(64)) to completely eliminate False Sharing.
 //
-// Backed by a std::deque, grown on demand to fit GlobalThreadId::get()'s highest value seen so
-// far -- no fixed thread-count ceiling, and no risk of two threads sharing a slot (see
-// GlobalThreadId's own comment for the bug this replaces). push_back/emplace_back on a deque
-// invalidates iterators but never references/pointers to existing elements, so growth (behind
-// growth_mutex_, only taken when a thread's ID hasn't been seen by this tracker before) never
-// disturbs another thread's already-established slot reference; the common case (a thread whose
-// ID already fits within capacity_) is a single atomic load, no lock at all. Tradeoff: a slot is
-// never reclaimed once grown into, even after that thread exits -- acceptable here since every
-// acquire() is paired with a release() via Guard's RAII (so a live slot always reads back to T{}
-// once idle) and this store's thread population is pool-shaped, not spawn-a-thread-per-request.
+// Backed by a fixed-size array of atomic pointers to fixed-size chunks, each chunk allocated
+// (and the pointer published) only once GlobalThreadId::get() first needs a slot in it -- no
+// risk of two threads sharing a slot (see GlobalThreadId's own comment for the bug this
+// replaces). Unlike a std::deque (the prior design here), growing never reallocates or moves
+// already-published memory: a chunk, once allocated, is never touched again by growth, so a
+// concurrent index-based read of an already-published chunk can never race with another
+// thread's growth of a *different* chunk. (A std::deque doesn't have this property even though
+// references to existing elements stay stable across push_back/emplace_back: growth can still
+// mutate the deque's own internal bookkeeping that operator[] reads, which is exactly the data
+// race this design exists to avoid.) The common case (a thread whose chunk already exists) is a
+// single atomic load, no lock at all. Tradeoffs: a slot is never reclaimed once grown into, even
+// after that thread exits -- acceptable here since every acquire() is paired with a release() via
+// Guard's RAII (so a live slot always reads back to T{} once idle) and this store's thread
+// population is pool-shaped, not spawn-a-thread-per-request; and the total thread-ID space this
+// can address is bounded (see kMaxChunks), generous enough for that same pool-shaped population.
 template <typename T>
 class ThreadReferenceTracker {
  public:
@@ -72,7 +78,14 @@ class ThreadReferenceTracker {
   };
 
   ThreadReferenceTracker() noexcept = default;
-  ~ThreadReferenceTracker() noexcept = default;
+
+  // Frees every chunk this instance ever allocated (see chunks_'s comment: allocation is
+  // append-only and never reclaimed while live, so this is the only place chunks are freed).
+  ~ThreadReferenceTracker() noexcept {
+    for (auto &chunk_ptr : chunks_) {
+      delete[] chunk_ptr.load(std::memory_order_relaxed);
+    }
+  }
 
   ThreadReferenceTracker(const ThreadReferenceTracker &) = delete;
   auto operator=(const ThreadReferenceTracker &) -> ThreadReferenceTracker & = delete;
@@ -95,13 +108,12 @@ class ThreadReferenceTracker {
   // repeats -- the same fix already applied to VMemKVImpl::get_impl()/try_in_place_update()'s
   // retry loops for the identical reason).
   void wait_until_retired(T old_val) const noexcept {
-    const size_t count = current_slot_count();
-    for (size_t i = 0; i < count; ++i) {
+    for_each_slot([&](std::atomic<T> &slot) {
       SpinBackoff backoff;
-      while (slots_[i].value.load(std::memory_order_seq_cst) == old_val) {
+      while (slot.load(std::memory_order_seq_cst) == old_val) {
         backoff.wait();
       }
-    }
+    });
   }
 
   // Waits until all thread slots have cleared (are T{}) or have advanced beyond the target epoch value.
@@ -112,17 +124,16 @@ class ThreadReferenceTracker {
   // registration racing this scan could be invisible to it even though the registering thread's
   // own read of the boundary is guaranteed ordered after the publish.
   void wait_until_epoch(T target_epoch) const noexcept {
-    const size_t count = current_slot_count();
-    for (size_t i = 0; i < count; ++i) {
+    for_each_slot([&](std::atomic<T> &slot) {
       SpinBackoff backoff;
       while (true) {
-        T epoch_val = slots_[i].value.load(std::memory_order_seq_cst);
+        T epoch_val = slot.load(std::memory_order_seq_cst);
         if (epoch_val == T{} || epoch_val >= target_epoch) {
           break;
         }
         backoff.wait();
       }
-    }
+    });
   }
 
  private:
@@ -130,37 +141,72 @@ class ThreadReferenceTracker {
     std::atomic<T> value{T{}};
   };
 
-  // Fast path: this thread's id already has a slot -- one atomic load, no lock. Slow path (a
-  // thread this tracker has never seen before): take growth_mutex_ and grow the deque up to and
-  // including `id`. A racing wait_until_retired()/wait_until_epoch() call taking the same mutex
-  // to read current_slot_count() is safe to interleave either way -- see the class comment for
-  // why a writer whose registration isn't yet visible to a concurrent wait can't have observed
-  // whatever boundary that wait is enforcing either (it hasn't reached the read that would
-  // matter yet), so missing it here is never a correctness problem, only a growth timing detail.
+  // Chunk granularity: kChunkSize slots per allocation (64 * 64-byte AlignedSlot == one 4 KiB
+  // page per chunk). kMaxChunks bounds the total addressable thread-ID space at
+  // kChunkSize * kMaxChunks == 65536 -- generous for this store's pool-shaped thread population
+  // (see class comment); chunks_ itself only costs kMaxChunks * sizeof(pointer) == 8 KiB
+  // regardless of how many chunks are ever actually allocated, since unused entries stay null.
+  static constexpr size_t kChunkSize = 64;
+  static constexpr size_t kMaxChunks = 1024;
+
+  // Fast path: this thread's chunk already exists -- one atomic load, no lock. Slow path (a
+  // thread ID whose chunk this tracker has never allocated): ensure_chunk() takes growth_mutex_
+  // and allocates it. Growth never touches an already-published chunk's memory or moves it, so a
+  // concurrent index-based read of a *different*, already-published chunk can never race with
+  // this allocation (see class comment for why this rules out the std::deque design's race).
   auto slot_for_current_thread() const -> std::atomic<T> & {
     const size_t thread_id = GlobalThreadId::get();
-    if (thread_id < capacity_.load(std::memory_order_acquire)) {
-      return slots_[thread_id].value;
+    const size_t chunk_index = thread_id / kChunkSize;
+    if (chunk_index >= kMaxChunks) {
+      throw std::runtime_error("ThreadReferenceTracker: thread-ID space exhausted");
     }
-    const std::lock_guard<std::mutex> lock(growth_mutex_);
-    while (slots_.size() <= thread_id) {
-      slots_.emplace_back();
+    AlignedSlot *chunk = chunks_[chunk_index].load(std::memory_order_acquire);
+    if (chunk == nullptr) {
+      chunk = ensure_chunk(chunk_index);
     }
-    capacity_.store(slots_.size(), std::memory_order_release);
-    return slots_[thread_id].value;
+    return chunk[thread_id % kChunkSize].value;
   }
 
-  auto current_slot_count() const -> size_t {
+  // Allocates chunks_[chunk_index] if another thread hasn't already (checked again under the
+  // lock). A racing wait_until_retired()/wait_until_epoch() call reading high_chunk_/chunks_
+  // without this lock is safe to interleave either way -- see the class comment for why a writer
+  // whose registration isn't yet visible to a concurrent wait can't have observed whatever
+  // boundary that wait is enforcing either (it hasn't reached the read that would matter yet), so
+  // missing a just-published chunk here is never a correctness problem, only a growth timing detail.
+  auto ensure_chunk(size_t chunk_index) const -> AlignedSlot * {
     const std::lock_guard<std::mutex> lock(growth_mutex_);
-    return slots_.size();
+    AlignedSlot *chunk = chunks_[chunk_index].load(std::memory_order_relaxed);
+    if (chunk == nullptr) {
+      chunk = new AlignedSlot[kChunkSize];
+      chunks_[chunk_index].store(chunk, std::memory_order_release);
+      if (const size_t new_high = chunk_index + 1; new_high > high_chunk_.load(std::memory_order_relaxed)) {
+        high_chunk_.store(new_high, std::memory_order_release);
+      }
+    }
+    return chunk;
+  }
+
+  // Invokes `fn(slot)` for every slot in every chunk allocated so far. A null (never-allocated)
+  // chunk is skipped outright: no thread has ever registered in its ID range for this instance,
+  // so it can hold no live reference `fn` would need to observe.
+  template <typename Fn>
+  void for_each_slot(Fn &&fn) const {
+    const size_t chunk_count = high_chunk_.load(std::memory_order_acquire);
+    for (size_t c = 0; c < chunk_count; ++c) {
+      AlignedSlot *chunk = chunks_[c].load(std::memory_order_acquire);
+      if (chunk == nullptr) {
+        continue;
+      }
+      for (size_t i = 0; i < kChunkSize; ++i) {
+        fn(chunk[i].value);
+      }
+    }
   }
 
   mutable std::mutex growth_mutex_;
-  // Mirrors slots_.size() so slot_for_current_thread()'s fast path can check it without taking
-  // growth_mutex_; only ever written (under the mutex) after a push_back, so a thread observing
-  // capacity_ > id here is guaranteed slots_[id] already exists.
-  mutable std::atomic<size_t> capacity_{0};
-  mutable std::deque<AlignedSlot> slots_;
+  mutable std::array<std::atomic<AlignedSlot *>, kMaxChunks> chunks_{};
+  // High-water mark of chunk indices ever allocated (not necessarily dense -- see for_each_slot()).
+  mutable std::atomic<size_t> high_chunk_{0};
 };
 
 }  // namespace vmemkv

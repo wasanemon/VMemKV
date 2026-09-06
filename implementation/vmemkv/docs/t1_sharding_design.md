@@ -1,0 +1,336 @@
+# T1の範囲シャーディング設計
+
+`reorganize()`/`checkpoint()`のO(corpus)コスト([`t1_index_structure_decision.md`](t1_index_structure_decision.md)参照)を、
+単一の`T1Index`を独立したK個のシャードに分割することで解消する設計。各シャードは既存の
+`src/t1_index/t1_index.hpp`をそのまま(変更なしで)使う。
+
+## 全体構造
+
+T1は2層になる:
+
+- **ディレクトリ**: 境界キーでソートされた配列。各区間を1つのシャードへマッピングする。
+- **シャード**: `T1Index<Config>`のインスタンスがK個。各シャードは自分が担当するキー範囲内の
+  データだけを持つ、独立したsorted region + append regionのペア。
+
+キー空間はレンジパーティション(ハッシュではない)する。理由: シャードが常に非重複かつ
+順序を保つため、Scanがシャード跨ぎでもk-wayマージを必要とせず、交差するシャードそれぞれの
+`scan()`結果をシャード順に連結するだけで全体がソート済みになる。
+
+初期状態はK=1(既存の単一T1Indexと同一の挙動)で、データ量が増えるにつれ動的にsplitする。
+
+## ディレクトリの並行性
+
+ディレクトリはT1Index自身がすでに使っているRCU的パターン(`AppendGeneration`/`SortedRegion`の
+atomicポインタ差し替え+epoch-basedな回収)をそのまま1段上に適用する。ディレクトリはイミュータブルな
+オブジェクトで、split/merge時にのみ新しいインスタンスへatomicに差し替えられる。読み取り側は
+操作開始時に1回ディレクトリをロードし、そのシャードへの参照を操作完了まで使い続ける。
+
+## Splitting
+
+`reorganize()`はすでに全生存エントリをマージ・重複排除したソート済み配列(`merged`)を計算している。
+splitはこの結果を再利用するが、`merged`をそのまま使うだけでは書き込みロストが起きるため、
+2段階のprotocolを踏む。
+
+**書き込みロストが起きる理由**: `reorganize()`は`merged`を計算する**前**に、旧active regionを
+immutableへfreezeし新しいactive regionをpublishする(既存の二重バッファリング)。つまり`merged`が
+確定した時点で、対象シャードは既に新しい(空の)active regionへの書き込みを受け付け始めている。
+この新しいactive regionへ書き込まれたエントリは`merged`に含まれないため、`merged`をそのまま
+2分割してS1・S2を構築すると、split決定後にそのシャードへ着弾した書き込みが消える。
+
+**2段階protocol(Closing → Split)**:
+
+1. 通常の`reorganize()`が完了し、結果(`merged`)のサイズが目標シャードサイズの閾値(例: 2倍)を
+   超えていたら、split対象と判定する。
+2. 対象シャードの`ShardSlot.superseded`に`Closing`をセットする(S1・S2はまだ存在しない。単に
+   「これ以上の新規書き込みを受け付けない」という印)。put/removeは`superseded`をチェックし、
+   `Closing`を見たらスピン待ちして新規書き込みを行わない(get/scanは`Closing`中も対象シャードを
+   直接読んでよい——データは壊れない、書き込みが止まるだけ)。
+3. 対象シャードの`reorganize()`をもう一度呼ぶ。既存の仕組み(`reorg_epoch_`/`active_epochs_`に
+   よるepoch drain)がそのまま、`Closing`セット時点で対象シャードに残っていた書き込み中の操作を
+   正しく`merged`へ含める。`Closing`以降に到達した新規書き込みは(2)で止まっているため、この
+   2回目の`merged`はそのシャードの完全な最終状態になる。T1Index自体には一切変更を加えない。
+4. この最終`merged`を中央で2分割し、それぞれから新しいシャード(空のappend region + 分割された
+   sorted region)を構築する。
+5. `superseded`を`Closing`から`Split{S1, S2, 分岐キー}`へ更新する(`Closing`でスピン待ちしていた
+   put/removeはここで起床し、S1かS2へリダイレクトされる)。
+6. ディレクトリを新しいエントリ(S1, S2への境界)で置き換える。
+7. epoch-basedな回収により、旧ディレクトリ経由で対象シャードを直接参照し得るすべての操作が
+   完了したことを確認してから、そのシャードを解放する。
+
+コストは償却でO(1)/insert、単発の最悪コストはO(シャードサイズ)であり、コーパス全体のサイズに
+依存しない(2回目の`reorganize()`もO(シャードサイズ)であり、この定数倍が増えるだけ)。
+`bench_kv.cpp`の`ikey()`(`"k"`+16進15桁)のような単調増加キーでも、成長し続けるのは常に最右端の
+1シャードだけなので、この特性は保たれる。
+
+## APPEND_CAPのスケーリング
+
+各シャードは独自の`AppendRegion`(固定のmmapフットプリントを持ち、疎な占有でもほぼ全ページが
+residentになる、オープンアドレッシングゆえの特性)を持つため、シャード数Kに比例して固定オーバー
+ヘッドが増える。
+
+このオーバーヘッドを抑えるため、`APPEND_CAP`はシャード目標サイズに比例させる: 目標サイズより
+append領域が大きくなる構成は本末転倒(サイズベースのsplitトリガーが発火する前にappend領域自体の
+hard thresholdで頭打ちになる)。これにより`APPEND_CAP`は`Config`のコンパイル時定数から、シャード
+生成/split時に目標サイズ×比率で決まる実行時パラメータへ変更する。
+
+結果として、チューニングすべきノブは「シャード目標サイズ」の1つに集約される: 大きくすればシャード数
+Kが減り固定オーバーヘッドは下がるが1回のreorganize/splitの最悪コストは増え、小さくすればその逆になる。
+
+## Shrink(マージバック)
+
+削除主体のワークロードで生存件数が目標サイズを大きく下回ったシャードは、隣接シャードとマージする。
+
+判定はsplitと同じタイミング(そのシャードの`reorganize()`完了時)で行う: 生存件数が下限(例: 目標の
+0.5倍)を下回り、隣接シャードとの合算が上限(例: 目標の1.5倍)以内に収まるならマージする。
+
+両シャードのキー範囲は非重複かつ順序があるため、双方の最終`merged`が確定した後は、ソートやマージ
+処理なしに単純な配列連結だけで正しい順序になる(シャード跨ぎScanの連結と同じ理屈)。「最終」
+`merged`を得る手順はsplitと対称: 両シャードに`Closing`をセットしてから、それぞれもう一度
+`reorganize()`を呼び、`Closing`セット後に着弾する新規書き込みを止めた上で完全な最終状態を得る
+(理由はsplitの項を参照——省略すると書き込みロストが起きる)。`superseded`は両シャードとも
+`Closing`から`Merged{結合後の新シャード}`へ更新し、ディレクトリから該当の境界を削除する。
+コストはO(対象2シャードのサイズ)。
+
+split/mergeはいずれも「背景ワーカーのスレッドプール」節で述べる仕組みにより、シャードごとに独立して
+並行に実行できる。ディレクトリの更新だけが共有オブジェクトへのCASを介して直列化される。
+
+## シャード跨ぎの並行アルゴリズム
+
+### Forwarding pointer(B-link tree方式)
+
+各シャードは`superseded`という1ワードのatomicフィールドを持つ(初期値null)。取りうる状態は
+`null`(通常)・`Closing`(split/merge中、新規書き込み拒否、S1/S2未確定)・
+`Split{S1, S2, 分岐キー}`(split完了、リダイレクト先確定)の3つで、遷移は
+`null → Closing → Split{...}`の一方向。具体的な手順は「Splitting」節を参照。
+
+すべての操作(get/put/remove/scan)は、シャードに入る前に`superseded`をチェックする:
+`Split{...}`ならキー比較でS1かS2へ転送してから操作をやり直す。`Closing`はput/removeだけが
+スピン待ちし(get/scanはそのままSを直接読んでよい——「Scanの一貫性モデルのスコープ」節の
+per-keyの鮮度の範囲内)、`Closing`が`Split{...}`に遷移するのを待って転送する。
+
+### `null → Closing`のCASは必ずrouting epoch guard配下で行う
+
+splitを開始する`null → Closing`のCAS自体が対象`ShardSlot`の参照外し(dereference)であるため、
+このCASは必ず(get/put/scanと同じ)routing epoch guardの内側で行い、CASに成功して初めて
+guardの外へ出て残りの処理(2回目のreorganize以降、`continue_split`相当)を行う。理由:
+CASの直前に対象を解決(resolve)した時点では`superseded == null`だったとしても、guardなしで
+CASを試みるまでの間に**別のスレッドによる同じシャードへのsplitが完了し、対象が既に解放されて
+いる**可能性がある。CASに成功した後は、そのシャードを解放できるのは自分だけになるため、
+残りの重い処理(2回目のreorganize、S1/S2構築、ディレクトリ更新、epoch drain、解放)は
+guardなしで行ってよい——むしろguard配下のままにすると、自分自身のepoch drain
+(`wait_until_epoch`)が自分自身のguard解放を待つ形になり**デッドロックする**。
+
+この「CAS試行だけをguard配下で行い、成功後の重い処理はguard外で行う」という分割は、
+splitを開始しうる**すべての**経路(明示呼び出し・背景ワーカーの自動発火のいずれも)が
+守るべき不変条件である。同様に、`Directory`を参照外しするだけの読み取り専用メソッド
+(例: シャード数を返すアクセサ)も、get/put/scanと同じrouting epoch guardの内側で
+`directory_`を読む必要がある——実装時、これを怠ったことでTSanが実際にuse-after-freeを
+検出した(背景ワーカーの完了したsplitが解放したディレクトリを、guardなしのアクセサが
+読みに行っていた)。
+
+この仕組みはLehman & Yao (1981)のB-link treeにおける"high key + right sibling link"と同型であり、
+「ディレクトリがまだ更新されていない古い参照でシャードに到達した操作」を、ロックなしで正しい行き先へ
+導く。これにより、split中に古いディレクトリ参照でSへ到達したput/removeが、破棄されるSへ書き込んで
+ロストする、という事態を避ける。
+
+### Get/Scanがsplit中のシャードに到達する場合
+
+Sのメモリは「Splitting」節の手順7(epoch回収)が完了するまで解放されないため、直接読んでも壊れない。
+read系操作もforwarding pointerを辿ることで、split後にS1/S2へ書き込まれた最新データを見逃さない。
+
+### Scanの一貫性モデルのスコープ
+
+T1(シャーディング層を含む)がScanに対して保証するのは以下の2点のみである:
+
+- **構造的完全性**: 交差するキー範囲は漏れなく、かつ重複なく1回ずつ返される。並行するsplit/merge
+  (SMO)が走っていても、これは崩れない。
+- **per-keyの鮮度**: 返される各キーの値は、Scanの開始から終了までの間のいずれかの時点で実際に
+  成立していた値である。
+
+意図的に保証しない(スコープ外とする)のは、**異なるキーにまたがる書き込み間の実時間順序**である。
+たとえば無関係な2クライアントが`put(A)`→`put(B)`を実時間で逐次実行したとき、Scanの結果が「Bは
+新しい値、Aは古い値」を返すことは許容する。
+
+この保証を省く根拠は「上位層がいずれ肩代わりするはず」という期待ではなく、**この保証が意味を持つ
+ためにはA・Bを1単位として書き込む機能(トランザクション、バッチ書き込み)が前提として必要**という点
+にある。VMemKVのAPIはget/put/remove/scanいずれも単一キー操作であり、複数キーを1つの書き込み単位と
+して扱う機能を持たず、その予定もない。独立した2回のput()の間にアプリ側が守るべき不変条件はそもそも
+表現しようがないため、scanがそれらをどの順序で見せても破られる不変条件が存在しない。この保証を
+scan側だけに単独で作り込んでも、対応する書き込み側の協調機構がない限り誰にも観測・活用され得ず、
+コスト(前述のbump/drainのいずれの方式でも発生する)に見合う価値がない。
+
+将来的に複数キーにまたがる書き込み機能を追加する場合は、その機構が自分自身のコミット時点で
+バージョン/タイムスタンプを刻み、読み取り時にそれをT1へ渡す形で一貫性を実現すべきである
+(RocksDB/WiredTiger/InnoDB等のストレージエンジンも、iteratorは呼び出し側が渡すsnapshotハンドルに
+従うだけで、ストレージ層自身がグローバルな順序を発明してはいない)。その時点で本セクションの
+スコープを再検討する。
+
+上記の2点(構造的完全性+per-keyの鮮度)は、forwarding pointerの仕組みだけで満たされる:
+split中の古いシャードSを直接読んでも(補正しなくても)、Sは freeze 時点のデータをすべて保持して
+おり、破棄されるまで壊れない。forwarding pointerを辿ってS1/S2側を読めば、freeze以降にS1/S2へ
+書き込まれた分もper-keyの鮮度の範囲内で反映される。いずれの読み方でも構造的完全性は崩れない。
+**グローバルなepoch/sequenceカウンタは不要であり、追加のコストは発生しない。**
+
+### 背景メンテナンス操作の直列化
+
+各シャードは既存のT1Index自身が持つ`reorg_in_progress_`相当のCASガードを独立に持ち、複数シャードの
+`reorganize()`/split/mergeは並行に実行できる。直列化が必要なのは共有ディレクトリオブジェクトの
+更新だけであり、これは共有ディレクトリポインタへのCASで解決する(複数シャードが同時にsplit/mergeを
+申告した場合は、CAS失敗時に最新のディレクトリを読み直して自分の変更を再適用するリトライループになる)。
+並行性を考える必要があるのは「1つのシャードの背景メンテナンス操作 vs そのシャードへの前景read/write」
+の組み合わせであり、「シャードA・Bの背景メンテナンス操作同士」は互いに独立で競合しない。
+
+## 背景ワーカーのスレッドプール
+
+### モデル
+
+シャードごとに専用スレッドは割り当てない(Kが大きい場合にOSスレッドが増えすぎるため)。かわりに、
+固定サイズの共有ワーカースレッドプールと、「reorganizeが必要なシャードID」を保持するキュー
+(集合、重複投入なし)を用いる。あるシャードへの書き込みが既存のsoft threshold相当を超えると、
+そのシャードIDがキューに投入される(すでにキュー中/処理中なら何もしない)。プール内の各ワーカーは
+キューからシャードIDを取り出し、そのシャードの`reorganize()`(split判定込み)を実行する。
+
+hard threshold(シャードのappend領域が実際に満杯)は既存と同じ発想をシャード単位にスコープを絞って
+維持する: そのシャード宛の書き込みを試みたスレッドだけがブロックして待つ。他シャードへの書き込みは
+影響を受けない。これは今日の(単一T1Indexの)hard threshold機構をそのままシャード単位に一般化した
+ものであり、`docs/benchmark/20260823_defragment_scaling_measurements.md`系で実測されている
+「メンテナンス作業を前景スレッドの経路に混ぜ込むとスループットが崩壊する」という既知の問題を
+再導入しないよう、**アクセスしたスレッド自身にreorganizeを代行させる方式は採用しない**。
+
+キューは集合なので深さは最大でもK(シャード総数)に収まり、無制限には膨らまない。FIFO+重複排除に
+より、処理済みのシャードが直後に再び閾値を超えても列の末尾に再投入されるだけで、特定シャードの
+飢餓は起きない。
+
+### Nested parallelismの回避
+
+既存の`reorganize()`は内部で`std::execution::par`によるparallel sortを使っている。これは「同時に
+1つのreorganizeしか走らない」という前提の下では正しい選択だったが、プールが複数シャードの
+`reorganize()`を同時に走らせるようになると、各タスクが内部でさらに全コアへfan-outしようとして、
+プールサイズ×内部並列度の分だけ実効スレッド数が物理コア数を超過し、コンテキストスイッチとキャッシュ
+スラッシングで悪化する。シャーディング後は、各シャードのサイズが目標サイズ以下に抑えられているため、
+シャードの`reorganize()`は逐次sortで十分に高速なはずであり、`std::execution::par`から
+`std::execution::seq`へ切り替える。並列性は「多数の小さなreorganizeを別々のワーカーが同時に処理する」
+ことで得る。
+
+### プールサイズ
+
+決め打ちにせず、既存の`T1ReorganizeSoftThresholdPercent`等と同じ流儀で設定可能にする
+(例: `T1ReorgWorkerThreads`)。デフォルト値は「物理コア数から前景トラフィック用に確保する分を
+引いた数」を出発点とし、実測によってチューニングする。
+
+### キューが追いつかない場合の劣化特性
+
+持続的にプールの処理能力を超える書き込み負荷がかかると、複数シャードが同時にhard thresholdへ
+到達し、それぞれのシャード宛の書き込みだけがブロックする。全体のスループットはプールの処理能力で
+頭打ちになるが、影響は該当シャードに限定され、他シャードへの書き込みは継続する——今日の単一
+T1Indexが持つ「hard thresholdで全体が止まる」状態より優れている。
+
+例外は、単調増加キーのように**常に1シャードだけが更新され続けるワークロード**である。この場合
+並列化できるシャードがそもそも1つしかなく、プールを大きくしても意味がない。この限界は
+「Splitting」節で述べた、splitのコスト分析における同じ限界と同一の原因による。
+
+### 検討したが不採用: コルーチン/グリーンスレッド
+
+コルーチン/グリーンスレッドは「大量の、待ち時間の多い(I/Oバウンドな)タスクを低オーバーヘッドで
+捌く」場面で有効な技術である。`reorganize()`は基本的にCPUバウンド(メモリ上のsort/merge/再構築)で
+あり、同時に存在しうるタスク数もK(シャード総数、現実的には数千程度)に収まる。これは軽量な
+同時実行数を必要とする問題ではなく、コルーチンを導入しても利点がない。また「シャード数Kに対して
+スレッドを1つずつ割り当てると多すぎる」という問題は、上記の固定サイズプール+キューの設計で
+既に解決されており、コルーチンに置き換える動機がない。
+
+## Checkpoint/Recovery
+
+T2とWALは既存どおりグローバル(シャード非依存)のまま維持する。`checkpoint()`はK個のシャードそれぞれに
+対して強制`reorganize()`(split判定込み)を行い、境界キー+各シャードのソート済みエントリをチェック
+ポイントファイルへ直列化する。既存の「T1チェックポイントをWALローテーションより前に行う」順序制約は
+維持し、これをK回繰り返す形になる。Recoveryはこのファイルからディレクトリ+K個のシャードを再構築した
+後、ディレクトリベースのルーティングでWALの残りを再生する。checkpoint中もforwarding pointerの仕組みで
+保護されるため、split固有の新しいハザードは生じない。
+
+## 実装状況
+
+- 済: `APPEND_CAP`のT1Index実行時コンストラクタ引数化(`src/t1_index/t1_index.hpp`)。
+- 済: `ThreadReferenceTracker`のstd::deque由来の競合状態を修正(`src/core/reference_tracker.hpp`)し、
+  ディレクトリ層のepoch回収の土台をTSanクリーンにした。
+- 済: ディレクトリ層本体(`src/t1_index/sharded_t1_index.hpp`の`ShardedT1Index<Config>`) —
+  ディレクトリのRCU差し替え、forwarding pointer(`null`/`Closing`/`Split{...}`)、2段階split
+  protocol、シャード跨ぎscan。
+- 済: サイズ閾値に基づくsplitの自動発火と背景ワーカーのスレッドプール+キュー
+  (`request_maintenance_if_needed()`/`worker_loop()`/`run_maintenance()`)。ポーリング間隔方式は
+  `vmemkv_impl.hpp`の`reorg_worker_loop()`と同じ流儀(condition variableではなく固定間隔ポーリング)。
+  実装過程でTSanが3件の実際のuse-after-freeを検出し修正した(いずれも根は同じ: routing epoch
+  guardの外で取得・使用された`ShardSlot*`が並行するsplitの解放と競合する)。(1) 重複キュー投入
+  されたエントリが、対象シャードの解放後もキューに残り得た問題 → `null → Closing`遷移時に同じ
+  mutexの下でキューをpurgeし、`request_maintenance_if_needed()`側も同じmutexの下で`superseded`
+  を再チェックしてから投入する形に修正。(2) `null → Closing`のCASやディレクトリを読むだけの
+  アクセサがrouting epoch guardの外で行われ、並行するsplitの解放と競合した問題 → 「`null →
+  Closing`のCASは必ずrouting epoch guard配下で行う」節の設計に修正。(3)
+  `worker_loop()`が`pop_queue()`をrouting epoch guardの外で呼び、取得した`ShardSlot*`を
+  `run_maintenance()`に渡していたため、同じシャードを狙う並行`split_shard_containing()`が
+  `continue_split()`まで完了して解放し終えても、そのworkerスレッドは`routing_epochs_`に一切
+  登録されておらず`wait_until_epoch()`から見えない問題(実データ損失も再現: 2000件中1件が
+  消失)。→ `pop_queue()`自体を`run_maintenance()`の(超過チェック/reorganize/CAS試行と同じ)
+  routing epoch guard配下に移し、workerがシャードへ触れる前に必ずguard登録済みになるよう修正。
+  `tests/test_sharded_t1_index.cpp`に、背景ワーカー主導の自動splitと明示的な
+  `split_shard_containing()`が同じシャード群を同時に取り合う専用のリグレッションテストを追加
+  (既存テストはこの2つの経路を同時に踏むケースを持っていなかった)。
+- 済: 各シャードのreorganize()を`std::execution::seq`へ切り替え(nested parallelism回避、
+  「Nested parallelismの回避」節参照)。`T1Index::reorganize()`に`parallel_sort`引数(既定`true`)を
+  追加し、既存の(シャーディングなしの)呼び出し元は変更不要のまま、`ShardedT1Index`側だけが
+  `false`を渡す形にした。
+- 済: Checkpoint/Recoveryのシャード対応。`ShardedT1Index::checkpoint_all_shards(offset_mapper,
+  per_shard_writer)` — 全シャードを昇順に強制reorganize()し、`T1Index::reorganize()`と同じ
+  `(OffsetMapper, ChkWriter)`契約をシャードごとに適用、境界キー配列を返す。split/mergeは呼び出し
+  期間中一時停止(`splits_paused_`)し、ループ全体を1つの`with_routing_guard()`配下に置くことで、
+  停止前にCASを勝ち取っていたsplitの解放とも競合しない。`ShardedT1Index::load_from_checkpoint(
+  boundaries, per_shard_entries)` — 構築直後の単一シャード状態を、チェックポイントデータから
+  複数シャードのディレクトリへ丸ごと置き換える(他スレッドに公開する前提、同期不要)。
+  実装過程で、シャーディングとは無関係な**T1Index本体の既存バグ**を発見・修正した:
+  `put()`の既存キー更新パスが、書き込み直後の2回目の`resolve()`が「見つからない」を返した理由
+  (真のappend領域ハッシュ衝突による追い出し/reorganize()によるfreeze起因のbypass)を区別せず、
+  どちらも自分の書き込みをtombstone化していたため、get()/scan()がfreeze競合時に生きているキーを
+  一瞬「存在しない」と誤って返し得た(恒久的なロストではなく自己修復するが、可視性の実バグ)。
+  `tests/test_t1_index.cpp`に能動的なreaderスレッドを伴うリグレッションテストを追加。
+- テスト: `tests/test_sharded_t1_index.cpp`(ルーティング、split後の整合性、gap-free/dedup-freeな
+  scan、put/get/scanが明示splitと競合する並行性ストレステスト、自動split発火、複数スレッドからの
+  並行insertが複数回の自動splitを引き起こしてもデータを失わないことの検証、checkpoint単体の
+  網羅性、load_from_checkpointからの復元、put/get/scan/splitと並行するcheckpointがデータを
+  失わないことの検証)。TSan(`ShardedT1Index*`+`T1Index*`全ケース)クリーン。
+- 済: `vmemkv_impl.hpp`への結線。`T1IndexT`を`ShardedT1Index<ConfigT>`に差し替え、`get`/`put`/
+  `get_with_hash`/`scan`は同一シグネチャのため呼び出し元は無変更。checkpoint(`checkpoint_internal()`)
+  は`ShardedT1Index::checkpoint_all_shards()`をシャード対応の複数シャードチェックポイントフォーマット
+  (`src/checkpoint/checkpoint.hpp`の`ShardedT1CheckpointWriter`/`ShardedT1CheckpointFile`。ヘッダを
+  ファイル末尾に置くトレイラー形式 — shard_count/boundaryが全シャードのコールバック完了まで
+  確定しないため)に接続。`reorganize_internal(T1Only)`は同じ`checkpoint_all_shards()`をno-op
+  writerで呼ぶ形にし、`store->reorganize()`の同期完了契約を維持。`ShardedT1Index`はコンストラクタで
+  `worker_threads=0`(背景ワーカー未起動)にしてから`load_from_checkpoint()`を行い(単一スレッド前提)、
+  直後に`start_workers()`を呼んでから`recover_from_wal()`に入る — WAL再生自体は単一スレッドのままだが、
+  `ShardedT1Index::put()`内部の`AppendRegionFull`自己解決が効くようワーカーを先に起動しておく必要が
+  あるため(旧実装の「reorg workerはrecovery後に起動」という順序からの意図的な変更)。
+  `maybe_reorganize_if_needed()`/`reorg_worker_loop()`からT1のappend容量閾値ロジックを削除し、
+  WALサイズ閾値によるcheckpoint起動のみを残した(T1自身のsplit/reorganizeトリガーは
+  `ShardedT1Index`の背景ワーカーが担う)。`maybe_reorganize_if_needed_for_delete()`は削除。
+  `tests/test_crash_recovery.cpp`に複数シャードでのcheckpoint+再起動ラウンドトリップテストを追加。
+  全271テストがTSan(`build-tsan/`、`external_symbolizer_path`にaddr2line指定 — サスペンションの
+  シンボルマッチにはシンボル化が必須なため`symbolize=0`は使えない)込みでクリーン。
+- 済: この結線のTSan検証中に、シャーディングとは無関係な**`Wal`本体の既存バグ**を発見・修正した
+  (`src/wal/wal.cpp`): `Wal::size_bytes()`が`fd_`をロードして`fstat()`する間に、並行する
+  `Wal::rotate_segment()`が同じfdを`close()`する競合があった(fstat-after-closeでEBADF例外、
+  最悪の場合はfd番号が別のopen()に再利用され無関係なファイルのサイズを返し得た)。
+  `rotate_segment()`の`close(old_fd)`と`size_bytes()`の`fstat(fd_)`を専用の`fd_close_mu_`で
+  相互排他する形で修正(書き込み/fsyncパスとは無関係、close呼び出しの瞬間だけをガード)。
+
+## 未実装/次のステップ
+
+- Shrink(マージバック)の実装(split実装後のfast follow、対象外として最初からスコープ外)。
+- delete圧力トリガー(`maybe_reorganize_if_needed_for_delete()`相当)の`ShardedT1Index`版。
+  `vmemkv_impl.hpp`結線時に、既存の実装を移植せず落とした既知のフォローアップ。
+- scan中の動的閾値低下(`scan_active_`駆動でappend領域をL2キャッシュサイズに保つ最適化)の
+  `ShardedT1Index`版。同じく結線時に落とした既知のフォローアップ。
+
+## 関連ドキュメント
+
+- [`t1_index_structure_decision.md`](t1_index_structure_decision.md): T1がflat arrayを維持するという
+  決定と、シャーディングを次の検討方向とする経緯。
+- [`benchmark/20260905_t1_structure_alternatives_survey.md`](benchmark/20260905_t1_structure_alternatives_survey.md):
+  pskiplistの実測、PMA/Bw-tree/ARTの調査、範囲シャーディングの先行研究(PebblesDB、B-link tree等)の詳細。

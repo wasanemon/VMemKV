@@ -239,6 +239,9 @@ class Wal {
   // close()-then-reassign; a plain int would be a data race (UB) and risk a
   // close-then-fd-number-reused hazard.
   std::atomic<int> fd_{-1};
+  // Guards only rotate_segment()'s close(old_fd) against size_bytes()'s fstat(fd_) -- see both
+  // functions' own comments. Not involved in the write/fsync path at all.
+  mutable std::mutex fd_close_mu_;
   // Published by rotate_segment(); see last_rotate_leader_wait_us()'s own comment.
   std::atomic<uint64_t> last_rotate_leader_wait_us_{0};
   std::filesystem::path path_;

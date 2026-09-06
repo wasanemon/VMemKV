@@ -17,21 +17,21 @@
 #include <cstdint>
 #include <system_error>
 
-template <typename Key, typename Slot, size_t SlotCapacity>
+template <typename Key, typename Slot>
 class LockFreeHashTable {
  public:
   using slot_index_type = uint32_t;
   static constexpr slot_index_type kEmpty = 0;
   static constexpr slot_index_type kNotFound = 0;
-  static constexpr size_t kBucketCount = std::bit_ceil(SlotCapacity * 2);
 
   // Bucket{}'s zero-initialized atomic (kEmpty) matches the bit pattern MAP_ANONYMOUS memory
   // already reads as, so buckets_ can come from a raw mmap instead of a constructed std::array:
   // untouched pages cost no resident memory instead of faulting in the whole table up front
   // regardless of how many entries this generation actually holds.
-  LockFreeHashTable()
-      : buckets_(static_cast<Bucket *>(::mmap(nullptr,
-                                              kBucketCount * sizeof(Bucket),
+  explicit LockFreeHashTable(size_t slot_capacity)
+      : bucket_count_(std::bit_ceil(slot_capacity * 2)),
+        buckets_(static_cast<Bucket *>(::mmap(nullptr,
+                                              bucket_count_ * sizeof(Bucket),
                                               PROT_READ | PROT_WRITE,
                                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                                               -1,
@@ -41,7 +41,7 @@ class LockFreeHashTable {
     }
   }
 
-  ~LockFreeHashTable() { ::munmap(buckets_, kBucketCount * sizeof(Bucket)); }
+  ~LockFreeHashTable() { ::munmap(buckets_, bucket_count_ * sizeof(Bucket)); }
 
   LockFreeHashTable(const LockFreeHashTable &) = delete;
   auto operator=(const LockFreeHashTable &) -> LockFreeHashTable & = delete;
@@ -50,7 +50,7 @@ class LockFreeHashTable {
   template <typename SlotAccessor>
   auto find_slot_index(const Key &key, uint64_t hash, SlotAccessor &&slot_at) const noexcept -> slot_index_type {
     size_t pos = bucket_index(hash);
-    for (size_t probe = 0; probe < kBucketCount; ++probe) {
+    for (size_t probe = 0; probe < bucket_count_; ++probe) {
       const slot_index_type observed = buckets_[pos].slot_plus_one.load(std::memory_order_acquire);
       if (observed == kEmpty) {
         return kNotFound;
@@ -80,7 +80,7 @@ class LockFreeHashTable {
                     SlotAccessor &&slot_at,
                     OnDisplaced &&on_displaced) noexcept -> bool {
     size_t pos = bucket_index(hash);
-    for (size_t probe = 0; probe < kBucketCount; ++probe) {
+    for (size_t probe = 0; probe < bucket_count_; ++probe) {
       // Retries by re-reading `pos` (not advancing) on CAS failure: a plain store() here is
       // unsound under >2-way contention -- if B and C both see A's slot and both decide to
       // displace it, a plain store from whichever runs second would silently clobber the
@@ -121,9 +121,12 @@ class LockFreeHashTable {
     std::atomic<slot_index_type> slot_plus_one{kEmpty};
   };
 
-  static auto bucket_index(uint64_t hash) noexcept -> size_t { return static_cast<size_t>(hash) & (kBucketCount - 1); }
+  [[nodiscard]] auto bucket_index(uint64_t hash) const noexcept -> size_t {
+    return static_cast<size_t>(hash) & (bucket_count_ - 1);
+  }
 
-  static auto next_pos(size_t pos) noexcept -> size_t { return (pos + 1) & (kBucketCount - 1); }
+  [[nodiscard]] auto next_pos(size_t pos) const noexcept -> size_t { return (pos + 1) & (bucket_count_ - 1); }
 
+  size_t bucket_count_;
   Bucket *buckets_;
 };

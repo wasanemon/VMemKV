@@ -119,17 +119,18 @@ class T1Index {
  public:
   using Key = StoreKey;
   using Payload = uint64_t;
-  // Capacity of the lock-free Append Region (an LSM-style MemTable), not the whole KVS.
-  // reorganize() merges it into the Sorted Region and resets this to empty when full.
-  static constexpr size_t APPEND_CAP = Config::T1AppendCapacityEntries;
 
   // RAII handle for Epoch-based Reclamation (EBR) of AppendRegion to prevent atomic shared_ptr load overhead.
   using T1ReadHandle = typename ThreadReferenceTracker<uint64_t>::Guard;
 
-  T1Index() {
-    auto *active_region = new AppendRegion();
+  // `append_cap` is the capacity of the lock-free Append Region (an LSM-style MemTable), not the
+  // whole KVS. reorganize() merges it into the Sorted Region and resets this to empty when full.
+  // Defaults to Config::T1AppendCapacityEntries; a sharded T1 constructs each shard with a
+  // smaller override sized to that shard's own target size (see t1_sharding_design.md).
+  explicit T1Index(size_t append_cap = Config::T1AppendCapacityEntries) : append_cap_(append_cap) {
+    auto *active_region = new AppendRegion(append_cap_);
     note_append_region_created();
-    auto *active_index = new AppendIndex();
+    auto *active_index = new AppendIndex(append_cap_);
     append_active_.store(new AppendGeneration{active_region, active_index}, std::memory_order_release);
     sorted_region_.store(new SortedRegion(), std::memory_order_release);
   }
@@ -225,9 +226,13 @@ class T1Index {
     return with_epoch_guard([&]() noexcept { return append_active_.load(std::memory_order_acquire)->region->size(); });
   }
 
+  // Capacity of this instance's Append Region, as passed to the constructor (or
+  // Config::T1AppendCapacityEntries by default). Fixed for this instance's lifetime.
+  [[nodiscard]] auto append_capacity() const noexcept -> size_t { return append_cap_; }
+
   // Number of AppendRegion instances (active + any not-yet-EBR-reclaimed retiring generation)
   // currently resident, and the high-water mark across this instance's lifetime. Each carries a
-  // fixed APPEND_CAP * sizeof(AppendSlot) mmap'd footprint that becomes almost fully resident
+  // fixed append_cap_ * sizeof(AppendSlot) mmap'd footprint that becomes almost fully resident
   // from even light occupancy (open-addressing page-scatter), independent of actual corpus size,
   // so how many pile up live at once directly bounds T1's own RSS contribution under sustained
   // reorganize() churn.
@@ -268,15 +273,38 @@ class T1Index {
             slot.end_write();
             continue;  // Stale snapshot (a benign concurrent update raced us) -- re-resolve.
           }
-          if (resolve(prefix, hash).same_slot_as(slot)) {
+          ResolvedSlot after = resolve(prefix, hash);
+          if (after.same_slot_as(slot)) {
             slot.store_hash(stored_hash);
             slot.end_write();
             return PutResult::Applied;
           }
-          // Displaced right after our write landed -- may have resurrected an orphaned slot.
-          // Best-effort retire (fine if this CAS loses to another cleanup) before retrying.
-          Payload ours = value;
-          std::ignore = slot.try_store(ours, STORE_NOT_FOUND);
+          if (after.found()) {
+            // A *different* slot now answers for this key: a genuine append-region hash-collision
+            // displacement (see LockFreeHashTable::publish_slot()'s on_displaced) -- our slot is a
+            // real orphaned duplicate now, since collect_live_entries()/scan() would otherwise
+            // carry it forward alongside the slot that's actually indexed. Best-effort retire
+            // (fine if this CAS loses to another cleanup) before retrying.
+            Payload ours = value;
+            std::ignore = slot.try_store(ours, STORE_NOT_FOUND);
+            slot.end_write();
+            continue;
+          }
+          // resolve() found nothing at all here -- unlike the branch above, this can *only* mean
+          // our slot's region was frozen by a concurrent reorganize() between our first resolve()
+          // and here (see resolve()'s own comment on the immutable/sorted-frozen bypass): a sorted
+          // slot has no hash index to be displaced from in the first place, and append_immutable_
+          // hits always report "not found" by construction, whether or not the key is still
+          // indexed there. Our slot itself was never touched by anyone else and still correctly
+          // holds `value` -- tombstoning it here (the old behavior) would make this key incorrectly
+          // invisible to get()/scan() until the bypass insert below lands, for no benefit (the
+          // slot isn't an orphaned duplicate; nothing else will ever carry it forward alongside
+          // another live copy of this key within *this* reorganize() cycle, since a bypass copy
+          // only ever lands in the fresh active generation, which isn't part of this cycle's
+          // merge input). So: leave it alone, and just fall through to the insert-new path below
+          // (resolve() will report "not found" again) to also place a safety-net copy in the fresh
+          // active region, covering the case where this reorganize()'s merge already read our
+          // slot's *old* value before our write above landed.
           slot.end_write();
           continue;
         }
@@ -284,7 +312,7 @@ class T1Index {
         AppendGeneration *active_gen = append_active_.load(std::memory_order_acquire);
         AppendRegion *active = active_gen->region;
         const size_t index = active->reserve();
-        if (index >= APPEND_CAP) {
+        if (index >= append_cap_) {
           return PutResult::AppendRegionFull;
         }
 
@@ -452,17 +480,25 @@ class T1Index {
   //   this mapper doesn't need to touch (inline, T1-only reorg) must be left untouched.
   // - ChkWriter: optional, called once with the finalized sorted entries right before publish,
   //   so a caller can serialize a checkpoint without T1Index knowing about files. No-op default.
+  // `parallel_sort`: true (default) matches this method's original, single-T1 behavior --
+  // there's only ever one reorganize() in flight, so letting its sort fan out across all cores
+  // is correct. A caller that instead runs many independent reorganize() calls concurrently
+  // (e.g. ShardedT1Index's background worker pool, one call per shard) should pass false: without
+  // it, N concurrently-running parallel sorts oversubscribe the machine's actual core count
+  // (pool size * per-call fan-out), trading cache-friendly sequential sorts of already
+  // shard-bounded input for context-switch and cache-thrashing overhead. See
+  // docs/t1_sharding_design.md's "Nested parallelismの回避".
   template <typename OffsetMapper, typename ChkWriter = NoOpChkWriter>
-  void reorganize(OffsetMapper offset_mapper, ChkWriter chk_writer = ChkWriter{}) {
+  void reorganize(OffsetMapper offset_mapper, ChkWriter chk_writer = ChkWriter{}, bool parallel_sort = true) {
     bool expected = false;
     if (!reorg_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       return;
     }
 
     // 1. Prepare new active buffers
-    auto *next_active_region = new AppendRegion();
+    auto *next_active_region = new AppendRegion(append_cap_);
     note_append_region_created();
-    auto *next_active_index = new AppendIndex();
+    auto *next_active_index = new AppendIndex(append_cap_);
     auto *next_active_gen = new AppendGeneration{next_active_region, next_active_index};
 
     // 2. Freeze the current active generation to immutable, publish a fresh one as active. Each
@@ -505,8 +541,13 @@ class T1Index {
       return (lhs.hash & t1_detail::kCleanHashMask) < (rhs.hash & t1_detail::kCleanHashMask);
     };
 
-    // Sort the smaller append immutable entries in parallel
-    std::sort(std::execution::par, imm_entries.begin(), imm_entries.end(), comp);
+    // Sort the smaller append immutable entries -- in parallel unless the caller says not to
+    // (see this method's own doc comment on `parallel_sort`).
+    if (parallel_sort) {
+      std::sort(std::execution::par, imm_entries.begin(), imm_entries.end(), comp);
+    } else {
+      std::sort(imm_entries.begin(), imm_entries.end(), comp);
+    }
 
     // Merges sorted_region directly with imm_entries in one pass (rather than first extracting
     // sorted_region into its own vector) to avoid a redundant O(sorted->size) copy. Hand-written
@@ -746,7 +787,7 @@ class T1Index {
     }
   }
 
-  using AppendIndex = LockFreeHashTable<Key, AppendSlot, APPEND_CAP>;
+  using AppendIndex = LockFreeHashTable<Key, AppendSlot>;
 
   struct ResolvedSlot {
     AppendSlot *append = nullptr;
@@ -830,9 +871,10 @@ class T1Index {
     // AppendSlot's `published{false}` default is all-zero, matching MAP_ANONYMOUS memory's
     // initial state (see LockFreeHashTable's constructor) -- unpublished slots are never
     // faulted in or zeroed up front.
-    AppendRegion()
-        : slots_(static_cast<AppendSlot *>(::mmap(nullptr,
-                                                  APPEND_CAP * sizeof(AppendSlot),
+    explicit AppendRegion(size_t capacity)
+        : capacity_(capacity),
+          slots_(static_cast<AppendSlot *>(::mmap(nullptr,
+                                                  capacity_ * sizeof(AppendSlot),
                                                   PROT_READ | PROT_WRITE,
                                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                                                   -1,
@@ -842,7 +884,7 @@ class T1Index {
       }
     }
 
-    ~AppendRegion() { ::munmap(slots_, APPEND_CAP * sizeof(AppendSlot)); }
+    ~AppendRegion() { ::munmap(slots_, capacity_ * sizeof(AppendSlot)); }
 
     AppendRegion(const AppendRegion &) = delete;
     auto operator=(const AppendRegion &) -> AppendRegion & = delete;
@@ -855,8 +897,8 @@ class T1Index {
     auto reserve() noexcept -> size_t {
       size_t index = tail_.load(std::memory_order_relaxed);
       while (true) {
-        if (index >= APPEND_CAP) {
-          return APPEND_CAP;
+        if (index >= capacity_) {
+          return capacity_;
         }
         if (tail_.compare_exchange_weak(index, index + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
           return index;
@@ -948,6 +990,7 @@ class T1Index {
     }
 
    private:
+    size_t capacity_;
     AppendSlot *slots_;
     std::atomic<size_t> tail_{0};
 
@@ -1098,6 +1141,7 @@ class T1Index {
   }
 
   // ─── Member Variables ──────────────────────────────────────────────────
+  const size_t append_cap_;
   mutable std::atomic<bool> reorg_in_progress_{false};
   std::atomic<uint64_t> reorg_epoch_{1};
 

@@ -109,6 +109,120 @@ class T1CheckpointFile {
   size_t entry_count_ = 0;
 };
 
+// ─── Sharded T1 Checkpoint File (t1_index.chk, multi-shard layout) ─────────
+//
+// Used by ShardedT1Index (src/t1_index/sharded_t1_index.hpp), whose checkpoint_all_shards()
+// forces every shard's reorganize() and hands back one already-sorted entry span per shard plus
+// the directory's boundary keys once the whole call returns -- unlike the single-shard format
+// above, the full entry set is never materialized as one array, and neither shard_count nor the
+// boundary keys are known until after every shard has already been written. So the header is a
+// *trailer* here, not a prefix: on-disk layout is `shard_count` sections of
+// (entry_count: uint64_t, entries[entry_count]), then `boundary_count` T1ChkKeyPrefix boundary
+// keys, then the header, last. This lets the writer be purely sequential (no seek-back-and-
+// overwrite once final counts are known) at the cost of the reader locating the header via
+// `file_size - sizeof(header)` instead of offset 0 -- trivial with mmap. Shard sections have no
+// fixed stride (entry counts vary), so a reader walks them sequentially using each section's own
+// entry_count. Same crash-safety discipline as the single-shard format: written once to a temp
+// path, fsynced, and only reachable once the manifest commits to its generation.
+
+inline constexpr uint32_t kShardedT1ChkMagic = 0x324B4C56;  // ASCII "VLK2" -- distinct from "VLK1"
+inline constexpr uint8_t kShardedT1ChkFormatVersion = 1;
+
+struct ShardedT1ChkFileHeader {
+  uint32_t magic = kShardedT1ChkMagic;
+  uint8_t format_version = kShardedT1ChkFormatVersion;
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)
+  uint8_t reserved[3] = {};
+  uint64_t shard_count = 0;
+  uint64_t boundary_count = 0;     // == shard_count - 1.
+  uint64_t total_entry_count = 0;  // Sum of every shard's entry_count -- lets a reader sanity
+                                   // check its walk consumed exactly the expected data.
+  // FNV-1a64, folded in write order: every shard section (entry_count then entries) + boundaries
+  // + this header with checksum zeroed *last* -- reversed from the other formats' "header first"
+  // convention, since this header's own fields aren't known until every shard has been written.
+  uint64_t checksum = 0;
+};
+inline constexpr size_t kShardedT1ChkFileHeaderBytes = 40;
+static_assert(sizeof(ShardedT1ChkFileHeader) == kShardedT1ChkFileHeaderBytes);
+static_assert(std::is_standard_layout_v<ShardedT1ChkFileHeader>);
+
+// Incremental writer: open once, call add_shard() once per shard in the same ascending order
+// ShardedT1Index::checkpoint_all_shards() invokes its per_shard_writer callback, then
+// finish(boundaries) once that call has returned and the boundary keys it produced are known.
+// Mirrors write_t1_checkpoint_file's temp+fsync+rename discipline, just spread across multiple
+// calls instead of one shot, so a shard's entries never need to be held in memory together with
+// any other shard's -- only this object's own small running state (counts and a running
+// checksum) persists across calls. Discards the temp file if destroyed before finish() is called
+// (crash-safe: the final path is never touched until finish()'s atomic rename).
+class ShardedT1CheckpointWriter {
+ public:
+  explicit ShardedT1CheckpointWriter(const std::filesystem::path &path);
+  ~ShardedT1CheckpointWriter();
+
+  ShardedT1CheckpointWriter(const ShardedT1CheckpointWriter &) = delete;
+  auto operator=(const ShardedT1CheckpointWriter &) -> ShardedT1CheckpointWriter & = delete;
+  ShardedT1CheckpointWriter(ShardedT1CheckpointWriter &&) = delete;
+  auto operator=(ShardedT1CheckpointWriter &&) -> ShardedT1CheckpointWriter & = delete;
+
+  // `entries` must already be sorted by key ascending (T1Index::reorganize()'s merge output, which
+  // ShardedT1Index::checkpoint_all_shards() calls this back with per shard, already satisfies
+  // this). EntrySnapshotLike is duck-typed exactly like write_t1_checkpoint()'s own template
+  // parameter -- see that function's comment.
+  template <typename EntrySnapshotLike>
+  void add_shard(std::span<const EntrySnapshotLike> entries) {
+    std::vector<T1ChkEntry> on_disk;
+    on_disk.reserve(entries.size());
+    for (const auto &entry : entries) {
+      on_disk.push_back(T1ChkEntry{entry.key, entry.hash, entry.payload_bits});
+    }
+    add_shard_entries(on_disk.data(), on_disk.size());
+  }
+
+  // Call exactly once, after every add_shard() call is done. Writes the boundary keys, then the
+  // header (now that shard_count/total_entry_count/checksum are all known) as a trailer, fsyncs,
+  // and renames the temp file atomically onto the final path.
+  void finish(std::span<const T1ChkKeyPrefix> boundaries);
+
+ private:
+  void add_shard_entries(const T1ChkEntry *entries, size_t entry_count);
+
+  std::filesystem::path final_path_;
+  std::filesystem::path temp_path_;
+  int file_descriptor_ = -1;
+  uint64_t shard_count_ = 0;
+  uint64_t total_entry_count_ = 0;
+  uint64_t checksum_ = 0;  // Running FNV-1a64 state, folded incrementally as bytes are written.
+  bool finished_ = false;
+};
+
+// Reads and validates a sharded T1 checkpoint file by mmap'ing it (MAP_PRIVATE, read-only).
+// Throws std::system_error / std::runtime_error if the file is missing or fails validation (bad
+// magic, format_version, size, or checksum). boundaries()/shard_entries() stay valid for this
+// object's lifetime.
+class ShardedT1CheckpointFile {
+ public:
+  explicit ShardedT1CheckpointFile(const std::filesystem::path &path);
+  ~ShardedT1CheckpointFile() noexcept;
+
+  ShardedT1CheckpointFile(const ShardedT1CheckpointFile &) = delete;
+  auto operator=(const ShardedT1CheckpointFile &) -> ShardedT1CheckpointFile & = delete;
+  ShardedT1CheckpointFile(ShardedT1CheckpointFile &&) = delete;
+  auto operator=(ShardedT1CheckpointFile &&) -> ShardedT1CheckpointFile & = delete;
+
+  [[nodiscard]] auto boundaries() const noexcept -> std::span<const T1ChkKeyPrefix>;
+  [[nodiscard]] auto shard_count() const noexcept -> size_t { return shard_entries_.size(); }
+  [[nodiscard]] auto shard_entries(size_t index) const noexcept -> std::span<const T1ChkEntry> {
+    return shard_entries_[index];
+  }
+
+ private:
+  void *mapped_ = nullptr;
+  size_t mapped_bytes_ = 0;
+  std::vector<std::span<const T1ChkEntry>> shard_entries_;
+  const T1ChkKeyPrefix *boundaries_ = nullptr;
+  size_t boundary_count_ = 0;
+};
+
 // ─── Manifest (<t2_path>.manifest) ─────────────────────────────────────────
 //
 // The single source of truth for "how much of the T1/T2 checkpoint files is durable and safe to
