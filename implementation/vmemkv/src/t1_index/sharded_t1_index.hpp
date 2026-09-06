@@ -438,26 +438,65 @@ class ShardedT1Index {
       queue_.erase(std::remove(queue_.begin(), queue_.end(), target), queue_.end());
     }
 
-    // Second reorganize(), taken *after* Closing is visible: captures target's truly-final
-    // state (nothing new can land in it from here on; anything already in flight when Closing
-    // was set is drained by T1Index's own existing reorg_epoch_/active_epochs_ mechanism, same
-    // as any ordinary reorganize()).
+    // Second reorganize(), taken *after* Closing is visible: captures target's state as of "no
+    // new writer can resolve target anymore" (anything already inside T1Index::put() when Closing
+    // was set is drained by T1Index's own existing reorg_epoch_/active_epochs_ mechanism, same as
+    // any ordinary reorganize()). This is *not* yet target's truly-final state, though -- a writer
+    // that resolved target just before Closing but hasn't reached T1Index::put() yet can still
+    // land a write after this snapshot; see the post-split drain further below (right before
+    // `delete target`) for how that residual window is closed.
+    //
+    // Retried until the callback actually fires (same pattern as checkpoint_all_shards()'s own
+    // per-shard loop, for the identical reason): T1Index::reorganize()'s reorg_in_progress_ CAS
+    // can make this call a no-op if a redundant, concurrently-dequeued run_maintenance() attempt
+    // for this same shard (a duplicate queue entry -- see run_maintenance()'s own comment) is
+    // *also* mid-reorganize() right now, in which case the callback never fires and
+    // merged_entries stays empty -- not because the shard is actually small, but because this
+    // call lost the race. Checking merged_entries.empty() can't tell those two cases apart; a
+    // `captured` flag set only inside the callback can. Without this retry, a shard could lose
+    // this race on every single split attempt for as long as write pressure keeps regenerating
+    // duplicate queue entries, silently aborting each time (the code below already resets
+    // superseded to null on "too small," making a lost race indistinguishable from a genuinely
+    // tiny shard) and growing without bound -- exactly the unsharded O(corpus) behavior this
+    // design exists to avoid.
     std::vector<EntrySnapshot> merged_entries;
-    target->index->reorganize(
-        [](std::span<EntrySnapshot> /*merged*/) {},
-        [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); },
-        /*parallel_sort=*/false);  // Many shards' reorganize() run concurrently; see T1Index::reorganize()'s
-                                   // own doc comment on this parameter.
+    bool captured = false;
+    SpinBackoff second_reorganize_backoff;
+    while (!captured) {
+      target->index->reorganize(
+          [](std::span<EntrySnapshot> /*merged*/) {},
+          [&](std::span<const EntrySnapshot> merged) {
+            merged_entries.assign(merged.begin(), merged.end());
+            captured = true;
+          },
+          /*parallel_sort=*/false);  // Many shards' reorganize() run concurrently; see
+                                     // T1Index::reorganize()'s own doc comment on this parameter.
+      if (!captured) {
+        second_reorganize_backoff.wait();
+      }
+    }
 
     constexpr size_t kMinSplitEntries = 2;
     if (merged_entries.size() < kMinSplitEntries) {
-      // Not actually big enough to split (caller's size check was stale, or reorganize() found
-      // less live data than expected) -- resume normal operation. Clear maintenance_pending too:
-      // it was left `true` by whichever request got purged above, and nothing else will ever
-      // clear it, so leaving it `true` would permanently block this shard from ever being
-      // re-queued by a future soft-threshold trip.
-      target->maintenance_pending.store(false, std::memory_order_relaxed);
+      // Genuinely too small to split (the callback did fire, so this reflects the shard's real
+      // state, not a lost race) -- resume normal operation.
+      //
+      // superseded must be reset *before* maintenance_pending, not after: request_maintenance_if_
+      // needed() first CASes maintenance_pending false->true, then checks superseded to decide
+      // whether to actually enqueue. If maintenance_pending went false first, a concurrent caller
+      // could win that CAS while superseded was still Closing here, see it, and back out --
+      // leaving maintenance_pending stuck true forever on a shard that (a moment later) becomes
+      // perfectly normal again, since nothing else will ever clear it outside a real dequeue.
+      // Resetting superseded first closes that window: by the time maintenance_pending can be
+      // won, superseded already reads null, so a concurrent winner always sees a shard safe to
+      // enqueue.
+      //
+      // Clearing maintenance_pending here at all is still necessary despite that reordering: it
+      // was left `true` by whichever request got purged above (see this function's own comment
+      // on the queue purge), and nothing else will ever clear a purged (never dequeued) entry's
+      // flag.
       target->superseded.store(nullptr, std::memory_order_release);
+      target->maintenance_pending.store(false, std::memory_order_relaxed);
       return;
     }
 
@@ -481,6 +520,49 @@ class ShardedT1Index {
     // or `old_dir` from before this split (see class comment on with_routing_guard()).
     const uint64_t bumped = routing_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     routing_epochs_.wait_until_epoch(bumped);
+
+    // Catches a real data-loss window the second reorganize() above cannot: put()'s retry loop
+    // (see its own definition) resolves a slot once via resolve_for_write(), then calls
+    // slot->index->put() with no re-check of `superseded` in between. A writer that read
+    // `superseded == null` a moment before this function set it to Closing can still be sitting
+    // between those two steps when the second reorganize() above takes its snapshot, and only
+    // reach slot->index->put() afterward -- landing in target's *post-snapshot* active
+    // generation. T1Index's own reorg_epoch_/active_epochs_ drain can't see this writer (it isn't
+    // inside T1Index::put() yet when the snapshot is taken), so without this step that write
+    // would be silently destroyed by `delete target` below.
+    //
+    // The epoch drain just above is what makes this safe to do *now*, and specifically not any
+    // earlier: it guarantees every routing-guarded caller registered before the bump -- including
+    // any writer still holding a stale (pre-Closing) reference to `target` -- has completed its
+    // own slot->index->put() call before this line runs. Attempting this same drain *before* the
+    // snapshot (rather than reusing this one) would self-deadlock the split against exactly the
+    // writers it is blocking: a writer that has already observed Closing spins inside
+    // resolve_for_write() until this function's own superseded.store() above resolves it, so a
+    // drain positioned earlier would be waiting on guards that can only ever be released by this
+    // function making further progress. And no *new* writer can reach target from here on either:
+    // resolve_for_write() only ever returns target while superseded reads null, which stopped
+    // being possible the moment Closing was set, long before this point. So target's state is now
+    // permanently final, and one more reorganize() sees all of it.
+    std::vector<EntrySnapshot> stragglers;
+    bool stragglers_captured = false;
+    SpinBackoff straggler_backoff;
+    while (!stragglers_captured) {
+      target->index->reorganize(
+          [](std::span<EntrySnapshot> /*merged*/) {},
+          [&](std::span<const EntrySnapshot> merged) {
+            stragglers.assign(merged.begin(), merged.end());
+            stragglers_captured = true;
+          },
+          /*parallel_sort=*/false);
+      if (!stragglers_captured) {
+        straggler_backoff.wait();
+      }
+    }
+    for (const EntrySnapshot &entry : stragglers) {
+      ShardSlot *destination = entry.key < boundary ? low_slot : high_slot;
+      destination->index->put_with_final_hash(entry.key, entry.hash, entry.payload_bits);
+    }
+
     delete old_dir;
     delete target;
   }

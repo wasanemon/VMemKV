@@ -250,11 +250,29 @@ class T1Index {
            Payload value,
            bool is_inline = false,
            uint8_t inline_size = 0) -> PutResult {
+    const auto [prefix, hash] = prepare_key_and_hash(key);
+    const uint64_t stored_hash = is_inline ? t1_detail::embed_metadata(hash, inline_size) : hash;
+    return put_with_stored_hash(prefix, hash, stored_hash, value);
+  }
+
+  // Same insert path as put(), for a caller that already has an entry's StoreKey prefix and
+  // final on-disk hash (EntrySnapshot::hash -- i.e. the raw full-key hash with any inline
+  // metadata bits already folded in by an earlier put()'s embed_metadata() call, exactly as
+  // stored in a slot and captured by reorganize()'s merge output) rather than the original raw
+  // key bytes. Used by ShardedT1Index::continue_split() to redistribute a straggler entry
+  // captured by its post-split drain, where only the already-hashed/prefixed form survives (the
+  // original bytes were never kept around) -- see that call site's own comment for why such a
+  // straggler can exist at all. `stored_hash` is written as-is (no re-embedding), so it must
+  // already be in on-disk form -- pass a plain hash_full_key() result for a non-inline entry.
+  auto put_with_final_hash(const Key &prefix, uint64_t stored_hash, Payload value) -> PutResult {
+    return put_with_stored_hash(prefix, stored_hash & t1_detail::kCleanHashMask, stored_hash, value);
+  }
+
+ private:
+  // Shared insert body for put()/put_with_final_hash() above, once each has resolved (prefix,
+  // clean hash, on-disk stored_hash) its own way.
+  auto put_with_stored_hash(const Key &prefix, uint64_t hash, uint64_t stored_hash, Payload value) -> PutResult {
     return with_epoch_guard([&]() -> PutResult {
-      const auto [prefix, hash] = prepare_key_and_hash(key);
-
-      uint64_t stored_hash = is_inline ? t1_detail::embed_metadata(hash, inline_size) : hash;
-
       // Retries because the in-place write below can race a concurrent insert that displaces the
       // same slot (LockFreeHashTable::publish_slot()'s on_displaced). same_slot_as() (a second
       // resolve() after writing) distinguishes real displacement from an ordinary delete/reinsert;
@@ -323,6 +341,7 @@ class T1Index {
     });
   }
 
+ public:
   // Range scan over [lo_bytes, hi_bytes]. Lock-free; collects a consistent snapshot of both
   // regions, dedups, and invokes callback per match.
   // `Callback`: `(key, payload, hash) -> void`.

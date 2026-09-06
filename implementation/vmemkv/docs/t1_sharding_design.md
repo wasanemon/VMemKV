@@ -319,8 +319,44 @@ T2とWALは既存どおりグローバル(シャード非依存)のまま維持�
   最悪の場合はfd番号が別のopen()に再利用され無関係なファイルのサイズを返し得た)。
   `rotate_segment()`の`close(old_fd)`と`size_bytes()`の`fstat(fd_)`を専用の`fd_close_mu_`で
   相互排他する形で修正(書き込み/fsyncパスとは無関係、close呼び出しの瞬間だけをガード)。
+- 済: `continue_split()`まわりに存在した3件のバグを発見・修正した。(4) 2回目の
+  `reorganize()`が`T1Index`内部の`reorg_in_progress_` CASを、同じシャードに対する冗長な
+  (重複キュー投入由来の)並行`run_maintenance()`呼び出しと取り合って負けることがあり、その結果
+  (空の`merged_entries`)を「分割するほどのデータがない」ケースと区別できず静かに中断していた
+  (`superseded`をnullへ戻し、シャードが無制限に肥大化を続ける——シャーディング導入前のO(corpus)
+  問題の再発)。持続的な書き込み負荷下では恒久的に発生しうる。→ `checkpoint_all_shards()`と
+  同じ「捕捉できるまでリトライする」パターン(`captured`フラグをコールバック内でのみ立てる)を
+  適用して修正。(5) 上記(4)のabortパスで`maintenance_pending`を`superseded`より先にfalseへ
+  戻していたため、その間隙に`request_maintenance_if_needed()`が滑り込むと
+  `maintenance_pending`がtrueのまま永久に取り残される問題があった → リセット順序を
+  `superseded`→`maintenance_pending`へ入れ替えて修正。(6) 上記を修正後もなお、
+  「Closing可視化直前にシャードを解決したが`T1Index::put()`本体にはまだ到達していない」
+  書き込みが、2回目の`reorganize()`のスナップショット確定後に`target`(まもなく削除される)へ
+  書き込みを完了させ、`delete target`で消失するケースが残っていた(`T1Index`自身のepoch機構は
+  `T1Index::put()`到達済みの呼び出ししか見えない)。既存の(結線前からある)コミット済みコードにも
+  存在する既存バグ。→ `continue_split()`終盤の既存epoch drain(`delete old_dir`/`delete target`
+  の直前)の**直後**に3回目の`reorganize()`でtarget残留分(straggler)を捕捉し、`boundary`で
+  低/高シャードへ再配分するステップを追加(このdrainはbump前に登録された全guardの解放を待つため、
+  完了時点で該当スレッドは必ず書き込みを終えている一方、それより前にdrainを置くとClosingで
+  スピン待機中の書き込みへの自己デッドロックになる)。`T1Index`に
+  `put_with_final_hash(prefix, stored_hash, value)`(`put()`の共通ロジックを
+  `put_with_stored_hash()`へ切り出し、生キーバイト列の代わりに確定済みhashを受け取る経路)を
+  追加。`tests/test_sharded_t1_index.cpp`に単発一意キー挿入によるリグレッションテストを追加
+  (検証は`shard_count()`の安定化+一定時間待機後に行う必要がある——split完了は上記stragglers
+  再配分の**前**に起こるため)。
+
+  未解決の別問題: 極端な設定(target_shard_size数百件+16書き込み/8ワーカースレッドで同一の
+  小さいキー範囲へ継続的に既存キーを再更新し続けるcyclingパターン)では、上記(4)(5)(6)修正後も
+  データ不整合が残存する。単発挿入パターンや本番相当スケール(数十万〜500万件)では再現しない
+  ため、cyclingする既存キー更新が極端な小シャード・高並行度と組み合わさった場合に固有の別バグと
+  見られる。根本原因未特定(次のステップ参照)。`tests/test_sharded_t1_index.cpp`の該当テストは
+  この極端な設定でのデータ整合性チェックを意図的に含めていない。
 
 ## 未実装/次のステップ
+
+- 極端に小さいtarget_shard_size+高並行度+継続的な既存キー更新(cycling)の組み合わせで残る
+  データ不整合の根本原因調査。本番相当の設定・単発挿入パターンでは再現しないため優先度は
+  上記(4)(5)(6)より低い。
 
 - Shrink(マージバック)の実装(split実装後のfast follow、対象外として最初からスコープ外)。
 - delete圧力トリガー(`maybe_reorganize_if_needed_for_delete()`相当)の`ShardedT1Index`版。
