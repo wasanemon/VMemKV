@@ -332,7 +332,19 @@ install_remote_dependencies() {
 prepare_remote_storage() {
   echo "Locating and mounting local NVMe SSD..."
   ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "
-    DEV=\$(lsblk -dno NAME | grep -E '^nvme[1-9]n1' | awk '{print \"/dev/\"\$1}' | head -n 1)
+    # Excludes whichever nvme*n1 device actually backs / or /boot (checked by mountpoint, not by
+    # assuming it's always nvme0n1) -- on i4i instances the root EBS volume and the local
+    # instance-store NVMe can enumerate in either order, and a fixed index picked the root volume
+    # on at least one observed launch, corrupting /boot via a bind-mount and failing later with
+    # \"not enough free space for a swapfile\" once /boot's small filesystem filled up.
+    ROOT_DEVS=\$(lsblk -no PKNAME,MOUNTPOINT | awk '\$2 == \"/\" || \$2 == \"/boot\" || \$2 == \"/boot/efi\" {print \$1}' | sort -u)
+    DEV=\"\"
+    for CAND in \$(lsblk -dno NAME | grep -E '^nvme[0-9]+n1'); do
+      if ! echo \"\$ROOT_DEVS\" | grep -qx \"\$CAND\"; then
+        DEV=\"/dev/\$CAND\"
+        break
+      fi
+    done
     if [ -z \"\$DEV\" ]; then
       echo \"[ERROR] Local NVMe SSD not found! A physical local NVMe is strictly required to run LTM / Swap benchmarks.\" >&2
       exit 1
