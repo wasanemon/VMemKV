@@ -287,7 +287,6 @@ class VMemKVImpl {
         // that (e.g. tests asserting scan order right after reorganize()) see no behavior change.
         t1_.checkpoint_all_shards([](std::span<typename T1IndexT::EntrySnapshot> /*merged*/) {},
                                   [](std::span<const typename T1IndexT::EntrySnapshot> /*merged*/) {});
-        reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
         break;
     }
   }
@@ -431,7 +430,6 @@ class VMemKVImpl {
       wal_rotate_duration = std::chrono::steady_clock::now() - rotate_start;
     }
 
-    reorg_t1_count_.fetch_add(1, std::memory_order_relaxed);
     checkpoint_count_.fetch_add(1, std::memory_order_relaxed);
     // Published last (after checkpoint_count_ above), so a poller that wakes on checkpoint_count_
     // changing always sees this cycle's own numbers, never a torn mix with the next cycle's.
@@ -615,9 +613,8 @@ class VMemKVImpl {
 
   auto get_statistics() const noexcept -> vmemkv::VMemKVStatistics {
     return vmemkv::VMemKVStatistics{
-        .t1_reorg_count = reorg_t1_count_.load(std::memory_order_relaxed),
+        .t1_split_count = t1_.total_splits(),
         .checkpoint_count = checkpoint_count_.load(std::memory_order_relaxed),
-        .hard_stall_count = hard_stall_count_.load(std::memory_order_relaxed),
         .last_checkpoint_duration_us = last_checkpoint_duration_us_.load(std::memory_order_relaxed),
         .last_checkpoint_msync_duration_us = last_checkpoint_msync_duration_us_.load(std::memory_order_relaxed),
         .last_checkpoint_t1_reorganize_duration_us =
@@ -1465,13 +1462,7 @@ class VMemKVImpl {
   T1IndexT t1_;
   vmemkv::T2FlatFile t2_;
   vmemkv::Wal wal_;
-  std::atomic<uint64_t> reorg_t1_count_{0};
   std::atomic<uint64_t> checkpoint_count_{0};
-  // Never incremented anymore: its only trigger was maybe_reorganize_if_needed()'s old
-  // append-region hard-threshold check, removed now that ShardedT1Index handles its own
-  // per-shard backpressure internally. Kept (always reads 0) for VMemKVStatistics/benchmark
-  // driver API compatibility (see bench_kv.cpp) rather than removing the field outright.
-  std::atomic<uint64_t> hard_stall_count_{0};
   // See wait_until_reorg_not_running()'s own comment.
   mutable std::atomic<uint64_t> total_hard_stall_duration_us_{0};
 

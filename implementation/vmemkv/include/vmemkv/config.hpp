@@ -107,9 +107,11 @@ using System_AllOn = Config<BloomFilter, T1InlineValue>;
 }  // namespace detail
 
 struct VMemKVStatistics {
-  uint64_t t1_reorg_count = 0;
+  // ShardedT1Index::total_splits(): count of shard splits completed, organic (background workers)
+  // and explicit (split_shard_containing()) alike -- the real signal for T1 background maintenance
+  // activity now that splitting, not a single global reorganize(), is how T1 stays bounded.
+  uint64_t t1_split_count = 0;
   uint64_t checkpoint_count = 0;
-  uint64_t hard_stall_count = 0;
 
   // Phase breakdown for the most recently completed checkpoint_internal() cycle (auto-triggered
   // or manually-forced), for measuring how checkpoint's own cost scales with data volume and

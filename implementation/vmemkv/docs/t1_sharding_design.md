@@ -370,6 +370,32 @@ T2とWALは既存どおりグローバル(シャード非依存)のまま維持�
   マージ・ソートするため、順序保証にreorganize()は不要——コメントは削除前の実装を反映した
   記述だった)。
 
+- 済: `VMemKVStatistics`のT1系カウンタをシャード化の実態に合わせて刷新。従来の`t1_reorg_count`
+  (`VMemKVImpl::reorganize_internal(T1Only)`が明示的に呼ばれた回数のみを数える)は、YCSB-Eの
+  強制reorganize()トリガーを撤去した後は事実上常に0になり、しかも本来観測したかった
+  「ShardedT1Indexの背景メンテナンス活動」を最初から一度も捉えていなかった(自動splitは
+  `worker_loop()`/`run_maintenance()`/`continue_split()`という別経路で動き、この
+  カウンタを一切経由しないため)。`ShardedT1Index`に`total_splits_`(`continue_split()`の成功
+  パス——`kMinSplitEntries`未満で中断するケースを除く——でのみ加算、organic/明示的
+  `split_shard_containing()`のどちらも同じ`continue_split()`を通るため区別不要)を追加し、
+  `total_splits()`として公開。`VMemKVStatistics::t1_reorg_count`を`t1_split_count`に置き換え、
+  `VMemKVImpl::get_statistics()`は`t1_.total_splits()`から取得する形に変更(`reorg_t1_count_`
+  atomicとその2箇所の加算は削除)。あわせて、`maybe_reorganize_if_needed()`のT1閾値ロジック
+  削除以来ずっと常に0だった`hard_stall_count`(`hard_stall_count_`atomic含め)も削除——
+  「常に0を返すAPI互換目的の値」として残す判断は本番リリース前の現段階では不要と判断。
+  `total_hard_stall_duration_us`(`wait_until_reorg_not_running()`経由で今も生きている)は
+  変更なし。`bench_kv.cpp`のベンチマークカウンタ名も実体に合わせて`Reorgs_T1`→`T1_Splits`、
+  `Reorgs_T2`→`Checkpoints`に変更し、常に0だった`Hard_Stalls`カウンタは削除。
+
+- 済: YCSB-Eベンチマーク(`bench_kv.cpp`の`register_ycsb_e_benchmark()`)の強制トリガー
+  スケジュールから`reorganize()`(t=5s)を撤去。従来のコメントは「known-cheap control」
+  としていたが、シャーディング後は`reorganize()`も`checkpoint_all_shards()`経由で全シャード
+  同期マージするためO(全コーパス)であり、YCSB-Eの母集団規模(シャード数十個程度)では
+  数秒〜十数秒かかりうる——もはや「軽量な対照」ではない。また、この強制呼び出しが提供して
+  いた「forced vs organic」比較は上記の通りorganic側が最初から測れておらず、実測している
+  内容は`run_background_jobs_probe.sh`の専用プローブと重複していた。checkpoint()トリガー
+  (t=10s, t=25s)はシャーディングと無関係な実I/O操作として引き続き有効なため維持。
+
 ## 未実装/次のステップ
 
 - 極端に小さいtarget_shard_size+高並行度+継続的な既存キー更新(cycling)の組み合わせで残る

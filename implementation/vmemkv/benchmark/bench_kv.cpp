@@ -57,31 +57,28 @@ class YCSBTimelineCollector {
     alignas(64) std::array<std::atomic<uint64_t>, kDurationSeconds> insert_counts{};
   };
 
-  // One forced store.reorganize()/store.checkpoint() call, fired deterministically at a fixed
-  // second-mark instead of waiting for (possibly rare, see kForcedTriggers' own comment) organic
-  // triggering. elapsed_sec is the call's own measured wall-clock duration, so a throughput dip
-  // in the timeline can be attributed directly instead of inferred after the fact.
+  // One forced store.checkpoint() call, fired deterministically at a fixed second-mark instead of
+  // waiting for organic triggering. elapsed_sec is the call's own measured wall-clock duration, so
+  // a throughput dip in the timeline can be attributed directly instead of inferred after the fact.
   struct ForcedEvent {
     int scheduled_sec;
     int fired_sec;     // may exceed scheduled_sec if a prior forced call ran long -- see
                        // kForcedTriggers' comment on why no guard skips a late trigger.
-    std::string kind;  // "reorganize" or "checkpoint"
+    std::string kind;  // always "checkpoint" -- see kForcedTriggers' comment on why a forced T1
+                       // reorganize() is no longer part of this schedule.
     double elapsed_sec;
   };
 
   std::vector<ThreadCounter> counters;
-  std::array<std::atomic<uint64_t>, kDurationSeconds> t1_reorg_counts{};
   std::array<std::atomic<uint64_t>, kDurationSeconds> t2_checkpoint_counts{};
-  // Separate from t1_reorg_counts/t2_checkpoint_counts: counts reorgs the benchmark itself
-  // forced (see kForcedTriggers below), as opposed to ones VMemKV triggered organically. Kept
-  // apart so a future report pass can render these as differently-colored vertical lines. Exact
-  // per-call timing lives in forced_events instead -- these per-second buckets exist only to keep
-  // the same "reorg activity per second" chart t1_reorg_counts/t2_checkpoint_counts already draw.
-  std::array<std::atomic<uint64_t>, kDurationSeconds> t1_forced_reorg_counts{};
+  // Separate from t2_checkpoint_counts: counts checkpoints the benchmark itself forced (see
+  // kForcedTriggers below), as opposed to ones VMemKV triggered organically (WAL-size threshold).
+  // Kept apart so a future report pass can render these as differently-colored vertical lines.
+  // Exact per-call timing lives in forced_events instead -- these per-second buckets exist only to
+  // keep the same "checkpoint activity per second" chart t2_checkpoint_counts already draws.
   std::array<std::atomic<uint64_t>, kDurationSeconds> t2_forced_checkpoint_counts{};
   // Only ever touched by thread_idx==0 (see the trigger site below), so no locking needed.
   std::vector<ForcedEvent> forced_events;
-  std::atomic<uint64_t> last_recorded_t1{0};
   std::atomic<uint64_t> last_recorded_checkpoint_t2{0};
   std::atomic<uint64_t> next_key_index;
   std::chrono::steady_clock::time_point start_time;
@@ -89,9 +86,7 @@ class YCSBTimelineCollector {
   YCSBTimelineCollector(size_t num_threads, uint64_t initial_keys)
       : counters(num_threads), next_key_index(initial_keys) {
     for (int i = 0; i < kDurationSeconds; ++i) {
-      t1_reorg_counts[i].store(0, std::memory_order_relaxed);
       t2_checkpoint_counts[i].store(0, std::memory_order_relaxed);
-      t1_forced_reorg_counts[i].store(0, std::memory_order_relaxed);
       t2_forced_checkpoint_counts[i].store(0, std::memory_order_relaxed);
     }
   }
@@ -120,9 +115,7 @@ class YCSBTimelineCollector {
   void dump_json(std::string store_name, std::string variant_name, std::string val_name, std::string scenario_tag) {
     std::vector<uint64_t> total_scan(kDurationSeconds, 0);
     std::vector<uint64_t> total_insert(kDurationSeconds, 0);
-    std::vector<uint64_t> total_reorg_t1(kDurationSeconds, 0);
     std::vector<uint64_t> total_checkpoint_t2(kDurationSeconds, 0);
-    std::vector<uint64_t> total_forced_reorg_t1(kDurationSeconds, 0);
     std::vector<uint64_t> total_forced_checkpoint_t2(kDurationSeconds, 0);
 
     for (const auto &tc : counters) {
@@ -132,9 +125,7 @@ class YCSBTimelineCollector {
       }
     }
     for (int i = 0; i < kDurationSeconds; ++i) {
-      total_reorg_t1[i] = t1_reorg_counts[i].load(std::memory_order_relaxed);
       total_checkpoint_t2[i] = t2_checkpoint_counts[i].load(std::memory_order_relaxed);
-      total_forced_reorg_t1[i] = t1_forced_reorg_counts[i].load(std::memory_order_relaxed);
       total_forced_checkpoint_t2[i] = t2_forced_checkpoint_counts[i].load(std::memory_order_relaxed);
     }
 
@@ -158,9 +149,7 @@ class YCSBTimelineCollector {
       out << "  \"timeline\": [\n";
       for (int i = 0; i < kDurationSeconds; ++i) {
         out << "    {\"sec\": " << (i + 1) << ", \"scan_ops\": " << total_scan[i]
-            << ", \"insert_ops\": " << total_insert[i] << ", \"t1_reorg_ops\": " << total_reorg_t1[i]
-            << ", \"t2_checkpoint_ops\": " << total_checkpoint_t2[i]
-            << ", \"t1_forced_reorg_ops\": " << total_forced_reorg_t1[i]
+            << ", \"insert_ops\": " << total_insert[i] << ", \"t2_checkpoint_ops\": " << total_checkpoint_t2[i]
             << ", \"t2_forced_checkpoint_ops\": " << total_forced_checkpoint_t2[i] << "}";
         if (i < kDurationSeconds - 1) out << ",";
         out << "\n";
@@ -180,16 +169,21 @@ class YCSBTimelineCollector {
   }
 };
 
-// Fixed schedule for YCSB-E's forced reorganize()/checkpoint() calls (see the trigger site in
+// Fixed schedule for YCSB-E's forced checkpoint() calls (see the trigger site in
 // register_ycsb_e_benchmark() below): natural triggering is unreliable within the 30s window
 // (especially under LTM's lower throughput), so YCSB-E's timeline would otherwise show little to
-// no reorg activity for some scenarios. Firing these deterministically guarantees comparable data
-// points every run instead of leaving it to chance.
+// no checkpoint activity for some scenarios. Firing these deterministically guarantees comparable
+// data points every run instead of leaving it to chance.
 //
-// t=5s: one reorganize() as a known-cheap control, giving the chart a reference line next to the
-// checkpoint() calls below. t=10s and t=25s: two checkpoint() calls, spaced 15s apart -- enough
-// room for each to complete and for surrounding throughput to resettle before/after. Two calls is
-// enough to see whether a second cycle looks like the first.
+// t=10s and t=25s: two checkpoint() calls, spaced 15s apart -- enough room for each to complete
+// and for surrounding throughput to resettle before/after. Two calls is enough to see whether a
+// second cycle looks like the first.
+//
+// No forced reorganize() here: post-sharding, store->reorganize() forces every T1 shard through a
+// full synchronous merge (see store_adapter.hpp's doc comment), so its cost scales with total
+// corpus size like checkpoint()'s does -- it is no longer a cheap, distinct reference point worth
+// contrasting against checkpoint() in this chart. It would also duplicate
+// run_background_jobs_probe.sh's dedicated, cleaner measurement of that same forced-job cost.
 //
 // Deliberately no guard against a late-running call pushing a later trigger's fire time past its
 // own schedule mark, or even past kDurationSeconds entirely: if checkpoint() at t=10s runs long
@@ -198,12 +192,10 @@ class YCSBTimelineCollector {
 // informative result, not a bug to engineer around.
 struct ForcedTrigger {
   int second_mark;
-  bool is_checkpoint;  // false = reorganize() (T1-only), true = checkpoint()
 };
-constexpr std::array<ForcedTrigger, 3> kForcedTriggers{{
-    {5, false},
-    {10, true},
-    {25, true},
+constexpr std::array<ForcedTrigger, 2> kForcedTriggers{{
+    {10},
+    {25},
 }};
 
 constexpr std::size_t kIndexKeyBufferBytes = 32;
@@ -1154,12 +1146,10 @@ static void record_store_statistics(benchmark::State &state, StoreHolder<StorePt
     return;
   }
   auto stats = holder.store->get_statistics();
-  state.counters["Reorgs_T1"] =
-      benchmark::Counter(static_cast<double>(stats.t1_reorg_count), benchmark::Counter::kDefaults);
-  state.counters["Reorgs_T2"] =
+  state.counters["T1_Splits"] =
+      benchmark::Counter(static_cast<double>(stats.t1_split_count), benchmark::Counter::kDefaults);
+  state.counters["Checkpoints"] =
       benchmark::Counter(static_cast<double>(stats.checkpoint_count), benchmark::Counter::kDefaults);
-  state.counters["Hard_Stalls"] =
-      benchmark::Counter(static_cast<double>(stats.hard_stall_count), benchmark::Counter::kDefaults);
   state.counters["Hard_Stall_Duration_us"] =
       benchmark::Counter(static_cast<double>(stats.total_hard_stall_duration_us), benchmark::Counter::kDefaults);
   state.counters["Append_Region_Live"] =
@@ -1378,7 +1368,6 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
               }
               col->start();
               auto stats = store.get_statistics();
-              col->last_recorded_t1.store(stats.t1_reorg_count, std::memory_order_relaxed);
               col->last_recorded_checkpoint_t2.store(stats.checkpoint_count, std::memory_order_relaxed);
               ycsb_state->start_done_epoch.store(local_epoch, std::memory_order_release);
             }
@@ -1395,18 +1384,9 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
               break;
             }
 
-            // Thread 0: poll and record Reorg stats (background thread handles actual triggering)
+            // Thread 0: poll and record Checkpoint stats (background thread handles actual triggering)
             if (thread_idx == 0) {
               auto stats = store.get_statistics();
-
-              // Track T1 Reorg
-              uint64_t current_t1 = stats.t1_reorg_count;
-              uint64_t prev_t1 = col->last_recorded_t1.load(std::memory_order_relaxed);
-              if (current_t1 > prev_t1) {
-                uint64_t diff = current_t1 - prev_t1;
-                col->t1_reorg_counts[elapsed].fetch_add(diff, std::memory_order_relaxed);
-                col->last_recorded_t1.store(current_t1, std::memory_order_relaxed);
-              }
 
               // Track T2 Checkpoint
               uint64_t current_checkpoint_t2 = stats.checkpoint_count;
@@ -1417,19 +1397,15 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                 col->last_recorded_checkpoint_t2.store(current_checkpoint_t2, std::memory_order_relaxed);
               }
 
-              // Fire the next scheduled forced reorganize()/checkpoint() call once elapsed
-              // reaches its mark -- see kForcedTriggers' own comment for the schedule and why a
-              // late-running call is deliberately allowed to push a later trigger's fire time (or
-              // cause it to be skipped entirely, if the window ends first).
+              // Fire the next scheduled forced checkpoint() call once elapsed reaches its mark --
+              // see kForcedTriggers' own comment for the schedule and why a late-running call is
+              // deliberately allowed to push a later trigger's fire time (or cause it to be
+              // skipped entirely, if the window ends first).
               if (next_forced_trigger_idx < kForcedTriggers.size() &&
                   elapsed >= kForcedTriggers[next_forced_trigger_idx].second_mark) {
                 const ForcedTrigger &trigger = kForcedTriggers[next_forced_trigger_idx];
                 const auto call_t0 = std::chrono::steady_clock::now();
-                if (trigger.is_checkpoint) {
-                  store.checkpoint();
-                } else {
-                  store.reorganize();  // T1-only, zero I/O
-                }
+                store.checkpoint();
                 const double call_elapsed_sec =
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - call_t0).count();
 
@@ -1443,14 +1419,6 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                     std::clamp<int64_t>(fired_elapsed, 0, YCSBTimelineCollector::kDurationSeconds - 1));
 
                 auto post_stats = store.get_statistics();
-                uint64_t post_t1 = post_stats.t1_reorg_count;
-                uint64_t pre_force_t1 = col->last_recorded_t1.load(std::memory_order_relaxed);
-                if (post_t1 > pre_force_t1) {
-                  col->t1_forced_reorg_counts[bucket].fetch_add(post_t1 - pre_force_t1, std::memory_order_relaxed);
-                  // Absorb the bump into last_recorded_t1 so the *next* poll of this loop
-                  // doesn't also attribute this same delta to the natural t1_reorg_counts.
-                  col->last_recorded_t1.store(post_t1, std::memory_order_relaxed);
-                }
                 uint64_t post_t2 = post_stats.checkpoint_count;
                 uint64_t pre_force_t2 = col->last_recorded_checkpoint_t2.load(std::memory_order_relaxed);
                 if (post_t2 > pre_force_t2) {
@@ -1458,10 +1426,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
                   col->last_recorded_checkpoint_t2.store(post_t2, std::memory_order_relaxed);
                 }
 
-                col->forced_events.push_back({trigger.second_mark,
-                                              bucket,
-                                              trigger.is_checkpoint ? "checkpoint" : "reorganize",
-                                              call_elapsed_sec});
+                col->forced_events.push_back({trigger.second_mark, bucket, "checkpoint", call_elapsed_sec});
                 ++next_forced_trigger_idx;
               }
             }

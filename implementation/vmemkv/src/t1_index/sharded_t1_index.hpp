@@ -163,6 +163,13 @@ class ShardedT1Index {
     return with_routing_guard([&]() -> size_t { return directory_.load(std::memory_order_acquire)->shards.size(); });
   }
 
+  // Cumulative count of shard splits completed over this store's lifetime (continue_split()'s
+  // success path only -- not incremented when a maintenance pass finds too little to split, see
+  // kMinSplitEntries there). The real signal for "how much background T1 maintenance activity has
+  // happened," independent of whether it was organic (background workers) or driven by an explicit
+  // split_shard_containing() call -- both go through the same continue_split().
+  [[nodiscard]] auto total_splits() const -> uint64_t { return total_splits_.load(std::memory_order_relaxed); }
+
   // Sum of every shard's *current* append-region occupancy -- "is there anything anywhere left to
   // merge" for a caller deciding whether a T1-only reorganize would be a no-op (e.g.
   // VMemKVImpl::run_reorganize()'s own skip-if-nothing-to-do check, mirroring what it did against
@@ -565,6 +572,7 @@ class ShardedT1Index {
 
     delete old_dir;
     delete target;
+    total_splits_.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Replaces `target` in the directory with {low_slot, high_slot} split at `boundary`, via a
@@ -728,6 +736,7 @@ class ShardedT1Index {
 
   mutable ThreadReferenceTracker<uint64_t> routing_epochs_;
   std::atomic<uint64_t> routing_epoch_{1};
+  std::atomic<uint64_t> total_splits_{0};
   std::atomic<Directory *> directory_{nullptr};
   size_t append_cap_;
   size_t target_shard_size_;
