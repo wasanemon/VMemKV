@@ -43,8 +43,14 @@ Release ビルド、20 writer threads、1KB values。
 - checkpoint 空シャードスキップ導入後の再測定: ltm/reorganize 0.35s、
   ltm/checkpoint 6.81s (内訳 t1_reorganize 5.20s + wal_rotate 0.9ms +
   msync 577ms)。T1 フェーズ -7%、reorganize -61%。populate 直後のため大半の
-  シャードが dirty でスキップ余地が小さく改善は控えめ。定常運用（dirty が hot
-  shard に偏る）で効果が最大化する。msync の 309→577ms 振れはディスク側のばらつき。
+  シャードが dirty でスキップ余地が小さく改善は控えめ。msync の 309→577ms 振れは
+  ディスク側のばらつき。
+- 定常状態の A/B（6M x 8B、3 shards、スキップ有無のみ差し替え、単発）:
+  bulk_load 直後 checkpoint #1 は 0.79s(base) vs 0.86s(skip) で互角（全 dirty のため
+  スキップ不発、差はノイズ）。200K 件の新規 insert 後 checkpoint #2 は 0.69s →
+  0.62s (-10%、dirty 1 shard のみマージ）。update-only 後 checkpoint #3 は 0.64s →
+  0.42s (-34%、全 clean で walk のみ。base は sorted region 再構築分が残る）。
+  定常運用（dirty が hot shard に偏る・update 主体）で効果が最大化する。
 - 別途、50M/200M のタイト cgroup での 200K x 1KB bulk_load で
   `bulk_load_throttle_events=169` を確認（throttle の end-to-end 作動証明）。
   `VMemKVStatistics::bulk_load_throttle_events` として公開した。
