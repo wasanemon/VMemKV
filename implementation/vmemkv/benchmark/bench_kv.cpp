@@ -1829,6 +1829,11 @@ struct ProbeArgs {
   ProbeMode mode = ProbeMode::kBackgroundJobProbe;
   double ratio = 1.0;
   std::string job;  // "reorganize" | "checkpoint" -- only read by kBackgroundJobProbe.
+  // "monotonic" (every insert a fresh increasing key, a single hot shard) or "random" (fresh
+  // keys uniform over the key space, writes spread over all shards) -- only read by
+  // kOrganicSplitProbe. Random is what shows whether one split's throughput impact shrinks as
+  // the shard count grows; monotonic structurally cannot (see run_organic_split_probe()).
+  std::string key_pattern = "monotonic";
 };
 
 [[noreturn]] void fail(const std::string &msg) {
@@ -1886,13 +1891,19 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
     } else if (key == "--job") {
       // Only read by kBackgroundJobProbe.
       args.job = std::string(value);
+    } else if (key == "--key-pattern") {
+      // Only read by kOrganicSplitProbe.
+      if (value != "monotonic" && value != "random") {
+        fail("unknown --key-pattern: " + std::string(value));
+      }
+      args.key_pattern = std::string(value);
     }
   }
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
         "--mode=<background_job_probe|organic_split_probe> "
-        "--ratio=<0.0-1.0> [--job=<reorganize|checkpoint>]");
+        "--ratio=<0.0-1.0> [--job=<reorganize|checkpoint>] [--key-pattern=<monotonic|random>]");
   }
   if (args.mode == ProbeMode::kBackgroundJobProbe && args.job != "reorganize" && args.job != "checkpoint") {
     fail("--mode=background_job_probe requires --job=<reorganize|checkpoint>");
@@ -2202,14 +2213,22 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   // path itself is what run_background_job_probe() already measures separately.
   setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
 
+  // Monotonic keys concentrate every write on the single hot (rightmost) shard no matter how
+  // many shards exist; random keys spread writes over all shards. The probe's question -- does
+  // one split's throughput impact shrink as the shard count grows -- is only answerable with the
+  // latter. Random draws come from a 2^48 space, so key reuse within one run is negligible and
+  // every insert still grows the corpus like the monotonic variant does.
+  const bool random_keys = args.key_pattern == "random";
   std::atomic<std::size_t> next_key{0};
   std::atomic<bool> stop{false};
   std::vector<std::thread> workers;
   workers.reserve(writer_threads);
   for (std::size_t t = 0; t < writer_threads; ++t) {
-    workers.emplace_back([&]() {
+    workers.emplace_back([&, t]() {
+      std::mt19937_64 rng(kBenchmarkSeed + t);
+      std::uniform_int_distribution<std::size_t> dist(0, (std::size_t{1} << 48) - 1);
       while (!stop.load(std::memory_order_relaxed)) {
-        const std::size_t idx = next_key.fetch_add(1, std::memory_order_relaxed);
+        const std::size_t idx = random_keys ? dist(rng) : next_key.fetch_add(1, std::memory_order_relaxed);
         store->insert(make_key(idx), make_value_for_key(idx, args.val_size));
       }
     });
@@ -2293,7 +2312,8 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   }
 
   std::cout << "{\"job\":\"organic_split\",\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\","
-            << "\"value_size\":" << args.val_size << ",\"writer_threads\":" << writer_threads << ","
+            << "\"value_size\":" << args.val_size << ",\"writer_threads\":" << writer_threads
+            << ",\"key_pattern\":\"" << args.key_pattern << "\","
             << "\"duration_sec\":" << kOrganicSplitProbeDurationSec << ","
             << "\"total_inserted\":" << next_key.load(std::memory_order_relaxed) << ","
             << "\"final_shard_count\":" << (final_split_count + 1) << ",\"splits\":[";

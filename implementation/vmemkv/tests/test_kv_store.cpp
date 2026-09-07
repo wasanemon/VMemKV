@@ -404,6 +404,40 @@ TEST_CASE_TEMPLATE("scan excludes removed entries", Store, STORE_TYPES) {
   CHECK(entry_count == 1U);
 }
 
+TEST_CASE_TEMPLATE("scan after churn returns key order with latest values", Store, STORE_TYPES) {
+  // 300 keys cross several internal read batches; updating every key with a larger value forces
+  // out-of-place appends, decorrelating T2 physical offsets from key order. The scan must still
+  // report keys in order, each with its latest value, and count every live entry.
+  auto store = StoreFactory<Store>::make();
+  constexpr int kKeys = 300;
+  for (int i = 0; i < kKeys; ++i) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "k%08d", i);
+    store->insert(std::string(buf), static_cast<uint64_t>(i));
+  }
+  // Descending update order appends tail records in reverse-key sequence, so T2 physical
+  // offset order is the opposite of key order: emitting reads in offset order would observably
+  // reverse the callback sequence.
+  for (int i = kKeys - 1; i >= 0; --i) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "k%08d", i);
+    store->update(std::string(buf), static_cast<uint64_t>(kKeys + i));
+  }
+  std::vector<std::pair<std::string, uint64_t>> seen;
+  const size_t entry_count = store->scan(
+      "k00000000", "k00000300", [&](std::span<const std::byte> key_bytes, std::span<const std::byte> value) {
+        seen.emplace_back(vmemkv_test::span_to_string(key_bytes), test_util::decode_scanned_u64(value));
+      });
+  CHECK(entry_count == static_cast<size_t>(kKeys));
+  REQUIRE(seen.size() == static_cast<size_t>(kKeys));
+  for (int i = 0; i < kKeys; ++i) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "k%08d", i);
+    CHECK(seen[static_cast<size_t>(i)].first == std::string(buf));
+    CHECK(seen[static_cast<size_t>(i)].second == static_cast<uint64_t>(kKeys + i));
+  }
+}
+
 TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);

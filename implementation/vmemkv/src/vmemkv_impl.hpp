@@ -44,6 +44,7 @@
 #include <filesystem>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -56,7 +57,9 @@
 #include <vmemkv/config.hpp>
 
 #include "checkpoint/checkpoint.hpp"
+#include "core/cgroup_memory_throttle.hpp"
 #include "core/reference_tracker.hpp"
+#include "core/swap_check.hpp"
 #include "t1_index/sharded_t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
 #include "wal/wal.hpp"
@@ -217,6 +220,9 @@ class VMemKVImpl {
       : t1_(ConfigT::T1AppendCapacityEntries, ConfigT::T1ShardTargetSizeEntries, /*worker_threads=*/0),
         t2_(t2_path, t2_bytes_capacity, adopted_t2_bytes_used(t2_path)),
         wal_(vmemkv::derive_wal_path(t2_path)) {
+    // Larger-than-memory operation pages through swap; fail fast on an operator-set floor, warn
+    // on no swap at all (see swap_check.hpp). First, before any mmap/recovery work.
+    vmemkv::validate_swap_for_ltm();
     recovering_ = true;
     load_checkpoint_if_present(t2_path);
     t1_.start_workers();
@@ -1077,15 +1083,20 @@ class VMemKVImpl {
   // means a crash after this returns can lose everything loaded, unless the caller separately
   // commits a checkpoint() afterward. Still triggers ordinary T1-only
   // reorganizes via maybe_reorganize_if_needed() once the append region crosses its soft
-  // threshold. Not safe to call concurrently with other writers.
+  // threshold. Under a cgroup v2 memory limit the unbroken dirtying burst below can outrun
+  // synchronous direct reclaim and stall, so the loop also paces itself against memory pressure
+  // (see CgroupMemoryThrottle -- inactive without such a limit). Not safe to call concurrently
+  // with other writers.
   template <typename KeyFn, typename ValueFn>
   void bulk_load_impl(std::size_t count, KeyFn &&make_key, ValueFn &&make_value) {
+    vmemkv::CgroupMemoryThrottle memory_throttle;
     for (std::size_t index = 0; index < count; ++index) {
       maybe_reorganize_if_needed();
       const std::string key = make_key(index);
       const std::string value = make_value(index);
       write_entry_lockfree(std::span<const std::byte>(reinterpret_cast<const std::byte *>(key.data()), key.size()),
                            std::span<const std::byte>(reinterpret_cast<const std::byte *>(value.data()), value.size()));
+      memory_throttle.maybe_throttle(index);
     }
   }
 
@@ -1098,6 +1109,103 @@ class VMemKVImpl {
                  std::span<const std::byte> upper_bound,
                  Callback callback) const -> size_t {
     size_t total_count = 0;
+
+    // Lowers ShardedT1Index's maintenance soft threshold for the scan's duration (see
+    // set_scan_active()), keeping append regions L2-cache-sized while the scan linearly passes
+    // over them.
+    struct ScanActiveGuard {
+      const T1IndexT &t1;
+      explicit ScanActiveGuard(const T1IndexT &t1) : t1(t1) { t1.set_scan_active(true); }
+      ~ScanActiveGuard() { t1.set_scan_active(false); }
+    } scan_active_guard(t1_);
+
+    // Bounded offset-ordered read batches: T1 yields matches in key order, but their T2 offsets
+    // decorrelate from key order once updates/deletes churn (ordering fragmentation), so reading
+    // them straight through faults pages randomly. Each batch is read in ascending T2
+    // physical-offset order (what BaseReader::kScan's readahead policy is tuned for) and handed
+    // to the caller's callback back in key order. Scan-internal only: no writer-stop, no space
+    // reclaimed, and callback order plus total_count semantics are unchanged (batches complete
+    // strictly in sequence, entries within a batch in T1 order).
+    constexpr size_t kScanBatchSize = 128;
+    struct BatchSlot {
+      uint64_t payload{};
+      uint64_t hash{};
+      std::span<const std::byte> key{};
+      std::span<const std::byte> value{};
+      size_t arena_key_off = 0;
+      size_t arena_key_len = 0;
+      size_t arena_val_len = 0;
+      bool copied = false;
+      bool skipped = false;
+    };
+    std::vector<BatchSlot> batch;
+    batch.reserve(kScanBatchSize);
+    std::vector<size_t> read_order;
+    read_order.reserve(kScanBatchSize);
+    std::vector<std::byte> arena;
+
+    const auto flush_batch = [&]() {
+      if (batch.empty()) {
+        return;
+      }
+      const T2Memory *mem = t2_.get_memory_handle();
+      read_order.resize(batch.size());
+      std::iota(read_order.begin(), read_order.end(), size_t{0});
+      std::sort(read_order.begin(), read_order.end(), [&](size_t a, size_t b) {
+        return (batch[a].payload & kOffsetMask) < (batch[b].payload & kOffsetMask);
+      });
+      arena.clear();
+      for (const size_t idx : read_order) {
+        BatchSlot &slot = batch[idx];
+        // Base-region fast path: see try_read_base_record()'s doc comment. No seqlock
+        // needed -- the base mappings' bytes are immutable once written, so the callback
+        // below can safely receive live spans straight into them.
+        if (const auto base_record = try_read_base_record(mem, slot.payload, BaseReader::kScan, nullptr);
+            base_record.has_value()) {
+          slot.key = base_record->key;
+          slot.value = base_record->value;
+          continue;
+        }
+        // t2_.at() called inside read_t2_record_seqlock() (as AtFunc), matching get_impl().
+        //
+        // Torn-read fix: copy_func below must only *copy* into the arena and return, never
+        // invoke `callback` from inside it -- see get_impl()'s identical fix and comment for
+        // the full rationale. Spans into the arena materialize only after the read loop (the
+        // arena never grows past that point, so they stay stable through the callbacks).
+        slot.skipped = !read_t2_record_seqlock(
+            [&]() -> T2RecordView { return t2_.at(slot.payload & kOffsetMask, mem); },
+            [&](const T2RecordView &record) -> bool {
+              if (!key_in_range(record.key, lower_bound, upper_bound)) {
+                return false;
+              }
+              slot.arena_key_off = arena.size();
+              slot.arena_key_len = record.key.size();
+              slot.arena_val_len = record.value.size();
+              arena.insert(arena.end(), record.key.begin(), record.key.end());
+              arena.insert(arena.end(), record.value.begin(), record.value.end());
+              slot.copied = true;
+              return true;
+            });
+      }
+      for (BatchSlot &slot : batch) {
+        // copied implies !skipped (copy_func only sets copied when returning true).
+        if (slot.copied) {
+          slot.key = std::span<const std::byte>(arena.data() + slot.arena_key_off, slot.arena_key_len);
+          slot.value = std::span<const std::byte>(arena.data() + slot.arena_key_off + slot.arena_key_len,
+                                                  slot.arena_val_len);
+        }
+      }
+      for (const BatchSlot &slot : batch) {  // Back in T1's key order.
+        if (slot.skipped) {
+          continue;
+        }
+        if (!slot.copied && !key_in_range(slot.key, lower_bound, upper_bound)) {
+          continue;
+        }
+        callback(slot.key, slot.value);
+      }
+      batch.clear();
+    };
 
     t1_.scan(lower_bound,
              upper_bound,
@@ -1141,46 +1249,13 @@ class VMemKVImpl {
                  }
                }
 
-               const T2Memory *mem = t2_.get_memory_handle();
-
-               // Base-region fast path: see try_read_base_record()'s doc comment. No seqlock
-               // needed -- the base mappings' bytes are immutable once written, so callback can
-               // safely receive live spans straight into them.
-               if (const auto base_record = try_read_base_record(mem, payload, BaseReader::kScan, nullptr);
-                   base_record.has_value()) {
-                 if (key_in_range(base_record->key, lower_bound, upper_bound)) {
-                   callback(base_record->key, base_record->value);
-                 }
-                 ++total_count;
-                 return;
-               }
-
-               // t2_.at() called inside read_t2_record_seqlock() (as AtFunc), matching get_impl() --
-               // see read_t2_record_seqlock()'s comment.
-               //
-               // Torn-read fix: copy_func below must only *copy* into an owned buffer and
-               // return, never invoke `callback` from inside it -- see get_impl()'s identical
-               // fix and comment for the full rationale. thread_local since this is called
-               // concurrently from many threads; static so repeated calls (once per matching
-               // record, possibly many per scan()) reuse already-grown capacity instead of
-               // reallocating.
-               thread_local static std::vector<std::byte> tl_scan_key_buf;
-               thread_local static std::vector<std::byte> tl_scan_value_buf;
-               bool in_range =
-                   read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(payload & kOffsetMask, mem); },
-                                          [&](const T2RecordView &record) -> bool {
-                                            if (!key_in_range(record.key, lower_bound, upper_bound)) {
-                                              return false;
-                                            }
-                                            tl_scan_key_buf.assign(record.key.begin(), record.key.end());
-                                            tl_scan_value_buf.assign(record.value.begin(), record.value.end());
-                                            return true;
-                                          });
-               if (in_range) {
-                 callback(std::span<const std::byte>(tl_scan_key_buf), std::span<const std::byte>(tl_scan_value_buf));
-               }
+               batch.push_back({payload, hash});
                ++total_count;
+               if (batch.size() >= kScanBatchSize) {
+                 flush_batch();
+               }
              });
+    flush_batch();
 
     return total_count;
   }
@@ -1402,12 +1477,10 @@ class VMemKVImpl {
   // request_maintenance_if_needed()/run_maintenance() in sharded_t1_index.hpp) -- t1_ has no
   // whole-store append_size()/append_capacity() notion to threshold against anymore, and doesn't
   // need VMemKVImpl to drive its maintenance. What's left here is purely about *checkpointing*
-  // (durabilizing T2 + WAL rotation), which only VMemKVImpl knows anything about.
-  //
-  // Known follow-up, not ported here (see docs/t1_sharding_design.md): the old version's
-  // scan_active_-driven dynamic soft-threshold lowering (kept T1's append region L2-cache-sized
-  // during active scans) and stripe-local delete-pressure triggering
-  // (maybe_reorganize_if_needed_for_delete(), removed) have no ShardedT1Index equivalent yet.
+  // (durabilizing T2 + WAL rotation), which only VMemKVImpl knows anything about. The two
+  // workload-adaptive triggers the old version drove from here both live in ShardedT1Index now:
+  // scan_impl()'s ScanActiveGuard (L2-cache-sized append regions during scans) and put()'s
+  // tombstone counting (delete-pressure maintenance per shard).
   void maybe_reorganize_if_needed() {
     // wal_over_threshold() -> Wal::size_bytes() does an fstat(), too expensive to pay on every
     // single write. Sampled once every kWalCheckStride writes instead: the resulting delay past

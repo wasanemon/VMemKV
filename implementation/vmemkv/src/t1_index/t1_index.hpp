@@ -230,6 +230,11 @@ class T1Index {
   // Config::T1AppendCapacityEntries by default). Fixed for this instance's lifetime.
   [[nodiscard]] auto append_capacity() const noexcept -> size_t { return append_cap_; }
 
+  // Byte size of one append-region slot, for callers expressing cache-derived entry budgets
+  // (e.g. ShardedT1Index's scan-aware maintenance threshold) without depending on AppendSlot's
+  // layout.
+  static auto append_slot_bytes() noexcept -> size_t;
+
   // Number of AppendRegion instances (active + any not-yet-EBR-reclaimed retiring generation)
   // currently resident, and the high-water mark across this instance's lifetime. Each carries a
   // fixed append_cap_ * sizeof(AppendSlot) mmap'd footprint that becomes almost fully resident
@@ -255,22 +260,9 @@ class T1Index {
     return put_with_stored_hash(prefix, hash, stored_hash, value);
   }
 
-  // Same insert path as put(), for a caller that already has an entry's StoreKey prefix and
-  // final on-disk hash (EntrySnapshot::hash -- i.e. the raw full-key hash with any inline
-  // metadata bits already folded in by an earlier put()'s embed_metadata() call, exactly as
-  // stored in a slot and captured by reorganize()'s merge output) rather than the original raw
-  // key bytes. Used by ShardedT1Index::continue_split() to redistribute a straggler entry
-  // captured by its post-split drain, where only the already-hashed/prefixed form survives (the
-  // original bytes were never kept around) -- see that call site's own comment for why such a
-  // straggler can exist at all. `stored_hash` is written as-is (no re-embedding), so it must
-  // already be in on-disk form -- pass a plain hash_full_key() result for a non-inline entry.
-  auto put_with_final_hash(const Key &prefix, uint64_t stored_hash, Payload value) -> PutResult {
-    return put_with_stored_hash(prefix, stored_hash & t1_detail::kCleanHashMask, stored_hash, value);
-  }
-
  private:
-  // Shared insert body for put()/put_with_final_hash() above, once each has resolved (prefix,
-  // clean hash, on-disk stored_hash) its own way.
+  // Insert body for put() above, once it has resolved (prefix, clean hash, on-disk stored_hash)
+  // its own way.
   auto put_with_stored_hash(const Key &prefix, uint64_t hash, uint64_t stored_hash, Payload value) -> PutResult {
     return with_epoch_guard([&]() -> PutResult {
       // Retries because the in-place write below can race a concurrent insert that displaces the
@@ -1171,5 +1163,10 @@ class T1Index {
 
   mutable ThreadReferenceTracker<uint64_t> active_epochs_;
 };
+
+template <typename Config>
+auto T1Index<Config>::append_slot_bytes() noexcept -> size_t {
+  return sizeof(AppendSlot);
+}
 
 }  // namespace vmemkv

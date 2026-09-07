@@ -98,12 +98,16 @@
   (検証は`shard_count()`の安定化+一定時間待機後に行う必要がある——split完了は上記stragglers
   再配分の**前**に起こるため)。
 
-  未解決の別問題: 極端な設定(target_shard_size数百件+16書き込み/8ワーカースレッドで同一の
-  小さいキー範囲へ継続的に既存キーを再更新し続けるcyclingパターン)では、上記(4)(5)(6)修正後も
-  データ不整合が残存する。単発挿入パターンや本番相当スケール(数十万〜500万件)では再現しない
-  ため、cyclingする既存キー更新が極端な小シャード・高並行度と組み合わさった場合に固有の別バグと
-  見られる。根本原因未特定(次のステップ参照)。`tests/test_sharded_t1_index.cpp`の該当テストは
-  この極端な設定でのデータ整合性チェックを意図的に含めていない。
+   上記とは別の不整合(2026-09-07に根本原因を特定・修正済み): 極端な設定(target_shard_size
+   数百件+高並行度で同一の小さいキー範囲へ継続的に既存キーを再更新し続けるcyclingパターン)で
+   データ不整合が残存していた。原因は`continue_split()`のpost-drain一括straggler再配分が、
+   既に完了済みの古い書き込み値を新しい書き込みの上から再適用し、real-time orderに反して
+   古い値で上書きすることだった(単発挿入ではキーが重複しないため発症しない)。修正は
+   `ShardedT1Index::put()`の自己転送化(書き込みスロットの`superseded`を再確認し、引退済みなら
+   生きているシャードへ同じ値を再適用してから返す)と、一括再配分(第3の`reorganize()`+
+   `put_with_final_hash`ループ)の削除。回帰テストは
+   `tests/test_sharded_t1_index.cpp`の"cycling updates under tiny shards keep every key at its
+   latest value"(修正前は毎回40〜90件のstale値で失敗、修正後は安定して成功)。
 
 - 済: シャーディング後の公開API整理。`KVStore`コンセプト(`include/vmemkv/vmemkv.hpp`)に
   `reorganize()`/`checkpoint()`/`get_statistics()`を追加(いずれも`StoreAdapter`が全バックエンド

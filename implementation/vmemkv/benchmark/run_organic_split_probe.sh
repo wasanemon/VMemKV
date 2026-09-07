@@ -9,10 +9,12 @@
 # get_statistics().t1_split_count) and comparing Insert QPS just before it to Insert QPS during it
 # -- see bench_kv.cpp's run_organic_split_probe() for the actual measurement.
 #
-# Usage: run_organic_split_probe.sh <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter]
+# Usage: run_organic_split_probe.sh <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter] [key_pattern]
 #   scenario_filter: "in_memory" or "ltm" (default: both). Matches run_bench_aws_c6id.sh's
 #   run_remote_probe() calling convention (in_memory unconstrained, ltm cgroup-wrapped by the
 #   caller via systemd-run -- this script applies no memory limit itself).
+#   key_pattern: "monotonic" (default, single hot shard) or "random" (writes spread over all
+#   shards -- the variant that shows whether one split's impact shrinks as shards grow).
 set -uo pipefail  # deliberately not -e: probe/timeout exit codes are inspected explicitly below
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +26,7 @@ BENCH_KV_BIN="${1:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [sce
 OUTPUT_PATH="${2:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter]}"
 DB_DIR="${3:-/tmp}"
 SCENARIO_FILTER="${4:-}"
+KEY_PATTERN="${5:-monotonic}"
 
 : > "$OUTPUT_PATH"
 
@@ -38,8 +41,9 @@ if [[ -n "$SCENARIO_FILTER" ]]; then
 fi
 
 for scenario in "${SCENARIOS[@]}"; do
-  log "=== ${scenario} ==="
-  run_probe_point "$scenario" "1KB" "organic_split_probe" "1.0" "${scenario}/organic_split"
+  log "=== ${scenario} (${KEY_PATTERN}) ==="
+  run_probe_point "$scenario" "1KB" "organic_split_probe" "1.0" "${scenario}/organic_split" \
+    --key-pattern="$KEY_PATTERN"
 done
 
 log "done. Results written to $OUTPUT_PATH"

@@ -105,6 +105,15 @@ class ShardedT1Index {
   // and resolve_for_write() routes to a fresh one. Backpressure is thus scoped to writers of
   // *this* shard's key range; writers to other shards are never affected (see
   // "キューが追いつかない場合の劣化特性" in docs/t1_sharding_design.md).
+  //
+  // After applying, re-checks the written slot's superseded: a split can retire the slot between
+  // this call's resolve_for_write() and its T1Index::put(), landing the write in a shard that is
+  // about to be deleted. In that case this call re-resolves (spinning past Closing, following a
+  // completed Split{}) and re-applies the same key/value to the live shard before returning, so
+  // every returned put is already in a live shard. Re-application is idempotent (same key, same
+  // value, upserted) whether or not the retired slot's copy also reached the new shards via a
+  // split snapshot, and it keeps this operation in flight until the value is live, so a newer
+  // completed write to the same key can never be overwritten by this older one.
   auto put(std::span<const std::byte> key,
            Payload value,
            bool is_inline = false,
@@ -116,12 +125,43 @@ class ShardedT1Index {
         ShardSlot *slot = resolve_for_write(prefix);
         request_maintenance_if_needed(slot);
         const PutResult result = slot->index->put(key, value, is_inline, inline_size);
-        if (result != PutResult::AppendRegionFull) {
-          return result;
+        if (result == PutResult::AppendRegionFull) {
+          backoff.wait();
+          continue;
         }
-        backoff.wait();
+        if (slot->superseded.load(std::memory_order_acquire) != nullptr) {
+          continue;
+        }
+        if (value == STORE_NOT_FOUND) {
+          slot->tombstones_since_maintenance.fetch_add(1, std::memory_order_relaxed);
+          // The pre-put request above only saw the pre-increment count -- re-check now that this
+          // delete landed, so the final delete of a quiet workload still trips the trigger
+          // without needing another write after it.
+          request_maintenance_if_needed(slot);
+        }
+        return result;
       }
     });
+  }
+
+  // Marks whether a scan is currently in flight (set by the caller driving scan(), cleared when
+  // it finishes). While set, request_maintenance_if_needed() lowers each shard's soft threshold
+  // to keep append regions L2-cache-sized, so the scan's linear pass over them stays
+  // cache-resident.
+  void set_scan_active(bool active) const noexcept { scan_active_.store(active, std::memory_order_relaxed); }
+
+  // Entries a shard's append region may hold before background maintenance is requested: half
+  // the append capacity normally, capped at the L2-cache-sized slot budget while a scan is
+  // active. Pure function of its inputs so the scan-active lowering stays unit-testable at
+  // production-scale capacities (in-tree test configs are far too small for the L2 cap to bind).
+  static auto maintenance_soft_threshold(size_t append_cap, bool scan_active) -> size_t {
+    constexpr size_t kSoftThresholdPercent = 50;
+    constexpr size_t kL2CacheSizeBytes = 1024 * 1024;
+    const size_t normal = (append_cap * kSoftThresholdPercent) / 100;
+    if (!scan_active) {
+      return normal;
+    }
+    return std::min(kL2CacheSizeBytes / Shard::append_slot_bytes(), normal);
   }
 
   // Range scan over [lo_bytes, hi_bytes]. Structural completeness + per-key freshness only --
@@ -135,6 +175,16 @@ class ShardedT1Index {
     const Key hi = t1_detail::prefix_from_bytes(hi_bytes);
     return with_routing_guard([&]() -> size_t {
       Directory *dir = directory_.load(std::memory_order_acquire);
+      if (dir->shards.size() == 1) {
+        // No boundary search, no leaf collection, no per-call leaf vector allocation: a single
+        // shard answers the whole range directly (a split in progress reads through Closing,
+        // same as collect_leaves() below).
+        ShardSlot *slot = dir->shards[0];
+        Split *split = slot->superseded.load(std::memory_order_acquire);
+        if (split == nullptr || split == kClosingSentinel) {
+          return slot->index->scan(lo_bytes, hi_bytes, callback);
+        }
+      }
       const size_t start_idx =
           dir->boundaries.empty()
               ? 0
@@ -303,6 +353,7 @@ class ShardedT1Index {
       Directory *dir = directory_.load(std::memory_order_acquire);
       for (ShardSlot *slot : dir->shards) {
         reorganize_until_captured(*slot->index, offset_mapper, per_shard_writer, /*parallel_sort=*/false);
+        slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
       }
       return dir->boundaries;
     });
@@ -360,6 +411,12 @@ class ShardedT1Index {
     // at the *start* of run_maintenance() (see its own comment), not after -- a fresh soft-
     // threshold trip during that run re-enqueues rather than being silently dropped.
     std::atomic<bool> maintenance_pending{false};
+    // Tombstone puts applied to this shard since its last completed reorganize() (which merges
+    // them away). Drives the delete-pressure half of request_maintenance_if_needed(); reset
+    // wherever a reorganize() is known to have run (run_maintenance(), continue_split()'s abort
+    // path, checkpoint_all_shards()). Relaxed: a heuristic trigger, exactness unnecessary -- a
+    // concurrent put racing the reset only delays the next trigger by one round.
+    std::atomic<uint64_t> tombstones_since_maintenance{0};
   };
 
   // Immutable once published; replaced wholesale (RCU-style) on every split. boundaries.size()
@@ -377,9 +434,13 @@ class ShardedT1Index {
 
   // Read-path resolution: chases Split{} redirects but treats Closing as "still safe to read
   // this slot directly" (see class comment / docs/t1_sharding_design.md's scan consistency
-  // scope -- get/scan never need to wait on a split in progress).
+  // scope -- get/scan never need to wait on a split in progress). The single-shard case skips
+  // the directory's binary search: with one shard the routing is trivial, and this is the
+  // hottest shape (every op on a corpus below the first split threshold). The routing epoch
+  // guard itself is never skipped -- see with_routing_guard()'s contract.
   [[nodiscard]] auto resolve(const Key &key) const -> ShardSlot * {
-    ShardSlot *slot = directory_.load(std::memory_order_acquire)->shard_for(key);
+    Directory *dir = directory_.load(std::memory_order_acquire);
+    ShardSlot *slot = dir->shards.size() == 1 ? dir->shards[0] : dir->shard_for(key);
     for (;;) {
       Split *split = slot->superseded.load(std::memory_order_acquire);
       if (split == nullptr || split == kClosingSentinel) {
@@ -392,7 +453,8 @@ class ShardedT1Index {
   // Write-path resolution: spins past Closing (never writes into a shard mid-split) until it
   // resolves to either a normal (null) slot or follows a completed Split{} redirect.
   [[nodiscard]] auto resolve_for_write(const Key &key) const -> ShardSlot * {
-    ShardSlot *slot = directory_.load(std::memory_order_acquire)->shard_for(key);
+    Directory *dir = directory_.load(std::memory_order_acquire);
+    ShardSlot *slot = dir->shards.size() == 1 ? dir->shards[0] : dir->shard_for(key);
     SpinBackoff backoff;
     for (;;) {
       Split *split = slot->superseded.load(std::memory_order_acquire);
@@ -491,10 +553,10 @@ class ShardedT1Index {
     // Second reorganize(), taken *after* Closing is visible: captures target's state as of "no
     // new writer can resolve target anymore" (anything already inside T1Index::put() when Closing
     // was set is drained by T1Index's own existing reorg_epoch_/active_epochs_ mechanism, same as
-    // any ordinary reorganize()). This is *not* yet target's truly-final state, though -- a writer
-    // that resolved target just before Closing but hasn't reached T1Index::put() yet can still
-    // land a write after this snapshot; see the post-split drain further below (right before
-    // `delete target`) for how that residual window is closed.
+    // any ordinary reorganize()). A writer that resolved target just before Closing but hasn't
+    // reached T1Index::put() yet can still land a write after this snapshot; that residual window
+    // is closed by the writer itself -- put() re-checks its slot's superseded and forwards its
+    // own write to the live shard before returning (see its own comment).
     //
     // Retried via reorganize_until_captured() for the same reason as checkpoint_all_shards():
     // a redundant, concurrently-dequeued run_maintenance() attempt for this same shard (a
@@ -533,6 +595,7 @@ class ShardedT1Index {
       // flag.
       target->superseded.store(nullptr, std::memory_order_release);
       target->maintenance_pending.store(false, std::memory_order_relaxed);
+      target->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
       return;
     }
 
@@ -569,41 +632,16 @@ class ShardedT1Index {
     Directory *old_dir = publish_directory_after_split(target, low_slot, high_slot, boundary);
 
     // Drain every routing-guarded call that could still be holding a raw reference to `target`
-    // or `old_dir` from before this split (see class comment on with_routing_guard()).
+    // or `old_dir` from before this split, then free both. No post-drain redistribution of
+    // target's leftovers is needed: put() re-checks its written slot's superseded and forwards
+    // its own write to the live shard before returning (see its own comment), so any write that
+    // landed in target after the second reorganize() above is re-applied by its own writer while
+    // still in flight -- and, unlike a bulk re-application here, can never overwrite a newer
+    // completed write to the same key. Draining before freeing (rather than before the snapshot)
+    // avoids self-deadlock against writers spinning on Closing inside resolve_for_write(), which
+    // only this function's own superseded.store() above can release.
     const uint64_t bumped = routing_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     routing_epochs_.wait_until_epoch(bumped);
-
-    // Catches a real data-loss window the second reorganize() above cannot: put()'s retry loop
-    // (see its own definition) resolves a slot once via resolve_for_write(), then calls
-    // slot->index->put() with no re-check of `superseded` in between. A writer that read
-    // `superseded == null` a moment before this function set it to Closing can still be sitting
-    // between those two steps when the second reorganize() above takes its snapshot, and only
-    // reach slot->index->put() afterward -- landing in target's *post-snapshot* active
-    // generation. T1Index's own reorg_epoch_/active_epochs_ drain can't see this writer (it isn't
-    // inside T1Index::put() yet when the snapshot is taken), so without this step that write
-    // would be silently destroyed by `delete target` below.
-    //
-    // The epoch drain just above is what makes this safe to do *now*, and specifically not any
-    // earlier: it guarantees every routing-guarded caller registered before the bump -- including
-    // any writer still holding a stale (pre-Closing) reference to `target` -- has completed its
-    // own slot->index->put() call before this line runs. Attempting this same drain *before* the
-    // snapshot (rather than reusing this one) would self-deadlock the split against exactly the
-    // writers it is blocking: a writer that has already observed Closing spins inside
-    // resolve_for_write() until this function's own superseded.store() above resolves it, so a
-    // drain positioned earlier would be waiting on guards that can only ever be released by this
-    // function making further progress. And no *new* writer can reach target from here on either:
-    // resolve_for_write() only ever returns target while superseded reads null, which stopped
-    // being possible the moment Closing was set, long before this point. So target's state is now
-    // permanently final, and one more reorganize() sees all of it.
-    std::vector<EntrySnapshot> stragglers;
-    reorganize_until_captured(
-        *target->index, [](std::span<EntrySnapshot> /*merged*/) {},
-        [&](std::span<const EntrySnapshot> merged) { stragglers.assign(merged.begin(), merged.end()); },
-        /*parallel_sort=*/false);
-    for (const EntrySnapshot &entry : stragglers) {
-      ShardSlot *destination = entry.key < boundary ? low_slot : high_slot;
-      destination->index->put_with_final_hash(entry.key, entry.hash, entry.payload_bits);
-    }
 
     delete old_dir;
     delete target;
@@ -641,8 +679,12 @@ class ShardedT1Index {
   }
 
   // Soft-threshold check: enqueues `slot` for background maintenance if it isn't already queued
-  // and its append region is more than half full. Mirrors vmemkv_impl.hpp's
-  // maybe_reorganize_if_needed(), scoped to one shard instead of the whole (unsharded) store.
+  // and either its append region crossed the soft threshold (scan-aware, see
+  // maintenance_soft_threshold()) or it accumulated a shard's worth of tombstones since its last
+  // maintenance -- the latter mirrors the old unsharded maybe_reorganize_if_needed_for_delete():
+  // deletes only retarget T1 offsets, so without this a delete-heavy workload fills shards with
+  // dead entries no occupancy threshold ever fires on. target_shard_size_ doubles as the live-size
+  // proxy the old per-stripe live_count played, keeping this design's single tuning knob.
   //
   // Re-checks `superseded` *inside* the queue_mutex_ critical section, the same mutex
   // split_shard() purges under right after its Closing CAS -- this is what actually makes the
@@ -654,8 +696,9 @@ class ShardedT1Index {
   void request_maintenance_if_needed(ShardSlot *slot) {
     const size_t size = slot->index->append_size();
     const size_t cap = slot->index->append_capacity();
-    constexpr size_t kSoftThresholdPercent = 50;
-    if (size * 100 < cap * kSoftThresholdPercent) {
+    const bool over_soft = size >= maintenance_soft_threshold(cap, scan_active_.load(std::memory_order_relaxed));
+    const bool delete_heavy = slot->tombstones_since_maintenance.load(std::memory_order_relaxed) >= target_shard_size_;
+    if (!over_soft && !delete_heavy) {
       return;
     }
     bool expected = false;
@@ -742,10 +785,21 @@ class ShardedT1Index {
         return true;  // Already split/being split by the time this was dequeued -- no-op.
       }
       std::vector<EntrySnapshot> merged_entries;
+      bool reorganized = false;
       slot->index->reorganize(
           [](std::span<EntrySnapshot> /*merged*/) {},
-          [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); },
+          [&](std::span<const EntrySnapshot> merged) {
+            merged_entries.assign(merged.begin(), merged.end());
+            reorganized = true;
+          },
           /*parallel_sort=*/false);  // See T1Index::reorganize()'s own doc comment on this parameter.
+      if (reorganized) {
+        // The merge above carried this shard's tombstones away -- without this reset the
+        // delete-pressure trigger would re-fire on every subsequent put and churn maintenance
+        // with nothing new to collect. (A no-op lost to reorg_in_progress_ leaves the count
+        // alone, so the pressure correctly survives until a real merge runs.)
+        slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
+      }
 
       const size_t split_threshold = (target_shard_size_ * Config::T1ShardSplitThresholdPercent) / 100;
       if (merged_entries.size() < split_threshold) {
@@ -766,6 +820,8 @@ class ShardedT1Index {
     return dequeued;
   }
 
+  // See set_scan_active().
+  mutable std::atomic<bool> scan_active_{false};
   mutable ThreadReferenceTracker<uint64_t> routing_epochs_;
   std::atomic<uint64_t> routing_epoch_{1};
   std::atomic<uint64_t> total_splits_{0};
