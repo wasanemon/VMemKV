@@ -2369,6 +2369,17 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   auto store = make_vmemkv_fresh(
       path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
 
+  // VMemKVImpl's own WAL-size-triggered organic checkpoint (reorg_worker_loop(), unrelated to
+  // ShardedT1Index's per-shard split logic this probe exists to isolate) fires far more often than
+  // any one shard's own append-region threshold at this insert rate/value size -- each such
+  // checkpoint calls checkpoint_all_shards(), forcing every shard's append region to compact well
+  // before it could ever cross the 50%-full soft threshold that triggers ShardedT1Index's own
+  // maintenance queue. Left unsuppressed, this starves organic splitting entirely (confirmed: zero
+  // splits observed after inserting ~10M records, an order of magnitude past the split threshold).
+  // Suppressing it here isolates exactly the mechanism this probe measures; the organic checkpoint
+  // path itself is what run_background_job_probe() already measures separately.
+  setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
+
   std::atomic<std::size_t> next_key{0};
   std::atomic<bool> stop{false};
   std::vector<std::thread> workers;
@@ -2399,6 +2410,7 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   for (auto &w : workers) {
     w.join();
   }
+  unsetenv("VMEMKV_SUPPRESS_AUTO_REORG");
   const uint64_t final_split_count = store->get_statistics().t1_split_count;
 
   // Nearest sample at or before `t_sec` (clamped to the first sample if `t_sec` predates the run).

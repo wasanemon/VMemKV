@@ -445,7 +445,22 @@ T2とWALは既存どおりグローバル(シャード非依存)のまま維持�
   内訳を追加。`generate_report.py`は"Background Jobs"セクションの説明文を「強制・全シャード」
   である旨を明記する形に更新し、新設の"Organic Per-Shard Splits"セクション(split数・
   ベースライン/split中QPS・劣化率をイベントごとに表示、shard数が増えるほど劣化率が下がる
-  傾向が見えるはず)を追加。まだAWS実測待ち(次回フルベンチで結果を確認)。
+  傾向が見えるはず)を追加。
+
+- 実測(初回、AWS): `run_organic_split_probe.sh`の初回実測で、in_memory/ltm両シナリオとも
+  約960〜980万件挿入してもsplitが1件も発生しない(`final_shard_count:1`)という結果になった。
+  原因調査の結果、**organicなcheckpoint(WALサイズ閾値駆動)がorganicなper-shard splitを
+  事実上飢餓状態にする**という、シャーディングとは別レイヤーの実在の相互作用を発見した:
+  1KB値・32並列挿入では`WalMaxBytesSinceCheckpoint`(64MiB)に約6万〜6万4千件ごとに到達し、
+  `reorg_worker_loop()`が非常に高頻度で`checkpoint_all_shards()`を発火させる。この呼び出しは
+  全シャードのappend領域を無条件に(占有率に関係なく)コンパクションするため、
+  `request_maintenance_if_needed()`のsoft閾値(append領域が容量の50%——約104万件——を
+  超えたら background maintenance キューに投入)が一度も成立せず、split判定を行う唯一の経路
+  である`run_maintenance()`/`continue_split()`が丸ごと呼ばれなくなる。コーパス総量がいくら
+  増えてもこの状態では恒久的にsplitが起きない。修正として、`run_organic_split_probe()`の
+  挿入フェーズ全体を`VMEMKV_SUPPRESS_AUTO_REORG=1`(`run_background_job_probe()`のpopulate
+  フェーズで既に使われていた抑制フラグ)で囲み、organic checkpointを止めた状態で
+  ShardedT1Indexの自前のsplit判定だけを働かせる形にした。再計測待ち。
 
 ## 未実装/次のステップ
 
