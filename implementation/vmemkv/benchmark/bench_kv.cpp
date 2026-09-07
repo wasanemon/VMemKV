@@ -2391,24 +2391,10 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   // path itself is what run_background_job_probe() already measures separately.
   setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
 
-  // Insert (growing the corpus) always runs at writer_threads -- unchanged from before, since
-  // that's what drives shards toward their split threshold and must stay the dominant workload.
-  // Update/Scan run concurrently at a smaller, fixed thread count: real signal without materially
-  // slowing the insert-driven growth this probe depends on. Both draw a uniformly random *existing*
-  // key each op (current upper bound re-read from next_key every call, since the corpus keeps
-  // growing) -- unlike Insert, which always targets whichever shard currently owns the tail of the
-  // keyspace, a uniformly random key only lands in the currently-splitting shard with probability
-  // roughly 1/shard_count, so their degradation is expected to *shrink* as shard count grows even
-  // though Insert's (always-the-hot-shard) does not -- see docs/t1_sharding_design.md.
-  constexpr std::size_t kUpdateThreads = 8;
-  constexpr std::size_t kScanThreads = 8;
-
   std::atomic<std::size_t> next_key{0};
-  std::atomic<std::size_t> update_ops{0};
-  std::atomic<std::size_t> scan_ops{0};
   std::atomic<bool> stop{false};
   std::vector<std::thread> workers;
-  workers.reserve(writer_threads + kUpdateThreads + kScanThreads);
+  workers.reserve(writer_threads);
   for (std::size_t t = 0; t < writer_threads; ++t) {
     workers.emplace_back([&]() {
       while (!stop.load(std::memory_order_relaxed)) {
@@ -2417,43 +2403,10 @@ constexpr double kOrganicSplitWindowSec = 1.2;
       }
     });
   }
-  for (std::size_t t = 0; t < kUpdateThreads; ++t) {
-    workers.emplace_back([&, t]() {
-      std::mt19937_64 rng(kBenchmarkSeed + 11000 + t);
-      while (!stop.load(std::memory_order_relaxed)) {
-        const std::size_t upper = next_key.load(std::memory_order_relaxed);
-        if (upper == 0) {
-          continue;
-        }
-        const std::size_t idx = std::uniform_int_distribution<std::size_t>(0, upper - 1)(rng);
-        store->update(make_key(idx), make_value_for_key(idx, args.val_size));
-        update_ops.fetch_add(1, std::memory_order_relaxed);
-      }
-    });
-  }
-  for (std::size_t t = 0; t < kScanThreads; ++t) {
-    workers.emplace_back([&, t]() {
-      std::mt19937_64 rng(kBenchmarkSeed + 12000 + t);
-      while (!stop.load(std::memory_order_relaxed)) {
-        const std::size_t upper = next_key.load(std::memory_order_relaxed);
-        if (upper == 0) {
-          continue;
-        }
-        const std::size_t start = std::uniform_int_distribution<std::size_t>(0, upper - 1)(rng);
-        std::size_t result_count = store->scan(
-            make_key(start), make_key(start + 99),
-            [](std::span<const std::byte>, std::span<const std::byte> value) { benchmark::DoNotOptimize(touch_bytes(value)); });
-        benchmark::DoNotOptimize(result_count);
-        scan_ops.fetch_add(1, std::memory_order_relaxed);
-      }
-    });
-  }
 
   struct Sample {
     double t_sec;
     std::size_t inserted;
-    std::size_t updated;
-    std::size_t scanned;
     uint64_t split_count;
     uint64_t last_pause_us;      // stats.t1_last_split_pause_us as of this poll
     uint64_t last_pause_end_ns;  // stats.t1_last_split_pause_end_ns as of this poll
@@ -2464,9 +2417,8 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   auto elapsed_sec = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
   while (elapsed_sec() < kOrganicSplitProbeDurationSec) {
     const auto stats = store->get_statistics();
-    samples.push_back({elapsed_sec(), next_key.load(std::memory_order_relaxed), update_ops.load(std::memory_order_relaxed),
-                       scan_ops.load(std::memory_order_relaxed), stats.t1_split_count, stats.t1_last_split_pause_us,
-                       stats.t1_last_split_pause_end_ns});
+    samples.push_back({elapsed_sec(), next_key.load(std::memory_order_relaxed), stats.t1_split_count,
+                       stats.t1_last_split_pause_us, stats.t1_last_split_pause_end_ns});
     std::this_thread::sleep_for(kOrganicSplitPollInterval);
   }
   stop.store(true, std::memory_order_relaxed);
@@ -2485,44 +2437,25 @@ constexpr double kOrganicSplitWindowSec = 1.2;
     }
     return *std::prev(it);
   };
-  enum class OpKind { kInsert, kUpdate, kScan };
-  auto op_count = [](const Sample &s, OpKind k) -> std::size_t {
-    switch (k) {
-      case OpKind::kInsert:
-        return s.inserted;
-      case OpKind::kUpdate:
-        return s.updated;
-      case OpKind::kScan:
-        return s.scanned;
-    }
-    return 0;
-  };
-  auto qps_between = [&](double from_sec, double to_sec, OpKind k) -> std::optional<double> {
+  auto qps_between = [&](double from_sec, double to_sec) -> std::optional<double> {
     if (from_sec < samples.front().t_sec) {
       return std::nullopt;
     }
     const Sample &a = sample_at_or_before(from_sec);
     const Sample &b = sample_at_or_before(to_sec);
     const double dt = b.t_sec - a.t_sec;
-    const std::size_t count_a = op_count(a, k);
-    const std::size_t count_b = op_count(b, k);
-    if (dt <= 0.0 || count_b <= count_a) {
+    if (dt <= 0.0 || b.inserted <= a.inserted) {
       return std::nullopt;
     }
-    return static_cast<double>(count_b - count_a) / dt;
+    return static_cast<double>(b.inserted - a.inserted) / dt;
   };
 
-  struct WorkloadQps {
-    double baseline_qps;
-    double during_qps;
-  };
   struct SplitEvent {
     double pause_start_sec;
     double pause_us;
     uint64_t shard_count_after;
-    WorkloadQps insert_qps;
-    std::optional<WorkloadQps> update_qps;
-    std::optional<WorkloadQps> scan_qps;
+    double baseline_qps;
+    double during_qps;
   };
   std::vector<SplitEvent> events;
   for (std::size_t i = 1; i < samples.size(); ++i) {
@@ -2540,51 +2473,25 @@ constexpr double kOrganicSplitWindowSec = 1.2;
     const double pause_us = static_cast<double>(samples[i].last_pause_us);
     const double pause_start_sec = pause_end_sec - pause_us / 1e6;
 
-    const auto insert_baseline = qps_between(pause_start_sec - kOrganicSplitWindowSec, pause_start_sec, OpKind::kInsert);
-    const auto insert_during = qps_between(pause_start_sec, pause_end_sec, OpKind::kInsert);
-    if (!insert_baseline.has_value() || !insert_during.has_value() || *insert_baseline <= 0.0) {
+    const auto baseline = qps_between(pause_start_sec - kOrganicSplitWindowSec, pause_start_sec);
+    const auto during = qps_between(pause_start_sec, pause_end_sec);
+    if (!baseline.has_value() || !during.has_value() || *baseline <= 0.0) {
       continue;
     }
-    auto make_optional_qps = [&](OpKind k) -> std::optional<WorkloadQps> {
-      const auto baseline = qps_between(pause_start_sec - kOrganicSplitWindowSec, pause_start_sec, k);
-      const auto during = qps_between(pause_start_sec, pause_end_sec, k);
-      if (!baseline.has_value() || !during.has_value() || *baseline <= 0.0) {
-        return std::nullopt;
-      }
-      return WorkloadQps{*baseline, *during};
-    };
-    events.push_back({pause_start_sec, pause_us, samples[i].split_count + 1, {*insert_baseline, *insert_during},
-                      make_optional_qps(OpKind::kUpdate), make_optional_qps(OpKind::kScan)});
+    events.push_back({pause_start_sec, pause_us, samples[i].split_count + 1, *baseline, *during});
   }
 
   std::cout << "{\"job\":\"organic_split\",\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\","
             << "\"value_size\":" << args.val_size << ",\"writer_threads\":" << writer_threads << ","
-            << "\"update_threads\":" << kUpdateThreads << ",\"scan_threads\":" << kScanThreads << ","
             << "\"duration_sec\":" << kOrganicSplitProbeDurationSec << ","
             << "\"total_inserted\":" << next_key.load(std::memory_order_relaxed) << ","
             << "\"final_shard_count\":" << (final_split_count + 1) << ",\"splits\":[";
-  auto pct_or_null = [](const std::optional<WorkloadQps> &q) -> std::string {
-    if (!q.has_value()) return "null";
-    return std::to_string((1.0 - q->during_qps / q->baseline_qps) * 100.0);
-  };
-  auto qps_or_null = [](const std::optional<WorkloadQps> &q, bool want_baseline) -> std::string {
-    if (!q.has_value()) return "null";
-    return std::to_string(want_baseline ? q->baseline_qps : q->during_qps);
-  };
   for (std::size_t i = 0; i < events.size(); ++i) {
     const auto &e = events[i];
-    const double insert_degradation_pct = (1.0 - e.insert_qps.during_qps / e.insert_qps.baseline_qps) * 100.0;
+    const double degradation_pct = (1.0 - e.during_qps / e.baseline_qps) * 100.0;
     std::cout << (i > 0 ? "," : "") << "{\"at_sec\":" << e.pause_start_sec << ",\"pause_us\":" << e.pause_us
-              << ",\"shard_count_after\":" << e.shard_count_after
-              << ",\"insert_baseline_qps\":" << e.insert_qps.baseline_qps
-              << ",\"insert_during_qps\":" << e.insert_qps.during_qps
-              << ",\"insert_degradation_pct\":" << insert_degradation_pct
-              << ",\"update_baseline_qps\":" << qps_or_null(e.update_qps, true)
-              << ",\"update_during_qps\":" << qps_or_null(e.update_qps, false)
-              << ",\"update_degradation_pct\":" << pct_or_null(e.update_qps)
-              << ",\"scan_baseline_qps\":" << qps_or_null(e.scan_qps, true)
-              << ",\"scan_during_qps\":" << qps_or_null(e.scan_qps, false)
-              << ",\"scan_degradation_pct\":" << pct_or_null(e.scan_qps) << "}";
+              << ",\"shard_count_after\":" << e.shard_count_after << ",\"baseline_qps\":" << e.baseline_qps
+              << ",\"during_qps\":" << e.during_qps << ",\"degradation_pct\":" << degradation_pct << "}";
   }
   std::cout << "],\"timed_out\":false}" << std::endl;
   std::_Exit(0);
