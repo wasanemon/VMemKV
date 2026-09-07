@@ -207,18 +207,32 @@ def build_organic_split_data(report_dir):
 
 
 def organic_split_averages(organic_split_data, scenario):
-    """(avg_pause_us, avg_degradation_pct, n) across a scenario's observed splits, or None if
-    that scenario has no usable data (missing file, timeout, or zero splits observed)."""
+    """{"pause_us", "n", "insert_degradation_pct", "update_degradation_pct",
+    "scan_degradation_pct"} averaged across a scenario's observed splits, or None if that scenario
+    has no usable data (missing file, timeout, or zero splits observed). update/scan average only
+    over events where that workload's degradation was actually measurable -- bench_kv.cpp reports
+    either as null for a given split when too few Update/Scan ops landed in its baseline/during
+    window to compute a rate (a uniformly random key only lands in whichever shard is currently
+    splitting with probability roughly 1/shard_count, so this gets less likely, not more, as more
+    shards accumulate)."""
     rec = organic_split_data.get(scenario)
     if not rec or rec.get("timed_out"):
         return None
     splits = rec.get("splits", [])
     if not splits:
         return None
-    n = len(splits)
-    avg_pause_us = sum(s["pause_us"] for s in splits) / n
-    avg_degr = sum(s["degradation_pct"] for s in splits) / n
-    return avg_pause_us, avg_degr, n
+
+    def avg_of(key):
+        vals = [s[key] for s in splits if s.get(key) is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    return {
+        "pause_us": sum(s["pause_us"] for s in splits) / len(splits),
+        "n": len(splits),
+        "insert_degradation_pct": avg_of("insert_degradation_pct"),
+        "update_degradation_pct": avg_of("update_degradation_pct"),
+        "scan_degradation_pct": avg_of("scan_degradation_pct"),
+    }
 
 
 def render_organic_split_chart_html(organic_split_data):
@@ -280,13 +294,13 @@ def render_organic_split_chart_html(organic_split_data):
         })
         qps_datasets.append({
             "label": f"{scenario_labels[scenario]} baseline",
-            "data": [{"x": s["shard_count_after"], "y": s["baseline_qps"]} for s in capped],
+            "data": [{"x": s["shard_count_after"], "y": s["insert_baseline_qps"]} for s in capped],
             "borderColor": col, "backgroundColor": col, "tension": 0.3,
             "pointRadius": 4, "pointHoverRadius": 6,
         })
         qps_datasets.append({
             "label": f"{scenario_labels[scenario]} during pause",
-            "data": [{"x": s["shard_count_after"], "y": s["during_qps"]} for s in capped],
+            "data": [{"x": s["shard_count_after"], "y": s["insert_during_qps"]} for s in capped],
             "borderColor": col, "backgroundColor": col, "borderDash": [6, 6], "tension": 0.3,
             "pointRadius": 4, "pointHoverRadius": 6,
         })
@@ -488,15 +502,20 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
                 out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
                             f'<td class="py-2 px-3 text-slate-300" colspan="4">n/a</td></tr>')
                 continue
-            avg_pause_us, avg_degr, n = averages
-            duration_cell = f'{avg_pause_us / 1000:.0f}ms<div class="text-[10px] text-slate-400 font-normal">avg of {n} splits</div>'
-            degr_badge = (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
-                          f'{_badge_for_slowdown(avg_degr)} font-bold w-fit">{avg_degr:.0f}%</span>')
+            duration_cell = (f'{averages["pause_us"] / 1000:.0f}ms'
+                              f'<div class="text-[10px] text-slate-400 font-normal">avg of {averages["n"]} splits</div>')
+
+            def badge_or_na(pct):
+                if pct is None:
+                    return '<span class="text-slate-300">n/a</span>'
+                return (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
+                        f'{_badge_for_slowdown(pct)} font-bold w-fit">{pct:.0f}%</span>')
+
             out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
                         f'<td class="py-2 px-3">{duration_cell}</td>'
-                        f'<td class="py-2 px-3">{degr_badge}</td>'
-                        f'<td class="py-2 px-3"><span class="text-slate-300">n/a</span></td>'
-                        f'<td class="py-2 px-3"><span class="text-slate-300">n/a</span></td></tr>')
+                        f'<td class="py-2 px-3">{badge_or_na(averages["insert_degradation_pct"])}</td>'
+                        f'<td class="py-2 px-3">{badge_or_na(averages["update_degradation_pct"])}</td>'
+                        f'<td class="py-2 px-3">{badge_or_na(averages["scan_degradation_pct"])}</td></tr>')
 
     out.append("</tbody></table></div>")
     return "\n".join(out)
