@@ -39,6 +39,11 @@ show_help() {
   echo "                   splitting under sustained write load (the maintenance path that"
   echo "                   actually runs during ordinary operation) via"
   echo "                   run_organic_split_probe.sh and download its JSONL output."
+  echo "  --organic-split-probe-random"
+  echo "                   Same as --organic-split-probe but with random keys (writes spread"
+  echo "                   over all shards), showing whether one split's throughput impact"
+  echo "                   shrinks as the shard count grows. Downloaded separately as"
+  echo "                   organic_split_random_{in_memory,ltm}.jsonl."
   echo "  --skip-matrix    Skip the main Google Benchmark-registered CRUD/Scan/YCSB-E matrix"
   echo "                   entirely (and its results download) -- provision/build the instance"
   echo "                   and run only the *-probe flags passed alongside this one."
@@ -57,6 +62,7 @@ SCENARIO_LIMIT="all"
 VALUE_SIZE_LIMIT=""
 BACKGROUND_JOBS_PROBE=false
 ORGANIC_SPLIT_PROBE=false
+ORGANIC_SPLIT_PROBE_RANDOM=false
 SKIP_MATRIX=false
 WITHOUT_RIVALS=false
 
@@ -92,6 +98,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --organic-split-probe)
       ORGANIC_SPLIT_PROBE=true
+      shift
+      ;;
+    --organic-split-probe-random)
+      ORGANIC_SPLIT_PROBE_RANDOM=true
       shift
       ;;
     --skip-matrix)
@@ -788,6 +798,7 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
 #       $2 = output basename (e.g. background_jobs -> background_jobs_in_memory.jsonl)
 #       $3 = log-file prefix (e.g. vmemkv_background_jobs_probe)
 #       $4 = human-readable label for [runner]/[WARN] messages (e.g. background-jobs-probe)
+#       $5 = optional extra args forwarded verbatim to the probe script (e.g. --key-pattern=random)
 #
 # A failure here is logged as [WARN], not [ERROR], and does not fail the whole run: unlike the
 # matrix above, this is a supplementary measurement, not the main deliverable.
@@ -796,6 +807,7 @@ run_remote_probe() {
   local output_basename="$2"
   local log_prefix="$3"
   local label="$4"
+  local extra_probe_args="${5:-}"
 
   local inmem_dst_name="${output_basename}_in_memory.jsonl"
   local ltm_dst_name="${output_basename}_ltm.jsonl"
@@ -817,7 +829,7 @@ run_remote_probe() {
     : >"$inmem_stderr_log"
     local inmem_remote_cmd="
 cd /home/ubuntu/faultkv/vmemkv &&
-./benchmark/${probe_script} './build-rel/benchmark/bench_kv' '/mnt/nvme/${output_basename}_in_memory.jsonl' '/mnt/nvme' '$inmem_combo_filter'
+./benchmark/${probe_script} './build-rel/benchmark/bench_kv' '/mnt/nvme/${output_basename}_in_memory.jsonl' '/mnt/nvme' '$inmem_combo_filter' ${extra_probe_args}
     "
     local inmem_remote_cmd_quoted
     printf -v inmem_remote_cmd_quoted '%q' "$inmem_remote_cmd"
@@ -855,7 +867,7 @@ cd /home/ubuntu/faultkv/vmemkv &&
     local ltm_remote_cmd="
 cd /home/ubuntu/faultkv/vmemkv &&
 VMEMKV_CONTEXT_memory_budget_bytes=$LTM_MEMORY_BUDGET_BYTES \
-./benchmark/${probe_script} './build-rel/benchmark/bench_kv' '/mnt/nvme/${output_basename}_ltm.jsonl' '/mnt/nvme' '$ltm_combo_filter'
+./benchmark/${probe_script} './build-rel/benchmark/bench_kv' '/mnt/nvme/${output_basename}_ltm.jsonl' '/mnt/nvme' '$ltm_combo_filter' ${extra_probe_args}
     "
     local ltm_remote_cmd_quoted
     printf -v ltm_remote_cmd_quoted '%q' "$ltm_remote_cmd"
@@ -1004,4 +1016,13 @@ if [[ "$ORGANIC_SPLIT_PROBE" == "true" ]]; then
   # happens during ordinary operation) rather than replacing it. Same ltm-cgroup-wrap/
   # VALUE_SIZE_LIMIT-ignoring/non-fatal-failure conventions as that call, see its own comment.
   run_remote_probe "run_organic_split_probe.sh" "organic_split" "vmemkv_organic_split_probe" "organic-split-probe"
+fi
+
+if [[ "$ORGANIC_SPLIT_PROBE_RANDOM" == "true" ]]; then
+  # Random-key twin of the probe above: same sustained-insert shape, but writes spread over all
+  # shards, showing whether one split's throughput impact shrinks as the shard count grows.
+  # Separate output basenames so both patterns coexist in one report dir (see generate_report.py's
+  # organic_split_random handling); same non-fatal-failure convention as every other probe.
+  run_remote_probe "run_organic_split_probe.sh" "organic_split_random" "vmemkv_organic_split_probe_random" \
+    "organic-split-probe-random" "--key-pattern=random"
 fi

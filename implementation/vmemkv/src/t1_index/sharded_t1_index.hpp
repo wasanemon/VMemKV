@@ -313,7 +313,8 @@ class ShardedT1Index {
     }
   }
 
-  // Forces every shard's reorganize() (fully draining its append region) and invokes
+  // Captures every shard's live entries (merging its append region first, unless it is
+  // already empty -- see the loop body's own comment) and invokes
   // offset_mapper(merged) then per_shard_writer(merged) once per shard, in ascending key order --
   // mirroring T1Index::reorganize()'s own (OffsetMapper, ChkWriter) contract exactly, just once
   // per shard instead of once overall (e.g. for T2 offset relocation: shards are visited in
@@ -351,7 +352,23 @@ class ShardedT1Index {
 
     return with_routing_guard([&]() -> std::vector<Key> {
       Directory *dir = directory_.load(std::memory_order_acquire);
+      std::vector<EntrySnapshot> dumped;
       for (ShardSlot *slot : dir->shards) {
+        // Merge-free shortcut for shards with nothing new to merge: with an empty append
+        // region, a merge's output is this shard's sorted region as-is (same key order, same
+        // tombstone-skipping), so serializing it directly yields byte-identical checkpoint
+        // content at O(sorted) walk cost instead of O(merge) cost. In-place updates to sorted
+        // slots and concurrent background merges stay consistent for the same reason a merge
+        // snapshot does: anything concurrent with this read is WAL-covered past this cycle's
+        // checkpoint_lsn and converges via replay (see checkpoint_internal()'s LSN discipline).
+        // The tombstone counter is deliberately *not* reset here -- only a real merge carries
+        // tombstones away, so the pressure correctly survives until one runs.
+        if (slot->index->append_size() == 0) {
+          slot->index->dump_sorted_region(dumped);
+          offset_mapper(std::span<EntrySnapshot>(dumped));
+          per_shard_writer(dumped);
+          continue;
+        }
         reorganize_until_captured(*slot->index, offset_mapper, per_shard_writer, /*parallel_sort=*/false);
         slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
       }

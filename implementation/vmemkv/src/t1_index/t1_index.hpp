@@ -230,6 +230,23 @@ class T1Index {
   // Config::T1AppendCapacityEntries by default). Fixed for this instance's lifetime.
   [[nodiscard]] auto append_capacity() const noexcept -> size_t { return append_cap_; }
 
+  // Streams every live sorted-region entry in key order without merging the append region.
+  // The merge-free read path behind ShardedT1Index::checkpoint_all_shards()'s clean-shard
+  // shortcut (see its own comment for why the output is identical to a merge when the append
+  // region is empty). Epoch-guarded like any other read; tombstoned entries are skipped exactly
+  // as a merge would skip them.
+  void dump_sorted_region(std::vector<EntrySnapshot> &out) const {
+    with_epoch_guard([&] {
+      out.clear();
+      const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
+      Key max_key;
+      max_key.fill(std::byte{0xFF});
+      walk_sorted_region(sorted, Key{}, max_key, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
+        out.push_back(EntrySnapshot{slot.key, payload, hash});
+      });
+    });
+  }
+
   // Byte size of one append-region slot, for callers expressing cache-derived entry budgets
   // (e.g. ShardedT1Index's scan-aware maintenance threshold) without depending on AppendSlot's
   // layout.

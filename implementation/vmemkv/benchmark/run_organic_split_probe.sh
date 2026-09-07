@@ -27,6 +27,9 @@ OUTPUT_PATH="${2:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [scen
 DB_DIR="${3:-/tmp}"
 SCENARIO_FILTER="${4:-}"
 KEY_PATTERN="${5:-monotonic}"
+# Accept both the bare pattern ("random") and the bench_kv flag form ("--key-pattern=random")
+# so remote callers can forward the flag verbatim.
+KEY_PATTERN="${KEY_PATTERN#--key-pattern=}"
 
 : > "$OUTPUT_PATH"
 

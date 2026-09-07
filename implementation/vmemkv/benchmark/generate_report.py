@@ -184,13 +184,14 @@ def build_background_jobs_data(report_dir):
     return data
 
 
-def build_organic_split_data(report_dir):
-    """Reads organic_split_in_memory.jsonl / organic_split_ltm.jsonl (run_organic_split_probe.sh
-    via run_bench_aws_c6id.sh's run_remote_probe()) into {scenario: rec}. Each rec's "splits" list
+def build_organic_split_data(report_dir, prefix="organic_split"):
+    """Reads {prefix}_in_memory.jsonl / {prefix}_ltm.jsonl (run_organic_split_probe.sh via
+    run_bench_aws_c6id.sh's run_remote_probe(); prefix is "organic_split" for monotonic keys,
+    "organic_split_random" for random keys) into {scenario: rec}. Each rec's "splits" list
     holds one entry per organic per-shard split observed during a fixed 90s sustained-insert run,
     see render_organic_split_summary_html()."""
     data = {}
-    for fname in ["organic_split_in_memory.jsonl", "organic_split_ltm.jsonl"]:
+    for fname in [f"{prefix}_in_memory.jsonl", f"{prefix}_ltm.jsonl"]:
         path = report_dir / fname
         if not path.exists():
             continue
@@ -221,7 +222,7 @@ def organic_split_averages(organic_split_data, scenario):
     return avg_pause_us, avg_degr, n
 
 
-def render_organic_split_chart_html(organic_split_data):
+def render_organic_split_chart_html(organic_split_data, chart_suffix=""):
     """Two line charts (pause duration in ms; absolute baseline/during Insert QPS) plotted against
     shard count reached, one line (two for QPS) per scenario -- the full per-split detail behind
     the summary rows organic_split_averages() feeds into the Background Jobs table.
@@ -296,11 +297,11 @@ def render_organic_split_chart_html(organic_split_data):
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-3">
   <div class="space-y-1.5">
     <h4 class="text-xs font-bold text-slate-600">Writer-visible pause duration</h4>
-    <div class="h-64 relative"><canvas id="organic-split-pause-chart"></canvas></div>
+    <div class="h-64 relative"><canvas id="organic-split-pause-chart{chart_suffix}"></canvas></div>
   </div>
   <div class="space-y-1.5">
     <h4 class="text-xs font-bold text-slate-600">Insert QPS: just before the pause vs. during it</h4>
-    <div class="h-64 relative"><canvas id="organic-split-qps-chart"></canvas></div>
+    <div class="h-64 relative"><canvas id="organic-split-qps-chart{chart_suffix}"></canvas></div>
   </div>
 </div>
 <script>
@@ -317,12 +318,12 @@ def render_organic_split_chart_html(organic_split_data):
     plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, font: {{size:11,family:'Inter',weight:'500'}}, usePointStyle: true }} }} }},
     scales: {{ x: xScale, y: yScale(yTitle, yExtra) }},
   }});
-  const pauseCanvas = document.getElementById('organic-split-pause-chart');
+  const pauseCanvas = document.getElementById('organic-split-pause-chart{chart_suffix}');
   if (pauseCanvas && d.pause.length) {{
     new Chart(pauseCanvas, {{ type: 'line', data: {{ datasets: d.pause }},
       options: commonOptions('Pause duration (ms)', {{ min: 0, max: 10000 }}) }});
   }}
-  const qpsCanvas = document.getElementById('organic-split-qps-chart');
+  const qpsCanvas = document.getElementById('organic-split-qps-chart{chart_suffix}');
   if (qpsCanvas && d.qps.length) {{
     new Chart(qpsCanvas, {{ type: 'line', data: {{ datasets: d.qps }},
       options: commonOptions('Insert ops/sec', {{ min: 0 }}) }});
@@ -422,7 +423,8 @@ def _badge_for_slowdown(pct):
     return "bg-emerald-50 text-emerald-700 border-emerald-200"
 
 
-def render_background_jobs_summary_html(background_jobs_data, organic_split_data=None):
+def render_background_jobs_summary_html(background_jobs_data, organic_split_data=None,
+                                    organic_split_random_data=None):
     """4 rows (reorganize/in_memory, reorganize/ltm, checkpoint/in_memory, checkpoint/ltm) x 4
     columns (job duration, Insert/Update/Scan QPS degradation %% while the job runs concurrently),
     all measured against one fixed 1KB x 10,000,000-record corpus (see build_background_jobs_data()).
@@ -480,10 +482,14 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
             out.append(f'<tr><td class="py-2 px-3">{row_label}</td>' +
                         "".join(f'<td class="py-2 px-3">{c}</td>' for c in cells) + '</tr>')
 
-    if organic_split_data:
+    for row_label_prefix, split_data in [("per-shard split (organic)", organic_split_data),
+                                           ("per-shard split (organic, random keys)",
+                                            organic_split_random_data)]:
+        if not split_data:
+            continue
         for scenario in ["in_memory", "ltm"]:
-            row_label = f'per-shard split (organic) <span class="text-slate-400">/ {scenario_labels[scenario]}</span>'
-            averages = organic_split_averages(organic_split_data, scenario)
+            row_label = f'{row_label_prefix} <span class="text-slate-400">/ {scenario_labels[scenario]}</span>'
+            averages = organic_split_averages(split_data, scenario)
             if averages is None:
                 out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
                             f'<td class="py-2 px-3 text-slate-300" colspan="4">n/a</td></tr>')
@@ -526,6 +532,7 @@ def main():
     forced_events_data = build_forced_events_data(args.report_dir)
     background_jobs_data = build_background_jobs_data(args.report_dir)
     organic_split_data = build_organic_split_data(args.report_dir)
+    organic_split_random_data = build_organic_split_data(args.report_dir, prefix="organic_split_random")
     winners_rows = compute_winners_matrix(raw_data)
 
     html = html.replace(args.template_id, args.report_id)
@@ -664,11 +671,27 @@ def main():
         winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
         return html[:winners_section_close] + section_html + html[winners_section_close:]
 
-    # Chart section's upsert_section call comes *before* Background Jobs' below on purpose: each
+    # Chart sections' upsert_section calls come *before* Background Jobs' below on purpose: each
     # "not yet present" insertion lands at the same fixed point (right after Workload Winners),
-    # ahead of whatever a previous call already put there -- so calling this one first, then
+    # ahead of whatever a previous call already put there -- so calling these first, then
     # Background Jobs second, produces the intended final order (Winners, Background Jobs summary
-    # table, this detail chart at the bottom) rather than the reverse.
+    # table, detail charts at the bottom) rather than the reverse. Random before monotonic puts
+    # the random detail section last.
+    if organic_split_random_data:
+        html = upsert_section(
+            html,
+            heading="Organic Per-Shard Splits (random keys)",
+            icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="split",
+            title="Organic Per-Shard Splits (random keys)",
+            description_html=(
+                "Same 90s sustained-insert probe as above, but with random keys spreading writes "
+                "over all shards concurrently -- the workload that shows whether one split's "
+                "throughput impact shrinks as the shard count grows. Compare against the "
+                "monotonic-key section: with a single hot shard the drop stays large across "
+                "every split by construction."
+            ),
+            table_html=render_organic_split_chart_html(organic_split_random_data, chart_suffix="-random"),
+        )
     html = upsert_section(
         html,
         heading="Organic Per-Shard Splits",
@@ -687,9 +710,8 @@ def main():
             "across the pause itself, both in absolute terms (see run_organic_split_probe.sh). "
             "With monotonically increasing keys, exactly one shard is ever \"hot\" at a time "
             "regardless of how many other shards exist, so the drop stays large across every split "
-            "here rather than shrinking with shard count -- that property (if it holds at all) "
-            "would need a workload whose writes spread across multiple hot shards concurrently, "
-            "e.g. random keys."
+            "here rather than shrinking with shard count -- the random-keys section below tests "
+            "whether spreading writes across shards changes that."
         ),
         table_html=render_organic_split_chart_html(organic_split_data),
     )
@@ -712,7 +734,8 @@ def main():
             "actually runs day to day (averaged across every split observed in that run; see the "
             "detail section further down for the full breakdown and charts)."
         ),
-        table_html=render_background_jobs_summary_html(background_jobs_data, organic_split_data),
+        table_html=render_background_jobs_summary_html(background_jobs_data, organic_split_data,
+                                                         organic_split_random_data),
     )
 
     args.out.write_text(html)

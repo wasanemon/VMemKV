@@ -390,10 +390,10 @@ class VMemKVImpl {
 
       // The only place T1 gets published this cycle. No record's payload_bits ever changes here --
       // checkpoint never relocates a record, so there is nothing for the offset_mapper to
-      // restamp; each shard's own reorganize() still merges its append_region into its
-      // sorted_region regardless. checkpoint_all_shards() forces every shard through this in
-      // ascending key order and streams each shard's merged entries into the checkpoint writer as
-      // it goes (never materializing the whole corpus at once), then hands back the directory's
+      // restamp; each shard's append_region is still merged into its sorted_region unless it is
+      // already empty (see checkpoint_all_shards()'s clean-shard shortcut). checkpoint_all_shards()
+      // visits every shard in ascending key order and streams each shard's entries into the
+      // checkpoint writer as it goes (never materializing the whole corpus at once), then hands back the directory's
       // boundary keys once every shard is done -- written as the writer's trailer in finish()
       // (see ShardedT1CheckpointWriter's own comment for why boundaries can only be written last).
       auto offset_mapper_fn = [](std::span<EntrySnapshot> /*merged*/) {};
@@ -1172,27 +1172,27 @@ class VMemKVImpl {
         // invoke `callback` from inside it -- see get_impl()'s identical fix and comment for
         // the full rationale. Spans into the arena materialize only after the read loop (the
         // arena never grows past that point, so they stay stable through the callbacks).
-        slot.skipped = !read_t2_record_seqlock(
-            [&]() -> T2RecordView { return t2_.at(slot.payload & kOffsetMask, mem); },
-            [&](const T2RecordView &record) -> bool {
-              if (!key_in_range(record.key, lower_bound, upper_bound)) {
-                return false;
-              }
-              slot.arena_key_off = arena.size();
-              slot.arena_key_len = record.key.size();
-              slot.arena_val_len = record.value.size();
-              arena.insert(arena.end(), record.key.begin(), record.key.end());
-              arena.insert(arena.end(), record.value.begin(), record.value.end());
-              slot.copied = true;
-              return true;
-            });
+        slot.skipped =
+            !read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(slot.payload & kOffsetMask, mem); },
+                                    [&](const T2RecordView &record) -> bool {
+                                      if (!key_in_range(record.key, lower_bound, upper_bound)) {
+                                        return false;
+                                      }
+                                      slot.arena_key_off = arena.size();
+                                      slot.arena_key_len = record.key.size();
+                                      slot.arena_val_len = record.value.size();
+                                      arena.insert(arena.end(), record.key.begin(), record.key.end());
+                                      arena.insert(arena.end(), record.value.begin(), record.value.end());
+                                      slot.copied = true;
+                                      return true;
+                                    });
       }
       for (BatchSlot &slot : batch) {
         // copied implies !skipped (copy_func only sets copied when returning true).
         if (slot.copied) {
           slot.key = std::span<const std::byte>(arena.data() + slot.arena_key_off, slot.arena_key_len);
-          slot.value = std::span<const std::byte>(arena.data() + slot.arena_key_off + slot.arena_key_len,
-                                                  slot.arena_val_len);
+          slot.value =
+              std::span<const std::byte>(arena.data() + slot.arena_key_off + slot.arena_key_len, slot.arena_val_len);
         }
       }
       for (const BatchSlot &slot : batch) {  // Back in T1's key order.

@@ -379,6 +379,51 @@ TEST_CASE("ShardedT1Index: delete pressure triggers maintenance below the occupa
   }
 }
 
+TEST_CASE("ShardedT1Index: checkpoint on clean shards matches a full merge") {
+  // checkpoint_all_shards() skips the merge for shards with an empty append region, serializing
+  // the sorted region directly. With no new writes between two checkpoints, the second one takes
+  // the dump path on every shard and must produce entry-for-entry identical output to the first
+  // (merge path) -- same keys, payloads, hashes, and shard assignment.
+  constexpr size_t kTargetShardSize = 5000;
+  constexpr int kKeyCount = 3000;
+  auto idx = make_index_with_target_size(kTargetShardSize, /*worker_threads=*/2);
+
+  for (int i = 0; i < kKeyCount; ++i) {
+    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
+  }
+
+  using Snapshot = TestIndex::EntrySnapshot;
+  auto capture = [&](std::vector<std::vector<Snapshot>> &out) {
+    out.clear();
+    std::vector<TestIndex::Key> boundaries = idx->checkpoint_all_shards(
+        no_op_offset_mapper, [&](std::span<const Snapshot> merged) { out.emplace_back(merged.begin(), merged.end()); });
+    return boundaries;
+  };
+
+  std::vector<std::vector<Snapshot>> merged_out;
+  const std::vector<TestIndex::Key> merged_boundaries = capture(merged_out);
+  size_t merged_total = 0;
+  for (const auto &shard : merged_out) {
+    merged_total += shard.size();
+  }
+  CHECK(merged_total == static_cast<size_t>(kKeyCount));
+
+  // No writes since: every shard's append region is empty, so this is the dump path throughout.
+  CHECK(idx->append_size() == 0);
+  std::vector<std::vector<Snapshot>> dumped_out;
+  const std::vector<TestIndex::Key> dumped_boundaries = capture(dumped_out);
+  CHECK(dumped_boundaries == merged_boundaries);
+  REQUIRE(dumped_out.size() == merged_out.size());
+  for (size_t s = 0; s < dumped_out.size(); ++s) {
+    REQUIRE(dumped_out[s].size() == merged_out[s].size());
+    for (size_t i = 0; i < dumped_out[s].size(); ++i) {
+      CHECK(dumped_out[s][i].key == merged_out[s][i].key);
+      CHECK(dumped_out[s][i].payload_bits == merged_out[s][i].payload_bits);
+      CHECK(dumped_out[s][i].hash == merged_out[s][i].hash);
+    }
+  }
+}
+
 TEST_CASE("ShardedT1Index: cycling updates under tiny shards keep every key at its latest value") {
   // Keys are partitioned across writers and each writer stores a monotonically increasing round
   // number per key, so the only correct final value of every key is kRounds - 1: anything older
