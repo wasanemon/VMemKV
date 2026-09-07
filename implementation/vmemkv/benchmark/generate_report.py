@@ -432,10 +432,11 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
     answer one question (how much does reorganize()/checkpoint() cost, and what does it cost
     concurrent writers/readers while it runs), not to reproduce the CRUD matrix.
 
-    Two more rows (organic per-shard split, in_memory/ltm) summarize organic_split_data as an
+    Two more rows per key pattern (organic per-shard split, in_memory/ltm -- plus the random-keys
+    twin when organic_split_random_*.jsonl exist) summarize organic_split_data as an
     average across every split observed in that scenario's run -- see organic_split_averages() and,
     for the full per-split detail behind the average, render_organic_split_chart_html()."""
-    if not background_jobs_data and not organic_split_data:
+    if not background_jobs_data and not organic_split_data and not organic_split_random_data:
         return ""
     job_labels = {
         "reorganize": "reorganize() (forced, all shards)",
