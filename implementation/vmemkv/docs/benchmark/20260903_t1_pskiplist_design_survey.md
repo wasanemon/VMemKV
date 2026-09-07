@@ -1,6 +1,6 @@
 # T1を「flat array + 周期的reorganize」から「mmap'd skip list」へ
 
-`docs/reorganize_optimizations.md`(reorganize()のO(corpus)コスト削減調査)からの派生検討。あちらは
+`20260902_reorganize_merge_optimization_survey.md`(reorganize()のO(corpus)コスト削減調査)からの派生検討。あちらは
 「今のflat array設計を維持したまま、マージ自体を速くする」方向を探ったが、根本的にO(N)/サイクルと
 いう計算量は変えられないという結論だった。ここでは逆に、**「T1をそもそも周期的に作り直さない」**
 方向、具体的にはT1をmmap'd・offsetベースのskip listにして、reorganize()という概念自体を消す設計を
@@ -14,7 +14,7 @@
 不変・一貫したスナップショットになるため)。欠点はTODO.md item 7が指摘する通り、この O(N) を
 差分の大きさに関係なく毎サイクル払うこと。
 
-`reorganize_optimizations.md`で検討した並列マージ・branchless merge等は、この O(N) 自体を高速化
+`20260902_reorganize_merge_optimization_survey.md`で検討した並列マージ・branchless merge等は、この O(N) 自体を高速化
 する方向。今回検討するのは方向転換で、「そもそもO(N)の再構築が要らない構造にする」。
 
 ## 検討した方向性の変遷(このドキュメントに至るまでの議論の要約)
@@ -49,7 +49,7 @@
    **今も**ディスク上に独立した永続化表現を持たない(常にWAL replayで再構築される)ため、
    実質的にこの「T0」はすでに存在している。
    **却下した理由**: この案はcheckpointのコストは下げられるが、reorganize自体のO(N)コストは
-   変わらず、単に頻度が下がるだけ。AWSでの1B件実測(`reorganize_optimizations.md`)で
+   変わらず、単に頻度が下がるだけ。AWSでの1B件実測(`20260902_reorganize_merge_optimization_survey.md`)で
    reorganizeが70秒台かかり、LTM環境のbackground jobs probeでは60秒の内部タイムアウトに
    達することがすでに分かっており、「低頻度でもいざ走れば止まる」問題は残る。
    → **結論: O(N)マージそのものを消す必要があり、insert時にO(log N)を払って常にソート済みを
@@ -79,7 +79,7 @@ pskiplistプロトタイプの現行実装は`capacity_bytes`(mmap'dファイル
 - ノード1件(`DurableNode<T1Key>`, 16byteプレフィックス+8byteハッシュのcomposite key、
   epoch/value/shadow/checkpoint-unlink linkage込み)は実測80byte。
 - 4TB ÷ 80byte ≈ 500億キー。直近AWSで検証済みの最大規模(10億キー、
-  `docs/reorganize_optimizations.md`のAWS 1B-entry/32-core検証)の50倍のマージン。
+  `20260902_reorganize_merge_optimization_survey.md`のAWS 1B-entry/32-core検証)の50倍のマージン。
 - mmapのオーバーサイズは実測上ほぼ無料——`msync()`のコストはマッピングサイズでなく
   dirtyページ数に比例し(1GB書込み・1GBぴったりのファイル vs 8TBオーバーサイズのファイルで
   msync時間はどちらも約0.16-0.2秒、ほぼ同じ)、`ftruncate`はsparse fileなので実ディスク

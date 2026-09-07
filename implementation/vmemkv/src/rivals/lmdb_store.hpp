@@ -111,59 +111,22 @@ class LMDBStore {
   }
 
   auto insert_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-    MDB_txn *txn = nullptr;
-    if (mdb_txn_begin(env_, nullptr, 0, &txn) != 0) {
-      return false;
-    }
-    MDB_val mkey = to_val(key);
-    MDB_val existing{};
-    if (mdb_get(txn, dbi_, &mkey, &existing) == 0) {
-      mdb_txn_abort(txn);
-      return false;  // already exists
-    }
-    MDB_val mval = to_val(value);
-    if (mdb_put(txn, dbi_, &mkey, &mval, 0) != 0) {
-      mdb_txn_abort(txn);
-      return false;
-    }
-    return mdb_txn_commit(txn) == 0;
+    return with_existence_checked_txn(key, /*existence_required=*/false, [&](MDB_txn *txn, MDB_val &mkey) {
+      MDB_val mval = to_val(value);
+      return mdb_put(txn, dbi_, &mkey, &mval, 0) == 0;
+    });
   }
 
   auto update_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-    MDB_txn *txn = nullptr;
-    if (mdb_txn_begin(env_, nullptr, 0, &txn) != 0) {
-      return false;
-    }
-    MDB_val mkey = to_val(key);
-    MDB_val existing{};
-    if (mdb_get(txn, dbi_, &mkey, &existing) != 0) {
-      mdb_txn_abort(txn);
-      return false;  // not found
-    }
-    MDB_val mval = to_val(value);
-    if (mdb_put(txn, dbi_, &mkey, &mval, 0) != 0) {
-      mdb_txn_abort(txn);
-      return false;
-    }
-    return mdb_txn_commit(txn) == 0;
+    return with_existence_checked_txn(key, /*existence_required=*/true, [&](MDB_txn *txn, MDB_val &mkey) {
+      MDB_val mval = to_val(value);
+      return mdb_put(txn, dbi_, &mkey, &mval, 0) == 0;
+    });
   }
 
   auto remove_impl(std::span<const std::byte> key) -> bool {
-    MDB_txn *txn = nullptr;
-    if (mdb_txn_begin(env_, nullptr, 0, &txn) != 0) {
-      return false;
-    }
-    MDB_val mkey = to_val(key);
-    MDB_val existing{};
-    if (mdb_get(txn, dbi_, &mkey, &existing) != 0) {
-      mdb_txn_abort(txn);
-      return false;  // not found
-    }
-    if (mdb_del(txn, dbi_, &mkey, nullptr) != 0) {
-      mdb_txn_abort(txn);
-      return false;
-    }
-    return mdb_txn_commit(txn) == 0;
+    return with_existence_checked_txn(key, /*existence_required=*/true,
+                                      [&](MDB_txn *txn, MDB_val &mkey) { return mdb_del(txn, dbi_, &mkey, nullptr) == 0; });
   }
 
   template <typename KeyFn, typename ValueFn>
@@ -351,6 +314,26 @@ class LMDBStore {
 
   static auto to_val(std::span<const std::byte> bytes) noexcept -> MDB_val {
     return MDB_val{bytes.size(), const_cast<std::byte *>(bytes.data())};
+  }
+
+  // Shared body for insert_impl/update_impl/remove_impl: begins a write txn, checks `key`'s
+  // existence against `existence_required`, and only runs `mutate(txn, mkey)` if it matches --
+  // aborting and returning false otherwise. Commits and returns the commit result once `mutate`
+  // succeeds.
+  template <typename Mutate>
+  auto with_existence_checked_txn(std::span<const std::byte> key, bool existence_required, Mutate &&mutate) -> bool {
+    MDB_txn *txn = nullptr;
+    if (mdb_txn_begin(env_, nullptr, 0, &txn) != 0) {
+      return false;
+    }
+    MDB_val mkey = to_val(key);
+    MDB_val existing{};
+    const bool exists = (mdb_get(txn, dbi_, &mkey, &existing) == 0);
+    if (exists != existence_required || !mutate(txn, mkey)) {
+      mdb_txn_abort(txn);
+      return false;
+    }
+    return mdb_txn_commit(txn) == 0;
   }
 
   // LMDB's default (unnamed) database uses plain memcmp byte-string ordering, so

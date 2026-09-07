@@ -92,6 +92,20 @@ if(ENABLE_LMDB)
   endif()
 endif()
 
+# Links the RocksDB/LMDB rival-store backends into `target` and defines ENABLE_ROCKSDB/ENABLE_LMDB
+# for it, whichever of the two were actually found above. Shared by tests/ and benchmark/, which
+# both build against the same optional rival backends.
+function(vmemkv_link_rival_backends target)
+  if(ENABLE_ROCKSDB AND RocksDB_FOUND)
+    target_compile_definitions(${target} PRIVATE ENABLE_ROCKSDB)
+    target_link_libraries(${target} PRIVATE RocksDB::rocksdb)
+  endif()
+  if(ENABLE_LMDB AND LMDB_FOUND)
+    target_compile_definitions(${target} PRIVATE ENABLE_LMDB)
+    target_link_libraries(${target} PRIVATE LMDB::lmdb)
+  endif()
+endfunction()
+
 include(CTest)
 
 # ── Tests ─────────────────────────────────────────────────────────────────────

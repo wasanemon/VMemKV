@@ -55,31 +55,19 @@ namespace variants {
 // ─── Baseline Plain Store ──────────────────────────────────────────────────
 using VMemKV_Baseline = StoreAdapter<VMemKVImpl<detail::T1_AllOff>>;
 
-using VMemKVRocksDB = StoreAdapter<::RocksDBStore>;
-using VMemKVRocksDBBlobDB = StoreAdapter<::RocksDBBlobDBStore>;
-using VMemKVLMDB = StoreAdapter<::LMDBStore>;
+using VMemKV_RocksDB = StoreAdapter<::RocksDBStore>;
+using VMemKV_RocksDBBlobDB = StoreAdapter<::RocksDBBlobDBStore>;
+using VMemKV_LMDB = StoreAdapter<::LMDBStore>;
 
 // ─── 1. Core Stacked Ablation Variants ───
-// Isolated (non-cumulative) prototype variant for one-off measurement of GetPopulateRead alone --
-// see docs/benchmark/20260809_ltm_64kb_get_hit_profiling.md. Not in AllPossibleTypes below: an
-// isolation-sweep diagnostic, not a cell in the main ablation comparison.
-using VMemKV_GetPopulateRead = StoreAdapter<VMemKVImpl<Config<GetPopulateRead>>>;
 using VMemKV_Var0_Baseline = VMemKV_Baseline;
 using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
 // Fully optimized production configuration. System_AllOn equals Config<BloomFilter,
 // T1InlineValue> (see config.hpp), i.e. exactly this variant's config, so this is the same type
 // as VMemKVStore rather than a distinct one.
 using VMemKV_Var2_Inline = VMemKVStore;
-using VMemKVStore = VMemKVStore;
-
-using VMemKV_RocksDB = VMemKVRocksDB;
-using VMemKV_RocksDBBlobDB = VMemKVRocksDBBlobDB;
-using VMemKV_LMDB = VMemKVLMDB;
 
 // ─── 2. Unified Benchmark Registration Tuple ───
-// SimdScan is intentionally absent from every variant below: contributes no measurable signal
-// even in its own target scenario (Scan), so excluding it reduces ablation noise. The tag and
-// Config machinery stay in config.hpp for future re-verification.
 using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
                                     VMemKV_Var1_Bloom,
                                     VMemKV_Var2_Inline,

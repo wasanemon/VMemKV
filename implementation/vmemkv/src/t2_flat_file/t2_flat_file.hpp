@@ -11,7 +11,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <thread>
 #include <vector>
 
 #include "../api/utils.hpp"

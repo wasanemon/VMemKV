@@ -20,23 +20,17 @@
 #include <vector>
 #include <vmemkv/config.hpp>
 
+#include "test_support.hpp"
+
 namespace {
 
-// Small append-region capacity so reorganize() triggers (both explicitly in tests and
-// implicitly in the stress test) without needing thousands of puts per run.
-struct TinyAppendConfig : vmemkv::Config<> {
-  // Both fields must be redeclared: Entries is computed from Log2 inside Config<>'s own scope,
-  // so overriding Log2 alone would silently leave Entries at the base 2^22 default.
-  static constexpr size_t T1AppendCapacityLog2 = 8;  // 256-entry append region.
-  static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
-};
-static_assert(TinyAppendConfig::T1AppendCapacityEntries == (size_t{1} << TinyAppendConfig::T1AppendCapacityLog2));
+using vmemkv_test::to_span;
+
+// 256-entry append region -- small enough that reorganize() triggers (both explicitly in tests
+// and implicitly in the stress test) without needing thousands of puts per run.
+using TinyAppendConfig = vmemkv_test::TinyAppendConfig<8>;
 
 using TestIndex = vmemkv::T1Index<TinyAppendConfig>;
-
-auto to_span(const std::string &key_string) -> std::span<const std::byte> {
-  return std::span<const std::byte>(reinterpret_cast<const std::byte *>(key_string.data()), key_string.size());
-}
 
 // Heap-allocate: the append-region hash index embeds a large bucket array unsuited to the stack.
 auto make_index() -> std::unique_ptr<TestIndex> { return std::make_unique<TestIndex>(); }
@@ -49,22 +43,7 @@ auto make_entry(const std::string &key_string, TestIndex::Payload payload) -> Te
   return TestIndex::EntrySnapshot{key, payload, t1_detail::hash_full_key(to_span(key_string))};
 }
 
-// reorganize()'s OffsetMapper contract is a single batch call over the whole merged span (see
-// t1_index.hpp's reorganize() doc comment), not one call per entry. These tests were written
-// against the older per-entry shape and rely on that shape's semantics (in particular, two tests
-// deliberately block *inside* the mapper to freeze a reorganize() call mid-flight for a race
-// test) -- this adapter preserves that per-entry timing exactly, by looping over the batch span
-// and invoking the wrapped per-entry function once per entry, in order, so only call sites need
-// updating, not the tests' own logic. A generic (`auto`) span parameter lets one adapter serve
-// every EntrySnapshot type used across this file (TestIndex, InlineTestIndex).
-template <typename PerEntryFn>
-auto per_entry_offset_mapper(PerEntryFn fn) {
-  return [fn = std::move(fn)](auto merged) {
-    for (auto &entry : merged) {
-      entry.payload_bits = fn(entry.payload_bits, entry.hash);
-    }
-  };
-}
+using vmemkv_test::per_entry_offset_mapper;
 
 }  // namespace
 
@@ -186,11 +165,10 @@ TEST_CASE("T1Index: load_sorted_region_from_checkpoint replaces any previously l
   CHECK(idx->get(to_span("a")) == 2U);
 }
 
-// Regression test for the epoch-guard fix (with_epoch_guard()): put(), get_with_hash(), and
-// append_size() must all register in active_epochs_ for their whole duration, or reorganize()'s
-// wait_until_epoch() has no way to know they are still using the buffers it is about to delete --
-// a TSan-confirmed data race / use-after-free before the fix. Hammering reorganize() concurrently
-// with all three is the most direct way to regress that.
+// put(), get_with_hash(), and append_size() must all register in active_epochs_ (via
+// with_epoch_guard()) for their whole duration, or reorganize()'s wait_until_epoch() has no way
+// to know they are still using the buffers it is about to delete. Hammering reorganize()
+// concurrently with all three is the most direct way to exercise that.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("T1Index: concurrent put/get_with_hash/append_size survive racing reorganize") {
   auto idx = make_index();
@@ -248,14 +226,12 @@ TEST_CASE("T1Index: concurrent put/get_with_hash/append_size survive racing reor
   }
 }
 
-// Regression test for a T2-checkpoint-bloat bug: reorganize()'s merge deduped a sorted-region
-// entry against an append-region entry for the same key by comparing raw EntrySnapshot::hash,
-// which missed an inline<->non-inline transition and let a put() racing resolve()'s
-// "immutable-region bypass" (inserts a *new* active-region entry instead of updating the frozen
-// one in place, to avoid a Lost Update) create two live entries for the same key. Fixed by
-// comparing *clean* hash instead (t1_detail::kCleanHashMask strips the inline-metadata bits an
-// inline<->non-inline transition changes), so both sides of the transition are recognized as the
-// same logical key.
+// reorganize()'s merge dedups a sorted-region entry against an append-region entry for the same
+// key by comparing *clean* hash (t1_detail::kCleanHashMask strips the inline-metadata bits an
+// inline<->non-inline transition changes), so a put() racing resolve()'s "immutable-region
+// bypass" (inserts a *new* active-region entry instead of updating the frozen one in place, to
+// avoid a Lost Update) across such a transition is still recognized as the same logical key
+// instead of surviving as two live entries.
 struct TinyInlineConfig : vmemkv::Config<vmemkv::T1InlineValue> {
   static constexpr size_t T1AppendCapacityLog2 = 8;
   static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
@@ -310,14 +286,11 @@ TEST_CASE(
   CHECK(idx->get(to_span("k")) == 222U);
 }
 
-// Regression test: SortedSlot::hash used to be a plain, non-atomic uint64_t, but put()'s in-place
-// update path (ResolvedSlot::store_hash()) mutates a live, published SortedSlot's hash
-// concurrently with reorganize()'s merge loop (and find_sorted()/get_with_hash()) reading it -- a
-// genuine data race (UB), not just staleness, that let offset_mapper decode a T2 record header
-// through a hash-tainted read and get a garbage value_len. The existing stress test above only
-// inserts brand-new keys, never exercising store_hash(); this test updates pre-seeded sorted-region
-// keys continuously while reorganize() runs concurrently. Best run under ThreadSanitizer, which
-// reliably flags the race if SortedSlot::hash reverts to a plain field.
+// put()'s in-place update path (ResolvedSlot::store_hash()) mutates a live, published
+// SortedSlot's atomic hash concurrently with reorganize()'s merge loop (and
+// find_sorted()/get_with_hash()) reading it. Unlike the stress test above (which only inserts
+// brand-new keys, never exercising store_hash()), this test updates pre-seeded sorted-region keys
+// continuously while reorganize() runs concurrently. Best run under ThreadSanitizer.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reorganize") {
   auto idx = make_index();
@@ -366,19 +339,15 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
   }
 }
 
-// Regression test: resolve() returns "not found" for two unrelated reasons -- a key that's
-// genuinely absent, and a deliberate bypass signal when the key's slot lives in a region a
-// concurrent reorganize() just froze (see resolve()'s own comment on the immutable/sorted-frozen
-// bypass). put()'s existing-key update path used to treat both identically: after a successful
-// in-place write, if a second resolve() came back empty for *either* reason, it tombstoned its
-// own just-written value before falling back to a bypass insert. For the frozen-region reason,
-// that tombstone briefly and incorrectly made get()/scan() report a live key as absent, for the
-// window between the tombstone and the bypass insert landing -- self-healing (never a permanent
-// loss), but a real, observable correctness gap unlike the "different slot found" case (a genuine
-// append-region hash-collision displacement), where tombstoning the orphaned original is correct.
-// A dedicated reader thread polling get() is required to catch this: checking only after every
-// writer/reorganizer thread joins (as the sibling "survive racing reorganize" tests above do)
-// never observes the transient window.
+// resolve() returns "not found" for two unrelated reasons -- a key that's genuinely absent, and a
+// deliberate bypass signal when the key's slot lives in a region a concurrent reorganize() just
+// froze (see resolve()'s own comment on the immutable/sorted-frozen bypass). put()'s existing-key
+// update path must distinguish them: tombstoning its own just-written value on the frozen-region
+// case (rather than only on a genuine append-region hash-collision displacement) would briefly
+// make get()/scan() report a live key as absent, in the window between the tombstone and the
+// bypass insert landing. A dedicated reader thread polling get() is required to catch this:
+// checking only after every writer/reorganizer thread joins (as the sibling "survive racing
+// reorganize" tests above do) never observes the transient window.
 TEST_CASE("T1Index: get() never observes a live key as absent while a concurrent update races reorganize") {
   auto idx = make_index();
   constexpr int key_count = 64;
@@ -429,15 +398,14 @@ TEST_CASE("T1Index: get() never observes a live key as absent while a concurrent
   CHECK_FALSE(saw_missing.load());
 }
 
-// Regression test for a Lost Update in reorganize()'s merge: put()'s in-place path used to
-// mutate an already-sorted key's live SortedSlot directly, but reorganize()'s merge loop takes
-// an earlier snapshot of that slot's value and publishes a brand-new SortedRegion built from it,
-// discarding the old one -- any write landing between the snapshot and the publish was silently
-// lost. Fixed by sorted_write_frozen_ (see WriteFrozenTier's own comment), the same bypass
-// append_immutable_ already had for the symmetric case. One dedicated writer per key (so "last
-// write" is well-defined) races a hammering reorganizer; the sleep inside offset_mapper widens
-// reorganize()'s merge-to-publish window to something close to what checkpoint_internal()'s real
-// msync()/file I/O costs in production, without which this reproduced only intermittently.
+// reorganize()'s merge loop takes an earlier snapshot of an already-sorted key's SortedSlot value
+// and publishes a brand-new SortedRegion built from it, discarding the old one; put()'s in-place
+// path must route through sorted_write_frozen_ (see WriteFrozenTier's own comment) -- the same
+// bypass append_immutable_ has for the symmetric case -- so a write landing between the snapshot
+// and the publish is never lost. One dedicated writer per key (so "last write" is well-defined)
+// races a hammering reorganizer; the sleep inside offset_mapper widens reorganize()'s
+// merge-to-publish window to something close to what checkpoint_internal()'s real msync()/file
+// I/O costs in production.
 TEST_CASE("T1Index: dedicated single writer per key survives racing reorganize with exact last value") {
   auto idx = make_index();
   constexpr int key_count = 8;
@@ -479,14 +447,12 @@ TEST_CASE("T1Index: dedicated single writer per key survives racing reorganize w
   }
 }
 
-// Regression test: resolve()'s immutable-region bypass makes every concurrent put() for a key
-// parked in append_immutable_ take the "not found, insert new" path with no re-check against each
-// other. LockFreeHashTable::publish_slot() used to let a later racer's insert silently overwrite
-// the hash index's pointer without retiring the slot it displaced, so N racers on the same key
-// could leave N-1 orphaned-but-live duplicate AppendSlots -- unreachable via get(), but still
-// collected by collect_live_entries() into every future checkpoint, forever. Needs no
-// inline<->non-inline transition (unlike the two bugs above) and scales with racer count, which is
-// what made it the dominant contributor to observed checkpoint bloat.
+// resolve()'s immutable-region bypass makes every concurrent put() for a key parked in
+// append_immutable_ take the "not found, insert new" path with no re-check against each other.
+// LockFreeHashTable::publish_slot() must retire the slot a later racer's insert displaces from the
+// hash index, or N racers on the same key would leave N-1 orphaned-but-live duplicate
+// AppendSlots -- unreachable via get(), but still collected by collect_live_entries() into every
+// future checkpoint, forever.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window collapse to one entry") {
   // The race window is narrower than "reorganize() is paused": once any racer publishes its slot,
@@ -540,8 +506,8 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
     proceed.notify_all();
     reorg1.join();
 
-    // append_active_ now holds up to racer_count bypass-created entries for hot_key -- all but one
-    // are orphaned duplicates if the bug is present.
+    // append_active_ now holds up to racer_count bypass-created entries for hot_key -- at most one
+    // may survive as live; the rest must have been retired as orphaned duplicates.
     CHECK(idx->get(to_span(hot_key)) != vmemkv::STORE_NOT_FOUND);
 
     std::vector<TestIndex::EntrySnapshot> merged_out;

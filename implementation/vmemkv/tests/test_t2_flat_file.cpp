@@ -65,14 +65,10 @@ TEST_CASE("T2FlatFile: update_value_at fails when the new value exceeds alloc_le
   CHECK_FALSE(vmemkv::T2FlatFile::update_value_at(offset, as_span(bytes_of("0123456789")), mem));
 }
 
-// Regression test: read_t2_record_seqlock() used to take an already-built T2RecordView and only
-// re-validate the version counter on retry, never re-reading key_len/value_len -- a view built
-// once outside the function could carry a stale size that no version recheck would catch. Fixed
-// by taking an AtFunc supplier called fresh on every retry instead. This deterministically shrinks
-// a record via update_value_at() then confirms read_t2_record_seqlock() always returns the
-// correct, current size -- no threading needed since the flaw was structural, not just a race
-// window (a concurrent version of this bug hung the reader spinning on a version field past the
-// record's own bytes).
+// read_t2_record_seqlock() takes an AtFunc supplier called fresh on every retry, so key_len/
+// value_len are always re-read alongside the version recheck. This deterministically shrinks a
+// record via update_value_at() then confirms read_t2_record_seqlock() always returns the
+// correct, current size.
 TEST_CASE(
     "T2FlatFile: read_t2_record_seqlock always observes the current value, even immediately "
     "after a shrinking update_value_at() (regression)") {
@@ -85,7 +81,7 @@ TEST_CASE(
   REQUIRE(vmemkv::T2FlatFile::update_value_at(offset, as_span(bytes_of(shrunk_value)), mem));
 
   // read_t2_record_seqlock() calls at_func() itself, fresh, so it always sees the record as it
-  // is *right now* -- there is no way for a caller to hand it a stale, pre-built view anymore.
+  // is *right now*.
   std::vector<std::byte> copied;
   vmemkv::read_t2_record_seqlock([&]() -> T2RecordView { return t2.file.at(offset, mem); },
                                  [&](const T2RecordView &record) -> bool {

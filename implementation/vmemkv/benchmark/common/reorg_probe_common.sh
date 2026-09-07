@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # reorg_probe_common.sh - Shared driver logic for bench_kv's standalone `--reorg-probe` CLI mode,
-# used by run_reorg_scaling_probe.sh, run_checkpoint_throughput_probe.sh, and
-# run_maintenance_contention_probe.sh. See each script's header comment for its own experiment;
-# this file holds the per-data-point execution/timeout-handling and driver-setup boilerplate they
-# share.
+# used by run_background_jobs_probe.sh and run_organic_split_probe.sh. See each script's header
+# comment for its own experiment; this file holds the per-data-point execution/timeout-handling
+# and driver-setup boilerplate they share.
 
 # Shared driver-script setup for the three scripts above: parses the common <bench_kv_bin>
 # <output_jsonl_path> [db_dir] [combo_filter] positional-arg convention, builds $COMBOS from

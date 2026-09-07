@@ -31,7 +31,6 @@
 #pragma once
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -44,10 +43,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
-#include <iterator>
-#include <memory>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -55,7 +51,6 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <vmemkv/config.hpp>
@@ -185,15 +180,8 @@ class VMemKVImpl {
     if constexpr (ConfigT::UseBloomFilter) {
       parts.emplace_back("Bloom");
     }
-    if constexpr (ConfigT::UseSimdScan) {
-      parts.emplace_back("Simd");
-    }
-
     if constexpr (ConfigT::UseT1InlineValue) {
       parts.emplace_back("T1InlineValue");
-    }
-    if constexpr (ConfigT::UseGetPopulateRead) {
-      parts.emplace_back("GetPopulateRead");
     }
 
     if (parts.empty()) {
@@ -991,23 +979,6 @@ class VMemKVImpl {
         [&](const T2RecordView &record) -> bool {
           if (!byte_span_equal(record.key, full_key)) {
             return false;
-          }
-          if constexpr (ConfigT::UseGetPopulateRead) {
-            // Prototype: batch-fault the value's full page range with one
-            // syscall instead of letting each page fault in one at a time
-            // as the copy below touches it -- see GetPopulateRead's doc
-            // comment in config.hpp. Below one page this is a no-op
-            // (the implicit fault from the copy already covers it in one
-            // shot), so only values spanning more than one page pay for it.
-            constexpr uintptr_t kPageSize = 4096;
-            constexpr uintptr_t kPageMask = kPageSize - 1;
-            if (record.value.size() > kPageSize) {
-              const auto start = reinterpret_cast<uintptr_t>(record.value.data());
-              const auto end = start + record.value.size();
-              const auto aligned_start = start & ~kPageMask;
-              const auto aligned_len = ((end + kPageMask) & ~kPageMask) - aligned_start;
-              ::madvise(reinterpret_cast<void *>(aligned_start), aligned_len, MADV_POPULATE_READ);
-            }
           }
           tl_get_value_buf.assign(record.value.begin(), record.value.end());
           return true;

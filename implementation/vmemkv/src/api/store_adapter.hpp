@@ -77,12 +77,9 @@ class StoreAdapter {
 
   // Shared body for insert()/update() below: both serialize key/value the same way before
   // dispatching to whichever KVSImpl method the caller names via `ImplMethod`. An 8-byte value
-  // that's all-1-bits used to be rejected here (it's bit-for-bit identical to T1's own
-  // STORE_NOT_FOUND sentinel, which would have made it permanently unreadable if inlined) --
-  // that's now handled once, for every write path (including bulk_load(), which this
-  // per-call guard never covered), by VMemKVImpl::try_make_inline_payload() declining to inline
-  // such a value and routing it through the ordinary T2-record path instead. No guard needed here
-  // any more, for VMemKV or any other KVSImpl.
+  // that's all-1-bits (bit-for-bit identical to T1's own STORE_NOT_FOUND sentinel) is handled by
+  // VMemKVImpl::try_make_inline_payload() declining to inline it and routing it through the
+  // ordinary T2-record path instead, uniformly across every write path including bulk_load().
   template <auto ImplMethod, typename Key, typename Value>
   auto insert_or_update(const Key &key, Value &&value) -> bool {
     return kvs_detail::with_key_serialized(key, [this, &value](std::span<const std::byte> key_bytes) -> bool {

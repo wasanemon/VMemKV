@@ -18,22 +18,19 @@
 #include <vector>
 #include <vmemkv/config.hpp>
 
+#include "test_support.hpp"
+
 namespace {
 
-// Small append-region capacity, but large enough to hold this file's largest key count (800)
-// directly without overflowing before a test explicitly triggers split_shard_containing()
-// (which reorganizes internally) -- these tests are about routing/split correctness, not about
+using vmemkv_test::to_span;
+
+// 1024-entry append region: large enough to hold this file's largest key count (800) directly
+// without overflowing before a test explicitly triggers split_shard_containing() (which
+// reorganizes internally) -- these tests are about routing/split correctness, not about
 // exercising AppendRegionFull backpressure (see test_t1_index.cpp for that).
-struct TinyAppendConfig : vmemkv::Config<> {
-  static constexpr size_t T1AppendCapacityLog2 = 10;  // 1024-entry append region.
-  static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
-};
+using TinyAppendConfig = vmemkv_test::TinyAppendConfig<10>;
 
 using TestIndex = vmemkv::ShardedT1Index<TinyAppendConfig>;
-
-auto to_span(const std::string &key_string) -> std::span<const std::byte> {
-  return std::span<const std::byte>(reinterpret_cast<const std::byte *>(key_string.data()), key_string.size());
-}
 
 auto make_index() -> std::unique_ptr<TestIndex> { return std::make_unique<TestIndex>(); }
 
@@ -42,9 +39,10 @@ auto make_index_with_target_size(size_t target_shard_size, size_t worker_threads
 }
 
 // checkpoint_all_shards() mirrors T1Index::reorganize()'s (OffsetMapper, ChkWriter) contract;
-// these tests don't exercise T2 offset relocation, so a no-op offset_mapper matches how
+// these tests don't exercise T2 offset relocation, so an identity offset_mapper matches how
 // test_t1_index.cpp's own reorganize() calls do the same for the equivalent parameter.
-auto no_op_offset_mapper(std::span<TestIndex::EntrySnapshot> /*merged*/) -> void {}
+const auto no_op_offset_mapper =
+    vmemkv_test::per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; });
 
 // Sortable, fixed-width keys ("k" + zero-padded index) so directory boundary comparisons and
 // scan range order match numeric order.
@@ -227,19 +225,14 @@ TEST_CASE("ShardedT1Index: concurrent put/get/scan survive a racing split_shard_
 }
 
 TEST_CASE("ShardedT1Index: a shard keeps splitting under sustained heavy concurrent writes, never stalling") {
-  // Regression test for a bug where continue_split()'s second reorganize() -- taken after already
-  // winning the Closing CAS, to capture the shard's truly-final state -- could lose
-  // T1Index::reorganize()'s internal reorg_in_progress_ CAS to a redundant, concurrently-dequeued
-  // run_maintenance() attempt for the *same* shard (a duplicate queue entry, which the design
-  // otherwise treats as harmless). A lost race means the callback never fires, so merged_entries
-  // stays empty -- indistinguishable, before this fix, from the shard genuinely being too small to
-  // split, which made continue_split() silently abort (reset superseded back to null) and keep
-  // maintenance_pending false, letting the shard resume unsharded growth. Under sustained heavy
-  // write pressure (which keeps regenerating duplicate queue entries as fast as the append region
-  // refills), this could recur on every single split attempt, permanently, for both monotonically
-  // increasing and randomly distributed keys. This test drives many writer and worker threads
-  // against a small split threshold so splits are attempted constantly, and asserts shard_count()
-  // actually keeps climbing rather than stalling near its earliest value.
+  // continue_split()'s second reorganize() -- taken after already winning the Closing CAS, to
+  // capture the shard's truly-final state -- can lose T1Index::reorganize()'s internal
+  // reorg_in_progress_ CAS to a redundant, concurrently-dequeued run_maintenance() attempt for the
+  // *same* shard (a duplicate queue entry, which the design otherwise treats as harmless);
+  // reorganize_until_captured() retries until the callback actually fires, so a lost race is never
+  // mistaken for the shard genuinely being too small to split. This test drives many writer and
+  // worker threads against a small split threshold so splits are attempted constantly, and asserts
+  // shard_count() actually keeps climbing rather than stalling near its earliest value.
   //
   // Sustained pressure matters here, not just a large one-shot key count: request_maintenance_if_
   // needed() only re-fires once a shard's *append region* crosses its own soft threshold again,
@@ -251,11 +244,9 @@ TEST_CASE("ShardedT1Index: a shard keeps splitting under sustained heavy concurr
   // existing key's update also churns its shard's append region) and the sheer volume keep
   // maintenance continuously re-triggered.
   //
-  // kTargetShardCount is deliberately conservative (well above the pre-fix failure mode of
-  // stalling at shard_count 1-2 forever, but well below counts where a separate, not-yet-root-
-  // caused slowdown in this same stress shape has been observed at very high split rates) -- this
-  // test's job is to catch a regression of the specific bug described above, not to fully
-  // characterize splitting throughput under extreme, unrealistic-scale contention.
+  // kTargetShardCount is a conservative progress bar, not a throughput characterization: this
+  // test's job is to catch splitting stalling outright, not to fully characterize splitting
+  // throughput under extreme, unrealistic-scale contention.
   constexpr size_t kTargetShardSize = 300;  // Split threshold 200% -> 600 entries.
   constexpr size_t kWorkerThreads = 8;      // High enough for duplicate queue entries to be common.
   constexpr int kWriterThreads = 16;
@@ -286,31 +277,29 @@ TEST_CASE("ShardedT1Index: a shard keeps splitting under sustained heavy concurr
     writer.join();
   }
 
-  // Before the fix, this stalled permanently at shard_count 1-2 regardless of how long writers
-  // kept running; a healthy split rate clears this conservative bar almost immediately.
+  // A healthy split rate clears this conservative bar almost immediately.
   //
   // Deliberately does NOT also verify get() correctness for every key here: at this test's scale
   // (16 writer threads, 8 workers, continuous cycling puts over a 6000-key range against a
-  // 300-entry target shard size), a separate, not-yet-root-caused data-consistency issue exists
-  // under this same extreme, unrealistic-scale contention shape -- distinct from the bug this test
-  // targets (see its own comment above) and not reproduced at moderate or production-scale
+  // 300-entry target shard size), a data-consistency issue exists under this same extreme,
+  // unrealistic-scale contention shape that is not reproduced at moderate or production-scale
   // configurations (see the sibling "loses no straggler entry" test below). Adding a full data
-  // check here, at this specific extreme scale, would make this test flaky against a real but
-  // distinct and still-open issue rather than reliably regression-testing the fix above.
+  // check here would make this test flaky against that separate, open issue rather than reliably
+  // testing shard-split progress.
   CHECK(shard_count >= kTargetShardCount);
 }
 
 TEST_CASE("ShardedT1Index: a split under concurrent writes loses no straggler entry") {
-  // Regression test for a bug where a write that resolved a shard just before it entered Closing
-  // (see put()'s own definition: it resolves a slot once via resolve_for_write(), then calls
-  // slot->index->put() with no re-check of `superseded` in between) could still be "in flight"
-  // when continue_split()'s pre-split snapshot was taken, and land afterward -- silently destroyed
-  // when the old shard was deleted at the end of the split, since it was never captured by that
-  // snapshot and T1Index's own concurrency handling has no visibility into a caller that hasn't
-  // reached T1Index::put() yet. This test does a single-pass unique-key insert (each key written
-  // exactly once, unlike the cycling-writes shape of this file's other stress tests, which is what
-  // this bug needs to surface) at a scale small enough to run quickly in-tree; the same shape has
-  // also been validated clean at production scale (~5M keys, default target_shard_size).
+  // A write that resolved a shard just before it entered Closing (see put()'s own definition: it
+  // resolves a slot once via resolve_for_write(), then calls slot->index->put() with no re-check
+  // of `superseded` in between) can still be "in flight" when continue_split()'s pre-split
+  // snapshot is taken, and land afterward -- continue_split()'s post-split straggler drain is what
+  // catches this before the old shard is deleted, since T1Index's own concurrency handling has no
+  // visibility into a caller that hasn't reached T1Index::put() yet. This test does a single-pass
+  // unique-key insert (each key written exactly once, unlike the cycling-writes shape of this
+  // file's other stress tests, which is what this straggler window needs to surface) at a scale
+  // small enough to run quickly in-tree; the same shape has also been validated clean at
+  // production scale (~5M keys, default target_shard_size).
   constexpr size_t kTargetShardSize = 5000;  // Split threshold 200% -> 10000 entries.
   constexpr int kWriterThreads = 4;
   constexpr int kKeyCount = 30000;  // Comfortably past several splits' worth at this target size.
@@ -535,13 +524,11 @@ TEST_CASE("ShardedT1Index: worker_threads=0 defers background maintenance until 
 TEST_CASE(
     "ShardedT1Index: background-worker-driven splits survive a concurrent explicit "
     "split_shard_containing on the same shards") {
-  // Regression test for a UAF where worker_loop() popped a ShardSlot* off the maintenance queue
-  // *before* run_maintenance() entered with_routing_guard() -- a concurrent
-  // split_shard_containing() targeting the same shard (which resolves and CASes entirely on its
-  // own, independent of the queue) could win, complete, and delete that shard before the worker's
-  // still-unguarded pointer was ever touched. Neither existing test combined real worker-driven
-  // splitting with a concurrent explicit splitter on shards the workers are also organically
-  // splitting: this one puts both paths in direct contention on the same small shards by using a
+  // run_maintenance() must dequeue a ShardSlot* from inside with_routing_guard(), not before it
+  // (see that method's own comment): a concurrent split_shard_containing() targeting the same
+  // shard (which resolves and CASes entirely on its own, independent of the queue) could
+  // otherwise win, complete, and delete that shard while a worker still holds an unguarded pointer
+  // to it. This test puts both paths in direct contention on the same small shards by using a
   // small target_shard_size (so background workers split constantly) alongside a splitter thread
   // hammering split_shard_containing() across the same key range.
   auto idx = make_index_with_target_size(/*target_shard_size=*/20, /*worker_threads=*/4);

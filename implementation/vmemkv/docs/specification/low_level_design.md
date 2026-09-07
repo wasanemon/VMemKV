@@ -8,9 +8,14 @@
 
 ### 2.1 Tier 1
 
-Tier 1 は fixed-size のエントリを格納するインデックス層である。`sorted_region` と `append_region`
-はどちらもエントリの配列として保持するが、フィールド構成はランタイム表現とオンディスク
-(checkpoint)表現とで異なる。
+Tier 1 は fixed-size のエントリを格納するインデックス層である。K 個の独立したシャードへの
+範囲パーティションとして実装されており、各シャードが本節で述べる `sorted_region` /
+`append_region` の対を独立に持つ。ディレクトリ層・split protocol・シャード跨ぎの並行性制御は
+[`../t1_sharding_design.md`](../t1_sharding_design.md) を参照。本節以降は、特に断りがなければ
+1 シャード内部の構造・操作を単一の T1 インデックスとして記述する。
+
+`sorted_region` と `append_region` はどちらもエントリの配列として保持するが、フィールド構成は
+ランタイム表現とオンディスク(checkpoint)表現とで異なる。
 
 **概念モデル**(両表現に共通するコアフィールド):
 
@@ -294,33 +299,13 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WA
 | `reorganize()` | T1 の Append→Sorted マージのみ。T2/ディスク非関与 |
 | `checkpoint()` | Tier 2 の tail を in-place で永続化し、manifest を commit して WAL を rotate する |
 
-### 4.5 T1 Reorganize Auto-Trigger (ワークロード適応型 L2 キャッシュサイズ制限と Soft/Hard しきい値)
+### 4.5 T1 Reorganize Auto-Trigger
 
-T1 `reorganize` は、`append_region` のサイズに応じて自動的にバックグラウンド実行がトリガーされる。この制御には、ライトバーストを吸収するための容量確保と、並行スキャン（Scan）のレイテンシ低減を両立させるため、**ワークロード適応型（Workload-Adaptive）自動トリガー機構**を導入する。
-
-#### 1. しきい値の定義 (Soft Limit と Hard Limit)
-*   **Soft Limit ($T_{\text{soft}}$):** バックグラウンド Reorg スレッドの起動を促すソフトしきい値。
-*   **Hard Limit ($T_{\text{hard}}$):** アペンドバッファの完全枯渇とメモリ破綻を防ぐため、新規の書き込み操作（Insert/Update）を一時的にブロッキング（Stall）させるハードしきい値。常に `APPEND_CAP` の 95% に固定し、バースト書き込み耐性を最大化する。
-
-#### 2. ワークロード適応型 Soft Limit 計算式 (Workload-Adaptive Thresholding)
-スキャン（Scan）操作の有無に応じて、ソフトしきい値 $T_{\text{soft}}$ を動的に切り替える。
-
-*   **スキャン非アクティブ（Pure-Insert ワークロード）:**
-    スキャンが実行されていない場合、未ソート領域の走査コストを考慮する必要がないため、書き込み効率と CPU 効率を優先してしきい値を引き上げる。
-    $$T_{\text{soft}} = \text{APPEND\_CAP} \times \frac{\text{SoftThresholdPercent}}{100}$$
-
-*   **スキャンアクティブ（Scan-Heavy / Mixed ワークロード）:**
-    スキャンが実行されている場合、未ソートのアペンド領域に対する $O(N)$ 線形走査がボトルネックとなる。スキャンの走査データを各 CPU コアの **L2 キャッシュ（プライベートキャッシュ）** に完全に収め、キャッシュライン無効化やメモリバス帯域の競合を防ぐため、L2 キャッシュ容量に基づいた絶対件数へしきい値を縮小する。
-    $$T_{\text{soft}} = \min \left( \frac{\text{L2\_Cache\_Bytes}}{\text{sizeof(AppendSlot)}}, \; \text{APPEND\_CAP} \times \frac{\text{SoftThresholdPercent}}{100} \right)$$
-    
-    *   $\text{L2\_Cache\_Bytes} = 1 \text{ MB}$ （現代の一般的なコアあたり L2 キャッシュ容量）
-    *   $\text{sizeof(AppendSlot)} = 48 \text{ バイト}$（2.1節参照）
-    *   スキャンアクティブ時の絶対上限件数: **21,845 件**
-
-#### 3. スキャンアクティブ状態の検出 (Read-only Fast Path)
-マルチスレッド並行スキャンにおいてフラグ書き込みによるキャッシュラインの奪い合い（Cache Bouncing）を回避するため、**Read-Check-Write (TEST and SET) パターン**による軽量なアトミックフラグ `scan_active_` を用いる。
-1. `scan()` の開始時に `scan_active_` が `false` の場合のみ `true` を書き込む。すでに `true` の場合は読み取り（Read-only）でバイパスし、無駄なキャッシュ無効化を防ぐ。
-2. `reorganize()` のマージ完了時に、`scan_active_` を `false` にリセットする。
+各シャードの `append_region` は、専用の背景ワーカースレッドプールによって独立に監視される。
+シャードの `append_size()` が `append_capacity()` の `T1ShardSplitThresholdPercent`(config.hpp)
+に達すると、そのシャードだけがメンテナンスキューに投入され、ワーカーが `reorganize()` を実行して
+必要なら split する。他のシャードや呼び出し元スレッドをブロックしない。詳細は
+[`../t1_sharding_design.md`](../t1_sharding_design.md) の「背景ワーカーのスレッドプール」節を参照。
 
 ## 5. Checkpoint Reload
 
@@ -336,7 +321,7 @@ T2 の稼働中 mmap は `MAP_SHARED` である(下記 NOTE)。書き込みは�
 
 1. manifest を読む。存在しない、または読み込みに失敗する場合は Tier 2 の永続ファイルを新規作成し、WAL 全体を LSN 1 から replay する(以降の手順はスキップ)。
 2. Tier 2 の永続ファイルを `mmap` し、`base_boundary` = `manifest.t2_bytes_used` として採用する。
-3. T1 checkpoint ファイル(5.4 節)を読み込み、`sorted_region` を再構築する。
+3. T1 checkpoint ファイル(5.4 節)を読み込み、ディレクトリと各シャードの `sorted_region` を再構築する。
 4. `checkpoint_lsn` の次の record から WAL の末尾までを replay する。
 
 **Hash Index Lifecycle in Checkpoint**
@@ -355,33 +340,41 @@ T2 の稼働中 mmap は `MAP_SHARED` である(下記 NOTE)。書き込みは�
 
 ### 5.4 T1 Checkpoint File Format (`t1_index.chk`)
 
-T1 checkpoint ファイルは、Tier 2 と同じく「`mmap` して即座に使う」ことを前提とした、パース不要のフラット配列フォーマットである。
+T1 checkpoint ファイルは、Tier 2 と同じく「`mmap` して即座に使う」ことを前提とした、パース不要のフラット配列フォーマットである。K 個のシャードそれぞれの `sorted_region` と、シャード間の境界キーを 1 ファイルに直列化する。
 
 **File Layout**
 
+書き手はシャードごとの entry 数を書き終えるまでシャード総数・境界キーを確定できないため、ヘッダは先頭ではなく末尾の **trailer** として置く:
+
 ```
-[T1ChkFileHeader]
-[IndexEntry] * entry_count   -- key_prefix 昇順にソート済み
+[entry_count: uint64][IndexEntry] * entry_count   -- シャード 0(key_prefix 昇順にソート済み)
+[entry_count: uint64][IndexEntry] * entry_count   -- シャード 1
+...                                                -- shard_count 個繰り返す
+[T1ChkKeyPrefix] * boundary_count                  -- シャード境界キー(shard_count - 1 個)
+[ShardedT1ChkFileHeader]                           -- trailer
 ```
 
 ```c++
-struct T1ChkFileHeader {
-    uint32_t magic;          // フォーマット識別子
+struct ShardedT1ChkFileHeader {
+    uint32_t magic;             // フォーマット識別子
     uint8_t  format_version;
     uint8_t  reserved[3];
-    uint64_t entry_count;    // 後続する IndexEntry の個数
-    uint64_t checksum;       // ヘッダ(checksum フィールドを除く) + 全 IndexEntry 配列に対する FNV-1a64
+    uint64_t shard_count;
+    uint64_t boundary_count;    // == shard_count - 1
+    uint64_t total_entry_count; // 全シャードの entry_count の合計
+    uint64_t checksum;          // 全シャード区間 + 境界キー + ヘッダ(checksum を除く)への FNV-1a64
 };
 // IndexEntry は 2.1 節と同一レイアウト、32B 固定長
 ```
 
 **Design Rationale**
 
-- **per-record ヘッダが不要な理由**: Tier 2 の record は可変長 (key_len / value_len が個体ごとに異なる) なので `ValueRecordHeader` が各 record に必要だが、`IndexEntry` は既に固定長 32B (2.1 節、AVX 命令の都合による制約) であるため、ファイル全体で 1 個のヘッダのみで足りる。
+- **per-record ヘッダが不要な理由**: Tier 2 の record は可変長 (key_len / value_len が個体ごとに異なる) なので `ValueRecordHeader` が各 record に必要だが、`IndexEntry` は既に固定長 32B (2.1 節、AVX 命令の都合による制約) であるため、シャードごとに 1 個の `entry_count` のみで足りる。
 - **per-record checksum / torn-tail 検出が不要な理由**: T1 chk は WAL と異なり、生きているプロセスの中で継続的に追記されるファイルではない。1 回の checkpoint 処理でシーケンシャルに書き切り、完成後にのみ manifest から参照される(5.3 節)。したがって「書き込み途中でクラッシュした半端なファイル」が観測されることは、manifest の `rename` が完了しない限り起こらない。ファイル全体に対する 1 個の checksum は、書き込み完了後の bit rot 検出のためだけに存在する。
-- **ロード手順**: 起動時、manifest が指す T1 chk ファイルを `mmap(MAP_PRIVATE)` し、header の magic / format_version / checksum を検証する。そこから `IndexEntry` 配列を 2 パスの O(N) コピーでランタイム表現へ変換する: (1) 各 `IndexEntry` を `EntrySnapshot` に変換、(2) その `EntrySnapshot` 列から新しい `sorted_region`(`SortedSlot` 配列)を構築する。パースや個別のハッシュテーブル挿入ループ(1 entry ずつのハッシュ計算・衝突解決)は不要であり、これによって典型的な WAL 全量 replay や B-Tree 逐次挿入よりも大幅に軽い Fast Boot を実現する。
+- **ヘッダを trailer にする理由**: 書き手(`ShardedT1CheckpointWriter`)は `checkpoint_all_shards()` が各シャードのコールバックを呼ぶたびに、そのシャードの entry 列を直接ファイルへ逐次書き込む。全シャードを書き終えるまで `shard_count`/`total_entry_count`/`checksum` は確定しないため、確定後にまとめて書ける末尾に置く。読み手は `file_size - sizeof(header)` の位置から `mmap` 越しに直接ヘッダを読める。
+- **ロード手順**: 起動時、manifest が指す T1 chk ファイルを `mmap(MAP_PRIVATE)` し、trailer の magic / format_version / checksum / レイアウト(各シャード区間・境界キーの合計サイズが `file_size` に一致するか)を検証する。検証後、シャード区間を先頭から順に走査して各シャードの `IndexEntry` 配列を `EntrySnapshot` へ変換し、シャードごとに新しい `sorted_region`(`SortedSlot` 配列)を構築、境界キー配列とあわせてディレクトリを再構築する。パースや個別のハッシュテーブル挿入ループ(1 entry ずつのハッシュ計算・衝突解決)は不要であり、これによって典型的な WAL 全量 replay や B-Tree 逐次挿入よりも大幅に軽い Fast Boot を実現する。
 - **`append_index` はシリアライズしない**: 5.2 節の Hash Index Lifecycle の通り、checkpoint 直後は `append_region` が空であるため、ハッシュインデックス自体は永続化不要で、起動時に空の状態から再構築される。
-- **runtime 表現との関係**: プロセス内で通常の(checkpoint を伴わない)T1-only reorganize が作る `sorted_region` は、従来通り heap 上の配列のままでよい。checkpoint 時にのみ、この配列の内容を上記フォーマットでファイルへコピーする。次回起動時の T1 chk 読み込みだけがこのファイルを直接 `mmap` して使う。同一プロセス内で checkpoint 直後にランタイム表現自体を mmap 領域へ切り替えるゼロコピー最適化は、今回はスコープ外とする。
+- **runtime 表現との関係**: プロセス内で通常の(checkpoint を伴わない)T1-only reorganize が作る `sorted_region` は、従来通り heap 上の配列のままでよい。checkpoint 時にのみ、各シャードの配列内容を上記フォーマットでファイルへコピーする。次回起動時の T1 chk 読み込みだけがこのファイルを直接 `mmap` して使う。同一プロセス内で checkpoint 直後にランタイム表現自体を mmap 領域へ切り替えるゼロコピー最適化は、今回はスコープ外とする。
 
 ### 5.5 WAL Rotation
 
@@ -531,7 +524,7 @@ T1のインデックススロットに十分な空きビット領域がないた
 
 ### 7.4 T2 書き込み時の Chunk Allocation / Pre-faulting は不採用
 
-各書き込みスレッドがT2領域へ`append`する際にスレッドごと大きなブロック(2MB)を一括予約し、直後に4KBページ単位でダミーライトして物理メモリページを一括割り当てさせる手法は、ページタッチ処理を`acquire_write_handle()`で取得したT2書き込みハンドル保持中に行うことになる。これは`checkpoint_internal()`の`stop_writers_and_wait()`(進行中のwriterが全員ハンドルを手放すまで待つdrain処理)を直接長引かせ、持続的な同時書き込み負荷下では`checkpoint_internal()`自体を2.7〜5.7倍遅くする。scanとinsertが混在するYCSB-Eワークロードでは、これによりscanスループットが最大16秒連続でゼロになる(詳細は`benchmark_results/pages/2026081711_charts.html`のYCSB-Eタブを参照)。唯一の恩恵(Zipf分布のホットな読み取りにおける初回page fault遅延の回避)は低スレッド数に偏っており、32スレッドの現実的な並行度ではほぼ消失する。
+各書き込みスレッドがT2領域へ`append`する際にスレッドごと大きなブロック(2MB)を一括予約し、直後に4KBページ単位でダミーライトして物理メモリページを一括割り当てさせる手法は、ページタッチ処理を`acquire_write_handle()`で取得したT2書き込みハンドル保持中に行うことになる。これは`checkpoint_internal()`の`stop_writers_and_wait()`(進行中のwriterが全員ハンドルを手放すまで待つdrain処理)を直接長引かせ、持続的な同時書き込み負荷下でscanスループットの停止を引き起こす(詳細は`benchmark_results/pages/2026081711_charts.html`のYCSB-Eタブを参照)。唯一の恩恵(Zipf分布のホットな読み取りにおける初回page fault遅延の回避)は低スレッド数に偏っており、32スレッドの現実的な並行度ではほぼ消失する。
 
 読み込み側の`base_mmap_scan`/`base_mmap_scan_seq`ウォームアップ(7.9節)は、書き込みハンドルとは無関係なタイミング・機構で実行されるため、この問題を持たず、常時有効である。
 
@@ -571,9 +564,9 @@ T2 の「base」領域(2.2節)は書き込み後二度と変更されないた�
 
 | Parameter | Meaning |
 | --- | --- |
-| `T1_MAX_INDEX_SIZE` | Tier 1 最大 entry 数 |
-| `T1_REORGANIZE_SOFT_THRESHOLD` | T1 Reorganize を非同期実行するソフトしきい値（スキャン有無で動的変化） |
-| `T1_REORGANIZE_HARD_THRESHOLD` | 新規書き込みをブロッキング（Stall）するハードしきい値（通常95%固定） |
-| `T2_MAX_VIRTUAL_MEMORY_SIZE` | Tier 2 最大仮想アドレス空間 |
-| `WAL_MAX_BYTES_SINCE_CHECKPOINT` | 直前 checkpoint 以降に許容する WAL 蓄積バイト数の上限。超過で checkpoint() へ昇格する |
+| `T1AppendCapacityEntries` | シャード 1 個あたりの `append_region` 容量(entry 数) |
+| `T1ShardTargetSizeEntries` | シャードあたりの目標 live entry 数。背景ワーカーはこの値の `T1ShardSplitThresholdPercent`% に達したシャードを split する |
+| `T1ShardSplitThresholdPercent` | `T1ShardTargetSizeEntries` に対する split 発火しきい値(%) |
+| `DefaultT2CapacityBytes` | Tier 2 最大仮想アドレス空間 |
+| `WalMaxBytesSinceCheckpoint` | 直前 checkpoint 以降に許容する WAL 蓄積バイト数の上限。超過で checkpoint() へ昇格する |
 

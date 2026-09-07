@@ -3,14 +3,12 @@
 # measurement for VMemKV's two background maintenance jobs: reorganize() and checkpoint(). For
 # each job, measures one call's own duration plus the QPS degradation it causes to concurrent
 # Insert/Update/Scan workloads -- see bench_kv.cpp's run_background_job_probe() for the actual
-# measurement (a matched-duration isolated/concurrent phase pair per workload, fixing an earlier
-# design's phase-window-length mismatch).
+# measurement (a matched-duration isolated/concurrent phase pair per workload).
 #
-# Supersedes run_reorg_scaling_probe.sh, run_checkpoint_throughput_probe.sh, and
-# run_maintenance_contention_probe.sh (all retired): unlike those, this is not a sweep across the
-# CRUD matrix's 4 scenario/value-size combos -- one fixed corpus, measured once per (job,
-# scenario) pair, 4 data points total (reorganize/in_memory, reorganize/ltm, checkpoint/in_memory,
-# checkpoint/ltm). defragment() is not measured here (permanent no-op, see TODO.md).
+# Not a sweep across the CRUD matrix's 4 scenario/value-size combos -- one fixed corpus, measured
+# once per (job, scenario) pair, 4 data points total (reorganize/in_memory, reorganize/ltm,
+# checkpoint/in_memory, checkpoint/ltm). defragment() is not measured here (permanent no-op, see
+# TODO.md).
 #
 # Usage: run_background_jobs_probe.sh <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter]
 #   scenario_filter: "in_memory" or "ltm" (default: both). Matches run_bench_aws_c6id.sh's

@@ -101,9 +101,8 @@ class Wal {
   //
   // Public only so reserve_*()/await_durable() can name it; callers must treat it as opaque.
   struct PendingRecord {
-    // Plain vector rather than an inline small-buffer-optimized array: measured no throughput
-    // benefit, and glibc's malloc is already fast enough here that allocation count isn't the
-    // bottleneck.
+    // Plain vector rather than an inline small-buffer-optimized array: glibc's malloc is fast
+    // enough here that allocation count isn't the bottleneck.
     std::vector<std::byte> buffer;  // fully serialized header(lsn/checksum patched)+key+value
     uint64_t lsn = 0;
     std::exception_ptr error;
@@ -164,11 +163,10 @@ class Wal {
   [[nodiscard]] auto size_bytes() const -> uint64_t;
 
   // How long the most recent rotate_segment() call spent waiting to become group-commit leader
-  // (see that function's own comment) before it could safely swap fd_ -- found, via direct
-  // measurement, to dominate checkpoint_internal()'s own wall-clock cost under sustained
-  // concurrent writers, far more than the msync()/T1-reorganize work checkpoint's duration was
-  // originally assumed to be spent on. Scales with how continuously busy the WAL's group-commit
-  // leader stays, not with data volume or checkpoint trigger frequency.
+  // (see that function's own comment) before it could safely swap fd_. Typically dominates
+  // checkpoint_internal()'s own wall-clock cost under sustained concurrent writers, and scales
+  // with how continuously busy the WAL's group-commit leader stays, not with data volume or
+  // checkpoint trigger frequency.
   [[nodiscard]] auto last_rotate_leader_wait_us() const noexcept -> uint64_t {
     return last_rotate_leader_wait_us_.load(std::memory_order_relaxed);
   }

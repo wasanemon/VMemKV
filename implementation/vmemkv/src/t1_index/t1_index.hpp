@@ -277,8 +277,7 @@ class T1Index {
       // same slot (LockFreeHashTable::publish_slot()'s on_displaced). same_slot_as() (a second
       // resolve() after writing) distinguishes real displacement from an ordinary delete/reinsert;
       // on displacement this thread retires its own write and retries. Bounded by resolve()'s
-      // immutable-region bypass window, so this always terminates. See regression test
-      // "concurrent puts racing the same immutable-bypass window collapse to one entry".
+      // immutable-region bypass window, so this always terminates.
       while (true) {
         ResolvedSlot slot = resolve(prefix, hash);
         if (slot.found()) {
@@ -314,7 +313,7 @@ class T1Index {
           // slot has no hash index to be displaced from in the first place, and append_immutable_
           // hits always report "not found" by construction, whether or not the key is still
           // indexed there. Our slot itself was never touched by anyone else and still correctly
-          // holds `value` -- tombstoning it here (the old behavior) would make this key incorrectly
+          // holds `value` -- tombstoning it here would make this key incorrectly
           // invisible to get()/scan() until the bypass insert below lands, for no benefit (the
           // slot isn't an orphaned duplicate; nothing else will ever carry it forward alongside
           // another live copy of this key within *this* reorganize() cycle, since a bypass copy
@@ -598,8 +597,7 @@ class T1Index {
           // (newer) wins. Compared by *clean* hash, not raw, since an inline<->non-inline
           // transition changes the raw hash (t1_detail::embed_metadata) without changing key
           // identity; matching on raw hash would leave a stale sorted-region copy unrecognized
-          // as superseded, surviving as a permanent duplicate. See regression test
-          // "inline-to-non-inline transition racing an in-flight reorganize...".
+          // as superseded, surviving as a permanent duplicate.
           merged.push_back(m);
           ++si;
           ++ii;
@@ -688,9 +686,8 @@ class T1Index {
   // put() to insert into the live append region (whose own retry/displacement machinery already
   // handles a fresh insert safely -- see put()'s own comment). Any future region built the same
   // way (snapshot-then-atomic-swap) must route its write-path lookup through an instance of this
-  // type rather than re-deriving its own bypass by hand -- exactly the mistake that originally
-  // left the sorted region unguarded (see the regression test "T1Index: dedicated single writer
-  // per key survives racing reorganize with exact last value").
+  // type rather than re-deriving its own bypass by hand, or the sorted region is left unguarded
+  // against the same Lost Update hazard.
   //
   // Read paths are unaffected: a frozen region's bytes are still the live, correct view of the
   // world until the replacement publishes, so get()/scan() keep reading through it directly
@@ -748,9 +745,6 @@ class T1Index {
       return hash.load(std::memory_order_acquire) & t1_detail::kCleanHashMask;
     }
   };
-
- public:
-  static constexpr size_t APPEND_SLOT_SIZE = sizeof(AppendSlot);
 
  private:
   struct SortedRegion {

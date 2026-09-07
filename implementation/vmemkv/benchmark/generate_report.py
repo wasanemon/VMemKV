@@ -493,13 +493,10 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
             degr_badge = (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
                           f'{_badge_for_slowdown(avg_degr)} font-bold w-fit">{avg_degr:.0f}%</span>')
             # Update/Scan degradation deliberately not measured here (permanently n/a, not a
-            # missing-data gap) -- see bench_kv.cpp's kOrganicSplitProbeDurationSec comment: a
-            # tried-and-reverted version added concurrent Update/Scan worker pools, but the extra
-            # threads oversubscribed the box enough to measurably slow the Insert stream that
-            # actually drives splitting, and Scan specifically showed nonsensical results from
-            # cross-workload CPU/lock-contention interaction, not the split's own cost. Given the
-            # pause itself is already short and infrequent (see the chart below), the added
-            # complexity and noise wasn't worth it just for Update/Scan's specific percentage.
+            # missing-data gap) -- see bench_kv.cpp's kOrganicSplitProbeDurationSec comment: adding
+            # concurrent Update/Scan worker pools would oversubscribe the box enough to measurably
+            # slow the Insert stream that actually drives splitting, and Scan specifically reflects
+            # cross-workload CPU/lock-contention interaction rather than the split's own cost.
             out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
                         f'<td class="py-2 px-3">{duration_cell}</td>'
                         f'<td class="py-2 px-3">{degr_badge}</td>'
@@ -551,8 +548,8 @@ def main():
     # Header title / links / description. Regex-based (not an exact previous-string match): the
     # template chain mutates its own <title>/<h1> text on every generation (each report's own
     # --title becomes baked-in literal text, not a stable marker), so matching against a fixed
-    # assumed-previous string silently no-ops once any report in the chain used a custom title --
-    # confirmed as the root cause of the 2026090215 report keeping 2026082819's title verbatim.
+    # assumed-previous string would silently no-op once any report in the chain used a custom
+    # title.
     html = re.sub(r"<title>.*?</title>", lambda m: f"<title>{args.title}</title>", html, count=1)
     html = re.sub(
         r'(<h1 class="text-3xl font-bold tracking-tight text-slate-900">).*?(</h1>)',
@@ -618,15 +615,12 @@ def main():
     section_open_marker = '<section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">'
 
     # heading is matched only inside its own <h3> tag (see h3_marker below), not as a bare
-    # substring against the whole document -- deliberately, after this bit *twice*: a section's
-    # title/description text (in this function or elsewhere already in the template) naming
-    # another section's heading in prose used to make a plain html.find(heading) match inside that
-    # other section's own body, and this function would then dutifully replace that section with a
-    # fresh, unrelated one. Once for the Organic Per-Shard Splits heading appearing in Background
-    # Jobs' own description, and again for the same heading appearing in the page's top-level
-    # description blurb. Scoping the search to the exact <h3>...</h3> wrapper this function itself
-    # always writes closes the whole class of bug rather than requiring every future caller to
-    # remember not to mention another section's name in prose.
+    # substring against the whole document: a section's title/description text (in this function
+    # or elsewhere already in the template) can name another section's heading in prose, which a
+    # plain html.find(heading) would match inside that other section's own body -- scoping the
+    # search to the exact <h3>...</h3> wrapper this function itself always writes avoids that
+    # entirely, rather than requiring every future caller to remember not to mention another
+    # section's name in prose.
     def upsert_section(html, heading, icon_bg, icon_text, icon_name, title, description_html, table_html):
         if not table_html:
             return html
@@ -649,17 +643,14 @@ def main():
         if heading_idx != -1:
             # Remove the existing section first (wherever it currently sits) rather than replacing
             # its content in place -- so this call's position in the code below, not wherever some
-            # earlier report round happened to leave it, determines where it ends up. Without this,
-            # re-running this function against its own prior output could update a section's
-            # content but could never reorder it relative to another section (confirmed: swapping
-            # the two call sites below had no effect on a re-run, since "replace in place" doesn't
-            # move anything).
+            # earlier report round happened to leave it, determines where it ends up. Replacing in
+            # place instead would let a re-run update a section's content but never reorder it
+            # relative to another section.
             section_start = html.rindex(section_open_marker, 0, heading_idx)
             # Also consume any whitespace-only text immediately preceding the marker: without this,
             # a re-run's fixed-format replacement (below) leaves the *previous* run's own leading
             # indentation orphaned in place, accumulating a little more on every regeneration
-            # instead of converging -- confirmed via a 3x-idempotency check while adding this
-            # section originally.
+            # instead of converging.
             ws_start = section_start
             while ws_start > 0 and html[ws_start - 1] in " \t\n":
                 ws_start -= 1

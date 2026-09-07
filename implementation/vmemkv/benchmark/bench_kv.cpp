@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -109,9 +108,8 @@ class YCSBTimelineCollector {
   // distinguishes an in_memory run's timeline from an ltm run's, since both can share the exact
   // same store/variant/value-size combination. Without it, run_bench_aws_c6id.sh's 4-parallel
   // split (one instance per scenario+value-size) downloads both scenarios' files into the same
-  // local directory under the same name, and whichever instance finishes later silently
-  // overwrites the other's timeline data -- observed directly: in_memory/1KB's timeline was lost
-  // this way when ltm/1KB (retried for hours after an unrelated OOM bug) finished afterward.
+  // local directory under the same name, and whichever instance finishes later silently overwrites
+  // the other's timeline data.
   void dump_json(std::string store_name, std::string variant_name, std::string val_name, std::string scenario_tag) {
     std::vector<uint64_t> total_scan(kDurationSeconds, 0);
     std::vector<uint64_t> total_insert(kDurationSeconds, 0);
@@ -201,6 +199,9 @@ constexpr std::array<ForcedTrigger, 2> kForcedTriggers{{
 constexpr std::size_t kIndexKeyBufferBytes = 32;
 constexpr std::size_t kIndexKeyBytes = 16;
 constexpr std::size_t kInlineValueBytes = 8;
+// For a non-8B value size, 1-in-kMixEveryNth keys get an 8-byte (inline-eligible) value instead --
+// the "20% 8B" mix labeled in value_label() below.
+constexpr std::size_t kMixEveryNth = 5;
 constexpr std::size_t kInMemoryInlineCorpusEntries = 20'000'000;
 // 1KB in-memory is fixed at roughly the same scale as the LTM/1KB scenario's own corpus (~8.26M
 // keys/8.6GB, itself sized from a small fixed budget x ratio, not host RAM) rather than scaling
@@ -505,11 +506,6 @@ static void register_benchmark_context() {
                               std::to_string(vmemkv::Config<>::T1ShardSplitThresholdPercent));
 }
 
-class BenchmarkContextRegistrar {
- public:
-  static void register_all() { register_benchmark_context(); }
-};
-
 static inline bool prefer_large_value_first() {
   const char *env = std::getenv("VMEMKV_BENCH_LARGE_VALUE_FIRST");
   return env != nullptr && std::string(env) == "1";
@@ -540,9 +536,9 @@ static inline double insert_time_budget_seconds() {
 // counting (each deleted key is gone for good, so re-running more iterations isn't
 // meaningful once the corpus is exhausted). A *fixed iteration count* is not a safe
 // substitute: per-delete cost can degrade non-linearly with how much has already been
-// deleted (observed locally: LMDB/1KB went from ~212K deletes/sec at a 20M-key corpus
-// to ~5K deletes/sec at a 16M-key corpus -- a 40x swing from value size alone), so any
-// fixed count can still land in a slow regime for some engine/corpus combination.
+// deleted (e.g. LMDB/1KB goes from ~212K deletes/sec at a 20M-key corpus to ~5K
+// deletes/sec at a 16M-key corpus), so any fixed count can still land in a slow regime
+// for some engine/corpus combination.
 // Instead, Delete runs its own bounded wall-clock loop (same technique as YCSB-E):
 // walk the corpus deleting keys until either the time budget or the corpus is
 // exhausted, whichever comes first. This caps worst-case per-cell time regardless of
@@ -666,7 +662,7 @@ static auto get_value_size_for_key(std::size_t index, std::size_t target_size) -
   if (target_size == kInlineValueBytes) {
     return kInlineValueBytes;
   }
-  if (index % 5 == 0) {
+  if (index % kMixEveryNth == 0) {
     return kInlineValueBytes;
   }
   return target_size;
@@ -871,8 +867,8 @@ static void copy_t2_checkpoint_sparse(const std::filesystem::path &source,
 // manifest, with *no* WAL at the new path -- so constructing a VMemKVImpl there fast-boots
 // straight from the checkpoint with nothing to replay.
 //
-// The T1 checkpoint file is hardlinked (checkpoint.hpp's write_t1_checkpoint(): always written to
-// a temp path and rename()'d onto the final one, so a later cycle on the clone replaces the
+// The T1 checkpoint file is hardlinked (checkpoint.hpp's ShardedT1CheckpointWriter: always written
+// to a temp path and rename()'d onto the final one, so a later cycle on the clone replaces the
 // clone's directory entry with a fresh inode rather than mutating the one still shared with the
 // master -- exactly like RocksDB's SST files, see RocksDBStore::clone_from()'s comment for the
 // same reasoning). The T2 checkpoint file cannot use the same trick: checkpoint_internal()
@@ -1449,7 +1445,7 @@ static void register_ycsb_e_benchmark(Holder ycsb_holder,
               // 5% Insert (with 20% 8B ratio for non-8B workloads)
               uint64_t next_idx = col->next_key_index.fetch_add(1, std::memory_order_relaxed);
               bool inserted;
-              if (val_size != 8 && next_idx % 5 == 0) {
+              if (val_size != 8 && next_idx % kMixEveryNth == 0) {
                 inserted = store.insert(make_key(next_idx), dummy_8b);
               } else {
                 inserted = store.insert(make_key(next_idx), dummy_large);
@@ -1521,7 +1517,7 @@ static void register_insert_benchmark(Holder insert_holder,
           while (std::chrono::steady_clock::now() < deadline) {
             std::size_t key_index = insert_start + thread_idx + i * threads;
             bool inserted;
-            if (val_size != 8 && key_index % 5 == 0) {
+            if (val_size != 8 && key_index % kMixEveryNth == 0) {
               inserted = store.insert(make_key(key_index), dummy_8b);
             } else {
               inserted = store.insert(make_key(key_index), dummy_large);
@@ -1781,26 +1777,20 @@ void register_all_benchmarks() {
 
 // ─── Reorg-scaling probe (standalone CLI mode, bypasses Google Benchmark) ───────────────────
 //
-// Measures how long a single reorganize()/checkpoint() call takes as a function of corpus size,
-// for T1-only vs T1+T2 modes. Google Benchmark's own registration model assumes the same
-// operation repeats many times to build a statistic; here we want to time exactly one, possibly
-// very slow, blocking call and be able to tell a driver script "this is taking too long" without
-// waiting indefinitely -- hence a standalone CLI mode instead of a registered benchmark case.
+// Measures how a reorganize()/checkpoint() call's cost and effect on concurrent traffic scale
+// with corpus size. Google Benchmark's own registration model assumes the same operation repeats
+// many times to build a statistic; here we want to time exactly one, possibly very slow, blocking
+// call and be able to tell a driver script "this is taking too long" without waiting indefinitely
+// -- hence a standalone CLI mode instead of a registered benchmark case.
 //
-// Population/checkpoint/churn are deliberately NOT time-limited here -- only the outer shell
-// driver's own generous backstop timeout (wrapping this whole process) covers them. Only the
+// Population/setup is deliberately NOT time-limited here -- only the outer shell driver's own
+// generous backstop timeout (wrapping this whole process) covers it. Only the
 // reorganize()/checkpoint() call itself is capped (timed_run(), below), via a background thread
 // plus future::wait_for(), so a runaway call is reported on its own without also charging setup
 // time against the same budget (conflating the two would make a timeout ambiguous: slow setup, or
 // slow reorganize/checkpoint?).
 //
-// Four modes, selected via --mode:
-//   t1only / t1t2 (run_bootstrap(), below): a single fresh populate followed by exactly one timed
-//     reorganize()/checkpoint() call.
-//   t1t2_steady (run_steady(), below): measures a *second* (or later) checkpoint() call against a
-//     corpus that already has one checkpointed generation. No automated driver script currently
-//     invokes this mode (its own sweep script was retired in favor of background_job_probe below)
-//     -- reachable directly via this CLI for ad-hoc use.
+// Two modes, selected via --mode:
 //   background_job_probe (run_background_job_probe(), below): fixed 10,000,000-record corpus;
 //     measures one reorganize()/checkpoint() call's own duration plus the QPS degradation it
 //     causes to concurrent Insert/Update/Scan workloads -- see run_background_jobs_probe.sh. This
@@ -1829,9 +1819,6 @@ static inline int reorg_timeout_seconds() {
 }
 
 enum class ProbeMode {
-  kT1Only,
-  kT1T2,
-  kT1T2Steady,
   kBackgroundJobProbe,
   kOrganicSplitProbe,
 };
@@ -1839,10 +1826,8 @@ enum class ProbeMode {
 struct ProbeArgs {
   bool is_ltm = false;
   std::size_t val_size = 0;
-  ProbeMode mode = ProbeMode::kT1Only;
+  ProbeMode mode = ProbeMode::kBackgroundJobProbe;
   double ratio = 1.0;
-  double churn_ratio = 0.0;
-  std::string sweep_tag = "default";
   std::string job;  // "reorganize" | "checkpoint" -- only read by kBackgroundJobProbe.
 };
 
@@ -1888,13 +1873,7 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
       }
       has_value_size = true;
     } else if (key == "--mode") {
-      if (value == "t1only") {
-        args.mode = ProbeMode::kT1Only;
-      } else if (value == "t1t2") {
-        args.mode = ProbeMode::kT1T2;
-      } else if (value == "t1t2_steady") {
-        args.mode = ProbeMode::kT1T2Steady;
-      } else if (value == "background_job_probe") {
+      if (value == "background_job_probe") {
         args.mode = ProbeMode::kBackgroundJobProbe;
       } else if (value == "organic_split_probe") {
         args.mode = ProbeMode::kOrganicSplitProbe;
@@ -1904,11 +1883,6 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
       has_mode = true;
     } else if (key == "--ratio") {
       args.ratio = std::stod(std::string(value));
-    } else if (key == "--churn-ratio") {
-      args.churn_ratio = std::stod(std::string(value));
-    } else if (key == "--sweep-tag") {
-      // Only read by run_steady() (t1t2_steady mode) -- every other mode ignores this value.
-      args.sweep_tag = std::string(value);
     } else if (key == "--job") {
       // Only read by kBackgroundJobProbe.
       args.job = std::string(value);
@@ -1917,18 +1891,14 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
   if (!has_scenario || !has_value_size || !has_mode) {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
-        "--mode=<t1only|t1t2|t1t2_steady|background_job_probe|organic_split_probe> "
-        "--ratio=<0.0-1.0> [--churn-ratio=<0.0-1.0>] [--sweep-tag=<name>] "
-        "[--job=<reorganize|checkpoint>]");
+        "--mode=<background_job_probe|organic_split_probe> "
+        "--ratio=<0.0-1.0> [--job=<reorganize|checkpoint>]");
   }
   if (args.mode == ProbeMode::kBackgroundJobProbe && args.job != "reorganize" && args.job != "checkpoint") {
     fail("--mode=background_job_probe requires --job=<reorganize|checkpoint>");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
     fail("--ratio must be in (0.0, 1.0]");
-  }
-  if (args.churn_ratio < 0.0 || args.churn_ratio > 1.0) {
-    fail("--churn-ratio must be in [0.0, 1.0]");
   }
   return args;
 }
@@ -1937,6 +1907,12 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
 // at reorg_timeout_seconds() -- see the file-level comment above this namespace for why
 // google-benchmark's iteration model doesn't fit timing exactly one, possibly very slow, blocking
 // call.
+//
+// Every caller must terminate via std::_Exit(), not a normal return, once this returns: on
+// timeout, the worker thread above is still inside reorganize()/checkpoint() touching the store,
+// so returning normally and running destructors (in particular the store's, which would join
+// reorg_worker_) could itself block forever. _Exit() is also the simplest way to avoid that same
+// destructor path racing the now-finished-but-still-detached worker thread on a non-timeout exit.
 template <typename Fn>
 auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   const int timeout_seconds = reorg_timeout_seconds();
@@ -1956,43 +1932,6 @@ auto timed_run(Fn &&fn) -> std::pair<double, bool> {
   return {elapsed_sec, timed_out};
 }
 
-// _Exit(), not return: on timeout, timed_run()'s worker thread is still inside reorganize()/
-// checkpoint() touching `store` -- abandoning it via detach() and terminating without running
-// destructors (skipping `store`'s ~VMemKVImpl(), which would otherwise join reorg_worker_ and
-// could itself block forever) is what makes this process's exit actually bounded. On success,
-// _Exit() is just the simplest way to avoid the same destructor path racing the
-// now-finished-but-still-detached worker thread.
-[[noreturn]] void report_and_exit(const ProbeArgs &args, std::size_t key_count, double elapsed_sec, bool timed_out) {
-  const char *mode_name = "t1t2_steady";
-  switch (args.mode) {
-    case ProbeMode::kT1Only:
-      mode_name = "t1only";
-      break;
-    case ProbeMode::kT1T2:
-      mode_name = "t1t2";
-      break;
-    case ProbeMode::kT1T2Steady:
-      mode_name = "t1t2_steady";
-      break;
-    case ProbeMode::kBackgroundJobProbe:
-      mode_name = "background_job_probe";  // Unreachable: this mode reports via its own print, below.
-      break;
-    case ProbeMode::kOrganicSplitProbe:
-      mode_name = "organic_split_probe";  // Unreachable: this mode reports via its own print, below.
-      break;
-  }
-  // churn_ratio only means anything for t1t2_steady (run_steady() is the only mode that applies
-  // it) -- every other mode never touches args.churn_ratio, so emitting its default 0.0 there
-  // would misleadingly read as "measured with zero churn" rather than "not applicable."
-  const bool churn_ratio_applicable = args.mode == ProbeMode::kT1T2Steady;
-  std::cout << "{\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\"," << "\"value_size\":" << args.val_size
-            << "," << "\"mode\":\"" << mode_name << "\"," << "\"ratio\":" << args.ratio << ","
-            << "\"churn_ratio\":" << (churn_ratio_applicable ? std::to_string(args.churn_ratio) : "null") << ","
-            << "\"key_count\":" << key_count << "," << "\"elapsed_sec\":" << elapsed_sec << ","
-            << "\"timed_out\":" << (timed_out ? "true" : "false") << "}" << std::endl;
-  std::_Exit(timed_out ? 124 : 0);
-}
-
 static std::string reorg_probe_path(const ProbeArgs &args, const std::string &suffix) {
   return get_db_dir() + "/reorg_probe_" + (args.is_ltm ? "ltm" : "inmem") + "_" + std::to_string(args.val_size) + "_" +
          suffix;
@@ -2002,140 +1941,6 @@ static std::size_t resolve_writer_threads() {
   return std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), 32});
 }
 
-// Samples `churn_count` random indices in [0, key_count) and update()s each, sharded across up
-// to 16 threads. Used by run_steady()'s kUpdateCold pre-churn.
-static void apply_random_churn(vmemkv::variants::VMemKVStore &store,
-                               std::size_t key_count,
-                               std::size_t churn_count,
-                               uint64_t seed,
-                               std::size_t val_size) {
-  std::mt19937_64 churn_rng(seed);
-  std::uniform_int_distribution<std::size_t> churn_index_dist(0, key_count - 1);
-  std::vector<std::size_t> churn_indices(churn_count);
-  for (auto &idx : churn_indices) {
-    idx = churn_index_dist(churn_rng);
-  }
-  const std::size_t churn_threads =
-      std::min<std::size_t>({std::max(1u, std::thread::hardware_concurrency()), std::size_t{16}, churn_count});
-  std::vector<std::thread> workers;
-  workers.reserve(churn_threads);
-  for (std::size_t t = 0; t < churn_threads; ++t) {
-    workers.emplace_back([&store, &churn_indices, val_size, t, churn_threads]() {
-      for (std::size_t i = t; i < churn_indices.size(); i += churn_threads) {
-        const std::size_t idx = churn_indices[i];
-        store.update(make_key(idx), make_value_for_key(idx, val_size));
-      }
-    });
-  }
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
-
-// T1-only / T1+T2 bootstrap modes: a single fresh populate (scattered insert order, see
-// populate_random_order()'s comment) followed by exactly one timed reorganize()/checkpoint()
-// call, against a corpus with no prior checkpoint.
-[[noreturn]] void run_bootstrap(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-  const bool force_checkpoint = args.mode == ProbeMode::kT1T2;
-
-  const std::string path = reorg_probe_path(
-      args,
-      (force_checkpoint ? "t1t2" : "t1only") + std::string("_") + std::to_string(static_cast<int>(args.ratio * 100)));
-
-  auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  populate_random_order(*store, {key_count, args.val_size});
-
-  auto [elapsed_sec, timed_out] = timed_run([&store, force_checkpoint]() {
-    if (force_checkpoint) {
-      store->checkpoint();
-    } else {
-      store->reorganize();
-    }
-  });
-  report_and_exit(args, key_count, elapsed_sec, timed_out);
-}
-
-// Steady-state mode: measures a *second* (or later) checkpoint() call, after the corpus already
-// has one checkpointed generation -- unlike run_bootstrap() above, which always measures a
-// from-scratch corpus's first checkpoint.
-//
-// Persists across invocations at a fixed, ratio/churn-independent path (keyed only by
-// --sweep-tag/scenario/value-size) so a driver script can call this repeatedly -- with an
-// ascending --ratio sequence ("Corpus-Size Invariance across Generations") or a fixed --ratio and
-// varying --churn-ratio ("Churn-Ratio Scaling") -- and have each call reuse/grow the *same*
-// on-disk corpus instead of re-populating it from scratch every time: populating 25/50/75/100%
-// independently costs 250% of a full corpus in total insert work, growing incrementally costs
-// 100%. A sidecar "<path>.steady_count" file tracks how many keys are already durably populated
-// at `path` so this process (a fresh one each invocation, same as the bootstrap modes) knows how
-// much delta to load.
-[[noreturn]] void run_steady(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
-
-  const std::size_t full_key_count = corpus_size_for_value(args.val_size);
-  const std::size_t key_count = std::max<std::size_t>(1, static_cast<std::size_t>(full_key_count * args.ratio));
-
-  const std::string path = get_db_dir() + "/reorg_probe_steady_" + args.sweep_tag + "_" +
-                           (args.is_ltm ? "ltm" : "inmem") + "_" + std::to_string(args.val_size);
-  const std::string count_marker_path = path + ".steady_count";
-
-  const bool manifest_exists = std::filesystem::exists(vmemkv::derive_manifest_path(path));
-  std::size_t prev_count = 0;
-  if (manifest_exists) {
-    if (std::ifstream marker(count_marker_path); marker) {
-      marker >> prev_count;
-    }
-  }
-
-  std::unique_ptr<Store> store;
-  if (manifest_exists) {
-    store = std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes);
-  } else {
-    store = make_vmemkv_fresh(
-        path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::DefaultT2CapacityBytes); });
-  }
-
-  if (key_count > prev_count) {
-    const std::size_t delta = key_count - prev_count;
-    store->bulk_load(
-        delta,
-        [prev_count](std::size_t i) { return make_key(prev_count + i); },
-        [prev_count, val_size = args.val_size](std::size_t i) { return make_value_for_key(prev_count + i, val_size); });
-  }
-
-  // Untimed: establishes a clean single-generation baseline before churn, same as any real
-  // caller would do -- not part of what this experiment measures.
-  store->checkpoint();
-
-  // Untimed, and deliberately multi-threaded: update() is WAL-durable (an fsync-equivalent wait
-  // per call, see update_impl()'s comment), so a single sequential thread issuing hundreds of
-  // thousands of them serializes on fsync latency alone -- observed locally taking >300s for
-  // 400K updates regardless of corpus size or churn ratio, i.e. a property of this churn-
-  // application loop, not of the checkpoint() call being measured. Splitting across threads lets
-  // concurrent WAL appends benefit from group commit (see wal.cpp) the same way a real concurrent
-  // write workload would.
-  const std::size_t churn_count = std::max<std::size_t>(1, static_cast<std::size_t>(key_count * args.churn_ratio));
-  apply_random_churn(
-      *store,
-      key_count,
-      churn_count,
-      kBenchmarkSeed + static_cast<uint64_t>(args.ratio * 1000) + static_cast<uint64_t>(args.churn_ratio * 1000000),
-      args.val_size);
-
-  auto [elapsed_sec, timed_out] = timed_run([&store]() { store->checkpoint(); });
-
-  if (!timed_out) {
-    std::ofstream marker(count_marker_path, std::ios::trunc);
-    marker << key_count;
-  }
-
-  report_and_exit(args, key_count, elapsed_sec, timed_out);
-}
-
 // Background-job probe: for a fixed corpus (args.val_size, kBackgroundJobProbeKeyCount records --
 // in-memory unconstrained, or LTM cgroup-constrained by the *caller* script, this binary itself
 // applies no memory limit), measures one call to reorganize()/checkpoint() (args.job) and, for
@@ -2143,14 +1948,11 @@ static void apply_random_churn(vmemkv::variants::VMemKVStore &store,
 // workload suffers while the job call is in flight. See run_background_jobs_probe.sh.
 //
 // Each workload gets its own paired isolated/concurrent measurement, both windows sized to the
-// SAME wall-clock duration (the job call's own measured elapsed time). This is a deliberate fix
-// over an earlier design (run_contention_probe(), removed) whose isolated phase ran a fixed
-// op-count per thread regardless of how long that took, while the concurrent phase's window was
-// set by the job's own (often very different) duration -- comparing TPS across two differently-
-// sized windows is not a fair measurement. Here, phase B (concurrent) runs the job once while
-// workload threads hammer continuously (stop-flag controlled) and measures its own elapsed time;
-// phase A (isolated) then runs the identical thread/workload setup for exactly that same elapsed
-// time (timer-controlled, no concurrent job) as the baseline.
+// SAME wall-clock duration (the job call's own measured elapsed time) -- comparing TPS across two
+// differently-sized windows would not be a fair measurement. Phase B (concurrent) runs the job
+// once while workload threads hammer continuously (stop-flag controlled) and measures its own
+// elapsed time; phase A (isolated) then runs the identical thread/workload setup for exactly that
+// same elapsed time (timer-controlled, no concurrent job) as the baseline.
 enum class BackgroundJobWorkload { kInsert, kUpdate, kScan };
 
 // kInsert draws from `next_fresh_key` (shared across a phase's threads, never reused within one
@@ -2270,7 +2072,7 @@ static auto measure_workload_degradation(Store &store,
 constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
 
 [[noreturn]] void run_background_job_probe(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
+  using Store = vmemkv::VMemKVStore;
 
   const std::size_t key_count = kBackgroundJobProbeKeyCount;
   const std::string path = reorg_probe_path(args, "backgroundjob_" + args.job);
@@ -2345,40 +2147,34 @@ constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
 // reorganize()/checkpoint() call), this measures the Insert-QPS impact of ShardedT1Index's own
 // automatic background splitting under sustained write load -- the maintenance path that actually
 // runs during ordinary operation. Starts from an empty store with real background workers active
-// and inserts continuously with monotonically increasing keys (so essentially all new writes land
-// in whichever shard currently owns the tail of the keyspace, the same access pattern
-// harness_new_incremental_scaling.cpp used to confirm one shard's own split cost stays flat
-// regardless of total corpus size -- see docs/t1_sharding_design.md), polling
-// get_statistics().t1_split_count at a fine interval to detect each split as it completes.
+// and inserts continuously with monotonically increasing keys, so essentially all new writes land
+// in whichever shard currently owns the tail of the keyspace -- one shard's own split cost stays
+// flat regardless of total corpus size under this access pattern (see docs/t1_sharding_design.md)
+// -- polling get_statistics().t1_split_count at a fine interval to detect each split as it
+// completes.
 //
 // For every observed split, the "during" window is get_statistics()'s own
-// t1_last_split_pause_us/t1_last_split_pause_end_ns -- the writer-visible pause's *exact*
-// measured span, not a guessed fixed-width window. An earlier version of this probe used a fixed
-// ~1.2s window on both sides of the moment total_splits() was observed to increment, which
-// produced nonsensical results (QPS *higher* "during" most splits than "baseline"): total_splits()
-// only increments after the pause has already ended (plus the epoch drain and straggler
-// redistribution that follow it), so that window mostly covered the newly-split, freshly-small
-// shard's *higher* post-split throughput rather than the pause itself, confounded with the
-// pre-split shard's throughput right as it was largest and most loaded (the natural low point of
-// one shard's own grow-then-split cycle, not a property of the split's own cost). Anchoring on the
-// pause's real, precisely-measured span removes that confound. "baseline" is still this event's
-// own local window just before the pause starts (not a single global average -- steady-state QPS
-// drifts slowly as the corpus grows, which would bias a global baseline against later events).
+// t1_last_split_pause_us/t1_last_split_pause_end_ns give the writer-visible pause's *exact*
+// measured span to anchor "during" against, rather than a guessed fixed-width window:
+// total_splits() only increments after the pause has already ended (plus the epoch drain and
+// straggler redistribution that follow it), so anchoring on when total_splits() increments would
+// mostly cover the newly-split, freshly-small shard's *higher* post-split throughput instead of
+// the pause itself, confounded with the pre-split shard's throughput right as it was largest and
+// most loaded (the natural low point of one shard's own grow-then-split cycle, not a property of
+// the split's own cost). "baseline" is still this event's own local window just before the pause
+// starts (not a single global average -- steady-state QPS drifts slowly as the corpus grows,
+// which would bias a global baseline against later events).
 //
-// Insert-only deliberately: a tried-and-reverted version added concurrent Update/Scan worker
-// pools to also measure their degradation (splits only happen at all because Insert keeps growing
-// the corpus, but Update/Scan hitting *existing* keys uniformly at random should, in theory, be
-// affected far less than Insert as shard count grows, since a random key only lands in whichever
-// shard is currently splitting with probability roughly 1/shard_count). In practice this backfired
-// two ways: the extra 16 threads oversubscribed the 32-vCPU box enough to noticeably slow Insert
-// itself, cutting the number of splits observed in the fixed 90s window roughly in half; and Scan
-// specifically showed wildly nonsensical results (QPS *far* higher during the pause than before
-// it) -- plausibly because pausing the many Insert/Update threads targeting the closing shard
-// measurably relieved CPU/lock contention for the comparatively few Scan threads, a real but
-// unwanted cross-workload interaction rather than a property of the split itself. Given the pause
-// is already short (~0.2s, see docs/t1_sharding_design.md) and infrequent relative to realistic
-// insert rates, the added complexity and noise wasn't worth it just to learn Update/Scan's
-// specific percentage during that already-brief window -- Insert-only stays the clean signal.
+// Insert-only deliberately: splits only happen at all because Insert keeps growing the corpus,
+// while Update/Scan hitting *existing* keys uniformly at random are affected far less as shard
+// count grows (a random key only lands in whichever shard is currently splitting with probability
+// roughly 1/shard_count). Measuring Update/Scan degradation alongside Insert would introduce two
+// confounds instead: extra worker threads oversubscribing the box enough to slow Insert itself
+// (reducing the number of splits observed in the fixed 90s window), and Scan's QPS reflecting
+// relieved CPU/lock contention from the paused Insert/Update threads targeting the closing shard
+// rather than the split's own cost. Given the pause is already short (~0.2s, see
+// docs/t1_sharding_design.md) and infrequent relative to realistic insert rates, Insert-only stays
+// the clean signal.
 constexpr int kOrganicSplitProbeDurationSec = 90;
 constexpr auto kOrganicSplitPollInterval = std::chrono::milliseconds(100);
 // Width of the "baseline" (pre-pause) window only -- wide enough to average out noise while still
@@ -2387,7 +2183,7 @@ constexpr auto kOrganicSplitPollInterval = std::chrono::milliseconds(100);
 constexpr double kOrganicSplitWindowSec = 1.2;
 
 [[noreturn]] void run_organic_split_probe(const ProbeArgs &args) {
-  using Store = vmemkv::variants::VMemKVStore;
+  using Store = vmemkv::VMemKVStore;
 
   const std::string path = reorg_probe_path(args, "organic_split");
   const std::size_t writer_threads = resolve_writer_threads();
@@ -2400,8 +2196,8 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   // any one shard's own append-region threshold at this insert rate/value size -- each such
   // checkpoint calls checkpoint_all_shards(), forcing every shard's append region to compact well
   // before it could ever cross the 50%-full soft threshold that triggers ShardedT1Index's own
-  // maintenance queue. Left unsuppressed, this starves organic splitting entirely (confirmed: zero
-  // splits observed after inserting ~10M records, an order of magnitude past the split threshold).
+  // maintenance queue. Left unsuppressed, this starves organic splitting entirely -- zero splits
+  // occur even after inserting ~10M records, an order of magnitude past the split threshold.
   // Suppressing it here isolates exactly the mechanism this probe measures; the organic checkpoint
   // path itself is what run_background_job_probe() already measures separately.
   setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
@@ -2523,14 +2319,10 @@ constexpr double kOrganicSplitWindowSec = 1.2;
     ::setenv("VMEMKV_BENCH_LTM", "1", 1);
     ::setenv("VMEMKV_BENCH_TARGET_RATIO", "8.0", 0);
   }
-  if (args.mode == ProbeMode::kT1T2Steady) {
-    run_steady(args);
-  } else if (args.mode == ProbeMode::kBackgroundJobProbe) {
+  if (args.mode == ProbeMode::kBackgroundJobProbe) {
     run_background_job_probe(args);
-  } else if (args.mode == ProbeMode::kOrganicSplitProbe) {
-    run_organic_split_probe(args);
   } else {
-    run_bootstrap(args);
+    run_organic_split_probe(args);
   }
 }
 
@@ -2546,7 +2338,7 @@ int main(int argc, char **argv) {
   if (!should_skip_cleanup()) {
     cleanup_stale_benchmark_files();
   }
-  BenchmarkContextRegistrar::register_all();
+  register_benchmark_context();
   benchmark::Initialize(&argc, argv);
   register_all_benchmarks();
   benchmark::RunSpecifiedBenchmarks();

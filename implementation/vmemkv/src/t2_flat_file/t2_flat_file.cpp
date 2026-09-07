@@ -11,7 +11,6 @@
 #include <limits>
 #include <optional>
 #include <system_error>
-#include <thread>
 #include <vmemkv/config.hpp>
 
 #include "../checkpoint/checkpoint.hpp"

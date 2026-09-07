@@ -77,7 +77,10 @@ auto join_all_with_timeout(std::vector<std::thread> &threads, std::chrono::milli
   return completed;
 }
 
-auto reserve_wal_path() -> std::filesystem::path { return vmemkv_test::reserve_unique_temp_path("vmemkv_wal_test"); }
+auto reserve_wal_path() -> vmemkv_test::ScopedTempPath {
+  return vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                     [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
+}
 
 using vmemkv_test::as_span;
 using vmemkv_test::bytes_of;
@@ -117,8 +120,6 @@ TEST_CASE("Wal: fresh file starts at LSN 1 with empty replay") {
                                        std::span<const std::byte> /*value*/,
                                        uint64_t /*lsn*/) { FAIL("replay callback invoked on empty WAL"); });
   CHECK(count == 0);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: insert/update/delete assign strictly increasing LSNs") {
@@ -138,8 +139,6 @@ TEST_CASE("Wal: insert/update/delete assign strictly increasing LSNs") {
   CHECK(lsn1 < lsn2);
   CHECK(lsn2 < lsn3);
   CHECK(wal.next_lsn() > lsn3);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: replay after reopen round-trips type/key/value/order") {
@@ -177,8 +176,6 @@ TEST_CASE("Wal: replay after reopen round-trips type/key/value/order") {
   // are an implementation detail -- only the relative ordering is part of the contract.
   CHECK(records[0].lsn < records[1].lsn);
   CHECK(records[1].lsn < records[2].lsn);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: delete record replays with empty value span") {
@@ -197,8 +194,6 @@ TEST_CASE("Wal: delete record replays with empty value span") {
     CHECK(value.empty());
   });
   CHECK(saw_record);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: LSN numbering continues across reopen, does not reset") {
@@ -214,8 +209,6 @@ TEST_CASE("Wal: LSN numbering continues across reopen, does not reset") {
   CHECK(wal.next_lsn() > last_lsn_before_reopen);
   const uint64_t lsn = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
   CHECK(lsn > last_lsn_before_reopen);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: repeated open/close with zero appends stays empty") {
@@ -232,8 +225,6 @@ TEST_CASE("Wal: repeated open/close with zero appends stays empty") {
                                        std::span<const std::byte> /*value*/,
                                        uint64_t /*lsn*/) { FAIL("replay callback invoked on empty WAL"); });
   CHECK(count == 0);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
@@ -270,8 +261,6 @@ TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
   REQUIRE(keys.size() == 2);
   CHECK(keys[0] == "a");
   CHECK(keys[1] == "b");
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: torn trailing record with full header but truncated payload is discarded") {
@@ -306,8 +295,6 @@ TEST_CASE("Wal: torn trailing record with full header but truncated payload is d
   vmemkv::Wal wal(path);
   CHECK(std::filesystem::file_size(seg1) == valid_end);
   CHECK(wal.next_lsn() == first_lsn + 1);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier records survive") {
@@ -345,8 +332,6 @@ TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier reco
                  uint64_t /*lsn*/) { keys.push_back(span_to_string(key)); });
   REQUIRE(keys.size() == 1);
   CHECK(keys[0] == "keep");
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: concurrent appends from multiple threads yield unique LSNs that all survive replay") {
@@ -398,8 +383,6 @@ TEST_CASE("Wal: concurrent appends from multiple threads yield unique LSNs that 
   CHECK(count == static_cast<uint64_t>(kTotal));
   std::sort(replayed_lsns.begin(), replayed_lsns.end());
   CHECK(replayed_lsns == acknowledged_lsns);  // Every acknowledged append survives replay, and no others do.
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: zero-length value on Insert round-trips distinctly from Delete") {
@@ -422,8 +405,6 @@ TEST_CASE("Wal: zero-length value on Insert round-trips distinctly from Delete")
     CHECK(value.empty());
   });
   CHECK(saw_record);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: large (>64KB) key/value payloads round-trip") {
@@ -450,8 +431,6 @@ TEST_CASE("Wal: large (>64KB) key/value payloads round-trip") {
     CHECK(std::equal(value.begin(), value.end(), big_value.begin()));
   });
   CHECK(saw_record);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE(
@@ -476,8 +455,6 @@ TEST_CASE(
   CHECK(records[0].key == "a");
   CHECK(records[1].key == "b");
   CHECK(records[2].key == "c");
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: rotate_segment() deletes the generation two rollovers back") {
@@ -502,8 +479,6 @@ TEST_CASE("Wal: rotate_segment() deletes the generation two rollovers back") {
   CHECK(records[0].key == "b");
   CHECK(records[0].lsn == lsn_b);
   CHECK(lsn_a < lsn_b);  // Sanity on the fixture, not the code under test.
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: rotate_segment() keeps LSN numbering continuous, does not reset") {
@@ -518,8 +493,6 @@ TEST_CASE("Wal: rotate_segment() keeps LSN numbering continuous, does not reset"
 
   const uint64_t lsn_after = append_insert(wal, as_span(bytes_of("c")), as_span(bytes_of("3")));
   CHECK(lsn_after > lsn_b);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: rotate_segment() with nothing written since the last rollover still preserves LSN continuity") {
@@ -541,8 +514,6 @@ TEST_CASE("Wal: rotate_segment() with nothing written since the last rollover st
 
   const uint64_t lsn_after = append_insert(wal, as_span(bytes_of("b")), as_span(bytes_of("2")));
   CHECK(lsn_after > lsn_a);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: rotate_segment() starts the new active segment empty") {
@@ -573,8 +544,6 @@ TEST_CASE("Wal: rotate_segment() starts the new active segment empty") {
                                                std::span<const std::byte> /*value*/,
                                                uint64_t lsn) { CHECK(lsn > 0); });
   CHECK(replayed_count == 51);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: rotate_segment() survives reopen -- every existing segment replays from a new Wal instance") {
@@ -600,8 +569,6 @@ TEST_CASE("Wal: rotate_segment() survives reopen -- every existing segment repla
   CHECK(keys[0] == "a");
   CHECK(keys[1] == "b");
   CHECK(keys[2] == "c");
-
-  vmemkv::remove_wal_segments(path);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -631,8 +598,6 @@ TEST_CASE("Wal: append after reopening a non-empty WAL does not hang") {
                  uint64_t /*lsn*/) { keys.push_back(span_to_string(key)); });
   REQUIRE(keys.size() == 3);
   CHECK(keys[2] == "c");
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: concurrent appends replay with exactly the content each thread wrote, keyed by LSN") {
@@ -682,8 +647,6 @@ TEST_CASE("Wal: concurrent appends replay with exactly the content each thread w
     CHECK(it->second.key == expected.key);
     CHECK(it->second.value == expected.value);
   }
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: append storm exceeding ring capacity does not corrupt or duplicate records") {
@@ -737,8 +700,6 @@ TEST_CASE("Wal: append storm exceeding ring capacity does not corrupt or duplica
     // wrapped-around ring slot.
     CHECK(it->second == expected_key);
   }
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: rotate_segment() under concurrent appends returns promptly and loses nothing") {
@@ -800,8 +761,6 @@ TEST_CASE("Wal: rotate_segment() under concurrent appends returns promptly and l
   // ever appended must still be present (see rotate_segment()'s doc comment for the retention
   // scheme), regardless of which segment it physically landed in.
   CHECK(replayed_lsns == expected_lsns);
-
-  vmemkv::remove_wal_segments(path);
 }
 
 TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding callers without hanging") {
@@ -863,6 +822,4 @@ TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding caller
   // The Wal must now be permanently poisoned: any further append fails immediately, without
   // attempting another syscall.
   CHECK_THROWS(append_insert(wal, as_span(bytes_of("after")), as_span(bytes_of("z"))));
-
-  vmemkv::remove_wal_segments(path);
 }

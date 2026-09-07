@@ -4,17 +4,48 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <checkpoint/checkpoint.hpp>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <vmemkv/config.hpp>
 #include <wal/wal.hpp>
 
 namespace vmemkv_test {
+
+// Config override providing a small T1 append-region capacity (2^Log2 entries) so
+// reorganize()/split triggers without needing thousands of puts per test run. Both fields must be
+// redeclared: Entries is computed from Log2 inside Config<>'s own scope, so overriding Log2 alone
+// would silently leave Entries at the base 2^22 default.
+template <size_t Log2>
+struct TinyAppendConfig : vmemkv::Config<> {
+  static constexpr size_t T1AppendCapacityLog2 = Log2;
+  static constexpr size_t T1AppendCapacityEntries = size_t{1} << Log2;
+};
+
+inline auto to_span(const std::string &text) -> std::span<const std::byte> {
+  return std::span<const std::byte>(reinterpret_cast<const std::byte *>(text.data()), text.size());
+}
+
+// Wraps a per-entry function into T1Index::reorganize()'s/ShardedT1Index::checkpoint_all_shards()'s
+// OffsetMapper contract (a single batch call over the whole merged span): invokes `fn` once per
+// entry, in order, so a test's mapper can block *inside* it to freeze a reorganize() call
+// mid-flight for a race test with exact per-entry timing. A generic (`auto`) span parameter lets
+// one adapter serve every EntrySnapshot type across callers.
+template <typename PerEntryFn>
+auto per_entry_offset_mapper(PerEntryFn fn) {
+  return [fn = std::move(fn)](auto merged) {
+    for (auto &entry : merged) {
+      entry.payload_bits = fn(entry.payload_bits, entry.hash);
+    }
+  };
+}
 
 // Base directory for test-created T2/WAL/checkpoint files. Sourced from VMEMKV_TEST_TMPDIR if
 // set, falling back to the system temp directory otherwise.
@@ -44,6 +75,47 @@ inline auto reserve_unique_temp_path(std::string_view prefix,
     vmemkv::remove_wal_segments(vmemkv::derive_wal_path(temp_path));
   }
   return temp_path;
+}
+
+// Removes every file a VMemKVImpl store could have created at `t2_path`: the T2 data file, its
+// WAL segments, manifest, and T1/T2 checkpoint files.
+inline void remove_store_files(const std::filesystem::path &t2_path) {
+  std::error_code ignored;
+  std::filesystem::remove(t2_path, ignored);
+  vmemkv::remove_wal_segments(vmemkv::derive_wal_path(t2_path));
+  std::filesystem::remove(vmemkv::derive_manifest_path(t2_path), ignored);
+  std::filesystem::remove(vmemkv::derive_t1_chk_path(t2_path), ignored);
+  std::filesystem::remove(vmemkv::derive_t2_chk_path(t2_path), ignored);
+}
+
+// RAII guard around a path from reserve_unique_temp_path(): implicitly converts to the reserved
+// path (so it drops into a call expecting a std::filesystem::path unchanged) and runs `cleanup`
+// on it both immediately (covering a stale leftover from a previous run, like
+// reserve_unique_temp_path()'s own `also_remove_wal_sibling`) and again on destruction --
+// including when a REQUIRE failure unwinds out of the test case, which an end-of-test cleanup
+// call would otherwise miss.
+class ScopedTempPath {
+ public:
+  ScopedTempPath(std::string_view prefix, std::function<void(const std::filesystem::path &)> cleanup)
+      : path_(reserve_unique_temp_path(prefix)), cleanup_(std::move(cleanup)) {
+    cleanup_(path_);
+  }
+  ~ScopedTempPath() { cleanup_(path_); }
+
+  ScopedTempPath(const ScopedTempPath &) = delete;
+  auto operator=(const ScopedTempPath &) -> ScopedTempPath & = delete;
+
+  operator const std::filesystem::path &() const noexcept { return path_; }
+  [[nodiscard]] auto get() const noexcept -> const std::filesystem::path & { return path_; }
+
+ private:
+  std::filesystem::path path_;
+  std::function<void(const std::filesystem::path &)> cleanup_;
+};
+
+inline void remove_plain_file(const std::filesystem::path &path) {
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
 }
 
 inline auto bytes_of(std::string_view value) -> std::vector<std::byte> {

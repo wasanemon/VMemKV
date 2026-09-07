@@ -41,11 +41,18 @@ inline auto encode_integral_key(Int value) noexcept -> std::array<std::byte, siz
   return out;
 }
 
-// Shared bodies for KeySerializer's and ValueSerializer's byte-container/string-like
-// specializations below: neither has a byte-order concern (the bytes are already raw, or a
-// string's bytes have no "order" to flip), so both serializer families share the same behavior
-// here -- only their integral specializations (big-endian + sign-bit flip for keys, little-endian
-// for values) actually differ.
+// Shared bodies and type-selection traits for KeySerializer's and ValueSerializer's
+// byte-container/string-like specializations below: neither has a byte-order concern (the bytes
+// are already raw, or a string's bytes have no "order" to flip), so both serializer families
+// share the same behavior here -- only their integral specializations (big-endian + sign-bit flip
+// for keys, little-endian for values) actually differ.
+template <typename T>
+inline constexpr bool is_byte_container_v =
+    std::is_same_v<std::decay_t<T>, std::span<const std::byte>> || std::is_same_v<std::decay_t<T>, std::vector<std::byte>>;
+
+template <typename T>
+inline constexpr bool is_string_like_v = std::is_convertible_v<std::decay_t<T>, std::string_view>;
+
 template <typename T>
 inline auto serialize_byte_container(const T& value) noexcept -> std::span<const std::byte> {
   return std::as_bytes(std::span(value));
@@ -66,17 +73,14 @@ struct KeySerializer {
 };
 
 template <typename T>
-struct KeySerializer<T,
-                     std::enable_if_t<std::is_same_v<std::decay_t<T>, std::span<const std::byte>> ||
-                                      std::is_same_v<std::decay_t<T>, std::vector<std::byte>> ||
-                                      std::is_same_v<std::decay_t<T>, std::vector<char>>>> {
+struct KeySerializer<T, std::enable_if_t<is_byte_container_v<T>>> {
   static auto serialize(const T& value) noexcept -> std::span<const std::byte> {
     return serialize_byte_container(value);
   }
 };
 
 template <typename T>
-struct KeySerializer<T, std::enable_if_t<std::is_convertible_v<std::decay_t<T>, std::string_view>>> {
+struct KeySerializer<T, std::enable_if_t<is_string_like_v<T>>> {
   static auto serialize(const T& value) noexcept -> std::span<const std::byte> { return serialize_string_like(value); }
 };
 
@@ -94,17 +98,14 @@ struct ValueSerializer {
 };
 
 template <typename T>
-struct ValueSerializer<T,
-                       std::enable_if_t<std::is_same_v<std::decay_t<T>, std::span<const std::byte>> ||
-                                        std::is_same_v<std::decay_t<T>, std::vector<std::byte>> ||
-                                        std::is_same_v<std::decay_t<T>, std::vector<char>>>> {
+struct ValueSerializer<T, std::enable_if_t<is_byte_container_v<T>>> {
   static auto serialize(const T& value) noexcept -> std::span<const std::byte> {
     return serialize_byte_container(value);
   }
 };
 
 template <typename T>
-struct ValueSerializer<T, std::enable_if_t<std::is_convertible_v<std::decay_t<T>, std::string_view>>> {
+struct ValueSerializer<T, std::enable_if_t<is_string_like_v<T>>> {
   static auto serialize(const T& value) noexcept -> std::span<const std::byte> { return serialize_string_like(value); }
 };
 

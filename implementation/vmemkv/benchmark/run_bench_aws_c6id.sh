@@ -309,13 +309,10 @@ wait_for_ssh_ready() {
   echo "Waiting for SSH to become available..."
   # ServerAliveInterval/CountMax: the LTM priming step's ssh command blocks for many minutes
   # while the remote side silently builds large corpora on NVMe -- no output flows back over the
-  # SSH channel for most of that time. Observed repeatedly: the local side of that connection
-  # dies (and this script exits) after ~16-18 minutes regardless of whether the remote instance
-  # or work is actually still healthy (confirmed via `aws ec2 describe-spot-instance-requests`
-  # showing the instance was still "active"/"fulfilled" when this happened) -- consistent with a
-  # NAT/firewall silently dropping a connection it sees as idle (WSL2's own NAT is a candidate),
-  # not an AWS-side problem. Periodic keepalives keep the channel visibly active even when the
-  # remote command itself has nothing to print for a while.
+  # SSH channel for most of that time. A NAT/firewall on the local side (WSL2's own NAT is a
+  # candidate) can silently drop a connection it sees as idle well before the remote work is done,
+  # independent of whether the remote instance is actually still healthy. Periodic keepalives keep
+  # the channel visibly active even when the remote command itself has nothing to print for a while.
   SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $PEM_FILE -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=6"
   for i in {1..30}; do
     if ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "echo 'SSH Ready'" >/dev/null 2>&1; then
@@ -429,11 +426,9 @@ prepare_remote_storage() {
     # amplification to a full 2MB on any write, khugepaged scan/lock overhead, synchronous
     # compaction stalls under the memory pressure this scenario deliberately creates, and 2MB-
     # granularity swap I/O that drags cold data in with hot data). VMemKV never opts in via
-    # MADV_HUGEPAGE anywhere, so there is no upside to THP being enabled for it; only ever
-    # observed locally under WSL2 (which happens to default to madvise, i.e. this was never an
-    # issue there) -- this AMI's actual default was unverified until now. 'madvise' rather than
-    # 'never': functionally equivalent for VMemKV (which never advises for it) while remaining
-    # the standard, less invasive system-wide choice.
+    # MADV_HUGEPAGE anywhere, so there is no upside to THP being enabled for it, regardless of
+    # this AMI's actual default. 'madvise' rather than 'never': functionally equivalent for VMemKV
+    # (which never advises for it) while remaining the standard, less invasive system-wide choice.
     THP_ENABLED_PATH=/sys/kernel/mm/transparent_hugepage/enabled
     THP_DEFRAG_PATH=/sys/kernel/mm/transparent_hugepage/defrag
     if [ -f \"\$THP_ENABLED_PATH\" ]; then
@@ -720,8 +715,8 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
         # so without a fresh drop_caches here, a cgroup-constrained pass could read the SAME
         # already-warm pages an earlier pass (or the unconstrained priming pass) just wrote, with
         # no new charge against MemoryHigh, meaning RocksDB never experiences the intended 8x
-        # memory oversubscription at all (confirmed directly:
-        # implementation/docs/benchmark/20260805_ltm_get_hit_profiling.md).
+        # memory oversubscription at all -- see
+        # implementation/docs/benchmark/20260805_ltm_get_hit_profiling.md.
         ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null" \
           >>"$scenario_stdout_log" 2>>"$scenario_stderr_log"
 

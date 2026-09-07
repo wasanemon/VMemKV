@@ -137,6 +137,10 @@ VMemKV が解消したい断片化は 2 種類ある。
 
 T1 の reorganize はT2とは独立して実行でき，高頻度で実施してもよい。
 
+Tier 1 自体は独立した複数シャードへの範囲パーティションとして実装されており、reorganize は
+シャード単位で背景ワーカーが自動的に実行する。設計は
+[t1_sharding_design.md](../t1_sharding_design.md) を参照。
+
 ![reorganize](../images/reorganization.png)
 
 Tier 1 は単独 `reorganize` により ordering fragmentation を軽く抑えられる。

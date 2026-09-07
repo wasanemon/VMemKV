@@ -289,9 +289,8 @@ class ShardedT1Index {
   // loop's own reorganize() call for that shard. T1Index::reorganize()'s reorg_in_progress_ CAS
   // guarantees at most one of the two actually runs -- but the *loser* returns immediately
   // without ever invoking its chk_writer callback at all, which would silently make this method
-  // skip that shard's data entirely if not retried. So each shard's call is retried (with
-  // backoff) until its callback actually fires, guaranteeing every shard contributes real data
-  // regardless of transient contention with the background pool.
+  // skip that shard's data entirely if not retried; reorganize_until_captured() below is what
+  // retries each shard's call until its callback actually fires.
   template <typename OffsetMapper, typename PerShardWriter>
   auto checkpoint_all_shards(OffsetMapper offset_mapper, PerShardWriter per_shard_writer) -> std::vector<Key> {
     splits_paused_.store(true, std::memory_order_release);
@@ -303,20 +302,7 @@ class ShardedT1Index {
     return with_routing_guard([&]() -> std::vector<Key> {
       Directory *dir = directory_.load(std::memory_order_acquire);
       for (ShardSlot *slot : dir->shards) {
-        bool captured = false;
-        SpinBackoff backoff;
-        while (!captured) {
-          slot->index->reorganize(
-              offset_mapper,
-              [&](std::span<const EntrySnapshot> merged) {
-                per_shard_writer(merged);
-                captured = true;
-              },
-              /*parallel_sort=*/false);
-          if (!captured) {
-            backoff.wait();
-          }
-        }
+        reorganize_until_captured(*slot->index, offset_mapper, per_shard_writer, /*parallel_sort=*/false);
       }
       return dir->boundaries;
     });
@@ -446,6 +432,30 @@ class ShardedT1Index {
     return func();
   }
 
+  // Retries shard.reorganize() until `on_merged` actually runs. T1Index::reorganize()'s
+  // reorg_in_progress_ CAS can make a call a no-op without invoking the callback at all when it
+  // races a concurrent reorganize() of the same shard (see that method's own comment) -- a bare
+  // merged_entries.empty() check can't distinguish that from a genuinely empty shard, so callers
+  // that need the real merge output retry through here instead.
+  template <typename OffsetMapper, typename OnMerged>
+  static void reorganize_until_captured(Shard &shard, OffsetMapper offset_mapper, OnMerged on_merged,
+                                        bool parallel_sort) {
+    bool captured = false;
+    SpinBackoff backoff;
+    while (!captured) {
+      shard.reorganize(
+          offset_mapper,
+          [&](std::span<const EntrySnapshot> merged) {
+            on_merged(merged);
+            captured = true;
+          },
+          parallel_sort);
+      if (!captured) {
+        backoff.wait();
+      }
+    }
+  }
+
   // Rest of the split protocol, run *after* the caller has already won `target`'s Closing CAS
   // (see docs/t1_sharding_design.md's "Splitting" section) -- deliberately unguarded (not called
   // from inside with_routing_guard()): winning that CAS makes `target` this thread's exclusive
@@ -486,35 +496,21 @@ class ShardedT1Index {
     // land a write after this snapshot; see the post-split drain further below (right before
     // `delete target`) for how that residual window is closed.
     //
-    // Retried until the callback actually fires (same pattern as checkpoint_all_shards()'s own
-    // per-shard loop, for the identical reason): T1Index::reorganize()'s reorg_in_progress_ CAS
-    // can make this call a no-op if a redundant, concurrently-dequeued run_maintenance() attempt
-    // for this same shard (a duplicate queue entry -- see run_maintenance()'s own comment) is
-    // *also* mid-reorganize() right now, in which case the callback never fires and
-    // merged_entries stays empty -- not because the shard is actually small, but because this
-    // call lost the race. Checking merged_entries.empty() can't tell those two cases apart; a
-    // `captured` flag set only inside the callback can. Without this retry, a shard could lose
-    // this race on every single split attempt for as long as write pressure keeps regenerating
-    // duplicate queue entries, silently aborting each time (the code below already resets
-    // superseded to null on "too small," making a lost race indistinguishable from a genuinely
-    // tiny shard) and growing without bound -- exactly the unsharded O(corpus) behavior this
-    // design exists to avoid.
+    // Retried via reorganize_until_captured() for the same reason as checkpoint_all_shards():
+    // a redundant, concurrently-dequeued run_maintenance() attempt for this same shard (a
+    // duplicate queue entry -- see run_maintenance()'s own comment) can be *also* mid-reorganize()
+    // right now, making this call a no-op via T1Index::reorganize()'s reorg_in_progress_ CAS.
+    // Without the retry, a shard could lose this race on every single split attempt for as long
+    // as write pressure keeps regenerating duplicate queue entries, silently aborting each time
+    // (the code below already resets superseded to null on "too small," making a lost race
+    // indistinguishable from a genuinely tiny shard) and growing without bound -- exactly the
+    // unsharded O(corpus) behavior this design exists to avoid.
     std::vector<EntrySnapshot> merged_entries;
-    bool captured = false;
-    SpinBackoff second_reorganize_backoff;
-    while (!captured) {
-      target->index->reorganize(
-          [](std::span<EntrySnapshot> /*merged*/) {},
-          [&](std::span<const EntrySnapshot> merged) {
-            merged_entries.assign(merged.begin(), merged.end());
-            captured = true;
-          },
-          /*parallel_sort=*/false);  // Many shards' reorganize() run concurrently; see
-                                     // T1Index::reorganize()'s own doc comment on this parameter.
-      if (!captured) {
-        second_reorganize_backoff.wait();
-      }
-    }
+    reorganize_until_captured(
+        *target->index, [](std::span<EntrySnapshot> /*merged*/) {},
+        [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); },
+        /*parallel_sort=*/false);  // Many shards' reorganize() run concurrently; see
+                                   // T1Index::reorganize()'s own doc comment on this parameter.
 
     constexpr size_t kMinSplitEntries = 2;
     if (merged_entries.size() < kMinSplitEntries) {
@@ -600,20 +596,10 @@ class ShardedT1Index {
     // being possible the moment Closing was set, long before this point. So target's state is now
     // permanently final, and one more reorganize() sees all of it.
     std::vector<EntrySnapshot> stragglers;
-    bool stragglers_captured = false;
-    SpinBackoff straggler_backoff;
-    while (!stragglers_captured) {
-      target->index->reorganize(
-          [](std::span<EntrySnapshot> /*merged*/) {},
-          [&](std::span<const EntrySnapshot> merged) {
-            stragglers.assign(merged.begin(), merged.end());
-            stragglers_captured = true;
-          },
-          /*parallel_sort=*/false);
-      if (!stragglers_captured) {
-        straggler_backoff.wait();
-      }
-    }
+    reorganize_until_captured(
+        *target->index, [](std::span<EntrySnapshot> /*merged*/) {},
+        [&](std::span<const EntrySnapshot> merged) { stragglers.assign(merged.begin(), merged.end()); },
+        /*parallel_sort=*/false);
     for (const EntrySnapshot &entry : stragglers) {
       ShardSlot *destination = entry.key < boundary ? low_slot : high_slot;
       destination->index->put_with_final_hash(entry.key, entry.hash, entry.payload_bits);
@@ -727,10 +713,7 @@ class ShardedT1Index {
   // then a concurrent split_shard_containing() (which resolves its own target independently of
   // the queue) could win the Closing CAS on that same slot, run continue_split() to completion,
   // bump routing_epoch_, and delete slot -- all invisible to routing_epochs_, since the worker
-  // never registered a guard before touching it. Found via TSan on a stress test combining real
-  // worker-driven splitting with a concurrent explicit splitter targeting the same shards (see
-  // that test's own comment); reproduced both a TSan data race and outright data loss before this
-  // fix.
+  // never registered a guard before touching it.
   //
   // With the dequeue inside the guard: if it observes `slot` still queued, that's only possible if
   // it ran (per queue_mutex_'s total order over all queue operations) before any concurrent

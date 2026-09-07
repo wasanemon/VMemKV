@@ -17,13 +17,11 @@ inline constexpr size_t kCacheLineSize = 64;
 // A process-wide, monotonically increasing ID assigned once per thread, shared by every
 // ThreadReferenceTracker<T> instance regardless of T or which specific instance a thread happens
 // to touch first -- this is what lets each tracker index a thread's slot directly (get() is the
-// same value everywhere), rather than each tracker independently searching for a "free" slot and
-// caching that instance-specific answer under one shared thread_local (the previous design's bug:
-// a slot free in the first tracker a thread ever touched says nothing about whether that same
-// index is free in a second, unrelated tracker instance of the same type -- two threads could
-// each get a locally-unique slot in different first-touched trackers, then collide when both
-// later touch a third, shared tracker). Never reused once assigned, even after the thread exits
-// -- see ThreadReferenceTracker's own comment for why that's an acceptable tradeoff here.
+// same value everywhere): a slot index assigned in one tracker instance is guaranteed free in
+// every other tracker instance too, so two threads can never collide on the same slot in a
+// shared tracker regardless of which tracker each first touched. Never reused once assigned, even
+// after the thread exits -- see ThreadReferenceTracker's own comment for why that's an acceptable
+// tradeoff here.
 class GlobalThreadId {
  public:
   static auto get() noexcept -> size_t {
@@ -42,14 +40,10 @@ class GlobalThreadId {
 //
 // Backed by a fixed-size array of atomic pointers to fixed-size chunks, each chunk allocated
 // (and the pointer published) only once GlobalThreadId::get() first needs a slot in it -- no
-// risk of two threads sharing a slot (see GlobalThreadId's own comment for the bug this
-// replaces). Unlike a std::deque (the prior design here), growing never reallocates or moves
-// already-published memory: a chunk, once allocated, is never touched again by growth, so a
-// concurrent index-based read of an already-published chunk can never race with another
-// thread's growth of a *different* chunk. (A std::deque doesn't have this property even though
-// references to existing elements stay stable across push_back/emplace_back: growth can still
-// mutate the deque's own internal bookkeeping that operator[] reads, which is exactly the data
-// race this design exists to avoid.) The common case (a thread whose chunk already exists) is a
+// risk of two threads sharing a slot (see GlobalThreadId's own comment). Growing never
+// reallocates or moves already-published memory: a chunk, once allocated, is never touched again
+// by growth, so a concurrent index-based read of an already-published chunk can never race with
+// another thread's growth of a *different* chunk. The common case (a thread whose chunk already exists) is a
 // single atomic load, no lock at all. Tradeoffs: a slot is never reclaimed once grown into, even
 // after that thread exits -- acceptable here since every acquire() is paired with a release() via
 // Guard's RAII (so a live slot always reads back to T{} once idle) and this store's thread
@@ -101,12 +95,9 @@ class ThreadReferenceTracker {
   void release() const noexcept { slot_for_current_thread().store(T{}, std::memory_order_release); }
 
   // Waits (spins/yields) until all thread slots no longer reference the specified old value.
-  // Useful for Hazard-pointer-like pointer retired validation. seq_cst load: see acquire()'s comment.
-  // SpinBackoff (not a bare yield()): a pure yield-spin here converges quickly on an
-  // under-subscribed machine but reproduced as genuine, sustained starvation on CI's real
-  // low-core-count, contended runner (see SpinBackoff's own doc comment for the precedent this
-  // repeats -- the same fix already applied to VMemKVImpl::get_impl()/try_in_place_update()'s
-  // retry loops for the identical reason).
+  // Useful for Hazard-pointer-like pointer retired validation. seq_cst load: see acquire()'s
+  // comment. SpinBackoff (not a bare yield()): avoids sustained starvation on a contended,
+  // low-core-count machine -- see SpinBackoff's own doc comment.
   void wait_until_retired(T old_val) const noexcept {
     for_each_slot([&](std::atomic<T> &slot) {
       SpinBackoff backoff;

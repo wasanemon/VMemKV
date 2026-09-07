@@ -30,7 +30,7 @@
 
 // Verify that all major variants satisfy the C++20 KVStore concept
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_Baseline>);
-static_assert(vmemkv::KVStore<vmemkv::variants::VMemKVStore>);
+static_assert(vmemkv::KVStore<vmemkv::VMemKVStore>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDB>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDBBlobDB>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_LMDB>);
@@ -163,16 +163,15 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 #define LONG_KEY_STORE_TYPES STORE_TYPES
 #define LARGE_VALUE_STORE_TYPES STORE_TYPES
 
-struct ReorgEveryWriteConfig : vmemkv::Config<> {
-  // Partial override style: inherit all defaults and only tune reorg aggressiveness.
-  static constexpr size_t T1ReorganizeSoftThresholdPercent = 1;
-  static constexpr size_t T1ReorganizeHardThresholdPercent = 1;
+struct FrequentCheckpointConfig : vmemkv::Config<> {
+  // Partial override style: inherit all defaults and only tune checkpoint aggressiveness.
+  static constexpr size_t WalMaxBytesSinceCheckpoint = 64ULL << 10;  // 64 KiB.
 };
 
-static_assert(ReorgEveryWriteConfig::T1AppendCapacityEntries ==
-              (size_t{1} << ReorgEveryWriteConfig::T1AppendCapacityLog2));
+static_assert(FrequentCheckpointConfig::T1AppendCapacityEntries ==
+              (size_t{1} << FrequentCheckpointConfig::T1AppendCapacityLog2));
 
-using VMemKV_ReorgEveryWrite = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<ReorgEveryWriteConfig>>;
+using VMemKV_FrequentCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<FrequentCheckpointConfig>>;
 
 template <typename StoreHandle>
 static void insert_sequential_u64_values(StoreHandle &store, int key_count) {
@@ -214,22 +213,22 @@ TEST_CASE_TEMPLATE("insert and get", Store, STORE_TYPES) {
   CHECK(test_util::get_sync(store, "a") == 10U);
 }
 
-TEST_CASE("sync reorganize-before-write is transparent") {
-  auto store = StoreFactory<VMemKV_ReorgEveryWrite>::make();
+TEST_CASE("checkpoint churn during writes is transparent") {
+  auto store = StoreFactory<VMemKV_FrequentCheckpoint>::make();
 
   constexpr int key_count = 25000;
   insert_sequential_u64_values(store, key_count);
 
-  // This update path requires append and should stay transparent even when
-  // pre-write reorganize triggers very frequently.
+  // The append-then-inline-to-non-inline update path should stay transparent even when
+  // checkpoints trigger frequently in between.
   check_hot_key_upgrade_is_visible(store);
 
   check_sequential_u64_values(store, key_count);
 }
 
 TEST_CASE("partial config inheritance keeps required append-capacity fields") {
-  auto store = StoreFactory<VMemKV_ReorgEveryWrite>::make();
-  CHECK(ReorgEveryWriteConfig::T1AppendCapacityEntries == vmemkv::Config<>::T1AppendCapacityEntries);
+  auto store = StoreFactory<VMemKV_FrequentCheckpoint>::make();
+  CHECK(FrequentCheckpointConfig::T1AppendCapacityEntries == vmemkv::Config<>::T1AppendCapacityEntries);
   CHECK(store->insert("partial_cfg", 1));
   CHECK(test_util::get_sync(store, "partial_cfg") == 1U);
 }
@@ -296,13 +295,10 @@ TEST_CASE_TEMPLATE("custom serializers (ADL) for user-defined types", Store, STO
   CHECK(results[1] == kLargeValue);
 }
 
-// Regression test: a value that's bit-for-bit identical to T1's STORE_NOT_FOUND sentinel
-// (~0ULL) used to be rejected outright by StoreAdapter::insert()/update() -- necessary at the
-// time because inlining it would have made the entry indistinguishable from "not found" on every
-// read path, but that rejection never covered bulk_load() (a real bug, fixed separately). Now
-// that VMemKVImpl::try_make_inline_payload() itself declines to inline this exact value (routing
-// it through the ordinary T2-record path instead, whose payload is an offset, never the raw value
-// bytes), the value is fully storable and retrievable like any other -- verifies that here.
+// A value that's bit-for-bit identical to T1's STORE_NOT_FOUND sentinel (~0ULL) is fully storable
+// and retrievable like any other: VMemKVImpl::try_make_inline_payload() declines to inline this
+// exact value, routing it through the ordinary T2-record path instead, whose payload is an
+// offset, never the raw value bytes.
 TEST_CASE_TEMPLATE("insert accepts a value equal to STORE_NOT_FOUND and it round-trips", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   CHECK(store->insert("a", vmemkv::STORE_NOT_FOUND));
@@ -331,13 +327,10 @@ TEST_CASE_TEMPLATE("update accepts a value equal to STORE_NOT_FOUND and it round
   CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
 }
 
-// Regression test for the actual bug: unlike insert()/update(), StoreAdapter::bulk_load() never
-// went through the sentinel-rejection guard above (it calls impl_.bulk_load_impl() directly), and
-// VMemKVImpl::try_make_inline_payload()/T1Index::put() had no equivalent check of their own --
-// so a bulk-loaded entry whose 8-byte value happened to equal STORE_NOT_FOUND was silently
-// inlined and became permanently invisible to both get() and scan() (indistinguishable from a
-// tombstone). Exercises the fix directly through bulk_load(), on the one variant where inlining
-// is actually possible.
+// StoreAdapter::bulk_load() calls impl_.bulk_load_impl() directly, bypassing insert()/update()'s
+// own path -- exercises that a bulk-loaded entry whose 8-byte value equals STORE_NOT_FOUND still
+// round-trips via get()/scan() instead of being silently inlined and becoming indistinguishable
+// from a tombstone, on the one variant where inlining is actually possible.
 TEST_CASE("bulk_load: an entry whose value equals STORE_NOT_FOUND round-trips via get() and scan()") {
   auto store = StoreFactory<vmemkv::variants::VMemKV_Var2_Inline>::make();
   const std::string all_ff_value(8, '\xFF');
@@ -604,15 +597,13 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
 // Deliberately bounded (kOpsPerCycle updates/scans per cycle, spawned and joined once per
 // checkpoint() call) rather than free-spinning update/scan threads for the whole test duration:
 // a handful of concurrent attempts per cycle, 60 times over, is enough to give any race a fair
-// chance without needing sustained throughput. Free-spinning threads were tried first and run into a
-// separate, already-fixed bug instead (get_impl()/scan_impl() exposing torn, mid-write T2
-// records to the caller's callback -- see the "Torn-read fix" comments in get_impl()/scan_impl()
-// in vmemkv_impl.hpp): at millions of scan calls, that unrelated race in the ordinary
-// seqlock-protected read path reproduces on its own, with zero checkpoint()/reorganize() activity
-// at all, and would make this test flaky for a reason that has nothing to do with what it's
-// actually trying to catch. Run under ThreadSanitizer for direct
-// race detection where available; also self-checks independent of TSan via the same
-// uniform-byte-value technique as the "...repeated reorganize" test above.
+// chance without needing sustained throughput. Free-spinning threads hit the unrelated torn-read
+// race in the ordinary seqlock-protected read path (see the "Torn-read fix" comments in
+// get_impl()/scan_impl() in vmemkv_impl.hpp) at millions of scan calls, with zero
+// checkpoint()/reorganize() activity at all, making this test flaky for a reason that has nothing
+// to do with what it's actually trying to catch. Run under ThreadSanitizer for direct race
+// detection where available; also self-checks independent of TSan via the same uniform-byte-value
+// technique as the "...repeated reorganize" test above.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE(
     "VMemKV: concurrent update+scan survive repeated cheap checkpoint() "
@@ -933,14 +924,12 @@ TEST_CASE_TEMPLATE("scan with integral keys verifies lexicographical ordering", 
   CHECK(keys[3] == kScanHundred);
 }
 
-// Regression test: scan_impl()'s inline-value fast path used to recover a key's original length
-// from T1's 16-byte zero-padded prefix by trimming trailing zero bytes -- ambiguous whenever the
-// key's own last byte is 0x00 (indistinguishable from padding), which silently truncated the key
-// handed to scan()'s callback. A big-endian-encoded integer key that's a multiple of 256 hits this
-// directly (e.g. 256 encodes as {0x00,0x00,0x01,0x00}). Fixed by excluding such keys from
-// inlining (try_make_inline_payload()) so they take the normal T2-record path instead, where the
-// full key is stored verbatim. This test only makes sense for a store with UseT1InlineValue on
-// (Var2_Inline) -- the bug is specific to that fast path.
+// try_make_inline_payload() excludes a key whose own last byte is 0x00 from inlining -- T1's
+// 16-byte zero-padded prefix would make such a key's true length ambiguous with padding on
+// scan_impl()'s inline-value fast path, so it takes the normal T2-record path instead, where the
+// full key is stored verbatim. A big-endian-encoded integer key that's a multiple of 256 hits this
+// directly (e.g. 256 encodes as {0x00,0x00,0x01,0x00}). This test only makes sense for a store
+// with UseT1InlineValue on (Var2_Inline) -- the case is specific to that fast path.
 TEST_CASE("Value Inlining: scan() returns the untruncated key for a key ending in a zero byte") {
   auto store = StoreFactory<vmemkv::variants::VMemKV_Var2_Inline>::make();
   store->insert(256U, 256U);  // big-endian encode(256) = {0x00,0x00,0x01,0x00} -- ends in 0x00.
@@ -973,87 +962,82 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   constexpr uint64_t kOddInlineValue = 0x003456789ABCDEF1ULL;
   constexpr uint64_t kEvenInlineValue = 0x123456789ABCDEF0ULL;
 
-  SUBCASE("T1InlineValue behavior (1-8 bytes)") {
-    using InlineStore = vmemkv::variants::VMemKV_Var2_Inline;
-    auto store = std::make_unique<InlineStore>(path, kInlineStoreCapacityBytes);
+  using InlineStore = vmemkv::variants::VMemKV_Var2_Inline;
+  auto store = std::make_unique<InlineStore>(path, kInlineStoreCapacityBytes);
 
-    uint64_t initial_bytes = store->t2().bytes_used();
-    CHECK(initial_bytes == 0);
+  uint64_t initial_bytes = store->t2().bytes_used();
+  CHECK(initial_bytes == 0);
 
-    // 1-7 bytes: should inline (no T2 usage).
-    std::vector<std::byte> val_short(kShortInlineValueBytes, kShortFillByte);
-    store->insert("key1", val_short);
+  // 1-7 bytes: should inline (no T2 usage).
+  std::vector<std::byte> val_short(kShortInlineValueBytes, kShortFillByte);
+  store->insert("key1", val_short);
 
-    CHECK(store->t2().bytes_used() == 0);
+  CHECK(store->t2().bytes_used() == 0);
 
-    auto res = test_util::get_bytes_sync(store, "key1");
-    if (!res.has_value()) {
-      FAIL("missing key1 inline payload");
-    }
-    const auto &res_value = *res;  // NOLINT(bugprone-unchecked-optional-access)
-    CHECK(res_value.size() == kShortInlineValueBytes);
-    CHECK(res_value[0] == kShortFillByte);
-
-    // 8-byte odd integer: should inline.
-    uint64_t val_odd = kOddInlineValue;
-    std::vector<std::byte> val_odd_bytes(kInlineValueBytes);
-    std::memcpy(val_odd_bytes.data(), &val_odd, kInlineValueBytes);
-
-    store->insert("key_odd", val_odd_bytes);
-    CHECK(store->t2().bytes_used() == 0);
-
-    auto res_odd = test_util::get_bytes_sync(store, "key_odd");
-    if (!res_odd.has_value()) {
-      FAIL("missing key_odd inline payload");
-    }
-    const auto &res_odd_value = *res_odd;  // NOLINT(bugprone-unchecked-optional-access)
-    REQUIRE(res_odd_value.size() == kInlineValueBytes);
-    uint64_t read_odd = 0;
-    std::memcpy(&read_odd, res_odd_value.data(), kInlineValueBytes);
-    CHECK(read_odd == val_odd);
-
-    // 8-byte even integer: should also inline.
-    uint64_t val_even = kEvenInlineValue;
-    std::vector<std::byte> val_even_bytes(kInlineValueBytes);
-    std::memcpy(val_even_bytes.data(), &val_even, kInlineValueBytes);
-
-    store->insert("key_even", val_even_bytes);
-    CHECK(store->t2().bytes_used() == 0);
-
-    auto res_even = test_util::get_bytes_sync(store, "key_even");
-    if (!res_even.has_value()) {
-      FAIL("missing key_even inline payload");
-    }
-    const auto &res_even_value = *res_even;  // NOLINT(bugprone-unchecked-optional-access)
-    REQUIRE(res_even_value.size() == kInlineValueBytes);
-    uint64_t read_even = 0;
-    std::memcpy(&read_even, res_even_value.data(), kInlineValueBytes);
-    CHECK(read_even == val_even);
-
-    // 9+ bytes: should bypass inlining and go to T2.
-    std::vector<std::byte> val_long(kLongValueBytes, kLongFillByte);
-    store->insert("key2", val_long);
-
-    CHECK(store->t2().bytes_used() > 0);
-
-    std::filesystem::remove(path);
-    vmemkv::remove_wal_segments(vmemkv::derive_wal_path(path));
+  auto res = test_util::get_bytes_sync(store, "key1");
+  if (!res.has_value()) {
+    FAIL("missing key1 inline payload");
   }
+  const auto &res_value = *res;  // NOLINT(bugprone-unchecked-optional-access)
+  CHECK(res_value.size() == kShortInlineValueBytes);
+  CHECK(res_value[0] == kShortFillByte);
+
+  // 8-byte odd integer: should inline.
+  uint64_t val_odd = kOddInlineValue;
+  std::vector<std::byte> val_odd_bytes(kInlineValueBytes);
+  std::memcpy(val_odd_bytes.data(), &val_odd, kInlineValueBytes);
+
+  store->insert("key_odd", val_odd_bytes);
+  CHECK(store->t2().bytes_used() == 0);
+
+  auto res_odd = test_util::get_bytes_sync(store, "key_odd");
+  if (!res_odd.has_value()) {
+    FAIL("missing key_odd inline payload");
+  }
+  const auto &res_odd_value = *res_odd;  // NOLINT(bugprone-unchecked-optional-access)
+  REQUIRE(res_odd_value.size() == kInlineValueBytes);
+  uint64_t read_odd = 0;
+  std::memcpy(&read_odd, res_odd_value.data(), kInlineValueBytes);
+  CHECK(read_odd == val_odd);
+
+  // 8-byte even integer: should also inline.
+  uint64_t val_even = kEvenInlineValue;
+  std::vector<std::byte> val_even_bytes(kInlineValueBytes);
+  std::memcpy(val_even_bytes.data(), &val_even, kInlineValueBytes);
+
+  store->insert("key_even", val_even_bytes);
+  CHECK(store->t2().bytes_used() == 0);
+
+  auto res_even = test_util::get_bytes_sync(store, "key_even");
+  if (!res_even.has_value()) {
+    FAIL("missing key_even inline payload");
+  }
+  const auto &res_even_value = *res_even;  // NOLINT(bugprone-unchecked-optional-access)
+  REQUIRE(res_even_value.size() == kInlineValueBytes);
+  uint64_t read_even = 0;
+  std::memcpy(&read_even, res_even_value.data(), kInlineValueBytes);
+  CHECK(read_even == val_even);
+
+  // 9+ bytes: should bypass inlining and go to T2.
+  std::vector<std::byte> val_long(kLongValueBytes, kLongFillByte);
+  store->insert("key2", val_long);
+
+  CHECK(store->t2().bytes_used() > 0);
+
+  std::filesystem::remove(path);
+  vmemkv::remove_wal_segments(vmemkv::derive_wal_path(path));
 }
 
-// Regression tests for the formerly-open "torn read via user callback" bug:
-// get_impl()/scan_impl() used to invoke the caller-supplied callback directly from inside
-// read_t2_record_seqlock()'s copy_func, handing it a std::span into T2Memory::base -- live,
-// concurrently update_value_at()-writable memory -- *before* the seqlock's version re-check had
-// run. The seqlock did correctly detect the race and retry afterward, but could not retract the
-// fact that the callback had already observed torn (part-old, part-new) bytes on the first,
-// discarded attempt. Fixed by having copy_func only copy into an owned buffer and invoking the
-// callback after read_t2_record_seqlock() returns (see get_impl()/scan_impl()'s own comments).
+// get_impl()/scan_impl() must invoke the caller-supplied callback only after
+// read_t2_record_seqlock() returns, from an owned buffer copy_func copied into -- never directly
+// from inside copy_func with a std::span into T2Memory::base, which is live, concurrently
+// update_value_at()-writable memory the seqlock's version re-check hasn't validated yet (see
+// get_impl()/scan_impl()'s own comments).
 //
 // Deliberately no reorganize()/checkpoint() anywhere in either test below: unlike
-// the writer-stop-barrier/residual-window tests elsewhere in this file, this race needed nothing but
-// plain concurrent update()+scan() (or update()+get()) on a single key -- proving the fix holds
-// even in that minimal case is the point.
+// the writer-stop-barrier/residual-window tests elsewhere in this file, this race needs nothing but
+// plain concurrent update()+scan() (or update()+get()) on a single key -- proving the guarantee
+// holds even in that minimal case is the point.
 TEST_CASE("VMemKV: scan callback never observes a torn read across a concurrent update (regression)") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
@@ -1251,7 +1235,7 @@ void verify_straggler_readback(StorePtr &store, const std::string &straggler_val
 TEST_CASE(
     "VMemKV: checkpoint's writer-stop barrier waits for an in-flight writer instead of "
     "capturing a frontier underneath it (regression)") {
-  using TestStore = vmemkv::variants::VMemKVStore;
+  using TestStore = vmemkv::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
@@ -1289,29 +1273,25 @@ TEST_CASE(
   verify_straggler_readback(store, straggler_value);
 }
 
-// Regression test for the formerly-open "residual window" race described in
-// checkpoint_internal()'s comment: T2FlatFile::acquire_write_handle() used to check
-// writer_stop_ *before* registering with the reference tracker, which
-// ThreadReferenceTracker::wait_until_retired()'s single index-ordered scan (it never re-examines
-// a slot once past it) could race -- a writer whose check saw the flag false, but who hadn't
-// registered yet, could still be missed by an already-in-progress scan, so the stop-and-wait
-// could complete and the writer would go on to append past the frontier this same cycle just
-// captured. Fixed by registering first and only then checking the flag, retrying if it turns out
-// to already be true.
+// T2FlatFile::acquire_write_handle() registers with the reference tracker *before* checking
+// writer_stop_, and retries if that check then finds the flag already true: registering first
+// closes a window that ThreadReferenceTracker::wait_until_retired()'s single index-ordered scan
+// (it never re-examines a slot once past it) would otherwise open -- a writer whose flag check ran
+// before registering could be missed by an already-in-progress scan, letting stop_writers_and_wait()
+// complete while that writer goes on to append past the frontier this same cycle just captured.
 //
 // Reproduces the adversarial timing deterministically via acquire_write_handle()'s hook seam
 // (fires once, right after registering and before the writer_stop_ check): the writer thread
 // registers, signals pre_stop_hook that it has done so, then sleeps -- guaranteeing
 // stop_writers_and_wait() (called on the main thread right after pre_stop_hook returns) sets
 // writer_stop_=true and starts scanning while this thread is still paused, already registered but
-// not yet having checked the flag. Under the fix, the writer's own check must then see
-// writer_stop_==true and back out/retry rather than proceed with a handle that might land past
-// the frontier this same cycle already captured -- exactly the guarantee the old check-then-register
-// order could not make.
+// not yet having checked the flag. The writer's own check must then see writer_stop_==true and
+// back out/retry rather than proceed with a handle that might land past the frontier this same
+// cycle already captured.
 TEST_CASE(
     "VMemKV: acquire_write_handle()'s register-then-check-retry survives a writer racing the "
     "writer-stop scan (regression)") {
-  using TestStore = vmemkv::variants::VMemKVStore;
+  using TestStore = vmemkv::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
@@ -1372,7 +1352,7 @@ TEST_CASE(
 // still fully functional afterward -- no hang, correct data, and a subsequent checkpoint()
 // succeeds normally.
 TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the store fully usable") {
-  using TestStore = vmemkv::variants::VMemKVStore;
+  using TestStore = vmemkv::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 

@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # run_5parallel_bench.sh - Wrapper to run 5 parallel AWS spot benchmarks: the 4 CRUD-matrix
-# combos (as run_4parallel_bench.sh, renamed, used to) plus a 5th dedicated instance for two
-# background-maintenance probes: background-jobs (reorganize()/checkpoint()'s own duration +
-# Insert/Update/Scan QPS degradation while a forced, whole-store call runs -- see
-# run_background_jobs_probe.sh) and organic-split (the same QPS-degradation question, but for
-# ShardedT1Index's own automatic per-shard splitting under sustained write load, the maintenance
-# path that actually runs during ordinary operation -- see run_organic_split_probe.sh). The 5th
-# task gets its own instance (--skip-matrix, no --scenario/--value-size) rather than riding along
-# on one of the other 4: both probes' corpora are unrelated to any one (scenario, value_size)
-# combo, and each runs both its own in_memory and ltm points there, so neither would partition
-# cleanly onto one of the 4 combo-scoped instances the way the retired reorg-scaling/checkpoint-
-# throughput/maintenance-contention probes used to.
+# combos plus a 5th dedicated instance for two background-maintenance probes: background-jobs
+# (reorganize()/checkpoint()'s own duration + Insert/Update/Scan QPS degradation while a forced,
+# whole-store call runs -- see run_background_jobs_probe.sh) and organic-split (the same
+# QPS-degradation question, but for ShardedT1Index's own automatic per-shard splitting under
+# sustained write load, the maintenance path that actually runs during ordinary operation -- see
+# run_organic_split_probe.sh). The 5th task gets its own instance (--skip-matrix, no
+# --scenario/--value-size) rather than riding along on one of the other 4: both probes' corpora
+# are unrelated to any one (scenario, value_size) combo, and each runs both its own in_memory and
+# ltm points there, so neither partitions cleanly onto one of the 4 combo-scoped instances.
 
 set -euo pipefail
 

@@ -15,6 +15,12 @@ This directory contains the benchmark executable, the local runner, the AWS runn
   - Keeps build/run plumbing out of the runners.
 - `common/benchmark_progress.awk`
   - Shared output prefixer for time and progress counters.
+- `common/run_scenario.sh`
+  - Host-agnostic wrapper that runs a single Google Benchmark scenario.
+  - Used identically by `run_bench.sh` (in-process) and `run_bench_aws_c6id.sh` (over SSH).
+- `common/reorg_probe_common.sh`
+  - Shared driver logic for `bench_kv`'s standalone `--reorg-probe` CLI mode.
+  - Used by `run_background_jobs_probe.sh` and `run_organic_split_probe.sh`.
 - `run_bench.sh`
   - Local-only runner.
   - Builds locally, executes locally, and saves raw Google Benchmark JSON.
@@ -23,6 +29,16 @@ This directory contains the benchmark executable, the local runner, the AWS runn
   - AWS orchestration runner.
   - Provisions EC2, prepares storage, builds remotely, runs the selected cases, and collects results.
   - `--ltm-first` flips execution order, `--large-value-first` flips the value order within the active scenario, and `--quick` runs one workload per scenario.
+- `run_5parallel_bench.sh`
+  - Wrapper running the 4 CRUD-matrix combos plus a 5th instance for the two background-maintenance probes below, each on its own AWS spot instance.
+- `run_background_jobs_probe.sh`
+  - Fixed-corpus reference measurement for `reorganize()`/`checkpoint()`'s own duration and the QPS degradation they cause to concurrent Insert/Update/Scan workloads.
+- `run_organic_split_probe.sh`
+  - Insert-QPS impact of `ShardedT1Index`'s own automatic per-shard background splitting under sustained write load.
+- `generate_report.py`
+  - Generates a `benchmark_results/pages/<id>_charts.html` report from a `benchmark_results/<id>/` directory.
+- `merge_vmemkv_only_results.py`
+  - Merges a `--without-rivals` run's VMemKV-only results back into a prior full-matrix run's rival numbers.
 - `aws/aws_clean.sh`
   - Cleanup helper for temporary AWS resources.
 

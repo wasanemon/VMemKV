@@ -61,6 +61,13 @@ compile_commands.json
 .markdownlintcache
 
 # =============================
+# Python cache
+# =============================
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# =============================
 # VMemKV Benchmark & DB Files
 # =============================
 *.bin

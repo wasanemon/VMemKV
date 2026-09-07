@@ -30,17 +30,8 @@
 
 namespace {
 
-auto reserve_crash_temp_path() -> std::filesystem::path {
-  return vmemkv_test::reserve_unique_temp_path("vmemkv_crash", /*also_remove_wal_sibling=*/true);
-}
-
-void cleanup_store_files(const std::filesystem::path &t2_path) {
-  std::error_code ignored;
-  std::filesystem::remove(t2_path, ignored);
-  vmemkv::remove_wal_segments(vmemkv::derive_wal_path(t2_path));
-  std::filesystem::remove(vmemkv::derive_manifest_path(t2_path), ignored);
-  std::filesystem::remove(vmemkv::derive_t1_chk_path(t2_path), ignored);
-  std::filesystem::remove(vmemkv::derive_t2_chk_path(t2_path), ignored);
+auto reserve_crash_temp_path() -> vmemkv_test::ScopedTempPath {
+  return vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
 }
 
 // Values are always >= 9 bytes so T1InlineValue's <=8B inlining never applies,
@@ -117,7 +108,6 @@ TEST_CASE_TEMPLATE("crash recovery: clean restart, empty store stays empty", Sto
     CHECK_FALSE(get_bytes(store, "anything").has_value());
     CHECK(store->insert("k", make_value(0)));
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE("crash recovery: clean restart recovers 100 inserted keys", Store, CRASH_RECOVERY_STORE_TYPES) {
@@ -137,7 +127,6 @@ TEST_CASE_TEMPLATE("crash recovery: clean restart recovers 100 inserted keys", S
       CHECK(*val == make_value(i));
     }
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE("crash recovery: update then restart persists only the latest value",
@@ -156,7 +145,6 @@ TEST_CASE_TEMPLATE("crash recovery: update then restart persists only the latest
     REQUIRE(val.has_value());
     CHECK(*val == make_value(2));
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE("crash recovery: delete then restart tombstone is durable, re-insert works",
@@ -176,7 +164,6 @@ TEST_CASE_TEMPLATE("crash recovery: delete then restart tombstone is durable, re
     REQUIRE(val.has_value());
     CHECK(*val == make_value(1));
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE("crash recovery: insert-delete-reinsert-update replays to final state only",
@@ -196,7 +183,6 @@ TEST_CASE_TEMPLATE("crash recovery: insert-delete-reinsert-update replays to fin
     REQUIRE(val.has_value());
     CHECK(*val == make_value(2));
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE("crash recovery: torn trailing partial header discarded, prior writes recovered, store usable",
@@ -223,7 +209,6 @@ TEST_CASE_TEMPLATE("crash recovery: torn trailing partial header discarded, prio
     REQUIRE(val.has_value());
     CHECK(*val == make_value(999));
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE(
@@ -251,7 +236,6 @@ TEST_CASE_TEMPLATE(
     REQUIRE(val.has_value());
     CHECK(*val == make_value(999));
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE("crash recovery: corrupted checksum on last record discarded, earlier keys intact",
@@ -280,7 +264,6 @@ TEST_CASE_TEMPLATE("crash recovery: corrupted checksum on last record discarded,
     }
     CHECK_FALSE(get_bytes(store, "doomed").has_value());
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE("crash recovery: writes after recovery remain durable across a second restart",
@@ -317,7 +300,6 @@ TEST_CASE_TEMPLATE("crash recovery: writes after recovery remain durable across 
       CHECK(*val == make_value(1000 + i));
     }
   }
-  cleanup_store_files(path);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -357,7 +339,6 @@ TEST_CASE_TEMPLATE("crash recovery: concurrent inserts before crash all recover"
       }
     }
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct split, reorganize still works",
@@ -398,17 +379,11 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
       CHECK(*val == make_value(i));
     }
   }
-  cleanup_store_files(path);
 }
 
 namespace {
-struct TinyAppendConfig : vmemkv::Config<> {
-  // Shrinks append-region capacity to force frequent reorganizes. Both fields must be
-  // redeclared: Entries is computed from Log2 inside Config<>'s own scope.
-  static constexpr size_t T1AppendCapacityLog2 = 8;  // 256-entry append region.
-  static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
-};
-static_assert(TinyAppendConfig::T1AppendCapacityEntries == (size_t{1} << TinyAppendConfig::T1AppendCapacityLog2));
+// 256-entry append region: shrinks append-region capacity to force frequent reorganizes.
+using TinyAppendConfig = vmemkv_test::TinyAppendConfig<8>;
 
 using VMemKV_TinyAppend = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyAppendConfig>>;
 }  // namespace
@@ -434,13 +409,11 @@ TEST_CASE("crash recovery: recovery under tiny T1 append-region capacity does no
       CHECK(*val == make_value(i));
     }
   }
-  cleanup_store_files(path);
 }
 
 namespace {
-struct TinyShardConfig : vmemkv::Config<> {
-  static constexpr size_t T1AppendCapacityLog2 = 10;  // 1024-entry append region.
-  static constexpr size_t T1AppendCapacityEntries = size_t{1} << T1AppendCapacityLog2;
+// 1024-entry append region.
+struct TinyShardConfig : vmemkv_test::TinyAppendConfig<10> {
   static constexpr size_t T1ShardTargetSizeEntries = 50;  // Forces splits well before kKeyCount below.
 };
 using VMemKV_TinyShard = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyShardConfig>>;
@@ -476,7 +449,6 @@ TEST_CASE("checkpoint: sharded T1 survives checkpoint and restart with multiple 
       CHECK(*val == make_value(i));
     }
   }
-  cleanup_store_files(path);
 }
 
 namespace {
@@ -485,10 +457,10 @@ namespace {
 auto capacity_test_key(int index) -> std::string { return "key_over16bytes_" + std::to_string(index); }
 }  // namespace
 
-// Regression test: insert_impl()/update_impl() used to log to the WAL before the T1/T2 mutation
-// was known to succeed. A failed mutation (e.g. T2 capacity exceeded) left a durably-fsynced
-// "phantom" WAL record whose replay hit the identical throw on the next restart, permanently
-// bricking the store. Fixed by logging only after the mutation actually applies.
+// insert_impl()/update_impl() must log to the WAL only after the T1/T2 mutation actually applies:
+// logging first would leave a durably-fsynced "phantom" WAL record behind a failed mutation (e.g.
+// T2 capacity exceeded), whose replay would hit the identical throw on every future restart,
+// permanently bricking the store.
 TEST_CASE("crash recovery: insert failing on T2 capacity exceeded leaves no phantom WAL record") {
   const auto path = reserve_crash_temp_path();
   constexpr uint64_t kTinyT2Capacity = 200;  // Room for 3 of these ~56B records, not 4.
@@ -516,8 +488,6 @@ TEST_CASE("crash recovery: insert failing on T2 capacity exceeded leaves no phan
     CHECK(*val == "01234567");
   }
   CHECK_FALSE(get_bytes(store, capacity_test_key(99)).has_value());
-
-  cleanup_store_files(path);
 }
 
 // Same bug, but through update_impl()'s write_entry_lockfree() fallback path (value grew too
@@ -548,8 +518,6 @@ TEST_CASE("crash recovery: update failing on T2 capacity exceeded leaves no phan
   const auto val1 = get_bytes(store, capacity_test_key(1));
   REQUIRE(val1.has_value());
   CHECK(*val1 == "01234567");
-
-  cleanup_store_files(path);
 }
 
 // ─── Checkpoint / Reload integration tests ──────────────────────────────────────────────────
@@ -578,7 +546,6 @@ TEST_CASE_TEMPLATE("checkpoint: explicit checkpoint() persists a manifest and su
       CHECK(*val == make_value(i));
     }
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE("checkpoint: rolls the WAL onto a fresh, empty active segment") {
@@ -600,8 +567,6 @@ TEST_CASE("checkpoint: rolls the WAL onto a fresh, empty active segment") {
   CHECK(*active_after != *active_before);  // rotate_segment() rolled onto a new generation.
   const uint64_t wal_size_after = std::filesystem::file_size(*active_after);
   CHECK(wal_size_after < wal_size_before);  // The new active segment starts empty.
-
-  cleanup_store_files(path);
 }
 
 TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 checkpoint files") {
@@ -630,8 +595,6 @@ TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 checkpoint file
   // durabilizes in place rather than building a new file per generation.
   CHECK(std::filesystem::exists(t1_chk_path));
   CHECK(std::filesystem::exists(t2_chk_path));
-
-  cleanup_store_files(path);
 }
 
 TEST_CASE("checkpoint: deletes and updates after a checkpoint are correctly reflected after restart") {
@@ -663,7 +626,6 @@ TEST_CASE("checkpoint: deletes and updates after a checkpoint are correctly refl
       CHECK(*val == make_value(1000 + i));
     }
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE("checkpoint: insert/checkpoint/insert-more/restart preserves both pre- and post-checkpoint keys") {
@@ -693,7 +655,6 @@ TEST_CASE("checkpoint: insert/checkpoint/insert-more/restart preserves both pre-
       CHECK(*val == make_value(1000 + i));
     }
   }
-  cleanup_store_files(path);
 }
 
 TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file fails construction loudly") {
@@ -711,20 +672,15 @@ TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file
   std::filesystem::remove(vmemkv::derive_t1_chk_path(path));
 
   CHECK_THROWS(std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes));
-
-  cleanup_store_files(path);
 }
 
-// Regression test for checkpoint()'s first-ever call: this store has never committed a checkpoint
-// before, so checkpoint_internal() must create the T2 checkpoint file (O_CREAT) rather than
-// assume one already exists, even for an insert-only workload that never generates fragmentation
-// on its own. Deliberately the default (large) WalMaxBytesSinceCheckpoint, not a tiny override --
-// this test's exact checkpoint_count assertions are about the *explicit* checkpoint() call below,
-// and a small threshold would let reorg_worker_loop()'s own auto-trigger race that explicit call
-// (both incrementing the same counter), making the exact-count assertion flaky (found the hard
-// way: maybe_reorganize_if_needed() used to never actually evaluate the byte-threshold check for
-// small corpora regardless of how small WalMaxBytesSinceCheckpoint was set -- a real bug, now
-// fixed -- so a tiny override here used to be silently inert rather than actually racy).
+// checkpoint()'s first-ever call: this store has never committed a checkpoint before, so
+// checkpoint_internal() must create the T2 checkpoint file (O_CREAT) rather than assume one
+// already exists, even for an insert-only workload that never generates fragmentation on its own.
+// Deliberately the default (large) WalMaxBytesSinceCheckpoint, not a tiny override -- this test's
+// exact checkpoint_count assertions are about the *explicit* checkpoint() call below, and a small
+// threshold would let reorg_worker_loop()'s own auto-trigger race that explicit call (both
+// incrementing the same counter), making the exact-count assertion flaky.
 TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint file") {
   const auto path = reserve_crash_temp_path();
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
@@ -744,8 +700,6 @@ TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint f
     REQUIRE(val.has_value());
     CHECK(*val == make_value(i));
   }
-
-  cleanup_store_files(path);
 }
 
 // Regression test: repeated checkpoint() calls each durabilize the tail written since the last
@@ -798,8 +752,6 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
       CHECK(*val == make_value(i));
     }
   }
-
-  cleanup_store_files(path);
 }
 
 // Stress/regression test: in-place updates racing concurrent checkpoint() cycles never observe
@@ -872,5 +824,4 @@ TEST_CASE("checkpoint: in-place updates racing concurrent checkpoint() stay corr
       CHECK(*val == last_written[static_cast<std::size_t>(i)]);
     }
   }
-  cleanup_store_files(path);
 }

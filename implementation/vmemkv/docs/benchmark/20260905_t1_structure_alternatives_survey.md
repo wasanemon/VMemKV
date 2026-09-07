@@ -2,7 +2,7 @@
 
 ## 発端
 
-`new_t1_design_from_flatfile_to_skiplist.md`にある通り、T1Index(flat array + append region +
+`20260903_t1_pskiplist_design_survey.md`にある通り、T1Index(flat array + append region +
 `reorganize()`)の`reorganize()`/`checkpoint()`がO(corpus)のコストを持つことが課題だった。この
 コストを避けるため、mmap'd・lock-freeなskip list(`implementation/pskiplist/`)を新規開発し、T1を
 置き換えるプロトタイプを実装した(コミット`f4beb99`)。

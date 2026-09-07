@@ -178,25 +178,27 @@ auto get_from_db(rocksdb::DB *db, std::span<const std::byte> key, Callback callb
   return true;
 }
 
-inline auto insert_into_db(rocksdb::DB *db, std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
+inline auto exists_in_db(rocksdb::DB *db, std::span<const std::byte> key) -> bool {
   rocksdb::PinnableSlice pinned_value;
-  if (db->Get({}, db->DefaultColumnFamily(), to_slice(key), &pinned_value).ok()) {
+  return db->Get({}, db->DefaultColumnFamily(), to_slice(key), &pinned_value).ok();
+}
+
+inline auto insert_into_db(rocksdb::DB *db, std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
+  if (exists_in_db(db, key)) {
     return false;  // already exists
   }
   return db->Put(make_durable_write_options(), to_slice(key), to_slice(value)).ok();
 }
 
 inline auto update_in_db(rocksdb::DB *db, std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-  rocksdb::PinnableSlice pinned_value;
-  if (!db->Get({}, db->DefaultColumnFamily(), to_slice(key), &pinned_value).ok()) {
+  if (!exists_in_db(db, key)) {
     return false;  // not found
   }
   return db->Put(make_durable_write_options(), to_slice(key), to_slice(value)).ok();
 }
 
 inline auto remove_from_db(rocksdb::DB *db, std::span<const std::byte> key) -> bool {
-  rocksdb::PinnableSlice pinned_value;
-  if (!db->Get({}, db->DefaultColumnFamily(), to_slice(key), &pinned_value).ok()) {
+  if (!exists_in_db(db, key)) {
     return false;  // not found
   }
   return db->Delete(make_durable_write_options(), to_slice(key)).ok();
