@@ -206,51 +206,103 @@ def build_organic_split_data(report_dir):
     return data
 
 
-def render_organic_split_summary_html(organic_split_data):
-    """One block per scenario (in_memory, ltm): a summary line (splits observed, final shard
-    count, total inserted) followed by one row per observed split (shard count right after that
-    split, baseline/during Insert QPS, degradation %%) -- see build_organic_split_data()."""
+def organic_split_averages(organic_split_data, scenario):
+    """(avg_pause_us, avg_degradation_pct, n) across a scenario's observed splits, or None if
+    that scenario has no usable data (missing file, timeout, or zero splits observed)."""
+    rec = organic_split_data.get(scenario)
+    if not rec or rec.get("timed_out"):
+        return None
+    splits = rec.get("splits", [])
+    if not splits:
+        return None
+    n = len(splits)
+    avg_pause_us = sum(s["pause_us"] for s in splits) / n
+    avg_degr = sum(s["degradation_pct"] for s in splits) / n
+    return avg_pause_us, avg_degr, n
+
+
+def render_organic_split_chart_html(organic_split_data):
+    """Two line charts (pause duration in ms, Insert QPS degradation %%) plotted against shard
+    count reached, one line per scenario -- the full per-split detail behind the summary rows
+    organic_split_averages() feeds into the Background Jobs table. Self-contained: canvases plus
+    their own inline <script> (Chart.js is already loaded in <head> by the time this renders, and
+    the Summary tab is visible on load, so creating the charts immediately is safe -- same
+    reasoning as every other chart on this page, just not routed through the shared initCharts()
+    since this section's data has a different shape from the workload/thread-count charts there)."""
     if not organic_split_data:
         return ""
     scenario_labels = {"in_memory": "in-memory", "ltm": "LTM"}
-    out = []
+    colors = {"in_memory": "#6366f1", "ltm": "#f59e0b"}
+    pause_datasets = []
+    degr_datasets = []
+    summary_lines = []
     for scenario in ["in_memory", "ltm"]:
         rec = organic_split_data.get(scenario)
-        out.append(f'<h4 class="text-xs font-bold text-slate-600 mt-3 first:mt-0">{scenario_labels[scenario]}</h4>')
         if not rec:
-            out.append('<p class="text-xs text-slate-300">n/a</p>')
             continue
         if rec.get("timed_out"):
-            out.append('<p class="text-xs text-rose-600 font-semibold">did not complete (timeout)</p>')
+            summary_lines.append(f'<p class="text-xs text-rose-600 font-semibold">{scenario_labels[scenario]}: did not complete (timeout)</p>')
             continue
         splits = rec.get("splits", [])
-        out.append(f'<p class="text-[11px] text-slate-500 mb-1">{len(splits)} split(s) observed over '
-                    f'{rec.get("duration_sec", "?")}s &middot; {rec.get("total_inserted", 0):,} total inserted '
-                    f'&middot; ended at {rec.get("final_shard_count", "?")} shards</p>')
+        summary_lines.append(f'<p class="text-[11px] text-slate-500">{scenario_labels[scenario]}: {len(splits)} split(s) observed over '
+                              f'{rec.get("duration_sec", "?")}s &middot; {rec.get("total_inserted", 0):,} total inserted '
+                              f'&middot; ended at {rec.get("final_shard_count", "?")} shards</p>')
         if not splits:
-            out.append('<p class="text-xs text-slate-400">No split observed in this window (corpus never '
-                        'crossed a shard\'s split threshold) -- not evidence of a problem, just a run where '
-                        'growth stayed within one shard.</p>')
             continue
-        out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
-                    '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
-                    '<th class="py-1.5 px-3 font-bold text-slate-700">Shard count after</th>'
-                    '<th class="py-1.5 px-3 font-bold text-slate-700">Pause duration</th>'
-                    '<th class="py-1.5 px-3 font-bold text-slate-700">Baseline Insert QPS</th>'
-                    '<th class="py-1.5 px-3 font-bold text-slate-700">During-split Insert QPS</th>'
-                    '<th class="py-1.5 px-3 font-bold text-slate-700">Degradation</th>'
-                    '</tr></thead><tbody class="divide-y divide-slate-100">')
-        for split in splits:
-            pct = split["degradation_pct"]
-            pause_cell = f'{split["pause_us"] / 1000:.0f}ms' if "pause_us" in split else '<span class="text-slate-300">n/a</span>'
-            out.append(f'<tr><td class="py-1.5 px-3">{split["shard_count_after"]}</td>'
-                        f'<td class="py-1.5 px-3">{pause_cell}</td>'
-                        f'<td class="py-1.5 px-3">{split["baseline_qps"]:,.0f}/s</td>'
-                        f'<td class="py-1.5 px-3">{split["during_qps"]:,.0f}/s</td>'
-                        f'<td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded '
-                        f'text-[10px] border {_badge_for_slowdown(pct)} font-bold w-fit">{pct:.0f}%</span></td></tr>')
-        out.append("</tbody></table></div>")
-    return "\n".join(out)
+        col = colors[scenario]
+        pause_datasets.append({
+            "label": scenario_labels[scenario],
+            "data": [{"x": s["shard_count_after"], "y": s["pause_us"] / 1000.0} for s in splits],
+            "borderColor": col, "backgroundColor": col, "tension": 0.3,
+            "pointRadius": 4, "pointHoverRadius": 6,
+        })
+        degr_datasets.append({
+            "label": scenario_labels[scenario],
+            "data": [{"x": s["shard_count_after"], "y": s["degradation_pct"]} for s in splits],
+            "borderColor": col, "backgroundColor": col, "borderDash": [6, 6], "tension": 0.3,
+            "pointRadius": 4, "pointHoverRadius": 6,
+        })
+    if not pause_datasets and not degr_datasets:
+        return "\n".join(summary_lines) if summary_lines else ""
+
+    data_json = json.dumps({"pause": pause_datasets, "degradation": degr_datasets})
+    return "\n".join(summary_lines) + f'''
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-3">
+  <div class="space-y-1.5">
+    <h4 class="text-xs font-bold text-slate-600">Writer-visible pause duration</h4>
+    <div class="h-64 relative"><canvas id="organic-split-pause-chart"></canvas></div>
+  </div>
+  <div class="space-y-1.5">
+    <h4 class="text-xs font-bold text-slate-600">Insert QPS degradation during that pause</h4>
+    <div class="h-64 relative"><canvas id="organic-split-degradation-chart"></canvas></div>
+  </div>
+</div>
+<script>
+(function() {{
+  const d = {data_json};
+  const commonScales = (yTitle) => ({{
+    x: {{ type: 'linear', title: {{ display: true, text: 'Shard count after this split', font: {{size:11,family:'Inter'}}, color: '#64748b' }},
+         ticks: {{ stepSize: 1, font: {{size:10,family:'Inter'}}, color: '#94a3b8' }},
+         grid: {{ color: 'rgba(100,116,139,0.08)' }} }},
+    y: {{ title: {{ display: true, text: yTitle, font: {{size:11,family:'Inter'}}, color: '#64748b' }},
+         ticks: {{ font: {{size:10,family:'Inter'}}, color: '#94a3b8' }},
+         grid: {{ color: 'rgba(100,116,139,0.08)' }} }},
+  }});
+  const commonOptions = (yTitle) => ({{
+    responsive: true, maintainAspectRatio: false,
+    plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, font: {{size:11,family:'Inter',weight:'500'}}, usePointStyle: true }} }} }},
+    scales: commonScales(yTitle),
+  }});
+  const pauseCanvas = document.getElementById('organic-split-pause-chart');
+  if (pauseCanvas && d.pause.length) {{
+    new Chart(pauseCanvas, {{ type: 'line', data: {{ datasets: d.pause }}, options: commonOptions('Pause duration (ms)') }});
+  }}
+  const degrCanvas = document.getElementById('organic-split-degradation-chart');
+  if (degrCanvas && d.degradation.length) {{
+    new Chart(degrCanvas, {{ type: 'line', data: {{ datasets: d.degradation }}, options: commonOptions('Insert QPS degradation (%)') }});
+  }}
+}})();
+</script>'''
 
 
 def compute_winners_matrix(raw_data):
@@ -344,14 +396,18 @@ def _badge_for_slowdown(pct):
     return "bg-emerald-50 text-emerald-700 border-emerald-200"
 
 
-def render_background_jobs_summary_html(background_jobs_data):
+def render_background_jobs_summary_html(background_jobs_data, organic_split_data=None):
     """4 rows (reorganize/in_memory, reorganize/ltm, checkpoint/in_memory, checkpoint/ltm) x 4
     columns (job duration, Insert/Update/Scan QPS degradation %% while the job runs concurrently),
     all measured against one fixed 1KB x 10,000,000-record corpus (see build_background_jobs_data()).
     Deliberately not swept across the matrix's 4 scenario/value-size combos -- this table exists to
     answer one question (how much does reorganize()/checkpoint() cost, and what does it cost
-    concurrent writers/readers while it runs), not to reproduce the CRUD matrix."""
-    if not background_jobs_data:
+    concurrent writers/readers while it runs), not to reproduce the CRUD matrix.
+
+    Two more rows (organic per-shard split, in_memory/ltm) summarize organic_split_data as an
+    average across every split observed in that scenario's run -- see organic_split_averages() and,
+    for the full per-split detail behind the average, render_organic_split_chart_html()."""
+    if not background_jobs_data and not organic_split_data:
         return ""
     job_labels = {
         "reorganize": "reorganize() (forced, all shards)",
@@ -397,6 +453,25 @@ def render_background_jobs_summary_html(background_jobs_data):
                                   f'{_badge_for_slowdown(pct)} font-bold w-fit">{pct:.0f}%</span>')
             out.append(f'<tr><td class="py-2 px-3">{row_label}</td>' +
                         "".join(f'<td class="py-2 px-3">{c}</td>' for c in cells) + '</tr>')
+
+    if organic_split_data:
+        for scenario in ["in_memory", "ltm"]:
+            row_label = f'per-shard split (organic) <span class="text-slate-400">/ {scenario_labels[scenario]}</span>'
+            averages = organic_split_averages(organic_split_data, scenario)
+            if averages is None:
+                out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
+                            f'<td class="py-2 px-3 text-slate-300" colspan="4">n/a</td></tr>')
+                continue
+            avg_pause_us, avg_degr, n = averages
+            duration_cell = f'{avg_pause_us / 1000:.0f}ms<div class="text-[10px] text-slate-400 font-normal">avg of {n} splits</div>'
+            degr_badge = (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
+                          f'{_badge_for_slowdown(avg_degr)} font-bold w-fit">{avg_degr:.0f}%</span>')
+            out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
+                        f'<td class="py-2 px-3">{duration_cell}</td>'
+                        f'<td class="py-2 px-3">{degr_badge}</td>'
+                        f'<td class="py-2 px-3"><span class="text-slate-300">n/a</span></td>'
+                        f'<td class="py-2 px-3"><span class="text-slate-300">n/a</span></td></tr>')
+
     out.append("</tbody></table></div>")
     return "\n".join(out)
 
@@ -537,20 +612,61 @@ def main():
 '''
         h3_marker = f'<h3 class="text-base font-bold text-slate-900">{heading}</h3>'
         heading_idx = html.find(h3_marker)
-        if heading_idx == -1:
-            # Not present yet: insert right after the Workload Winners section closes.
-            winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
-            return html[:winners_section_close] + section_html + html[winners_section_close:]
-        section_start = html.rindex(section_open_marker, 0, heading_idx)
-        # Also consume any whitespace-only text immediately preceding the marker: without this,
-        # a re-run's fixed-format replacement (below) leaves the *previous* run's own leading
-        # indentation orphaned in place, accumulating a little more on every regeneration instead
-        # of converging -- confirmed via a 3x-idempotency check while adding this section.
-        ws_start = section_start
-        while ws_start > 0 and html[ws_start - 1] in " \t\n":
-            ws_start -= 1
-        section_end = html.index("</section>", heading_idx) + len("</section>")
-        return html[:ws_start] + "\n" + section_html.strip("\n") + html[section_end:]
+        if heading_idx != -1:
+            # Remove the existing section first (wherever it currently sits) rather than replacing
+            # its content in place -- so this call's position in the code below, not wherever some
+            # earlier report round happened to leave it, determines where it ends up. Without this,
+            # re-running this function against its own prior output could update a section's
+            # content but could never reorder it relative to another section (confirmed: swapping
+            # the two call sites below had no effect on a re-run, since "replace in place" doesn't
+            # move anything).
+            section_start = html.rindex(section_open_marker, 0, heading_idx)
+            # Also consume any whitespace-only text immediately preceding the marker: without this,
+            # a re-run's fixed-format replacement (below) leaves the *previous* run's own leading
+            # indentation orphaned in place, accumulating a little more on every regeneration
+            # instead of converging -- confirmed via a 3x-idempotency check while adding this
+            # section originally.
+            ws_start = section_start
+            while ws_start > 0 and html[ws_start - 1] in " \t\n":
+                ws_start -= 1
+            section_end = html.index("</section>", heading_idx) + len("</section>")
+            html = html[:ws_start] + html[section_end:]
+        # Insert right after the Workload Winners section closes -- recomputed fresh against
+        # (possibly just-shrunk) html, so each call in a single run's sequence lands at the same
+        # fixed point ahead of whatever an *earlier* call already inserted there. That gives LIFO
+        # ordering across calls in one run (the last-called section ends up closest to Winners);
+        # the call sites below rely on this to control final section order deliberately.
+        winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
+        return html[:winners_section_close] + section_html + html[winners_section_close:]
+
+    # Chart section's upsert_section call comes *before* Background Jobs' below on purpose: each
+    # "not yet present" insertion lands at the same fixed point (right after Workload Winners),
+    # ahead of whatever a previous call already put there -- so calling this one first, then
+    # Background Jobs second, produces the intended final order (Winners, Background Jobs summary
+    # table, this detail chart at the bottom) rather than the reverse.
+    html = upsert_section(
+        html,
+        heading="Organic Per-Shard Splits",
+        icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="split",
+        title="Organic Per-Shard Splits",
+        description_html=(
+            "Full per-split detail behind the \"per-shard split (organic)\" summary rows in the "
+            "Background Jobs table above: what actually happens during ordinary operation, as "
+            "opposed to the forced whole-store reorganize() there. Starting from an empty store "
+            "with real background workers active, insert continuously for 90s (fixed 1KB values, "
+            "monotonically increasing keys) and detect each automatic per-shard split as "
+            "ShardedT1Index's own background worker pool completes it. Pause duration is the "
+            "exact, directly-instrumented span writers targeting that shard were blocked "
+            "(get_statistics().t1_last_split_pause_us) -- not an inferred window; degradation is "
+            "this event's own local Insert QPS just before the pause vs. QPS across the pause "
+            "itself (see run_organic_split_probe.sh). With monotonically increasing keys, exactly "
+            "one shard is ever \"hot\" at a time regardless of how many other shards exist, so "
+            "degradation stays high across every split here rather than shrinking with shard count "
+            "-- that property (if it holds at all) would need a workload whose writes spread across "
+            "multiple hot shards concurrently, e.g. random keys."
+        ),
+        table_html=render_organic_split_chart_html(organic_split_data),
+    )
 
     html = upsert_section(
         html,
@@ -566,33 +682,12 @@ def main():
             "matched-duration window on both sides (see run_background_jobs_probe.sh). "
             "reorganize() forces every shard through a synchronous merge in one call -- a manual "
             "escape hatch (pre-backup flush, capacity planning), not what happens during ordinary "
-            "operation. See the organic per-shard split measurement below for that."
+            "operation. The last two rows summarize the organic per-shard split alternative that "
+            "actually runs day to day (averaged across every split observed in that run; see the "
+            "detail section further down for the full breakdown and charts)."
         ),
-        table_html=render_background_jobs_summary_html(background_jobs_data),
+        table_html=render_background_jobs_summary_html(background_jobs_data, organic_split_data),
     )
-
-    html = upsert_section(
-        html,
-        heading="Organic Per-Shard Splits",
-        icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="split",
-        title="Organic Per-Shard Splits",
-        description_html=(
-            "What actually happens during ordinary operation, as opposed to the forced whole-store "
-            "reorganize() above: starting from an empty store with real background workers active, "
-            "insert continuously for 90s (fixed 1KB values, monotonically increasing keys) and "
-            "detect each automatic per-shard split as ShardedT1Index's own background worker pool "
-            "completes it. \"Pause duration\" is the exact, directly-instrumented span writers "
-            "targeting that shard were blocked (get_statistics().t1_last_split_pause_us) -- not an "
-            "inferred window; baseline/during QPS are this event's own local Insert QPS just before "
-            "the pause and QPS across the pause itself (see run_organic_split_probe.sh). With "
-            "monotonically increasing keys, exactly one shard is ever \"hot\" at a time regardless of "
-            "how many other shards exist, so degradation stays high across every split here rather "
-            "than shrinking with shard count -- that property (if it holds at all) would need a "
-            "workload whose writes spread across multiple hot shards concurrently, e.g. random keys."
-        ),
-        table_html=render_organic_split_summary_html(organic_split_data),
-    )
-
 
     args.out.write_text(html)
     print(f"Wrote {args.out} ({len(html)} bytes)")

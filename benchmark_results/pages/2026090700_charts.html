@@ -48,7 +48,7 @@
           <a href="../2026090700/background_jobs_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Background Jobs, LTM)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl"><p>ShardedT1Index(T1のrange-shardingによるO(コーパスサイズ)問題の解消)を本番結線後、初のフルCRUDマトリクス+background jobs probe計測。today: split protocolの3件のバグ修正(重複キュー投入によるsplit中断、abortパスのリセット順序、split境界を跨ぐstraggler書き込みのデータ損失)、KVStoreコンセプトへのreorganize/checkpoint/get_statistics追加、T1統計をreorgカウントから実際のsplit回数(<code>T1_Splits</code>)へ刷新、YCSB-Eの強制reorganize()トリガー撤去(background-jobs-probeと重複測定だったため)。background jobsのscan劣化率は前回検証済みのbounded rangeを維持(in_memory: 14.6/17.8%, ltm: 2.0/4.8% — シャーディング前は65-83%だった)。追記: organicなper-shard splitの書き込み停止区間を直接計測する仕組みを追加し、単調増加キー挿入下では約0.20〜0.22秒でコーパスサイズ非依存に安定していることを確認(詳細は下部のセクション参照)。ベンチ実行自体はコード変更ではなく、monorepo再編以降放置されていたAWSオーケストレーションスクリプトの複数のパスバグ(rsync同期先、NVMeデバイス検出、結果ダウンロード先)を発見・修正して初めて完走した。</p></p></p></p>
+      <p class="text-slate-500 text-sm max-w-3xl"><p>ShardedT1Index(T1のrange-shardingによるO(コーパスサイズ)問題の解消)を本番結線後、初のフルCRUDマトリクス+background jobs probe計測。today: split protocolの3件のバグ修正(重複キュー投入によるsplit中断、abortパスのリセット順序、split境界を跨ぐstraggler書き込みのデータ損失)、KVStoreコンセプトへのreorganize/checkpoint/get_statistics追加、T1統計をreorgカウントから実際のsplit回数(<code>T1_Splits</code>)へ刷新、YCSB-Eの強制reorganize()トリガー撤去(background-jobs-probeと重複測定だったため)。background jobsのscan劣化率は前回検証済みのbounded rangeを維持(in_memory: 14.6/17.8%, ltm: 2.0/4.8% — シャーディング前は65-83%だった)。追記: organicなper-shard splitの書き込み停止区間を直接計測する仕組みを追加し、単調増加キー挿入下では約0.20〜0.22秒でコーパスサイズ非依存に安定していることを確認(詳細は下部のセクション参照)。ベンチ実行自体はコード変更ではなく、monorepo再編以降放置されていたAWSオーケストレーションスクリプトの複数のパスバグ(rsync同期先、NVMeデバイス検出、結果ダウンロード先)を発見・修正して初めて完走した。</p></p></p></p></p></p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -437,44 +437,12 @@
       </section>
       <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
         <div class="flex items-center gap-3">
-          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
-            <i data-lucide="split" class="w-6 h-6"></i>
-          </div>
-          <div>
-            <h3 class="text-base font-bold text-slate-900">Organic Per-Shard Splits</h3>
-            <p class="text-xs text-slate-500">What actually happens during ordinary operation, as opposed to the forced whole-store reorganize() above: starting from an empty store with real background workers active, insert continuously for 90s (fixed 1KB values, monotonically increasing keys) and detect each automatic per-shard split as ShardedT1Index's own background worker pool completes it. "Pause duration" is the exact, directly-instrumented span writers targeting that shard were blocked (get_statistics().t1_last_split_pause_us) -- not an inferred window; baseline/during QPS are this event's own local Insert QPS just before the pause and QPS across the pause itself (see run_organic_split_probe.sh). With monotonically increasing keys, exactly one shard is ever "hot" at a time regardless of how many other shards exist, so degradation stays high across every split here rather than shrinking with shard count -- that property (if it holds at all) would need a workload whose writes spread across multiple hot shards concurrently, e.g. random keys.</p>
-          </div>
-        </div>
-        <h4 class="text-xs font-bold text-slate-600 mt-3 first:mt-0">in-memory</h4>
-<p class="text-[11px] text-slate-500 mb-1">6 split(s) observed over 90s &middot; 9,403,453 total inserted &middot; ended at 8 shards</p>
-<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs"><thead><tr class="border-b border-slate-200 bg-slate-50/50"><th class="py-1.5 px-3 font-bold text-slate-700">Shard count after</th><th class="py-1.5 px-3 font-bold text-slate-700">Pause duration</th><th class="py-1.5 px-3 font-bold text-slate-700">Baseline Insert QPS</th><th class="py-1.5 px-3 font-bold text-slate-700">During-split Insert QPS</th><th class="py-1.5 px-3 font-bold text-slate-700">Degradation</th></tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-1.5 px-3">2</td><td class="py-1.5 px-3">213ms</td><td class="py-1.5 px-3">104,751/s</td><td class="py-1.5 px-3">14,298/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">86%</span></td></tr>
-<tr><td class="py-1.5 px-3">3</td><td class="py-1.5 px-3">215ms</td><td class="py-1.5 px-3">104,570/s</td><td class="py-1.5 px-3">25,660/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">75%</span></td></tr>
-<tr><td class="py-1.5 px-3">4</td><td class="py-1.5 px-3">204ms</td><td class="py-1.5 px-3">108,089/s</td><td class="py-1.5 px-3">47,172/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">56%</span></td></tr>
-<tr><td class="py-1.5 px-3">5</td><td class="py-1.5 px-3">209ms</td><td class="py-1.5 px-3">108,577/s</td><td class="py-1.5 px-3">14,936/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">86%</span></td></tr>
-<tr><td class="py-1.5 px-3">7</td><td class="py-1.5 px-3">207ms</td><td class="py-1.5 px-3">108,475/s</td><td class="py-1.5 px-3">47,610/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">56%</span></td></tr>
-<tr><td class="py-1.5 px-3">8</td><td class="py-1.5 px-3">209ms</td><td class="py-1.5 px-3">107,588/s</td><td class="py-1.5 px-3">4,897/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">95%</span></td></tr>
-</tbody></table></div>
-<h4 class="text-xs font-bold text-slate-600 mt-3 first:mt-0">LTM</h4>
-<p class="text-[11px] text-slate-500 mb-1">6 split(s) observed over 90s &middot; 7,694,305 total inserted &middot; ended at 7 shards</p>
-<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs"><thead><tr class="border-b border-slate-200 bg-slate-50/50"><th class="py-1.5 px-3 font-bold text-slate-700">Shard count after</th><th class="py-1.5 px-3 font-bold text-slate-700">Pause duration</th><th class="py-1.5 px-3 font-bold text-slate-700">Baseline Insert QPS</th><th class="py-1.5 px-3 font-bold text-slate-700">During-split Insert QPS</th><th class="py-1.5 px-3 font-bold text-slate-700">Degradation</th></tr></thead><tbody class="divide-y divide-slate-100">
-<tr><td class="py-1.5 px-3">2</td><td class="py-1.5 px-3">208ms</td><td class="py-1.5 px-3">90,766/s</td><td class="py-1.5 px-3">37,643/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">59%</span></td></tr>
-<tr><td class="py-1.5 px-3">3</td><td class="py-1.5 px-3">219ms</td><td class="py-1.5 px-3">104,299/s</td><td class="py-1.5 px-3">29,845/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">71%</span></td></tr>
-<tr><td class="py-1.5 px-3">4</td><td class="py-1.5 px-3">216ms</td><td class="py-1.5 px-3">93,638/s</td><td class="py-1.5 px-3">28,576/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">69%</span></td></tr>
-<tr><td class="py-1.5 px-3">5</td><td class="py-1.5 px-3">222ms</td><td class="py-1.5 px-3">111,411/s</td><td class="py-1.5 px-3">19,132/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">83%</span></td></tr>
-<tr><td class="py-1.5 px-3">6</td><td class="py-1.5 px-3">223ms</td><td class="py-1.5 px-3">61,734/s</td><td class="py-1.5 px-3">35,594/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-amber-50 text-amber-700 border-amber-200 font-bold w-fit">42%</span></td></tr>
-<tr><td class="py-1.5 px-3">7</td><td class="py-1.5 px-3">216ms</td><td class="py-1.5 px-3">83,840/s</td><td class="py-1.5 px-3">1,624/s</td><td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">98%</span></td></tr>
-</tbody></table></div>
-      </section>
-
-      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
-        <div class="flex items-center gap-3">
           <div class="p-2 bg-rose-50 text-rose-600 rounded-lg">
             <i data-lucide="swords" class="w-6 h-6"></i>
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Background Jobs: reorganize() / checkpoint()</h3>
-            <p class="text-xs text-slate-500">Fixed reference point (1KB values, 10,000,000 records; in-memory unconstrained, LTM cgroup-constrained to the same memory budget as the rest of the suite) -- not swept across the CRUD matrix's 4 scenario/value-size combos. Duration is a single call in isolation; the three degradation columns are the percentage drop in concurrent Insert/Update/Scan QPS while that one call runs, measured over a matched-duration window on both sides (see run_background_jobs_probe.sh). reorganize() forces every shard through a synchronous merge in one call -- a manual escape hatch (pre-backup flush, capacity planning), not what happens during ordinary operation. See the organic per-shard split measurement below for that.</p>
+            <p class="text-xs text-slate-500">Fixed reference point (1KB values, 10,000,000 records; in-memory unconstrained, LTM cgroup-constrained to the same memory budget as the rest of the suite) -- not swept across the CRUD matrix's 4 scenario/value-size combos. Duration is a single call in isolation; the three degradation columns are the percentage drop in concurrent Insert/Update/Scan QPS while that one call runs, measured over a matched-duration window on both sides (see run_background_jobs_probe.sh). reorganize() forces every shard through a synchronous merge in one call -- a manual escape hatch (pre-backup flush, capacity planning), not what happens during ordinary operation. The last two rows summarize the organic per-shard split alternative that actually runs day to day (averaged across every split observed in that run; see the detail section further down for the full breakdown and charts).</p>
           </div>
         </div>
         <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">
@@ -489,7 +457,59 @@
 <tr><td class="py-2 px-3">reorganize() (forced, all shards) <span class="text-slate-400">/ LTM</span></td><td class="py-2 px-3">14.082s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">51%</span></td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">3%</span></td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">2%</span></td></tr>
 <tr><td class="py-2 px-3">checkpoint() <span class="text-slate-400">/ in-memory</span></td><td class="py-2 px-3">3.727s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-amber-50 text-amber-700 border-amber-200 font-bold w-fit">49%</span></td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">9%</span></td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">18%</span></td></tr>
 <tr><td class="py-2 px-3">checkpoint() <span class="text-slate-400">/ LTM</span></td><td class="py-2 px-3">4.094s</td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">54%</span></td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">9%</span></td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-emerald-50 text-emerald-700 border-emerald-200 font-bold w-fit">5%</span></td></tr>
+<tr><td class="py-2 px-3">per-shard split (organic) <span class="text-slate-400">/ in-memory</span></td><td class="py-2 px-3">209ms<div class="text-[10px] text-slate-400 font-normal">avg of 6 splits</div></td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">76%</span></td><td class="py-2 px-3"><span class="text-slate-300">n/a</span></td><td class="py-2 px-3"><span class="text-slate-300">n/a</span></td></tr>
+<tr><td class="py-2 px-3">per-shard split (organic) <span class="text-slate-400">/ LTM</span></td><td class="py-2 px-3">217ms<div class="text-[10px] text-slate-400 font-normal">avg of 6 splits</div></td><td class="py-2 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border bg-rose-600 text-white border-transparent shadow-sm font-bold w-fit">70%</span></td><td class="py-2 px-3"><span class="text-slate-300">n/a</span></td><td class="py-2 px-3"><span class="text-slate-300">n/a</span></td></tr>
 </tbody></table></div>
+      </section>
+
+      <section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="p-2 bg-indigo-50 text-indigo-600 rounded-lg">
+            <i data-lucide="split" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-slate-900">Organic Per-Shard Splits</h3>
+            <p class="text-xs text-slate-500">Full per-split detail behind the "per-shard split (organic)" summary rows in the Background Jobs table above: what actually happens during ordinary operation, as opposed to the forced whole-store reorganize() there. Starting from an empty store with real background workers active, insert continuously for 90s (fixed 1KB values, monotonically increasing keys) and detect each automatic per-shard split as ShardedT1Index's own background worker pool completes it. Pause duration is the exact, directly-instrumented span writers targeting that shard were blocked (get_statistics().t1_last_split_pause_us) -- not an inferred window; degradation is this event's own local Insert QPS just before the pause vs. QPS across the pause itself (see run_organic_split_probe.sh). With monotonically increasing keys, exactly one shard is ever "hot" at a time regardless of how many other shards exist, so degradation stays high across every split here rather than shrinking with shard count -- that property (if it holds at all) would need a workload whose writes spread across multiple hot shards concurrently, e.g. random keys.</p>
+          </div>
+        </div>
+        <p class="text-[11px] text-slate-500">in-memory: 6 split(s) observed over 90s &middot; 9,403,453 total inserted &middot; ended at 8 shards</p>
+<p class="text-[11px] text-slate-500">LTM: 6 split(s) observed over 90s &middot; 7,694,305 total inserted &middot; ended at 7 shards</p>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-3">
+  <div class="space-y-1.5">
+    <h4 class="text-xs font-bold text-slate-600">Writer-visible pause duration</h4>
+    <div class="h-64 relative"><canvas id="organic-split-pause-chart"></canvas></div>
+  </div>
+  <div class="space-y-1.5">
+    <h4 class="text-xs font-bold text-slate-600">Insert QPS degradation during that pause</h4>
+    <div class="h-64 relative"><canvas id="organic-split-degradation-chart"></canvas></div>
+  </div>
+</div>
+<script>
+(function() {
+  const d = {"pause": [{"label": "in-memory", "data": [{"x": 2, "y": 212.554}, {"x": 3, "y": 214.95}, {"x": 4, "y": 204.464}, {"x": 5, "y": 208.504}, {"x": 7, "y": 207.347}, {"x": 8, "y": 209.003}], "borderColor": "#6366f1", "backgroundColor": "#6366f1", "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}, {"label": "LTM", "data": [{"x": 2, "y": 208.143}, {"x": 3, "y": 219.26}, {"x": 4, "y": 215.645}, {"x": 5, "y": 221.543}, {"x": 6, "y": 223.298}, {"x": 7, "y": 215.863}], "borderColor": "#f59e0b", "backgroundColor": "#f59e0b", "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}], "degradation": [{"label": "in-memory", "data": [{"x": 2, "y": 86.3501}, {"x": 3, "y": 75.4618}, {"x": 4, "y": 56.3584}, {"x": 5, "y": 86.2439}, {"x": 7, "y": 56.1103}, {"x": 8, "y": 95.4481}], "borderColor": "#6366f1", "backgroundColor": "#6366f1", "borderDash": [6, 6], "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}, {"label": "LTM", "data": [{"x": 2, "y": 58.5275}, {"x": 3, "y": 71.3847}, {"x": 4, "y": 69.4821}, {"x": 5, "y": 82.8271}, {"x": 6, "y": 42.344}, {"x": 7, "y": 98.063}], "borderColor": "#f59e0b", "backgroundColor": "#f59e0b", "borderDash": [6, 6], "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}]};
+  const commonScales = (yTitle) => ({
+    x: { type: 'linear', title: { display: true, text: 'Shard count after this split', font: {size:11,family:'Inter'}, color: '#64748b' },
+         ticks: { stepSize: 1, font: {size:10,family:'Inter'}, color: '#94a3b8' },
+         grid: { color: 'rgba(100,116,139,0.08)' } },
+    y: { title: { display: true, text: yTitle, font: {size:11,family:'Inter'}, color: '#64748b' },
+         ticks: { font: {size:10,family:'Inter'}, color: '#94a3b8' },
+         grid: { color: 'rgba(100,116,139,0.08)' } },
+  });
+  const commonOptions = (yTitle) => ({
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: {size:11,family:'Inter',weight:'500'}, usePointStyle: true } } },
+    scales: commonScales(yTitle),
+  });
+  const pauseCanvas = document.getElementById('organic-split-pause-chart');
+  if (pauseCanvas && d.pause.length) {
+    new Chart(pauseCanvas, { type: 'line', data: { datasets: d.pause }, options: commonOptions('Pause duration (ms)') });
+  }
+  const degrCanvas = document.getElementById('organic-split-degradation-chart');
+  if (degrCanvas && d.degradation.length) {
+    new Chart(degrCanvas, { type: 'line', data: { datasets: d.degradation }, options: commonOptions('Insert QPS degradation (%)') });
+  }
+})();
+</script>
       </section>
 
 
