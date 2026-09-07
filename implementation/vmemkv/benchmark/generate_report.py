@@ -222,19 +222,27 @@ def organic_split_averages(organic_split_data, scenario):
 
 
 def render_organic_split_chart_html(organic_split_data):
-    """Two line charts (pause duration in ms, Insert QPS degradation %%) plotted against shard
-    count reached, one line per scenario -- the full per-split detail behind the summary rows
-    organic_split_averages() feeds into the Background Jobs table. Self-contained: canvases plus
-    their own inline <script> (Chart.js is already loaded in <head> by the time this renders, and
-    the Summary tab is visible on load, so creating the charts immediately is safe -- same
-    reasoning as every other chart on this page, just not routed through the shared initCharts()
-    since this section's data has a different shape from the workload/thread-count charts there)."""
+    """Two line charts (pause duration in ms; absolute baseline/during Insert QPS) plotted against
+    shard count reached, one line (two for QPS) per scenario -- the full per-split detail behind
+    the summary rows organic_split_averages() feeds into the Background Jobs table.
+
+    Truncated to shard counts both scenarios actually reached: in a 90s fixed-duration run, LTM's
+    somewhat lower insert throughput under memory pressure means it simply runs out of time before
+    its next split, ending on fewer total splits than in-memory (7 vs 8 shards in the run this was
+    written against) -- not a bug, just less corpus grown in the same wall-clock window. Plotting
+    in-memory's extra point(s) anyway would compare an uneven number of shards per scenario instead
+    of the same points side by side.
+
+    Self-contained: canvases plus their own inline <script> (Chart.js is already loaded in <head>
+    by the time this renders, and the Summary tab is visible on load, so creating the charts
+    immediately is safe -- same reasoning as every other chart on this page, just not routed
+    through the shared initCharts() since this section's data has a different shape from the
+    workload/thread-count charts there)."""
     if not organic_split_data:
         return ""
     scenario_labels = {"in_memory": "in-memory", "ltm": "LTM"}
     colors = {"in_memory": "#6366f1", "ltm": "#f59e0b"}
-    pause_datasets = []
-    degr_datasets = []
+    usable = {}
     summary_lines = []
     for scenario in ["in_memory", "ltm"]:
         rec = organic_split_data.get(scenario)
@@ -247,25 +255,43 @@ def render_organic_split_chart_html(organic_split_data):
         summary_lines.append(f'<p class="text-[11px] text-slate-500">{scenario_labels[scenario]}: {len(splits)} split(s) observed over '
                               f'{rec.get("duration_sec", "?")}s &middot; {rec.get("total_inserted", 0):,} total inserted '
                               f'&middot; ended at {rec.get("final_shard_count", "?")} shards</p>')
-        if not splits:
-            continue
+        if splits:
+            usable[scenario] = splits
+    if not usable:
+        return "\n".join(summary_lines) if summary_lines else ""
+
+    # Common cap: the lowest "highest shard count reached" across scenarios with data, so every
+    # plotted point exists for every scenario shown (see the docstring above).
+    common_max_shard = min(max(s["shard_count_after"] for s in splits) for splits in usable.values())
+    if len(usable) > 1 and any(max(s["shard_count_after"] for s in splits) != common_max_shard for splits in usable.values()):
+        summary_lines.append(f'<p class="text-[11px] text-slate-400">Charts below truncated to shard count '
+                              f'&le;{common_max_shard} (the highest both scenarios reached in this run) for a like-for-like comparison.</p>')
+
+    pause_datasets = []
+    qps_datasets = []
+    for scenario, splits in usable.items():
+        capped = [s for s in splits if s["shard_count_after"] <= common_max_shard]
         col = colors[scenario]
         pause_datasets.append({
             "label": scenario_labels[scenario],
-            "data": [{"x": s["shard_count_after"], "y": s["pause_us"] / 1000.0} for s in splits],
+            "data": [{"x": s["shard_count_after"], "y": s["pause_us"] / 1000.0} for s in capped],
             "borderColor": col, "backgroundColor": col, "tension": 0.3,
             "pointRadius": 4, "pointHoverRadius": 6,
         })
-        degr_datasets.append({
-            "label": scenario_labels[scenario],
-            "data": [{"x": s["shard_count_after"], "y": s["degradation_pct"]} for s in splits],
+        qps_datasets.append({
+            "label": f"{scenario_labels[scenario]} baseline",
+            "data": [{"x": s["shard_count_after"], "y": s["baseline_qps"]} for s in capped],
+            "borderColor": col, "backgroundColor": col, "tension": 0.3,
+            "pointRadius": 4, "pointHoverRadius": 6,
+        })
+        qps_datasets.append({
+            "label": f"{scenario_labels[scenario]} during pause",
+            "data": [{"x": s["shard_count_after"], "y": s["during_qps"]} for s in capped],
             "borderColor": col, "backgroundColor": col, "borderDash": [6, 6], "tension": 0.3,
             "pointRadius": 4, "pointHoverRadius": 6,
         })
-    if not pause_datasets and not degr_datasets:
-        return "\n".join(summary_lines) if summary_lines else ""
 
-    data_json = json.dumps({"pause": pause_datasets, "degradation": degr_datasets})
+    data_json = json.dumps({"pause": pause_datasets, "qps": qps_datasets})
     return "\n".join(summary_lines) + f'''
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-3">
   <div class="space-y-1.5">
@@ -273,33 +299,33 @@ def render_organic_split_chart_html(organic_split_data):
     <div class="h-64 relative"><canvas id="organic-split-pause-chart"></canvas></div>
   </div>
   <div class="space-y-1.5">
-    <h4 class="text-xs font-bold text-slate-600">Insert QPS degradation during that pause</h4>
-    <div class="h-64 relative"><canvas id="organic-split-degradation-chart"></canvas></div>
+    <h4 class="text-xs font-bold text-slate-600">Insert QPS: just before the pause vs. during it</h4>
+    <div class="h-64 relative"><canvas id="organic-split-qps-chart"></canvas></div>
   </div>
 </div>
 <script>
 (function() {{
   const d = {data_json};
-  const commonScales = (yTitle) => ({{
-    x: {{ type: 'linear', title: {{ display: true, text: 'Shard count after this split', font: {{size:11,family:'Inter'}}, color: '#64748b' }},
-         ticks: {{ stepSize: 1, font: {{size:10,family:'Inter'}}, color: '#94a3b8' }},
-         grid: {{ color: 'rgba(100,116,139,0.08)' }} }},
-    y: {{ title: {{ display: true, text: yTitle, font: {{size:11,family:'Inter'}}, color: '#64748b' }},
-         ticks: {{ font: {{size:10,family:'Inter'}}, color: '#94a3b8' }},
-         grid: {{ color: 'rgba(100,116,139,0.08)' }} }},
-  }});
-  const commonOptions = (yTitle) => ({{
+  const xScale = {{ type: 'linear', title: {{ display: true, text: 'Shard count after this split', font: {{size:11,family:'Inter'}}, color: '#64748b' }},
+       ticks: {{ stepSize: 1, font: {{size:10,family:'Inter'}}, color: '#94a3b8' }},
+       grid: {{ color: 'rgba(100,116,139,0.08)' }} }};
+  const yScale = (yTitle, extra) => Object.assign({{ title: {{ display: true, text: yTitle, font: {{size:11,family:'Inter'}}, color: '#64748b' }},
+       ticks: {{ font: {{size:10,family:'Inter'}}, color: '#94a3b8' }},
+       grid: {{ color: 'rgba(100,116,139,0.08)' }} }}, extra || {{}});
+  const commonOptions = (yTitle, yExtra) => ({{
     responsive: true, maintainAspectRatio: false,
     plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, font: {{size:11,family:'Inter',weight:'500'}}, usePointStyle: true }} }} }},
-    scales: commonScales(yTitle),
+    scales: {{ x: xScale, y: yScale(yTitle, yExtra) }},
   }});
   const pauseCanvas = document.getElementById('organic-split-pause-chart');
   if (pauseCanvas && d.pause.length) {{
-    new Chart(pauseCanvas, {{ type: 'line', data: {{ datasets: d.pause }}, options: commonOptions('Pause duration (ms)') }});
+    new Chart(pauseCanvas, {{ type: 'line', data: {{ datasets: d.pause }},
+      options: commonOptions('Pause duration (ms)', {{ min: 0, max: 10000 }}) }});
   }}
-  const degrCanvas = document.getElementById('organic-split-degradation-chart');
-  if (degrCanvas && d.degradation.length) {{
-    new Chart(degrCanvas, {{ type: 'line', data: {{ datasets: d.degradation }}, options: commonOptions('Insert QPS degradation (%)') }});
+  const qpsCanvas = document.getElementById('organic-split-qps-chart');
+  if (qpsCanvas && d.qps.length) {{
+    new Chart(qpsCanvas, {{ type: 'line', data: {{ datasets: d.qps }},
+      options: commonOptions('Insert ops/sec', {{ min: 0 }}) }});
   }}
 }})();
 </script>'''
@@ -657,13 +683,14 @@ def main():
             "monotonically increasing keys) and detect each automatic per-shard split as "
             "ShardedT1Index's own background worker pool completes it. Pause duration is the "
             "exact, directly-instrumented span writers targeting that shard were blocked "
-            "(get_statistics().t1_last_split_pause_us) -- not an inferred window; degradation is "
-            "this event's own local Insert QPS just before the pause vs. QPS across the pause "
-            "itself (see run_organic_split_probe.sh). With monotonically increasing keys, exactly "
-            "one shard is ever \"hot\" at a time regardless of how many other shards exist, so "
-            "degradation stays high across every split here rather than shrinking with shard count "
-            "-- that property (if it holds at all) would need a workload whose writes spread across "
-            "multiple hot shards concurrently, e.g. random keys."
+            "(get_statistics().t1_last_split_pause_us) -- not an inferred window; the QPS chart "
+            "plots this event's own local Insert ops/sec just before the pause against ops/sec "
+            "across the pause itself, both in absolute terms (see run_organic_split_probe.sh). "
+            "With monotonically increasing keys, exactly one shard is ever \"hot\" at a time "
+            "regardless of how many other shards exist, so the drop stays large across every split "
+            "here rather than shrinking with shard count -- that property (if it holds at all) "
+            "would need a workload whose writes spread across multiple hot shards concurrently, "
+            "e.g. random keys."
         ),
         table_html=render_organic_split_chart_html(organic_split_data),
     )

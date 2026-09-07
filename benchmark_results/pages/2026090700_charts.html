@@ -48,7 +48,7 @@
           <a href="../2026090700/background_jobs_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Background Jobs, LTM)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl"><p>ShardedT1Index(T1のrange-shardingによるO(コーパスサイズ)問題の解消)を本番結線後、初のフルCRUDマトリクス+background jobs probe計測。today: split protocolの3件のバグ修正(重複キュー投入によるsplit中断、abortパスのリセット順序、split境界を跨ぐstraggler書き込みのデータ損失)、KVStoreコンセプトへのreorganize/checkpoint/get_statistics追加、T1統計をreorgカウントから実際のsplit回数(<code>T1_Splits</code>)へ刷新、YCSB-Eの強制reorganize()トリガー撤去(background-jobs-probeと重複測定だったため)。background jobsのscan劣化率は前回検証済みのbounded rangeを維持(in_memory: 14.6/17.8%, ltm: 2.0/4.8% — シャーディング前は65-83%だった)。追記: organicなper-shard splitの書き込み停止区間を直接計測する仕組みを追加し、単調増加キー挿入下では約0.20〜0.22秒でコーパスサイズ非依存に安定していることを確認(詳細は下部のセクション参照)。ベンチ実行自体はコード変更ではなく、monorepo再編以降放置されていたAWSオーケストレーションスクリプトの複数のパスバグ(rsync同期先、NVMeデバイス検出、結果ダウンロード先)を発見・修正して初めて完走した。</p></p></p></p></p></p>
+      <p class="text-slate-500 text-sm max-w-3xl"><p>ShardedT1Index(T1のrange-shardingによるO(コーパスサイズ)問題の解消)を本番結線後、初のフルCRUDマトリクス+background jobs probe計測。today: split protocolの3件のバグ修正(重複キュー投入によるsplit中断、abortパスのリセット順序、split境界を跨ぐstraggler書き込みのデータ損失)、KVStoreコンセプトへのreorganize/checkpoint/get_statistics追加、T1統計をreorgカウントから実際のsplit回数(<code>T1_Splits</code>)へ刷新、YCSB-Eの強制reorganize()トリガー撤去(background-jobs-probeと重複測定だったため)。background jobsのscan劣化率は前回検証済みのbounded rangeを維持(in_memory: 14.6/17.8%, ltm: 2.0/4.8% — シャーディング前は65-83%だった)。追記: organicなper-shard splitの書き込み停止区間を直接計測する仕組みを追加し、単調増加キー挿入下では約0.20〜0.22秒でコーパスサイズ非依存に安定していることを確認(詳細は下部のセクション参照)。ベンチ実行自体はコード変更ではなく、monorepo再編以降放置されていたAWSオーケストレーションスクリプトの複数のパスバグ(rsync同期先、NVMeデバイス検出、結果ダウンロード先)を発見・修正して初めて完走した。</p></p></p></p></p></p></p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -469,44 +469,45 @@
           </div>
           <div>
             <h3 class="text-base font-bold text-slate-900">Organic Per-Shard Splits</h3>
-            <p class="text-xs text-slate-500">Full per-split detail behind the "per-shard split (organic)" summary rows in the Background Jobs table above: what actually happens during ordinary operation, as opposed to the forced whole-store reorganize() there. Starting from an empty store with real background workers active, insert continuously for 90s (fixed 1KB values, monotonically increasing keys) and detect each automatic per-shard split as ShardedT1Index's own background worker pool completes it. Pause duration is the exact, directly-instrumented span writers targeting that shard were blocked (get_statistics().t1_last_split_pause_us) -- not an inferred window; degradation is this event's own local Insert QPS just before the pause vs. QPS across the pause itself (see run_organic_split_probe.sh). With monotonically increasing keys, exactly one shard is ever "hot" at a time regardless of how many other shards exist, so degradation stays high across every split here rather than shrinking with shard count -- that property (if it holds at all) would need a workload whose writes spread across multiple hot shards concurrently, e.g. random keys.</p>
+            <p class="text-xs text-slate-500">Full per-split detail behind the "per-shard split (organic)" summary rows in the Background Jobs table above: what actually happens during ordinary operation, as opposed to the forced whole-store reorganize() there. Starting from an empty store with real background workers active, insert continuously for 90s (fixed 1KB values, monotonically increasing keys) and detect each automatic per-shard split as ShardedT1Index's own background worker pool completes it. Pause duration is the exact, directly-instrumented span writers targeting that shard were blocked (get_statistics().t1_last_split_pause_us) -- not an inferred window; the QPS chart plots this event's own local Insert ops/sec just before the pause against ops/sec across the pause itself, both in absolute terms (see run_organic_split_probe.sh). With monotonically increasing keys, exactly one shard is ever "hot" at a time regardless of how many other shards exist, so the drop stays large across every split here rather than shrinking with shard count -- that property (if it holds at all) would need a workload whose writes spread across multiple hot shards concurrently, e.g. random keys.</p>
           </div>
         </div>
         <p class="text-[11px] text-slate-500">in-memory: 6 split(s) observed over 90s &middot; 9,403,453 total inserted &middot; ended at 8 shards</p>
 <p class="text-[11px] text-slate-500">LTM: 6 split(s) observed over 90s &middot; 7,694,305 total inserted &middot; ended at 7 shards</p>
+<p class="text-[11px] text-slate-400">Charts below truncated to shard count &le;7 (the highest both scenarios reached in this run) for a like-for-like comparison.</p>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-3">
   <div class="space-y-1.5">
     <h4 class="text-xs font-bold text-slate-600">Writer-visible pause duration</h4>
     <div class="h-64 relative"><canvas id="organic-split-pause-chart"></canvas></div>
   </div>
   <div class="space-y-1.5">
-    <h4 class="text-xs font-bold text-slate-600">Insert QPS degradation during that pause</h4>
-    <div class="h-64 relative"><canvas id="organic-split-degradation-chart"></canvas></div>
+    <h4 class="text-xs font-bold text-slate-600">Insert QPS: just before the pause vs. during it</h4>
+    <div class="h-64 relative"><canvas id="organic-split-qps-chart"></canvas></div>
   </div>
 </div>
 <script>
 (function() {
-  const d = {"pause": [{"label": "in-memory", "data": [{"x": 2, "y": 212.554}, {"x": 3, "y": 214.95}, {"x": 4, "y": 204.464}, {"x": 5, "y": 208.504}, {"x": 7, "y": 207.347}, {"x": 8, "y": 209.003}], "borderColor": "#6366f1", "backgroundColor": "#6366f1", "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}, {"label": "LTM", "data": [{"x": 2, "y": 208.143}, {"x": 3, "y": 219.26}, {"x": 4, "y": 215.645}, {"x": 5, "y": 221.543}, {"x": 6, "y": 223.298}, {"x": 7, "y": 215.863}], "borderColor": "#f59e0b", "backgroundColor": "#f59e0b", "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}], "degradation": [{"label": "in-memory", "data": [{"x": 2, "y": 86.3501}, {"x": 3, "y": 75.4618}, {"x": 4, "y": 56.3584}, {"x": 5, "y": 86.2439}, {"x": 7, "y": 56.1103}, {"x": 8, "y": 95.4481}], "borderColor": "#6366f1", "backgroundColor": "#6366f1", "borderDash": [6, 6], "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}, {"label": "LTM", "data": [{"x": 2, "y": 58.5275}, {"x": 3, "y": 71.3847}, {"x": 4, "y": 69.4821}, {"x": 5, "y": 82.8271}, {"x": 6, "y": 42.344}, {"x": 7, "y": 98.063}], "borderColor": "#f59e0b", "backgroundColor": "#f59e0b", "borderDash": [6, 6], "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}]};
-  const commonScales = (yTitle) => ({
-    x: { type: 'linear', title: { display: true, text: 'Shard count after this split', font: {size:11,family:'Inter'}, color: '#64748b' },
-         ticks: { stepSize: 1, font: {size:10,family:'Inter'}, color: '#94a3b8' },
-         grid: { color: 'rgba(100,116,139,0.08)' } },
-    y: { title: { display: true, text: yTitle, font: {size:11,family:'Inter'}, color: '#64748b' },
-         ticks: { font: {size:10,family:'Inter'}, color: '#94a3b8' },
-         grid: { color: 'rgba(100,116,139,0.08)' } },
-  });
-  const commonOptions = (yTitle) => ({
+  const d = {"pause": [{"label": "in-memory", "data": [{"x": 2, "y": 212.554}, {"x": 3, "y": 214.95}, {"x": 4, "y": 204.464}, {"x": 5, "y": 208.504}, {"x": 7, "y": 207.347}], "borderColor": "#6366f1", "backgroundColor": "#6366f1", "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}, {"label": "LTM", "data": [{"x": 2, "y": 208.143}, {"x": 3, "y": 219.26}, {"x": 4, "y": 215.645}, {"x": 5, "y": 221.543}, {"x": 6, "y": 223.298}, {"x": 7, "y": 215.863}], "borderColor": "#f59e0b", "backgroundColor": "#f59e0b", "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}], "qps": [{"label": "in-memory baseline", "data": [{"x": 2, "y": 104751}, {"x": 3, "y": 104570}, {"x": 4, "y": 108089}, {"x": 5, "y": 108577}, {"x": 7, "y": 108475}], "borderColor": "#6366f1", "backgroundColor": "#6366f1", "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}, {"label": "in-memory during pause", "data": [{"x": 2, "y": 14298.3}, {"x": 3, "y": 25659.5}, {"x": 4, "y": 47171.7}, {"x": 5, "y": 14936}, {"x": 7, "y": 47609.5}], "borderColor": "#6366f1", "backgroundColor": "#6366f1", "borderDash": [6, 6], "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}, {"label": "LTM baseline", "data": [{"x": 2, "y": 90765.9}, {"x": 3, "y": 104299}, {"x": 4, "y": 93638.4}, {"x": 5, "y": 111411}, {"x": 6, "y": 61734.3}, {"x": 7, "y": 83839.9}], "borderColor": "#f59e0b", "backgroundColor": "#f59e0b", "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}, {"label": "LTM during pause", "data": [{"x": 2, "y": 37642.9}, {"x": 3, "y": 29845.4}, {"x": 4, "y": 28576.5}, {"x": 5, "y": 19132.4}, {"x": 6, "y": 35593.5}, {"x": 7, "y": 1623.98}], "borderColor": "#f59e0b", "backgroundColor": "#f59e0b", "borderDash": [6, 6], "tension": 0.3, "pointRadius": 4, "pointHoverRadius": 6}]};
+  const xScale = { type: 'linear', title: { display: true, text: 'Shard count after this split', font: {size:11,family:'Inter'}, color: '#64748b' },
+       ticks: { stepSize: 1, font: {size:10,family:'Inter'}, color: '#94a3b8' },
+       grid: { color: 'rgba(100,116,139,0.08)' } };
+  const yScale = (yTitle, extra) => Object.assign({ title: { display: true, text: yTitle, font: {size:11,family:'Inter'}, color: '#64748b' },
+       ticks: { font: {size:10,family:'Inter'}, color: '#94a3b8' },
+       grid: { color: 'rgba(100,116,139,0.08)' } }, extra || {});
+  const commonOptions = (yTitle, yExtra) => ({
     responsive: true, maintainAspectRatio: false,
     plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: {size:11,family:'Inter',weight:'500'}, usePointStyle: true } } },
-    scales: commonScales(yTitle),
+    scales: { x: xScale, y: yScale(yTitle, yExtra) },
   });
   const pauseCanvas = document.getElementById('organic-split-pause-chart');
   if (pauseCanvas && d.pause.length) {
-    new Chart(pauseCanvas, { type: 'line', data: { datasets: d.pause }, options: commonOptions('Pause duration (ms)') });
+    new Chart(pauseCanvas, { type: 'line', data: { datasets: d.pause },
+      options: commonOptions('Pause duration (ms)', { min: 0, max: 10000 }) });
   }
-  const degrCanvas = document.getElementById('organic-split-degradation-chart');
-  if (degrCanvas && d.degradation.length) {
-    new Chart(degrCanvas, { type: 'line', data: { datasets: d.degradation }, options: commonOptions('Insert QPS degradation (%)') });
+  const qpsCanvas = document.getElementById('organic-split-qps-chart');
+  if (qpsCanvas && d.qps.length) {
+    new Chart(qpsCanvas, { type: 'line', data: { datasets: d.qps },
+      options: commonOptions('Insert ops/sec', { min: 0 }) });
   }
 })();
 </script>
