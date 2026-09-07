@@ -2364,6 +2364,21 @@ constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
 // pause's real, precisely-measured span removes that confound. "baseline" is still this event's
 // own local window just before the pause starts (not a single global average -- steady-state QPS
 // drifts slowly as the corpus grows, which would bias a global baseline against later events).
+//
+// Insert-only deliberately: a tried-and-reverted version added concurrent Update/Scan worker
+// pools to also measure their degradation (splits only happen at all because Insert keeps growing
+// the corpus, but Update/Scan hitting *existing* keys uniformly at random should, in theory, be
+// affected far less than Insert as shard count grows, since a random key only lands in whichever
+// shard is currently splitting with probability roughly 1/shard_count). In practice this backfired
+// two ways: the extra 16 threads oversubscribed the 32-vCPU box enough to noticeably slow Insert
+// itself, cutting the number of splits observed in the fixed 90s window roughly in half; and Scan
+// specifically showed wildly nonsensical results (QPS *far* higher during the pause than before
+// it) -- plausibly because pausing the many Insert/Update threads targeting the closing shard
+// measurably relieved CPU/lock contention for the comparatively few Scan threads, a real but
+// unwanted cross-workload interaction rather than a property of the split itself. Given the pause
+// is already short (~0.2s, see docs/t1_sharding_design.md) and infrequent relative to realistic
+// insert rates, the added complexity and noise wasn't worth it just to learn Update/Scan's
+// specific percentage during that already-brief window -- Insert-only stays the clean signal.
 constexpr int kOrganicSplitProbeDurationSec = 90;
 constexpr auto kOrganicSplitPollInterval = std::chrono::milliseconds(100);
 // Width of the "baseline" (pre-pause) window only -- wide enough to average out noise while still

@@ -492,6 +492,14 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
             duration_cell = f'{avg_pause_us / 1000:.0f}ms<div class="text-[10px] text-slate-400 font-normal">avg of {n} splits</div>'
             degr_badge = (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
                           f'{_badge_for_slowdown(avg_degr)} font-bold w-fit">{avg_degr:.0f}%</span>')
+            # Update/Scan degradation deliberately not measured here (permanently n/a, not a
+            # missing-data gap) -- see bench_kv.cpp's kOrganicSplitProbeDurationSec comment: a
+            # tried-and-reverted version added concurrent Update/Scan worker pools, but the extra
+            # threads oversubscribed the box enough to measurably slow the Insert stream that
+            # actually drives splitting, and Scan specifically showed nonsensical results from
+            # cross-workload CPU/lock-contention interaction, not the split's own cost. Given the
+            # pause itself is already short and infrequent (see the chart below), the added
+            # complexity and noise wasn't worth it just for Update/Scan's specific percentage.
             out.append(f'<tr><td class="py-2 px-3">{row_label}</td>'
                         f'<td class="py-2 px-3">{duration_cell}</td>'
                         f'<td class="py-2 px-3">{degr_badge}</td>'
