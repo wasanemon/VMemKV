@@ -235,13 +235,16 @@ def render_organic_split_summary_html(organic_split_data):
         out.append('<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">'
                     '<thead><tr class="border-b border-slate-200 bg-slate-50/50">'
                     '<th class="py-1.5 px-3 font-bold text-slate-700">Shard count after</th>'
+                    '<th class="py-1.5 px-3 font-bold text-slate-700">Pause duration</th>'
                     '<th class="py-1.5 px-3 font-bold text-slate-700">Baseline Insert QPS</th>'
                     '<th class="py-1.5 px-3 font-bold text-slate-700">During-split Insert QPS</th>'
                     '<th class="py-1.5 px-3 font-bold text-slate-700">Degradation</th>'
                     '</tr></thead><tbody class="divide-y divide-slate-100">')
         for split in splits:
             pct = split["degradation_pct"]
+            pause_cell = f'{split["pause_us"] / 1000:.0f}ms' if "pause_us" in split else '<span class="text-slate-300">n/a</span>'
             out.append(f'<tr><td class="py-1.5 px-3">{split["shard_count_after"]}</td>'
+                        f'<td class="py-1.5 px-3">{pause_cell}</td>'
                         f'<td class="py-1.5 px-3">{split["baseline_qps"]:,.0f}/s</td>'
                         f'<td class="py-1.5 px-3">{split["during_qps"]:,.0f}/s</td>'
                         f'<td class="py-1.5 px-3"><span class="inline-flex items-center px-1.5 py-0.5 rounded '
@@ -505,15 +508,16 @@ def main():
     # otherwise insert a fresh section right after the Workload Winners section closes.
     section_open_marker = '<section class="bg-white rounded-xl shadow-sm border border-slate-100 p-6 space-y-4">'
 
-    # heading is matched as a bare substring (see html.find(heading) below) against the *entire*
-    # document, not scoped to an <h3> tag -- so no other upsert_section call's title/description
-    # text (in this function or any other section already in the template) may contain another
-    # section's heading string verbatim, or that other section's own body gets matched and
-    # clobbered instead of inserting a new section. Confirmed the hard way: an early draft of the
-    # Organic Per-Shard Splits section's own description cross-referenced "Organic Per-Shard
-    # Splits" by name from within the Background Jobs section's description, and this function
-    # dutifully replaced Background Jobs' own section with a fresh (empty of Background Jobs
-    # content) Organic Per-Shard Splits one.
+    # heading is matched only inside its own <h3> tag (see h3_marker below), not as a bare
+    # substring against the whole document -- deliberately, after this bit *twice*: a section's
+    # title/description text (in this function or elsewhere already in the template) naming
+    # another section's heading in prose used to make a plain html.find(heading) match inside that
+    # other section's own body, and this function would then dutifully replace that section with a
+    # fresh, unrelated one. Once for the Organic Per-Shard Splits heading appearing in Background
+    # Jobs' own description, and again for the same heading appearing in the page's top-level
+    # description blurb. Scoping the search to the exact <h3>...</h3> wrapper this function itself
+    # always writes closes the whole class of bug rather than requiring every future caller to
+    # remember not to mention another section's name in prose.
     def upsert_section(html, heading, icon_bg, icon_text, icon_name, title, description_html, table_html):
         if not table_html:
             return html
@@ -531,7 +535,8 @@ def main():
         {table_html}
       </section>
 '''
-        heading_idx = html.find(heading)
+        h3_marker = f'<h3 class="text-base font-bold text-slate-900">{heading}</h3>'
+        heading_idx = html.find(h3_marker)
         if heading_idx == -1:
             # Not present yet: insert right after the Workload Winners section closes.
             winners_section_close = html.index("</section>", tbody_content_start) + len("</section>")
@@ -576,11 +581,14 @@ def main():
             "reorganize() above: starting from an empty store with real background workers active, "
             "insert continuously for 90s (fixed 1KB values, monotonically increasing keys) and "
             "detect each automatic per-shard split as ShardedT1Index's own background worker pool "
-            "completes it. Each row is one observed split; baseline/during QPS are this event's own "
-            "local Insert QPS just before it and QPS in the ~1.2s window overlapping it (see "
-            "run_organic_split_probe.sh). Watch whether degradation shrinks as shard count grows -- "
-            "only one shard pauses per split, so its share of total keyspace (and thus of total "
-            "QPS) should fall as more shards exist."
+            "completes it. \"Pause duration\" is the exact, directly-instrumented span writers "
+            "targeting that shard were blocked (get_statistics().t1_last_split_pause_us) -- not an "
+            "inferred window; baseline/during QPS are this event's own local Insert QPS just before "
+            "the pause and QPS across the pause itself (see run_organic_split_probe.sh). With "
+            "monotonically increasing keys, exactly one shard is ever \"hot\" at a time regardless of "
+            "how many other shards exist, so degradation stays high across every split here rather "
+            "than shrinking with shard count -- that property (if it holds at all) would need a "
+            "workload whose writes spread across multiple hot shards concurrently, e.g. random keys."
         ),
         table_html=render_organic_split_summary_html(organic_split_data),
     )
