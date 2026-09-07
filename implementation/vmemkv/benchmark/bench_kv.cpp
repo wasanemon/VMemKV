@@ -2349,15 +2349,26 @@ constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
 // in whichever shard currently owns the tail of the keyspace, the same access pattern
 // harness_new_incremental_scaling.cpp used to confirm one shard's own split cost stays flat
 // regardless of total corpus size -- see docs/t1_sharding_design.md), polling
-// get_statistics().t1_split_count at a fine interval to detect each split as it completes. For
-// every observed split, compares this event's own local Insert QPS just before it (not a single
-// global average -- steady-state QPS drifts slowly as the corpus grows, which would bias a global
-// baseline against later events) to Insert QPS in the window overlapping the split.
+// get_statistics().t1_split_count at a fine interval to detect each split as it completes.
+//
+// For every observed split, the "during" window is get_statistics()'s own
+// t1_last_split_pause_us/t1_last_split_pause_end_ns -- the writer-visible pause's *exact*
+// measured span, not a guessed fixed-width window. An earlier version of this probe used a fixed
+// ~1.2s window on both sides of the moment total_splits() was observed to increment, which
+// produced nonsensical results (QPS *higher* "during" most splits than "baseline"): total_splits()
+// only increments after the pause has already ended (plus the epoch drain and straggler
+// redistribution that follow it), so that window mostly covered the newly-split, freshly-small
+// shard's *higher* post-split throughput rather than the pause itself, confounded with the
+// pre-split shard's throughput right as it was largest and most loaded (the natural low point of
+// one shard's own grow-then-split cycle, not a property of the split's own cost). Anchoring on the
+// pause's real, precisely-measured span removes that confound. "baseline" is still this event's
+// own local window just before the pause starts (not a single global average -- steady-state QPS
+// drifts slowly as the corpus grows, which would bias a global baseline against later events).
 constexpr int kOrganicSplitProbeDurationSec = 90;
 constexpr auto kOrganicSplitPollInterval = std::chrono::milliseconds(100);
-// Wide enough to fully cover one shard's own reorganize/split cost (observed flat at ~0.6-1.0s
-// regardless of corpus size, see docs/t1_sharding_design.md) without averaging too much
-// surrounding steady-state activity into the "during" window.
+// Width of the "baseline" (pre-pause) window only -- wide enough to average out noise while still
+// reflecting recent steady-state throughput, not tied to the split's own duration anymore (see
+// above).
 constexpr double kOrganicSplitWindowSec = 1.2;
 
 [[noreturn]] void run_organic_split_probe(const ProbeArgs &args) {
@@ -2397,13 +2408,17 @@ constexpr double kOrganicSplitWindowSec = 1.2;
     double t_sec;
     std::size_t inserted;
     uint64_t split_count;
+    uint64_t last_pause_us;      // stats.t1_last_split_pause_us as of this poll
+    uint64_t last_pause_end_ns;  // stats.t1_last_split_pause_end_ns as of this poll
   };
   std::vector<Sample> samples;
   const auto t0 = std::chrono::steady_clock::now();
+  const auto t0_epoch_ns = static_cast<uint64_t>(t0.time_since_epoch().count());
   auto elapsed_sec = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
   while (elapsed_sec() < kOrganicSplitProbeDurationSec) {
     const auto stats = store->get_statistics();
-    samples.push_back({elapsed_sec(), next_key.load(std::memory_order_relaxed), stats.t1_split_count});
+    samples.push_back({elapsed_sec(), next_key.load(std::memory_order_relaxed), stats.t1_split_count,
+                       stats.t1_last_split_pause_us, stats.t1_last_split_pause_end_ns});
     std::this_thread::sleep_for(kOrganicSplitPollInterval);
   }
   stop.store(true, std::memory_order_relaxed);
@@ -2436,7 +2451,8 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   };
 
   struct SplitEvent {
-    double at_sec;
+    double pause_start_sec;
+    double pause_us;
     uint64_t shard_count_after;
     double baseline_qps;
     double during_qps;
@@ -2446,13 +2462,23 @@ constexpr double kOrganicSplitWindowSec = 1.2;
     if (samples[i].split_count <= samples[i - 1].split_count) {
       continue;
     }
-    const double at = samples[i].t_sec;
-    const auto baseline = qps_between(at - kOrganicSplitWindowSec, at);
-    const auto during = qps_between(at, std::min(at + kOrganicSplitWindowSec, samples.back().t_sec));
+    // Place the pause on this function's own elapsed_sec() timeline via last_split_pause_end_ns
+    // (a steady_clock timestamp shared with t0 above, both process-local and directly comparable)
+    // rather than assuming it happened right at this poll -- continue_split()'s own comment on
+    // that field explains why it doesn't: total_splits() only increments after the epoch drain and
+    // straggler redistribution that follow the pause itself, so this poll's t_sec is later than
+    // the pause actually was by however long those steps took.
+    const uint64_t pause_end_ns = samples[i].last_pause_end_ns;
+    const double pause_end_sec = static_cast<double>(pause_end_ns - t0_epoch_ns) / 1e9;
+    const double pause_us = static_cast<double>(samples[i].last_pause_us);
+    const double pause_start_sec = pause_end_sec - pause_us / 1e6;
+
+    const auto baseline = qps_between(pause_start_sec - kOrganicSplitWindowSec, pause_start_sec);
+    const auto during = qps_between(pause_start_sec, pause_end_sec);
     if (!baseline.has_value() || !during.has_value() || *baseline <= 0.0) {
       continue;
     }
-    events.push_back({at, samples[i].split_count + 1, *baseline, *during});
+    events.push_back({pause_start_sec, pause_us, samples[i].split_count + 1, *baseline, *during});
   }
 
   std::cout << "{\"job\":\"organic_split\",\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\","
@@ -2463,9 +2489,9 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   for (std::size_t i = 0; i < events.size(); ++i) {
     const auto &e = events[i];
     const double degradation_pct = (1.0 - e.during_qps / e.baseline_qps) * 100.0;
-    std::cout << (i > 0 ? "," : "") << "{\"at_sec\":" << e.at_sec << ",\"shard_count_after\":" << e.shard_count_after
-              << ",\"baseline_qps\":" << e.baseline_qps << ",\"during_qps\":" << e.during_qps
-              << ",\"degradation_pct\":" << degradation_pct << "}";
+    std::cout << (i > 0 ? "," : "") << "{\"at_sec\":" << e.pause_start_sec << ",\"pause_us\":" << e.pause_us
+              << ",\"shard_count_after\":" << e.shard_count_after << ",\"baseline_qps\":" << e.baseline_qps
+              << ",\"during_qps\":" << e.during_qps << ",\"degradation_pct\":" << degradation_pct << "}";
   }
   std::cout << "],\"timed_out\":false}" << std::endl;
   std::_Exit(0);

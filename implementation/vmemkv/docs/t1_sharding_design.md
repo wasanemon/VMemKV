@@ -460,7 +460,35 @@ T2とWALは既存どおりグローバル(シャード非依存)のまま維持�
   増えてもこの状態では恒久的にsplitが起きない。修正として、`run_organic_split_probe()`の
   挿入フェーズ全体を`VMEMKV_SUPPRESS_AUTO_REORG=1`(`run_background_job_probe()`のpopulate
   フェーズで既に使われていた抑制フラグ)で囲み、organic checkpointを止めた状態で
-  ShardedT1Indexの自前のsplit判定だけを働かせる形にした。再計測待ち。
+  ShardedT1Indexの自前のsplit判定だけを働かせる形にした。
+
+- 実測(2回目、AWS): 上記修正後、実際にsplitを観測できた(in_memory: 7回、shard 2→8。ltm: 5回、
+  shard 2→6)。ただし固定幅(前後1.2秒)の窓による劣化率計算が、ほとんどのイベントで**マイナス**
+  (during窓の方がbaselineよりQPSが高い)という不可解な結果になった。原因は、単調増加キーの
+  挿入では常に1つの「hot」シャードだけが書き込みを受けており、そのシャードはsplit直前に
+  最も肥大化(閾値の約210万件に到達)している一方、split直後は新しく分割された小さい方の
+  シャードに書き込みが移るため処理が軽くなるという、シャード自身の成長サイクルの中で
+  baseline窓が最も重い瞬間を、during窓がその後の身軽な瞬間を捉えてしまう交絡にあった。
+  加えて`total_splits()`(観測に使っていたカウンタ)はepoch drain・straggler再配分まで完了した
+  後にしか増分されないため、観測時刻とsplit本体の停止区間には実際にはズレがあり、固定窓の
+  位置取り自体もそもそも不正確だった。
+- 済: 上記の交絡を解消するため、`ShardedT1Index`に書き込みが実際にブロックされていた区間を
+  直接計測する仕組みを追加した。`continue_split()`内で、Closing可視化(`run_maintenance()`の
+  CAS成功直後、この関数の呼び出しとほぼ同時)から`target->superseded.store(split_info, ...)`
+  (spin待機中の書き込みが起床・リダイレクトする瞬間)までを`steady_clock`で直接計測し、
+  `last_split_pause_us_`(区間長)と`last_split_pause_end_ns_`(区間終了時刻、プロセス内で
+  `steady_clock::now()`と直接比較可能な生タイムスタンプ)という2つのatomicに保存、
+  `total_splits()`と同様に`get_statistics()`(`VMemKVStatistics::t1_last_split_pause_us`/
+  `t1_last_split_pause_end_ns`)経由で公開した。`epoch drain`/straggler再配分(停止区間より
+  *後*に走る、書き込みは既に解放済みの処理)は意図的に含めていない——呼び出し元が実際に
+  気にするのは書き込みが止まっていた区間そのものであり、`continue_split()`全体の所要時間
+  ではないため。「last」(単一フィールド、蓄積ではない)なので異なるシャードの並行splitが
+  競合しうるが、`last_checkpoint_*`系と同じ許容範囲の設計(診断目的であり、単調増加キーのように
+  同時に1シャードしかhotにならないワークロードでは実質問題にならない)。`run_organic_split_probe()`
+  はこれらの値を使い、observed総split数増分ごとに「baseline窓」を停止区間開始の直前1.2秒、
+  「during窓」を停止区間そのもの(固定幅の当て推量ではなく実測区間)に置き換えた。274/274テスト
+  変更なし(本番コード側の追加は既存の書き込みパスに新しい分岐を入れておらず、統計値の追記の
+  み)。再計測待ち。
 
 ## 未実装/次のステップ
 

@@ -620,6 +620,8 @@ class VMemKVImpl {
   auto get_statistics() const noexcept -> vmemkv::VMemKVStatistics {
     return vmemkv::VMemKVStatistics{
         .t1_split_count = t1_.total_splits(),
+        .t1_last_split_pause_us = t1_.last_split_pause_us(),
+        .t1_last_split_pause_end_ns = t1_.last_split_pause_end_ns(),
         .checkpoint_count = checkpoint_count_.load(std::memory_order_relaxed),
         .last_checkpoint_duration_us = last_checkpoint_duration_us_.load(std::memory_order_relaxed),
         .last_checkpoint_msync_duration_us = last_checkpoint_msync_duration_us_.load(std::memory_order_relaxed),

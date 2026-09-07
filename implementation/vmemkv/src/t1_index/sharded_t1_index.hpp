@@ -170,6 +170,31 @@ class ShardedT1Index {
   // split_shard_containing() call -- both go through the same continue_split().
   [[nodiscard]] auto total_splits() const -> uint64_t { return total_splits_.load(std::memory_order_relaxed); }
 
+  // Duration of the most recently completed split's writer-visible pause: from the moment the
+  // Closing sentinel makes the target shard unresolvable (any in-flight resolve_for_write() call
+  // starts spin-waiting) to the moment superseded is set to the real Split{...} (spinning writers
+  // wake up and redirect to the new shards) -- see continue_split()'s own comment on exactly where
+  // this is measured. Deliberately *not* the whole continue_split() call's duration: the epoch
+  // drain and straggler redistribution after that point run with writers already unblocked, so
+  // including them would overstate the pause an actual caller experiences. "Last" (not
+  // aggregated): concurrent splits of different shards would race this single field, acceptable
+  // for its diagnostic purpose (matches last_checkpoint_* in VMemKVStatistics), and moot for any
+  // workload -- like monotonic-key inserts -- where only one shard is ever hot enough to split at
+  // a time.
+  [[nodiscard]] auto last_split_pause_us() const -> uint64_t {
+    return last_split_pause_us_.load(std::memory_order_relaxed);
+  }
+
+  // steady_clock::now().time_since_epoch().count() at the end of that same pause (see
+  // last_split_pause_us()) -- lets a caller running in the same process (any std::chrono::
+  // steady_clock is process-local and otherwise meaningless) place the pause precisely on its own
+  // timeline via its own steady_clock::now() calls, rather than inferring a window from whenever
+  // it happens to observe total_splits() increment (which lags this by the epoch drain + straggler
+  // redistribution's own cost -- see continue_split()'s comment at the store site).
+  [[nodiscard]] auto last_split_pause_end_ns() const -> uint64_t {
+    return last_split_pause_end_ns_.load(std::memory_order_relaxed);
+  }
+
   // Sum of every shard's *current* append-region occupancy -- "is there anything anywhere left to
   // merge" for a caller deciding whether a T1-only reorganize would be a no-op (e.g.
   // VMemKVImpl::run_reorganize()'s own skip-if-nothing-to-do check, mirroring what it did against
@@ -433,6 +458,14 @@ class ShardedT1Index {
   // as any other read of a ShardSlot, or a concurrent split completing between "resolve" and "CAS
   // attempt" could leave the CAS touching already-freed memory.
   void continue_split(ShardSlot *target) {
+    // Marks the start of the window writers targeting `target` actually spend spin-waiting on
+    // Closing (see resolve_for_write()) -- run_maintenance()'s own Closing CAS, just before this
+    // call, is close enough to call this the start with negligible error (nothing of substance
+    // runs between them). Stopped right after superseded.store(split_info, ...) below, the exact
+    // point spinning writers wake up and redirect -- see last_split_pause_us()'s own comment for
+    // why this range, not continue_split()'s full duration, is what a caller cares about.
+    const auto split_pause_start = std::chrono::steady_clock::now();
+
     // Purge any queue entry for `target` now, under the same mutex request_maintenance_if_needed()
     // re-checks `superseded` under (see that method's comment): together these guarantee no
     // worker can ever dequeue `target` after this point, which is what makes `delete target`
@@ -520,6 +553,22 @@ class ShardedT1Index {
     auto *split_info = new Split{boundary, low_slot, high_slot};
     // Closing -> Split{...}: any put/remove spin-waiting on Closing wakes up and redirects.
     target->superseded.store(split_info, std::memory_order_release);
+
+    const auto split_pause_end = std::chrono::steady_clock::now();
+    last_split_pause_us_.store(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(split_pause_end - split_pause_start).count()),
+        std::memory_order_relaxed);
+    // Absolute steady_clock timestamp (not wall-clock -- unrelated to any real epoch), valid to
+    // compare only against other steady_clock::now() calls within this same process. Lets a caller
+    // that also calls steady_clock::now() itself (e.g. a benchmark probe timing its own workload
+    // threads) place this pause precisely on its own timeline instead of guessing a window around
+    // whenever it happens to observe total_splits() having incremented -- which, notably, is *not*
+    // the same instant as split_pause_end: total_splits_ increments only once this whole function
+    // returns, after the epoch drain and straggler redistribution below, both of which run *after*
+    // writers are already unblocked.
+    last_split_pause_end_ns_.store(static_cast<uint64_t>(split_pause_end.time_since_epoch().count()),
+                                    std::memory_order_relaxed);
 
     Directory *old_dir = publish_directory_after_split(target, low_slot, high_slot, boundary);
 
@@ -737,6 +786,8 @@ class ShardedT1Index {
   mutable ThreadReferenceTracker<uint64_t> routing_epochs_;
   std::atomic<uint64_t> routing_epoch_{1};
   std::atomic<uint64_t> total_splits_{0};
+  std::atomic<uint64_t> last_split_pause_us_{0};
+  std::atomic<uint64_t> last_split_pause_end_ns_{0};
   std::atomic<Directory *> directory_{nullptr};
   size_t append_cap_;
   size_t target_shard_size_;

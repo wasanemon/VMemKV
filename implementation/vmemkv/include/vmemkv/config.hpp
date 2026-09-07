@@ -111,6 +111,13 @@ struct VMemKVStatistics {
   // and explicit (split_shard_containing()) alike -- the real signal for T1 background maintenance
   // activity now that splitting, not a single global reorganize(), is how T1 stays bounded.
   uint64_t t1_split_count = 0;
+  // ShardedT1Index::last_split_pause_us()/last_split_pause_end_ns(): the writer-visible pause
+  // window of the most recently completed split (see those methods' own comments for exactly what
+  // this does and doesn't include). end_ns is a process-local std::chrono::steady_clock epoch
+  // timestamp -- only meaningful compared against the caller's own steady_clock::now() calls in
+  // this same process, e.g. to place the pause on a benchmark's own polling timeline.
+  uint64_t t1_last_split_pause_us = 0;
+  uint64_t t1_last_split_pause_end_ns = 0;
   uint64_t checkpoint_count = 0;
 
   // Phase breakdown for the most recently completed checkpoint_internal() cycle (auto-triggered
