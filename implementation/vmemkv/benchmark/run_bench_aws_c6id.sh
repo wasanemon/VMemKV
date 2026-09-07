@@ -344,29 +344,42 @@ install_remote_dependencies() {
 prepare_remote_storage() {
   echo "Locating and mounting local NVMe SSD..."
   ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "
-    # Picks the *largest* nvme*n1 device rather than assuming a fixed index (nvme0n1 = root,
-    # nvme1n1 = local NVMe): on i4i instances the root EBS volume and the local instance-store NVMe
-    # can enumerate in either order, and a fixed index picked the root volume on at least one
-    # observed launch, corrupting /boot via a bind-mount and failing later with \"not enough free
-    # space for a swapfile\" once /boot's small filesystem filled up. Size is a robust discriminator
-    # regardless of enumeration order or partition layout: i4i's instance-store NVMe is multiple
-    # TB, dwarfing any plausible root EBS volume (tens of GB) -- a prior mountpoint-based exclusion
-    # attempt (matching PKNAME against / /boot /boot/efi) missed a whole-disk-mounted root (no
-    # partition, so no PKNAME) because lsblk -no PKNAME,MOUNTPOINT's empty PKNAME field shifts the
-    # mountpoint into the wrong awk column when field-split on whitespace.
-    DEV=\$(lsblk -dbno NAME,SIZE | grep -E '^nvme[0-9]+n1' | sort -k2 -n -r | head -n1 | awk '{print \"/dev/\"\$1}')
-    DEV_SIZE_BYTES=\$(lsblk -dbno SIZE \"\$DEV\" 2>/dev/null || echo 0)
-    MIN_EXPECTED_BYTES=\$((100 * 1024 * 1024 * 1024))
-    if [ -z \"\$DEV\" ] || [ \"\$DEV_SIZE_BYTES\" -lt \"\$MIN_EXPECTED_BYTES\" ]; then
-      echo \"[ERROR] Local NVMe SSD not found (or suspiciously small: \$DEV_SIZE_BYTES bytes)! A physical local NVMe is strictly required to run LTM / Swap benchmarks.\" >&2
+    # Picks the nvme*n1 device that is both unpartitioned and not itself mounted, rather than
+    # assuming a fixed index (nvme0n1 = root, nvme1n1 = local NVMe) or comparing raw size: a
+    # freshly-launched instance's local instance-store NVMe is always raw and untouched at boot,
+    # while the root EBS volume always carries at least one partition (boot/root, or a separate
+    # /boot). This survived two narrower earlier attempts that both broke on real launches: (1)
+    # excluding whichever device's PKNAME matched / /boot /boot/efi missed a whole-disk-mounted
+    # root (no partition, so no PKNAME -- lsblk -no PKNAME,MOUNTPOINT's empty PKNAME field then
+    # shifts the mountpoint into the wrong awk column when field-split on whitespace); (2) picking
+    # the largest device by size alone correctly identified the real local NVMe, but the *existing*
+    # already-mounted-elsewhere fallback below (now removed) matched by a bare \"nvme[1-9]n1\"
+    # regex against /proc/mounts with no regard for which device it actually found -- when /boot
+    # lived on a *partition* of the selected device (so findmnt -S <whole device> correctly found
+    # nothing), that fallback matched instead on an unrelated device/partition also mounted at
+    # /boot, and reported it as if it were the selected device's own mount.
+    DEV=\"\"
+    for CAND in \$(lsblk -dbno NAME,SIZE | grep -E '^nvme[0-9]+n1' | sort -k2 -n -r | awk '{print \$1}'); do
+      PART_COUNT=\$(lsblk -ln -o NAME \"/dev/\$CAND\" | wc -l)
+      if [ \"\$PART_COUNT\" -gt 1 ]; then
+        continue  # has at least one partition -- almost certainly the root EBS volume
+      fi
+      if findmnt -rn -S \"/dev/\$CAND\" >/dev/null 2>&1; then
+        continue  # mounted directly (whole-disk root, no partition table)
+      fi
+      DEV=\"/dev/\$CAND\"
+      break
+    done
+    if [ -z \"\$DEV\" ]; then
+      echo \"[ERROR] Local NVMe SSD not found! A physical local NVMe is strictly required to run LTM / Swap benchmarks.\" >&2
       exit 1
     fi
 
     sudo mkdir -p /mnt/nvme
+    # By construction DEV is unpartitioned and unmounted, so this should always be empty --
+    # checked anyway (rather than assuming) in case some other process mounted it between the
+    # selection above and here.
     MOUNT_TARGET=\$(findmnt -rn -S \"\$DEV\" -o TARGET 2>/dev/null | head -n 1 || true)
-    if [ -z \"\$MOUNT_TARGET\" ]; then
-      MOUNT_TARGET=\$(grep -E \"^[^ ]*nvme[1-9]n1\" /proc/mounts | awk '{print \$2}' | head -n 1 || true)
-    fi
 
     if [ -n \"\$MOUNT_TARGET\" ]; then
       echo \"NVMe SSD \$DEV is already mounted at \$MOUNT_TARGET\"
