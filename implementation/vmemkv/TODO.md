@@ -27,27 +27,48 @@ This document outlines the roadmap to implement the full, robust architecture of
 * **Durable finding**: for this project's `ltm/1KB` write-burst workload, `target_ratio<=1.5` is
   reliably safe and `target_ratio>=1.65` reliably hangs; `1.5-1.65` is a probabilistic knife's edge.
 * **Landed as a partial mitigation**: `T1AppendCapacityLog2` shrunk 22->21, halving each
-  `AppendRegion` generation's fixed RSS footprint (`append_region_live_count`/
-  `append_region_peak_count` in `VMemKVStatistics` track this).
-* **Next steps**: (a) a self-throttling/backpressure mechanism in `bulk_load()`'s write burst
-  (check memory pressure, voluntarily pace writes, rather than relying solely on the kernel's
-  `memory.high` response); (b) item 7 below (`reorganize()`'s O(corpus) cost) is a second,
-  independent contributor to this class of stall and should be considered alongside any fix here.
+  `AppendRegion` generation's fixed RSS footprint; separately, `reorganize()`/`checkpoint()`'s own
+  O(corpus) cost (a second, independent contributor to this class of stall) is now resolved by
+  `ShardedT1Index` (see item 8 below) -- remaining gap is `bulk_load()`'s write burst itself.
+* **Next step**: a self-throttling/backpressure mechanism in `bulk_load()` (check memory pressure,
+  voluntarily pace writes, rather than relying solely on the kernel's `memory.high` response).
 
-## 7. `T1Index::reorganize()`'s O(corpus) merge cost
-* **Status**: 🔴 **Not Implemented** -- found 2026-08-31.
-* **Problem**: `reorganize()`'s in-memory merge of `sorted_region_` with `append_active_`'s region
-  walks the full existing `sorted_region_` every call, regardless of how small the delta being
-  merged in is.
-  `checkpoint_internal()`'s T1-checkpoint-file rewrite inherits this same O(corpus) cost, since it
-  depends on this merge to produce a coherent snapshot. This is the structural reason checkpoint
-  and T1-only-reorganize auto-triggering can compound under sustained writes: each cycle pays the
-  same fixed corpus-sized cost, so triggering more often does not reduce total overhead
-  proportionally, and a write burst that outpaces one cycle's completion can cascade into a
-  worsening backlog (observed directly this session during a population-phase benchmark run).
-* **Real fix**: an incremental/leveled T1 checkpoint format (LSM-style memtable-flush +
-  compaction) so durability cost is O(delta), decoupling WAL-rotation frequency from full-corpus
-  compaction frequency. Deemed too complex to take on immediately; documented here for future work.
-* **Mitigation in use for benchmarking**: `VMEMKV_SUPPRESS_AUTO_REORG` lets a benchmark driver
-  suppress the auto-triggered Checkpoint branch specifically during a population/setup phase (see
-  `reorg_worker_loop()` in `vmemkv_impl.hpp`), without touching the underlying cost.
+## 8. `ShardedT1Index` single-shard "routing tax"
+* **Status**: 🔴 **Not implemented** -- found 2026-09-07, `docs/t1_sharding_design.md`.
+* **Problem**: for a corpus small enough to never cross one shard's split threshold, every
+  put/get/scan still pays `with_routing_guard()`'s directory-lookup/epoch-guard overhead with none
+  of sharding's contention-spreading benefit to offset it. Measured up to ~30% Insert/Update
+  throughput regression at high thread counts (`ltm/64KB`, 131K-key corpus) vs. the pre-sharding
+  baseline.
+* **Idea**: a fast path that bypasses `with_routing_guard()` while `shard_count() == 1`.
+
+## 9. `ShardedT1Index` data inconsistency under extreme concurrency + cycling writes
+* **Status**: 🔴 **Not root-caused** -- `docs/t1_sharding_design.md`. Lower priority: does not
+  reproduce at production-representative scale or with single-pass (non-cycling) writes.
+* **Problem**: small `target_shard_size` + high thread count + sustained cycling updates on a
+  small key range produces real data inconsistency, distinct from (and surviving past) the three
+  split-protocol bugs fixed this round.
+
+## 10. `ShardedT1Index` migration gaps from the pre-sharding `T1Index`
+* **Status**: 🔴 **Not implemented** -- dropped during the `VMemKVImpl` wiring, `docs/t1_sharding_design.md`.
+* Delete-pressure trigger equivalent to the old `maybe_reorganize_if_needed_for_delete()`.
+* Scan-active dynamic append-threshold reduction (kept the append region L2-cache-sized during a
+  scan).
+
+## 11. Validate organic-split impact with non-monotonic keys
+* **Status**: 🔴 **Not measured**, `docs/t1_sharding_design.md`. `run_organic_split_probe.sh`'s
+  monotonically-increasing-key workload always concentrates writes on exactly one "hot" shard
+  regardless of shard count, so it structurally can't show whether a split's throughput impact
+  *shrinks* as shard count grows -- that would need a random-key (or otherwise multi-hot-shard)
+  variant of the same probe.
+
+## 12. `defragment()` (T2 space reclamation) needs a full redesign
+* **Status**: 🔴 **Not implemented** -- permanently no-op'd (round 1) then fully removed from the
+  codebase (round 3); a real gap, not a resolved one. `docs/benchmark/20260823_maintenance_ops_priority_triage.md`.
+* **Problem**: the original implementation couldn't keep up with Insert at `64KB/LTM` (0.4x its
+  throughput) and collapsed concurrent-write TPS by up to 98% (effectively a 60s+ stall) -- the
+  same "maintenance work competing with the foreground write path" failure mode `ShardedT1Index`'s
+  background-worker-pool design was built to avoid for T1.
+* **Direction**: redesign around the same principle that worked for T1 sharding (dedicated
+  background worker pool + per-region/per-shard scoped backpressure, never the accessing thread
+  doing the compaction itself) rather than reviving the old implementation as-is. Not yet scoped.
