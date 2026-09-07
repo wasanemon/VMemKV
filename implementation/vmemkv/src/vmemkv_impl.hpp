@@ -633,7 +633,8 @@ class VMemKVImpl {
         .last_checkpoint_corpus_bytes = last_checkpoint_corpus_bytes_.load(std::memory_order_relaxed),
         .total_reorganize_wait_duration_us = total_reorganize_wait_duration_us_.load(std::memory_order_relaxed),
         .append_region_live_count = t1_.append_region_live_count(),
-        .append_region_peak_count = t1_.append_region_peak_count()};
+        .append_region_peak_count = t1_.append_region_peak_count(),
+        .bulk_load_throttle_events = bulk_load_throttle_.throttle_events()};
   }
 
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
@@ -1089,14 +1090,13 @@ class VMemKVImpl {
   // with other writers.
   template <typename KeyFn, typename ValueFn>
   void bulk_load_impl(std::size_t count, KeyFn &&make_key, ValueFn &&make_value) {
-    vmemkv::CgroupMemoryThrottle memory_throttle;
     for (std::size_t index = 0; index < count; ++index) {
       maybe_reorganize_if_needed();
       const std::string key = make_key(index);
       const std::string value = make_value(index);
       write_entry_lockfree(std::span<const std::byte>(reinterpret_cast<const std::byte *>(key.data()), key.size()),
                            std::span<const std::byte>(reinterpret_cast<const std::byte *>(value.data()), value.size()));
-      memory_throttle.maybe_throttle(index);
+      bulk_load_throttle_.maybe_throttle(index);
     }
   }
 
@@ -1514,6 +1514,9 @@ class VMemKVImpl {
   T1IndexT t1_;
   vmemkv::T2FlatFile t2_;
   vmemkv::Wal wal_;
+  // Paces bulk_load_impl() against cgroup v2 memory pressure (see its own comment). Member (not
+  // a bulk_load-local) so the engagement count survives in get_statistics().
+  vmemkv::CgroupMemoryThrottle bulk_load_throttle_;
   std::atomic<uint64_t> checkpoint_count_{0};
   // See wait_until_reorg_not_running()'s own comment.
   mutable std::atomic<uint64_t> total_reorganize_wait_duration_us_{0};

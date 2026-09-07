@@ -10,6 +10,7 @@
 // inactive and each call costs only a counter check.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -49,12 +50,20 @@ class CgroupMemoryThrottle {
     // current >= 95% of high: approaching the budget -- ease off early, before the race starts.
     if (current >= high_bytes_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      throttle_events_.fetch_add(1, std::memory_order_relaxed);
     } else if (current * 100 >= high_bytes_ * 95) {
       std::this_thread::sleep_for(std::chrono::microseconds(200));
+      throttle_events_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
   [[nodiscard]] auto active() const noexcept -> bool { return active_; }
+
+  // Lifetime count of backpressure sleeps taken -- diagnostic (e.g. confirming the throttle
+  // actually engaged during a larger-than-memory bulk load).
+  [[nodiscard]] auto throttle_events() const noexcept -> uint64_t {
+    return throttle_events_.load(std::memory_order_relaxed);
+  }
 
  private:
   static auto read_uint_file(const std::string &path, uint64_t &out) -> bool {
@@ -119,6 +128,7 @@ class CgroupMemoryThrottle {
   bool active_ = false;
   uint64_t high_bytes_ = 0;
   std::string dir_;
+  std::atomic<uint64_t> throttle_events_{0};
 };
 
 }  // namespace vmemkv

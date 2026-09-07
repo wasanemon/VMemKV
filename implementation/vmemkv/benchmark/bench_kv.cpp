@@ -2220,6 +2220,9 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   // every insert still grows the corpus like the monotonic variant does.
   const bool random_keys = args.key_pattern == "random";
   std::atomic<std::size_t> next_key{0};
+  // Completed inserts (QPS sampling and the final total). Separate from next_key, which only
+  // advances in the monotonic pattern -- random draws never touch it.
+  std::atomic<std::size_t> inserted{0};
   std::atomic<bool> stop{false};
   std::vector<std::thread> workers;
   workers.reserve(writer_threads);
@@ -2230,6 +2233,7 @@ constexpr double kOrganicSplitWindowSec = 1.2;
       while (!stop.load(std::memory_order_relaxed)) {
         const std::size_t idx = random_keys ? dist(rng) : next_key.fetch_add(1, std::memory_order_relaxed);
         store->insert(make_key(idx), make_value_for_key(idx, args.val_size));
+        inserted.fetch_add(1, std::memory_order_relaxed);
       }
     });
   }
@@ -2247,7 +2251,7 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   auto elapsed_sec = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
   while (elapsed_sec() < kOrganicSplitProbeDurationSec) {
     const auto stats = store->get_statistics();
-    samples.push_back({elapsed_sec(), next_key.load(std::memory_order_relaxed), stats.t1_split_count,
+    samples.push_back({elapsed_sec(), inserted.load(std::memory_order_relaxed), stats.t1_split_count,
                        stats.t1_last_split_pause_us, stats.t1_last_split_pause_end_ns});
     std::this_thread::sleep_for(kOrganicSplitPollInterval);
   }
@@ -2315,7 +2319,7 @@ constexpr double kOrganicSplitWindowSec = 1.2;
             << "\"value_size\":" << args.val_size << ",\"writer_threads\":" << writer_threads
             << ",\"key_pattern\":\"" << args.key_pattern << "\","
             << "\"duration_sec\":" << kOrganicSplitProbeDurationSec << ","
-            << "\"total_inserted\":" << next_key.load(std::memory_order_relaxed) << ","
+            << "\"total_inserted\":" << inserted.load(std::memory_order_relaxed) << ","
             << "\"final_shard_count\":" << (final_split_count + 1) << ",\"splits\":[";
   for (std::size_t i = 0; i < events.size(); ++i) {
     const auto &e = events[i];

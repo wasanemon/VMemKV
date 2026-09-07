@@ -121,6 +121,10 @@ struct VMemKVStatistics {
   // this bounds T1's own RSS contribution under sustained reorganize() churn.
   int64_t append_region_live_count = 0;
   int64_t append_region_peak_count = 0;
+
+  // CgroupMemoryThrottle::throttle_events(): backpressure sleeps taken by bulk_load_impl()
+  // against cgroup v2 memory pressure over this store's lifetime. 0 without a cgroup limit.
+  uint64_t bulk_load_throttle_events = 0;
 };
 
 }  // namespace vmemkv

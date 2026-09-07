@@ -73,6 +73,7 @@ TEST_CASE("CgroupMemoryThrottle: low usage never sleeps") {
             throttle.maybe_throttle(i);
           }
         }) < std::chrono::milliseconds(100));
+  CHECK(throttle.throttle_events() == 0);
 }
 
 TEST_CASE("CgroupMemoryThrottle: usage at the limit backs off hard") {
@@ -87,6 +88,7 @@ TEST_CASE("CgroupMemoryThrottle: usage at the limit backs off hard") {
             throttle.maybe_throttle(i);
           }
         }) >= std::chrono::milliseconds(5));
+  CHECK(throttle.throttle_events() == 3);
 }
 
 TEST_CASE("CgroupMemoryThrottle: usage at 96% eases off early") {
