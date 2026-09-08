@@ -298,7 +298,10 @@ class LeanStoreStore {
     }
     // No bulk-insert fast path exists in this backend version, so load goes through regular
     // transactions: strided across loader threads (content is index-derived, hence identical
-    // regardless of insertion order) with a commit every batch to bound TX WAL size.
+    // regardless of insertion order) with a commit every batch to bound TX WAL size. Each key
+    // probes before inserting: a batch that aborts mid-way retries the whole chunk, and only
+    // the probe makes that retry idempotent (blind re-insert would hit the engine's
+    // duplicate path).
     constexpr std::size_t kBatchKeys = 10000;
     const auto loader_threads = static_cast<unsigned>(
         std::min<std::size_t>(worker_threads(), std::max<std::size_t>(1, key_count / kBatchKeys)));
@@ -316,6 +319,13 @@ class LeanStoreStore {
                   if (value.size() > kMaxValueBytes) {
                     failed.store(true, std::memory_order_relaxed);
                     return 0;
+                  }
+                  bool present = false;
+                  scan_exact(
+                      btree, std::span<const std::byte>(reinterpret_cast<const std::byte *>(key.data()), key.size()),
+                      [&](const ::u8 *, ::u16) {}, present);
+                  if (present) {
+                    continue;
                   }
                   const auto res = btree.insert(reinterpret_cast<::u8 *>(const_cast<char *>(key.data())),
                                                 checked_len(key.size()),
@@ -390,8 +400,6 @@ class LeanStoreStore {
                      std::span<const std::byte>(value_buf.data(), value_buf.size()));
             ++out.count;
           }
-          out.keys.clear();
-          out.keys.shrink_to_fit();
           return out;
         },
         /*read_only=*/true);
@@ -415,7 +423,8 @@ class LeanStoreStore {
 
   static auto worker_threads() -> uint32_t {
     if (const char *env = std::getenv("LEANSTORE_WORKER_THREADS")) {
-      return static_cast<uint32_t>(std::strtoul(env, nullptr, 10));
+      // Clamped to the slot-mutex array bound; fewer workers only (bisect/debug knob).
+      return std::min(static_cast<uint32_t>(kWorkerThreads), static_cast<uint32_t>(std::strtoul(env, nullptr, 10)));
     }
     return static_cast<uint32_t>(kWorkerThreads);
   }
