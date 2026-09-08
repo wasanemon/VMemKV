@@ -24,14 +24,17 @@ STORE_VARIANT_TO_LABEL = {
     ("VMemKV", "Bloom"): "+BF",
     ("VMemKV", "Bloom-T1InlineValue"): "+Inline",
     ("VMemKV", "Bloom-T1InlineValue-Prefaulting"): "+Prefault",
+    ("VMemKV", "Bloom-T1InlineValue-ReadRandom"): "+Random",
+    ("VMemKV", "Bloom-T1InlineValue-ReadSeq"): "+Seq",
 }
 
-VARIANT_ORDER = ["RocksDB", "LMDB", "RocksDB-BlobDB", "Baseline", "+BF", "+Inline", "+Prefault"]
+VARIANT_ORDER = ["RocksDB", "LMDB", "RocksDB-BlobDB", "Baseline", "+BF", "+Inline", "+Prefault", "+Random", "+Seq"]
 RIVAL_STORES = ["RocksDB", "LMDB", "RocksDB-BlobDB"]
 COLORS = {
     "RocksDB": "#64748b", "LMDB": "#10b981", "RocksDB-BlobDB": "#a855f7",
     "Baseline": "#94a3b8",
     "+BF": "#f59e0b", "+Inline": "#6366f1", "+Prefault": "#ec4899",
+    "+Random": "#0ea5e9", "+Seq": "#84cc16",
 }
 WORKLOADS = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"]
 THREADS = [1, 4, 16, 32]

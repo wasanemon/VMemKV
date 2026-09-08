@@ -184,3 +184,15 @@ vmemkv_matrix::scenario_quick_filter() {
       ;;
   esac
 }
+
+vmemkv_matrix::read_policy_ablation_filter() {
+  # Trifecta on/off ablation: representative read cells only (Scan + Get Hit + YCSB-E),
+  # comparing the production config (Bloom-T1InlineValue, i.e. the trifecta) against its two
+  # single-policy pins (ReadRandom/ReadSeq). Insert/Update/Delete/Get Miss are trimmed: the
+  # read path cannot move them. Scenarios/values are chosen by the caller pairing this with
+  # scenario_run_filter-style invocation -- LTM 1KB/64KB is the paper's representative set.
+  local value_key="$1"
+  local value_regex
+  value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
+  printf '%s\n' "(^Store=VMemKV/Variant=Bloom-T1InlineValue(-ReadRandom|-ReadSeq)?/Op=(Scan/|Get/Mode=Hit/|YCSB-E/)).*${value_regex}"
+}

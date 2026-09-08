@@ -67,10 +67,21 @@ using VMemKV_Var1_Bloom = StoreAdapter<VMemKVImpl<Config<BloomFilter>>>;
 // as VMemKVStore rather than a distinct one.
 using VMemKV_Var2_Inline = VMemKVStore;
 
+// ─── Read-path policy ablations (trifecta on/off) ───
+// Production config pinned to a single base-region read mapping: RandomOnly reads everything
+// through the primary (MADV_RANDOM) mapping, SeqOnly through the MADV_SEQUENTIAL one.
+// The unpinned Var2 above is the trifecta. Compared on representative read cells only
+// (Scan + Get Hit + YCSB-E); see benchmark/common/benchmark_matrix.sh's
+// read_policy_ablation_filter().
+using VMemKV_Var3_ReadRandom = StoreAdapter<VMemKVImpl<Config<BloomFilter, T1InlineValue, ReadPolicyRandomOnly>>>;
+using VMemKV_Var4_ReadSeq = StoreAdapter<VMemKVImpl<Config<BloomFilter, T1InlineValue, ReadPolicySeqOnly>>>;
+
 // ─── 2. Unified Benchmark Registration Tuple ───
 using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
                                     VMemKV_Var1_Bloom,
                                     VMemKV_Var2_Inline,
+                                    VMemKV_Var3_ReadRandom,
+                                    VMemKV_Var4_ReadSeq,
                                     VMemKV_RocksDB,
                                     VMemKV_RocksDBBlobDB,
                                     VMemKV_LMDB>;

@@ -32,6 +32,13 @@ namespace vmemkv {
 // ─── Optimization Tags ───────────────────────────────────────────────────────
 struct BloomFilter {};
 struct T1InlineValue {};
+// Read-path policy ablations for the base/tail split (low_level_design.md 7.9).
+// Neither tag (default): trifecta -- size- and reader-dependent choice among the
+// primary (MADV_RANDOM) mapping, the base-only default-readahead mapping, and pread().
+// ReadPolicyRandomOnly: every base-region read goes through the primary mapping.
+// ReadPolicySeqOnly: every base-region read goes through the MADV_SEQUENTIAL mapping.
+struct ReadPolicyRandomOnly {};
+struct ReadPolicySeqOnly {};
 
 // ─── Unified System Config Template (Tag-List Pattern) ──────────────────────
 template <typename... Opts>
@@ -41,6 +48,8 @@ struct Config {
 
   static constexpr bool UseBloomFilter = has_opt<BloomFilter>;
   static constexpr bool UseT1InlineValue = has_opt<T1InlineValue>;
+  static constexpr bool UseReadPolicyRandomOnly = has_opt<ReadPolicyRandomOnly>;
+  static constexpr bool UseReadPolicySeqOnly = has_opt<ReadPolicySeqOnly>;
 
   static constexpr size_t kBitsPerByte = 8;
 
@@ -72,6 +81,8 @@ struct Config {
 
   static_assert(T1AppendCapacityLog2 > 0 && T1AppendCapacityLog2 < (sizeof(size_t) * kBitsPerByte),
                 "T1AppendCapacityLog2 must be in (0, bitwidth(size_t))");
+  static_assert(!(UseReadPolicyRandomOnly && UseReadPolicySeqOnly),
+                "ReadPolicyRandomOnly and ReadPolicySeqOnly are mutually exclusive");
 };
 
 namespace detail {

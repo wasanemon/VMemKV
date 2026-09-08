@@ -186,6 +186,12 @@ class VMemKVImpl {
     if constexpr (ConfigT::UseT1InlineValue) {
       parts.emplace_back("T1InlineValue");
     }
+    if constexpr (ConfigT::UseReadPolicyRandomOnly) {
+      parts.emplace_back("ReadRandom");
+    }
+    if constexpr (ConfigT::UseReadPolicySeqOnly) {
+      parts.emplace_back("ReadSeq");
+    }
 
     if (parts.empty()) {
       return "VMemKV/Baseline";
@@ -872,6 +878,15 @@ class VMemKVImpl {
         // MADV_SEQUENTIAL's wider window; large records would have one call's readahead
         // overshoot into unrelated neighboring records, so they use the plain/no-advise mapping
         // instead.
+        // Read-policy ablations collapse this choice to a single mapping: RandomOnly pins
+        // everything to the primary (MADV_RANDOM) mapping, SeqOnly to the MADV_SEQUENTIAL one.
+        if constexpr (ConfigT::UseReadPolicyRandomOnly) {
+          return read_base_record_via(mem->base, offset, base_boundary);
+        }
+        if constexpr (ConfigT::UseReadPolicySeqOnly) {
+          std::byte *seq = mem->base_mmap_scan_seq != nullptr ? mem->base_mmap_scan_seq : mem->base;
+          return read_base_record_via(seq, offset, base_boundary);
+        }
         return read_base_record_via(is_small ? mem->base_mmap_scan_seq : mem->base_mmap_scan, offset, base_boundary);
 
       case BaseReader::kGet:
@@ -886,6 +901,12 @@ class VMemKVImpl {
           // through base_mmap_scan (no madvise, some readahead) costs ~4.4x more kernel time per
           // major fault than `base` does, and through base_mmap_scan_seq (Scan's mapping,
           // MADV_SEQUENTIAL) ~10x more, LTM/1KB Get/Hit/Zipf/threads:32.
+          // SeqOnly ablation reads here through the MADV_SEQUENTIAL mapping instead; RandomOnly
+          // is identical to the default below.
+          if constexpr (ConfigT::UseReadPolicySeqOnly) {
+            std::byte *seq = mem->base_mmap_scan_seq != nullptr ? mem->base_mmap_scan_seq : mem->base;
+            return read_base_record_via(seq, offset, base_boundary);
+          }
           return read_base_record_via(mem->base, offset, base_boundary);
         }
         {
@@ -894,6 +915,14 @@ class VMemKVImpl {
           // mmap read costing nothing beyond what a plain mmap-based Get would have paid
           // anyway; if not, one bounded pread() beats the N separate page faults an mmap read
           // of a multi-page cold record would trigger.
+          // Read-policy ablations skip the residency check and pin the read to one mapping.
+          if constexpr (ConfigT::UseReadPolicyRandomOnly) {
+            return read_base_record_via(mem->base, offset, base_boundary);
+          }
+          if constexpr (ConfigT::UseReadPolicySeqOnly) {
+            std::byte *seq = mem->base_mmap_scan_seq != nullptr ? mem->base_mmap_scan_seq : mem->base;
+            return read_base_record_via(seq, offset, base_boundary);
+          }
           const uint64_t read_len = std::min(size_hint, base_boundary - offset);
           if (mem->base_mmap_scan != nullptr) {
             if (auto resident = try_read_resident_base_record(mem->base_mmap_scan, offset, read_len, base_boundary);
