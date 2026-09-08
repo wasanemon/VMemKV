@@ -5,11 +5,25 @@
 # duplicating filter strings.
 
 vmemkv_matrix::scenario_filter() {
-  # vmemkv_only ("true"/"1"): drops the three rival backends (RocksDB/RocksDB-BlobDB/LMDB) from
+  # vmemkv_only ("true"/"1"): drops the four rival backends
+  # (RocksDB/RocksDB-BlobDB/LMDB/LeanStore) from
   # the filter -- their numbers are unaffected by a VMemKV-internal-only code change, so
   # re-measuring them is pure wasted AWS time/cost for a regression-check run. Their most recent
   # full-matrix numbers (from a run with this left off) are meant to be merged back in afterward
   # rather than re-measured every time; see merge_vmemkv_only_results.py.
+  local vmemkv_only="${1:-}"
+  if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
+    printf '%s\n' '(^Store=VMemKV/)'
+  else
+    printf '%s\n' '(^Store=VMemKV/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/|^Store=LeanStore/)'
+  fi
+}
+
+vmemkv_matrix::scenario_filter_no_leanstore() {
+  # Same as scenario_filter() without LeanStore. LeanStore's BTreeVI key/value lengths are u16,
+  # so the 64KB corpus (65536-byte values) is unstorable there; benchmark_filter_for_case()
+  # substitutes this for 64KB cases (RE2 has no negative lookahead, hence the explicit
+  # alternation instead of an exclusion pattern).
   local vmemkv_only="${1:-}"
   if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
     printf '%s\n' '(^Store=VMemKV/)'
@@ -98,7 +112,11 @@ vmemkv_matrix::benchmark_filter_for_case() {
   local scenario_regex
   local value_regex
 
-  scenario_regex="$(vmemkv_matrix::scenario_filter "$vmemkv_only")"
+  if [[ "$value_key" == "64kb" ]]; then
+    scenario_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "$vmemkv_only")"
+  else
+    scenario_regex="$(vmemkv_matrix::scenario_filter "$vmemkv_only")"
+  fi
   value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
   printf '%s\n' "(${scenario_regex}).*${value_regex}"
 }

@@ -959,7 +959,8 @@ using BenchmarkTypes = vmemkv::variants::AllPossibleTypes;
 template <typename Store>
 inline constexpr bool kUsesSingleArgConstructor = std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDB> ||
                                                   std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDBBlobDB> ||
-                                                  std::is_same_v<Store, vmemkv::variants::VMemKV_LMDB>;
+                                                  std::is_same_v<Store, vmemkv::variants::VMemKV_LMDB> ||
+                                                  std::is_same_v<Store, vmemkv::variants::VMemKV_LeanStore>;
 
 // A per-(val_size, key_count) master-corpus path shared by every scenario in visit_one() below
 // that wants a fully-populated, fully-reorganized/committed corpus (Get/Update/Delete/YCSB-E/

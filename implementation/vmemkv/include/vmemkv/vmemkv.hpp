@@ -11,6 +11,7 @@
 
 #include "api/store_adapter.hpp"
 #include "config.hpp"
+#include "rivals/leanstore_store.hpp"
 #include "rivals/lmdb_store.hpp"
 #include "rivals/rocksdb_blobdb_store.hpp"
 #include "rivals/rocksdb_store.hpp"
@@ -58,6 +59,7 @@ using VMemKV_Baseline = StoreAdapter<VMemKVImpl<detail::T1_AllOff>>;
 using VMemKV_RocksDB = StoreAdapter<::RocksDBStore>;
 using VMemKV_RocksDBBlobDB = StoreAdapter<::RocksDBBlobDBStore>;
 using VMemKV_LMDB = StoreAdapter<::LMDBStore>;
+using VMemKV_LeanStore = StoreAdapter<::LeanStoreStore>;
 
 // ─── 1. Core Stacked Ablation Variants ───
 using VMemKV_Var0_Baseline = VMemKV_Baseline;
@@ -84,7 +86,8 @@ using AllPossibleTypes = std::tuple<VMemKV_Var0_Baseline,
                                     VMemKV_Var4_ReadSeq,
                                     VMemKV_RocksDB,
                                     VMemKV_RocksDBBlobDB,
-                                    VMemKV_LMDB>;
+                                    VMemKV_LMDB,
+                                    VMemKV_LeanStore>;
 }  // namespace variants
 
 }  // namespace vmemkv

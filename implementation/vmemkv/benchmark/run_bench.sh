@@ -21,6 +21,7 @@ source "$SCRIPT_DIR/common/benchmark_common.sh"
 # ── Defaults ────────────────────────────────────────────────────────────
 ENABLE_ROCKSDB=ON
 ENABLE_LMDB=ON
+ENABLE_LEANSTORE=ON
 BUILD_TYPE=Release
 BUILD_DIR=build
 OUTPUT_FILE=""
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-rocksdb)   ENABLE_ROCKSDB=OFF; shift ;;
     --no-lmdb)      ENABLE_LMDB=OFF;    shift ;;
+    --no-leanstore) ENABLE_LEANSTORE=OFF; shift ;;
     --build-type)   BUILD_TYPE="$2";    shift 2 ;;
     --build-dir)    BUILD_DIR="$2";     shift 2 ;;
     --min-time)     MIN_TIME="$2";      shift 2 ;;
@@ -58,6 +60,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --ltm-first       With --scenario all, run LTM before in-memory"
       echo "  --no-rocksdb      Disable RocksDB build"
       echo "  --no-lmdb         Disable LMDB build"
+      echo "  --no-leanstore    Disable LeanStore build"
       echo "  --build-type <T>  CMake build type (default: Release)"
       echo "  --build-dir <D>   Build directory (default: build)"
       echo "  --min-time <S>    Minimum measurement time (default: 5.0s)"
@@ -118,7 +121,7 @@ fi
 
 # ── CMake Configure & Build ──────────────────────────────────────────────
 echo "Building benchmark binary..."
-vmemkv_build_bench "$IMPL_ROOT" "$BUILD_DIR" "$BUILD_TYPE" "$ENABLE_ROCKSDB" -DENABLE_LMDB="$ENABLE_LMDB" >/dev/null
+vmemkv_build_bench "$IMPL_ROOT" "$BUILD_DIR" "$BUILD_TYPE" "$ENABLE_ROCKSDB" -DENABLE_LMDB="$ENABLE_LMDB" -DENABLE_LEANSTORE="$ENABLE_LEANSTORE" >/dev/null
 echo "Build completed."
 
 BENCH_BIN="$REPO_ROOT/$BUILD_DIR/benchmark/bench_kv"

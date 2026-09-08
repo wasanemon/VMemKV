@@ -20,6 +20,7 @@ STORE_VARIANT_TO_LABEL = {
     ("RocksDB", "RocksDB"): "RocksDB",
     ("LMDB", "LMDB"): "LMDB",
     ("RocksDB-BlobDB", "RocksDB-BlobDB"): "RocksDB-BlobDB",
+    ("LeanStore", "LeanStore"): "LeanStore",
     ("VMemKV", "Baseline"): "Baseline",
     ("VMemKV", "Bloom"): "+BF",
     ("VMemKV", "Bloom-T1InlineValue"): "+Inline",
@@ -28,10 +29,10 @@ STORE_VARIANT_TO_LABEL = {
     ("VMemKV", "Bloom-T1InlineValue-ReadSeq"): "+Seq",
 }
 
-VARIANT_ORDER = ["RocksDB", "LMDB", "RocksDB-BlobDB", "Baseline", "+BF", "+Inline", "+Prefault", "+Random", "+Seq"]
-RIVAL_STORES = ["RocksDB", "LMDB", "RocksDB-BlobDB"]
+VARIANT_ORDER = ["RocksDB", "LMDB", "RocksDB-BlobDB", "LeanStore", "Baseline", "+BF", "+Inline", "+Prefault", "+Random", "+Seq"]
+RIVAL_STORES = ["RocksDB", "LMDB", "RocksDB-BlobDB", "LeanStore"]
 COLORS = {
-    "RocksDB": "#64748b", "LMDB": "#10b981", "RocksDB-BlobDB": "#a855f7",
+    "RocksDB": "#64748b", "LMDB": "#10b981", "RocksDB-BlobDB": "#a855f7", "LeanStore": "#0d9488",
     "Baseline": "#94a3b8",
     "+BF": "#f59e0b", "+Inline": "#6366f1", "+Prefault": "#ec4899",
     "+Random": "#0ea5e9", "+Seq": "#84cc16",

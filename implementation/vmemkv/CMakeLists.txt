@@ -16,6 +16,7 @@ endif()
 # ── Interface library for headers ─────────────────────────────────────────────
 option(ENABLE_ROCKSDB "Build with RocksDB backend" ON)
 option(ENABLE_LMDB "Build with LMDB backend" ON)
+option(ENABLE_LEANSTORE "Build with LeanStore backend" ON)
 add_library(vmemkv_headers INTERFACE)
 target_include_directories(vmemkv_headers INTERFACE 
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -92,9 +93,57 @@ if(ENABLE_LMDB)
   endif()
 endif()
 
-# Links the RocksDB/LMDB rival-store backends into `target` and defines ENABLE_ROCKSDB/ENABLE_LMDB
-# for it, whichever of the two were actually found above. Shared by tests/ and benchmark/, which
-# both build against the same optional rival backends.
+# ── LeanStore (optional) ────────────────────────────────────────────────────
+# Pinned by commit: master moves fast and carries no stable tags. Only backend/ is
+# configured (EXCLUDE_FROM_ALL, built on demand); frontend/ executables additionally need
+# rocksdb/wiredtiger and are never configured. backend's own CMakeLists links tbb/aio by
+# bare name, so their -I/-L are appended to the leanstore target below (PUBLIC: consumers
+# including leanstore headers need them too).
+if(ENABLE_LEANSTORE)
+  FetchContent_Declare(leanstore_probe
+    GIT_REPOSITORY https://github.com/leanstore/leanstore.git
+    GIT_TAG 90fcf185c1c8506344a7aa779928787d494348f4)
+  FetchContent_GetProperties(leanstore_probe)
+  if(NOT leanstore_probe_POPULATED)
+    FetchContent_Populate(leanstore_probe)
+    find_package(Threads REQUIRED)
+    include(${leanstore_probe_SOURCE_DIR}/libs/tabluate.cmake)
+    include(${leanstore_probe_SOURCE_DIR}/libs/rapidjson.cmake)
+    add_subdirectory(${leanstore_probe_SOURCE_DIR}/backend ${leanstore_probe_BINARY_DIR}/backend EXCLUDE_FROM_ALL)
+  endif()
+  find_path(LEANSTORE_TBB_INCLUDE_DIR tbb/enumerable_thread_specific.h
+    HINTS $ENV{LEANSTORE_SYSROOT}/usr/include /usr/include)
+  find_library(LEANSTORE_TBB_LIB tbb
+    HINTS $ENV{LEANSTORE_SYSROOT}/usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib)
+  find_path(LEANSTORE_AIO_INCLUDE_DIR libaio.h
+    HINTS $ENV{LEANSTORE_SYSROOT}/usr/include /usr/include)
+  find_library(LEANSTORE_AIO_LIB aio
+    HINTS $ENV{LEANSTORE_SYSROOT}/usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib)
+  if(LEANSTORE_TBB_INCLUDE_DIR AND LEANSTORE_TBB_LIB AND LEANSTORE_AIO_INCLUDE_DIR AND LEANSTORE_AIO_LIB)
+    set(LeanStore_FOUND TRUE)
+    message(STATUS "Found LeanStore deps: ${LEANSTORE_TBB_LIB} ${LEANSTORE_AIO_LIB}")
+    # SYSTEM: third-party headers carry GNU extensions our -Wpedantic -Werror build
+    # would otherwise reject; -isystem keeps our warnings enforced on our own code only.
+    target_include_directories(leanstore SYSTEM PUBLIC ${LEANSTORE_TBB_INCLUDE_DIR} ${LEANSTORE_AIO_INCLUDE_DIR})
+    target_include_directories(leanstore SYSTEM PUBLIC ${leanstore_probe_SOURCE_DIR}/backend
+                                                       ${leanstore_probe_SOURCE_DIR}/shared-headers)
+    target_include_directories(tabluate SYSTEM INTERFACE ${TABLUATE_INCLUDE_DIR})
+    target_include_directories(rapidjson SYSTEM INTERFACE ${RAPIDJSON_INCLUDE_DIR})
+    get_filename_component(LEANSTORE_TBB_LIB_DIR "${LEANSTORE_TBB_LIB}" DIRECTORY)
+    get_filename_component(LEANSTORE_AIO_LIB_DIR "${LEANSTORE_AIO_LIB}" DIRECTORY)
+    target_link_directories(leanstore PUBLIC ${LEANSTORE_TBB_LIB_DIR} ${LEANSTORE_AIO_LIB_DIR})
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
+      target_compile_options(leanstore PRIVATE -mavx2 -mcx16)
+    endif()
+  else()
+    message(FATAL_ERROR "ENABLE_LEANSTORE=ON but tbb/aio not found (apt install libtbb-dev libaio-dev, or point LEANSTORE_SYSROOT at an extracted sysroot).")
+  endif()
+endif()
+
+# Links the RocksDB/LMDB/LeanStore rival-store backends into `target` and defines
+# ENABLE_ROCKSDB/ENABLE_LMDB/ENABLE_LEANSTORE for it, whichever of the three were actually
+# found above. Shared by tests/ and benchmark/, which both build against the same optional
+# rival backends.
 function(vmemkv_link_rival_backends target)
   if(ENABLE_ROCKSDB AND RocksDB_FOUND)
     target_compile_definitions(${target} PRIVATE ENABLE_ROCKSDB)
@@ -103,6 +152,10 @@ function(vmemkv_link_rival_backends target)
   if(ENABLE_LMDB AND LMDB_FOUND)
     target_compile_definitions(${target} PRIVATE ENABLE_LMDB)
     target_link_libraries(${target} PRIVATE LMDB::lmdb)
+  endif()
+  if(ENABLE_LEANSTORE AND LeanStore_FOUND)
+    target_compile_definitions(${target} PRIVATE ENABLE_LEANSTORE)
+    target_link_libraries(${target} PRIVATE leanstore)
   endif()
 endfunction()
 

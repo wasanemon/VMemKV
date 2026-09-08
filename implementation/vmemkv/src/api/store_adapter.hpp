@@ -14,6 +14,7 @@
 class RocksDBStore;
 class RocksDBBlobDBStore;
 class LMDBStore;
+class LeanStoreStore;
 
 namespace vmemkv {
 
@@ -34,7 +35,8 @@ struct get_config_type<T, std::void_t<typename T::ConfigType>> {
 // layout, so reorganize()/get_statistics() are no-ops/empty for all of them.
 template <typename T>
 inline constexpr bool is_rival_store_v =
-    std::is_same_v<T, ::RocksDBStore> || std::is_same_v<T, ::RocksDBBlobDBStore> || std::is_same_v<T, ::LMDBStore>;
+    std::is_same_v<T, ::RocksDBStore> || std::is_same_v<T, ::RocksDBBlobDBStore> || std::is_same_v<T, ::LMDBStore> ||
+    std::is_same_v<T, ::LeanStoreStore>;
 }  // namespace detail
 
 template <typename KVSImpl>
@@ -53,6 +55,8 @@ class StoreAdapter {
       return "RocksDB-BlobDB";
     } else if constexpr (std::is_same_v<KVSImpl, ::LMDBStore>) {
       return "LMDB";
+    } else if constexpr (std::is_same_v<KVSImpl, ::LeanStoreStore>) {
+      return "LeanStore";
     } else {
       return KVSImpl::name();
     }

@@ -50,7 +50,7 @@ show_help() {
   echo "                   For a standalone probe-only run when the matrix has already been"
   echo "                   measured separately and only a probe (e.g. --background-jobs-probe)"
   echo "                   is still needed."
-  echo "  --without-rivals  Drop RocksDB/RocksDB-BlobDB/LMDB from the benchmark filter, running"
+  echo "  --without-rivals  Drop RocksDB/RocksDB-BlobDB/LMDB/LeanStore from the benchmark filter, running"
   echo "                   VMemKV variants only. Use for regression-check runs after a"
   echo "                   VMemKV-internal-only code change, where the rivals' numbers are"
   echo "                   unaffected and re-measuring them is pure wasted AWS time/cost -- merge"
@@ -344,7 +344,7 @@ install_remote_dependencies() {
       fi
       sleep 4
     done
-    sudo apt-get update -y >/tmp/setup.log 2>&1 && sudo apt-get install -y build-essential cmake ninja-build libgoogle-perftools-dev librocksdb-dev liblmdb-dev jq rsync >>/tmp/setup.log 2>&1
+    sudo apt-get update -y >/tmp/setup.log 2>&1 && sudo apt-get install -y build-essential cmake ninja-build libgoogle-perftools-dev librocksdb-dev liblmdb-dev libtbb-dev libaio-dev jq rsync >>/tmp/setup.log 2>&1
   "
 }
 
@@ -475,6 +475,7 @@ build_remote_benchmark() {
       -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -march=native' \
       -DENABLE_ROCKSDB=ON \
       -DENABLE_LMDB=ON \
+      -DENABLE_LEANSTORE=ON \
       -DENABLE_BENCHMARK=ON &&
     cmake --build build-rel --target bench_kv --clean-first -j\"\$(nproc)\"
   "
