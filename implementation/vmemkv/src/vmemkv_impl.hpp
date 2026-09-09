@@ -264,12 +264,11 @@ class VMemKVImpl {
 
   // Full-range T1 scan bounds for defrag bucketing: every 16-byte prefix falls in [lo, hi].
   static constexpr std::array<std::byte, 16> kDefragScanLo{};
-  static constexpr std::array<std::byte, 16> kDefragScanHi{std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
-                                                           std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
-                                                           std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
-                                                           std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
-                                                           std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
-                                                           std::byte{0xFF}};
+  static constexpr std::array<std::byte, 16> kDefragScanHi = [] {
+    std::array<std::byte, 16> hi{};
+    hi.fill(std::byte{0xFF});
+    return hi;
+  }();
 
   // T1Only: in-memory merge, zero I/O, T2 untouched. Checkpoint: durabilizes T2's live tail
   // in-place (checkpoint_internal()) -- no record ever moves.
@@ -1649,25 +1648,6 @@ class VMemKVImpl {
     return checkpoint_count_.load(std::memory_order_relaxed) != last_defrag_checkpoint_.load(std::memory_order_relaxed);
   }
 
-  // Invokes cb(masked T2 offset, payload_bits) for every live T2-offset entry: tombstones,
-  // inline values, and offsets past used_limit (paranoia against a torn T1 read) are skipped.
-  // Shared scan prologue for defrag's recount and collection passes.
-  template <typename Callback>
-  void scan_live_offsets(uint64_t used_limit, Callback &&cb) const {
-    t1_.scan(std::span<const std::byte>(kDefragScanLo.data(), kDefragScanLo.size()),
-             std::span<const std::byte>(kDefragScanHi.data(), kDefragScanHi.size()),
-             [&](std::span<const std::byte> /*index_key*/, uint64_t payload, uint64_t hash) {
-               if (payload == vmemkv::STORE_NOT_FOUND || t1_detail::is_inline(hash)) {
-                 return;
-               }
-               const uint64_t off = payload & kOffsetMask;
-               if (off >= used_limit) {
-                 return;
-               }
-               cb(off, payload);
-             });
-  }
-
   // Relocates one live record (identified by its current T2 offset) to the append frontier.
   // Returns the moved record's exact aligned bytes, or 0 when the entry moved on concurrently
   // (offset mismatch under the stripe lock), vanished, or went inline. The caller batches the
@@ -1682,10 +1662,11 @@ class VMemKVImpl {
     T2RecordView frozen = t2_.at(bucket_offset & kOffsetMask, mem);
     const uint64_t record_aligned =
         vmemkv::align_up(sizeof(ValueRecordHeader) + frozen.header->key_len + frozen.header->value_len);
-    std::vector<std::byte> key(frozen.key.begin(), frozen.key.end());
-    std::vector<std::byte> value(frozen.value.begin(), frozen.value.end());
-    const std::span<const std::byte> key_span(key.data(), key.size());
-    const std::span<const std::byte> value_span(value.data(), value.size());
+    // Spans into the frozen mapping: valid through this section (the mapping lives with the
+    // process, these bytes go nowhere before next cycle's punch at the earliest, and every
+    // consumer below copies synchronously).
+    const std::span<const std::byte> key_span = frozen.key;
+    const std::span<const std::byte> value_span = frozen.value;
 
     std::lock_guard<std::mutex> key_lock(key_mutex(key_span));
     const auto cur = t1_.get_with_hash(key_span);
@@ -1704,11 +1685,13 @@ class VMemKVImpl {
   }
 
   // Punches segments evacuated by the previous cycle. Returns punched bytes. Already-hollow
-  // ranges are skipped silently; a failed punch latches support off and drops the queue.
+  // ranges resolve inside the punch call and count nothing; a failed punch latches support
+  // off and drops the queue.
   auto punch_evacuated_segments(const vmemkv::T2Memory *mem) -> uint64_t {
     uint64_t punched_bytes = 0;
     std::lock_guard<std::mutex> punch_lock(defrag_punch_mu_);
     std::vector<uint64_t> keep;
+    bool punch_failed = false;
     for (const uint64_t seg : pending_punch_) {
       const uint64_t seg_start = seg * ConfigT::T2SegmentBytes;
       const uint64_t seg_end = seg_start + ConfigT::T2SegmentBytes;
@@ -1719,43 +1702,53 @@ class VMemKVImpl {
         keep.push_back(seg);
         continue;
       }
-      if (t2_.is_hollow_range(seg_start, ConfigT::T2SegmentBytes)) {
-        continue;
+      switch (t2_.punch_if_occupied(seg_start, ConfigT::T2SegmentBytes)) {
+        case vmemkv::T2FlatFile::PunchOutcome::Punched:
+          punched_bytes += ConfigT::T2SegmentBytes;
+          break;
+        case vmemkv::T2FlatFile::PunchOutcome::AlreadyHollow:
+          break;
+        case vmemkv::T2FlatFile::PunchOutcome::Failed:
+          // Structural (aligned valid range), never transient: latch support off and drop
+          // the queue rather than retry-storming every cycle.
+          punch_failed = true;
+          break;
       }
-      if (t2_.punch_hole_range(seg_start, ConfigT::T2SegmentBytes)) {
-        punched_bytes += ConfigT::T2SegmentBytes;
-        continue;
+      if (punch_failed) {
+        break;
       }
-      // Punch failures here are structural (aligned valid range), never transient:
-      // latch support off and drop the queue rather than retry-storming every cycle.
+    }
+    if (punch_failed) {
       punch_supported_.store(false, std::memory_order_relaxed);
       pending_punch_.clear();
       pending_punch_count_.store(0, std::memory_order_relaxed);
-      break;
+    } else {
+      pending_punch_.swap(keep);
+      pending_punch_count_.store(pending_punch_.size(), std::memory_order_relaxed);
     }
-    pending_punch_.swap(keep);
-    pending_punch_count_.store(pending_punch_.size(), std::memory_order_relaxed);
     return punched_bytes;
   }
 
-  // Selects victim segments from a pass-1 live table: frozen segments at >=50% garbage,
-  // greediest first, bounded by the per-cycle move budget. Garbage uses exact used bytes
-  // (not the hint-undercounted live), so a segment reads as full as it physically is.
-  static auto select_defrag_victims(const std::vector<uint64_t> &fresh, uint64_t base, uint64_t used)
-      -> std::vector<uint64_t> {
+  // Selects victim segments from the authoritative live counters: frozen segments at >=50%
+  // garbage, greediest first, bounded by the per-cycle move budget. Garbage uses exact used
+  // bytes (not the hint-undercounted live), so a segment reads as full as it physically is.
+  // Zero-live frozen segments select too (100% garbage): the punch phase hollow-skips the
+  // already-punched ones and queues the rest, which also heals restarts (no punch list kept).
+  auto select_defrag_victims(uint64_t base, uint64_t used) const -> std::vector<uint64_t> {
     struct Victim {
       uint64_t seg;
       uint64_t garbage;
     };
+    const uint64_t n = t2_seg_live_.size();
     std::vector<Victim> victims;
-    for (uint64_t seg = 0; seg < fresh.size(); ++seg) {
+    for (uint64_t seg = 0; seg < n; ++seg) {
       const uint64_t seg_start = seg * ConfigT::T2SegmentBytes;
       const uint64_t seg_end = seg_start + ConfigT::T2SegmentBytes;
       if (seg_end > base || seg_start >= used) {
         continue;
       }
       const uint64_t seg_used = std::min(seg_end, used) - seg_start;
-      const uint64_t seg_live = std::min(fresh[seg], seg_used);
+      const uint64_t seg_live = std::min(t2_seg_live_[seg].load(std::memory_order_relaxed), seg_used);
       if (seg_used > seg_live && (seg_used - seg_live) * 2 >= seg_used) {
         victims.push_back(Victim{seg, seg_used - seg_live});
       }
@@ -1768,7 +1761,7 @@ class VMemKVImpl {
         break;
       }
       victim_segs.push_back(victim.seg);
-      est_move += std::min(fresh[victim.seg], ConfigT::T2SegmentBytes);
+      est_move += std::min(t2_seg_live_[victim.seg].load(std::memory_order_relaxed), ConfigT::T2SegmentBytes);
     }
     std::sort(victim_segs.begin(), victim_segs.end());
     return victim_segs;
@@ -1781,24 +1774,33 @@ class VMemKVImpl {
                               uint64_t used,
                               const vmemkv::T2Memory *mem) const -> std::vector<uint64_t> {
     std::vector<uint64_t> offsets;
-    scan_live_offsets(used, [&](uint64_t off, uint64_t /*payload*/) {
-      const uint64_t seg = t2_seg_index(off);
-      if (std::binary_search(victim_segs.begin(), victim_segs.end(), seg)) {
-        offsets.push_back(off);
-        return;
-      }
-      if (seg + 1 < t2_seg_live_.size() && std::binary_search(victim_segs.begin(), victim_segs.end(), seg + 1)) {
-        const uint64_t span_start = (seg + 1) * ConfigT::T2SegmentBytes;
-        if (off + kT2PunchSlopBytes >= span_start && off < span_start) {
-          const T2RecordView head = t2_.at(off, mem);
-          const uint64_t aligned = vmemkv::align_up(sizeof(ValueRecordHeader) + head.header->key_len +
-                                                    head.header->value_len);
-          if (off + aligned > span_start) {
-            offsets.push_back(off);
-          }
-        }
-      }
-    });
+    t1_.scan(std::span<const std::byte>(kDefragScanLo.data(), kDefragScanLo.size()),
+             std::span<const std::byte>(kDefragScanHi.data(), kDefragScanHi.size()),
+             [&](std::span<const std::byte> /*index_key*/, uint64_t payload, uint64_t hash) {
+               if (payload == vmemkv::STORE_NOT_FOUND || t1_detail::is_inline(hash)) {
+                 return;
+               }
+               const uint64_t off = payload & kOffsetMask;
+               if (off >= used) {
+                 return;
+               }
+                const uint64_t seg = t2_seg_index(off);
+                if (std::binary_search(victim_segs.begin(), victim_segs.end(), seg)) {
+                  offsets.push_back(off);
+                  return;
+                }
+                if (seg + 1 < t2_seg_live_.size() && std::binary_search(victim_segs.begin(), victim_segs.end(), seg + 1)) {
+                  const uint64_t span_start = (seg + 1) * ConfigT::T2SegmentBytes;
+                  if (off + kT2PunchSlopBytes >= span_start && off < span_start) {
+                    const T2RecordView head = t2_.at(off, mem);
+                    const uint64_t aligned = vmemkv::align_up(sizeof(ValueRecordHeader) + head.header->key_len +
+                                                              head.header->value_len);
+                    if (off + aligned > span_start) {
+                      offsets.push_back(off);
+                    }
+                  }
+                }
+              });
     std::sort(offsets.begin(), offsets.end());
     offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
     return offsets;
@@ -1846,17 +1848,7 @@ class VMemKVImpl {
     const uint64_t overhead_bp = (used == 0 || live >= used) ? 0 : (used - live) * 10000 / used;
     if (force || defrag_scan_wanted(overhead_bp)) {
       scanned = true;
-      // Pass 1: recount live bytes per segment straight from T1 (ground truth for selection;
-      // the atomic counters stay authoritative and are never overwritten, so concurrent writes
-      // mid-scan cannot lose accounting).
-      std::vector<uint64_t> fresh(t2_seg_live_.size(), 0);
-      scan_live_offsets(used, [&](uint64_t off, uint64_t payload) {
-        const uint64_t seg = t2_seg_index(off);
-        if (seg < fresh.size()) {
-          fresh[seg] += t2_hint_bytes(payload);
-        }
-      });
-      const std::vector<uint64_t> victim_segs = select_defrag_victims(fresh, base, used);
+      const std::vector<uint64_t> victim_segs = select_defrag_victims(base, used);
       if (!victim_segs.empty()) {
         // Pass 2: collect live offsets starting in the victim spans. Spans extend one slop
         // (max record overhang) below each victim so live tails reaching into it relocate too;
