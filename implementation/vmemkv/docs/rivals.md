@@ -40,8 +40,10 @@ Optional via `ENABLE_LEANSTORE` (`--no-leanstore` locally; AWS installs
 - Keys/values are raw byte spans through `BTreeVI` (variable-length, memcmp-ordered).
 - Value ceiling: `BTreeVI` lengths are u16, so values above 65535 bytes are rejected. The
   64KB corpus (65536-byte values) is excluded by `benchmark_matrix.sh`.
-- Update is same-size in-place only; size-changing updates fail fast. Benchmark updates are
-  index-derived same-size, so this never triggers there.
+- Update is same-size in-place only; size-changing updates fail fast. The benchmark Update
+  always writes full-size values, so mixed corpora (1KB with 20% 8B values) would grow 8B
+  records: LeanStore is excluded from Update on those corpora by the matrix filter (uniform
+  8B Update still runs).
 - Insert-after-remove has no engine path (upstream TODO): reinserting a removed key aborts.
   Benchmark flows never do this; three unit cases covering it (re-insert after remove,
   long-prefix CRUD, large-value grow/shrink) skip this backend with a message.

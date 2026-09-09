@@ -114,11 +114,21 @@ vmemkv_matrix::benchmark_filter_for_case() {
 
   if [[ "$value_key" == "64kb" ]]; then
     scenario_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "$vmemkv_only")"
+    value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
+    printf '%s\n' "(${scenario_regex}).*${value_regex}"
+  elif [[ "$value_key" == "1kb" && "$vmemkv_only" != "true" && "$vmemkv_only" != "1" ]]; then
+    # The 1KB corpus mixes in 20% 8B values, and the Update benchmark always writes full-size
+    # values -- growing an 8B record, which LeanStore's engine cannot do (same-size in-place
+    # updates only; see docs/rivals.md). RE2 has no negative lookahead, so LeanStore's clause
+    # spells every op except Update explicitly.
+    scenario_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "$vmemkv_only")"
+    value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
+    printf '%s\n' "(((${scenario_regex})).*${value_regex}|(^Store=LeanStore/).*Op=(Insert|Get|Delete|Scan|YCSB-E)/.*${value_regex})"
   else
     scenario_regex="$(vmemkv_matrix::scenario_filter "$vmemkv_only")"
+    value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
+    printf '%s\n' "(${scenario_regex}).*${value_regex}"
   fi
-  value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
-  printf '%s\n' "(${scenario_regex}).*${value_regex}"
 }
 
 vmemkv_matrix::scenario_run_filter() {
