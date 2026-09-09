@@ -1605,11 +1605,20 @@ static void register_update_benchmark(Holder crud_holder,
       noop_already_populated_init,
       [corpus_size, val_size](benchmark::State &state, auto &store) {
         std::string dummy(val_size, 'a');
+        std::string dummy_8b(8, 'a');
         std::mt19937_64 rng(kBenchmarkSeed + state.thread_index());
         ZipfDistribution zipf({corpus_size, 1.0});
         for (auto _ : state) {
           std::size_t key_index = zipf(rng);
-          bool updated = store.update(make_key(key_index), dummy);
+          // Per-key sizes matching the corpus distribution (see get_value_size_for_key() and
+          // the Insert loops): 8B-valued keys get 8B updates (exercising the inline path),
+          // so updates never change a record's size class.
+          bool updated;
+          if (val_size != 8 && key_index % kMixEveryNth == 0) {
+            updated = store.update(make_key(key_index), dummy_8b);
+          } else {
+            updated = store.update(make_key(key_index), dummy);
+          }
           benchmark::DoNotOptimize(updated);
         }
         state.SetItemsProcessed(state.iterations());
