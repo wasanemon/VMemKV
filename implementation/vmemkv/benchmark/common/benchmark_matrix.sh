@@ -177,7 +177,18 @@ vmemkv_matrix::ltm_priming_filter() {
   local vmemkv_only="${1:-}"
   local scenario_regex
   scenario_regex="$(vmemkv_matrix::scenario_filter "$vmemkv_only")"
-  printf '(%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$\n' "$scenario_regex"
+  if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
+    printf '(%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$\n' "$scenario_regex"
+  else
+    # Full runs additionally prime LeanStore's masters -- except its 64KB cells, which cannot
+    # exist (BTreeVI u16 length ceiling; see benchmark_filter_for_case()). RE2 has no negative
+    # lookahead, so the first alternative drops LeanStore while the second spells its storable
+    # value sizes explicitly.
+    local no_leanstore_regex
+    no_leanstore_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "$vmemkv_only")"
+    printf '((%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$|(^Store=LeanStore/).*Op=Get/Mode=Hit/Dist=Zipf/.*Value=(8B|1KB).*threads:1$)\n' \
+      "$no_leanstore_regex"
+  fi
 }
 
 vmemkv_matrix::scenario_quick_filter() {
