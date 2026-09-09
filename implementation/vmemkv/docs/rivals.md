@@ -51,6 +51,11 @@ Optional via `ENABLE_LEANSTORE` (`--no-leanstore` locally; AWS installs
   by the tuple header size. Range scans collect keys first, then resolve values, in one TX.
 - Master/clone mirrors LMDB (build once with WAL off, persist-flush, file copy), reopened
   through WAL recovery from the copied state file.
+- LeanStore never unregisters tables: every constructed instance leaves dangling entries in
+  the process-global datastructure registry, and persist-on-close serializes the registry by
+  dereferencing every entry (segfault once heap reuse makes one fatal). Master builds clear
+  the registry before and after the scratch instance; safe because no other instance is
+  alive while a master builds.
 - Memory posture: 1GiB DRAM under `VMEMKV_BENCH_LTM`, 16GiB otherwise
   (`LEANSTORE_DRAM_GIB` overrides; `LEANSTORE_WORKER_THREADS` and `LEANSTORE_PP_THREADS`
   exist for experiments).

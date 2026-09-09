@@ -43,6 +43,7 @@
 #include <leanstore/KVInterface.hpp>
 #include <leanstore/LeanStore.hpp>
 #include <leanstore/concurrency-recovery/Worker.hpp>
+#include <leanstore/storage/buffer-manager/DTRegistry.hpp>
 #include <leanstore/utils/JumpMU.hpp>
 #endif
 
@@ -488,6 +489,13 @@ class LeanStoreStore {
   // frames, so the file copy below is self-consistent) before anything copies it, so a crash
   // mid-build never leaves a partial master for a later call to trust. WAL is disabled for
   // the build itself, like the other engines' non-durable bulk loaders.
+  //
+  // Clears the process-global datastructure registry before and after the scratch instance:
+  // LeanStore never unregisters tables, so every constructed instance leaves dangling entries
+  // behind, and this build's persist-on-close serializes the registry by dereferencing every
+  // entry (segfault once heap reuse makes a dead entry fatal). Safe because no other instance
+  // is alive while a master builds (bench/test setup is single-threaded; the clone opens
+  // only after this returns). Type registrations are untouched.
   template <typename KeyFn, typename ValueFn>
   static void ensure_master_built(const std::string &master_path,
                                   std::size_t key_count,
@@ -496,6 +504,10 @@ class LeanStoreStore {
     const std::string master_json = master_path + ".json";
     if (std::filesystem::exists(master_path) && std::filesystem::exists(master_json)) {
       return;
+    }
+    {
+      std::lock_guard guard(leanstore::storage::DTRegistry::global_dt_registry.mutex);
+      leanstore::storage::DTRegistry::global_dt_registry.dt_instances_ht.clear();
     }
     const std::string building_ssd = master_path + ".building";
     const std::string building_json = building_ssd + ".json";
@@ -517,6 +529,10 @@ class LeanStoreStore {
     tmp.warmup_workers();
     tmp.bulk_load_impl(key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
     tmp.close();
+    {
+      std::lock_guard guard(leanstore::storage::DTRegistry::global_dt_registry.mutex);
+      leanstore::storage::DTRegistry::global_dt_registry.dt_instances_ht.clear();
+    }
 
     std::filesystem::remove(master_path, ignored);
     std::filesystem::remove(master_json, ignored);
