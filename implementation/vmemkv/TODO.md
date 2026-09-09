@@ -23,8 +23,9 @@ This document outlines the roadmap to implement the full, robust architecture of
   its cause lies outside the routing layer.
 
 ## 12. `defragment()` (T2 space reclamation) needs a full redesign
-* **Status**: 🔴 **Not implemented** -- permanently no-op'd (round 1) then fully removed from the
-  codebase (round 3); a real gap, not a resolved one. `docs/benchmark/20260823_maintenance_ops_priority_triage.md`.
+* **Status**: 🟢 **Implemented (phases 0+1)** -- segment-scoped incremental background compaction
+  (`defragment()` + dedicated worker + `T2DefragSpaceOverheadPercent` trigger), `docs/t2_defragment_design.md`.
+  Unit round-trip (relocate/punch/recovery/concurrent) green; full suite green.
 * **Problem**: the original implementation couldn't keep up with Insert at `64KB/LTM` (0.4x its
   throughput) and collapsed concurrent-write TPS by up to 98% (effectively a 60s+ stall) -- the
   same "maintenance work competing with the foreground write path" failure mode `ShardedT1Index`'s
@@ -36,4 +37,9 @@ This document outlines the roadmap to implement the full, robust architecture of
   rewrite + writer-stop design failed (numbers), the segment-scoped incremental background
   compaction direction, crash-safety ordering, phased plan (0: observability, 1: correctness
   gate, 2: background + interference <=20%, 3: bounded footprint), and acceptance criteria.
-  Implementation starts at phase 0.
+* **Deviations from that doc** (`docs/benchmark/20260908_t2_defragment_notes.md`): single
+  dedicated worker thread (not a pool); relocation under per-key stripe locks (the doc's
+  lock-free claim would lose concurrent same-key updates); WAL-durable + one-cycle quarantine
+  instead of post-checkpoint punch; punch-support probe for non-punching filesystems.
+* **Remaining**: phase 2 interference measurement (`ltm/1KB` + `ltm/64KB`, 32 writers, <=20%)
+  and phase 3 long-churn bounded-footprint demo -- both need AWS runs.

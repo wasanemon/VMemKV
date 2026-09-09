@@ -157,6 +157,16 @@ class StoreAdapter {
     }
   }
 
+  // Forces one T2 defragmentation cycle (see VMemKVImpl::defragment()). False for rival
+  // backends (no cycle exists there) and while the store is still recovering.
+  auto defragment() -> bool {
+    if constexpr (detail::is_rival_store_v<KVSImpl>) {
+      return false;
+    } else {
+      return impl_.defragment();
+    }
+  }
+
   auto get_statistics() const noexcept -> ::vmemkv::VMemKVStatistics {
     if constexpr (detail::is_rival_store_v<KVSImpl>) {
       return ::vmemkv::VMemKVStatistics{};

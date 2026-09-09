@@ -270,6 +270,22 @@ class T2FlatFile {
   // - Guarantees: Returns true on success; false if new value exceeds alloc_len.
   static auto update_value_at(uint64_t payload, std::span<const std::byte> value, const T2Memory *mem) noexcept -> bool;
 
+  // Reclaims a fully-evacuated byte range [offset, offset + len): hole-punches the file blocks
+  // (FALLOC_FL_PUNCH_HOLE | KEEP_SIZE, so the file size and every live offset stay valid) and
+  // drops the range from the page cache (MADV_DONTNEED on the primary mapping; the page cache
+  // is shared, so one call covers all mappings). Callers must guarantee no live record starts
+  // in, or spans into, the range, and that every relocated move out of it is already
+  // WAL-durable -- see VMemKVImpl::defragment(). Returns false (leaving everything untouched)
+  // where the filesystem cannot punch holes; the range then simply keeps its file blocks.
+  auto punch_hole_range(uint64_t offset, uint64_t len) const noexcept -> bool;
+
+  // Whether [offset, offset + len) holds no allocated file blocks (SEEK_DATA finds nothing
+  // before len). Lets defragment() tell an already-punched segment from a garbage-full one
+  // without keeping cross-restart state: both read as zero live bytes in segment accounting.
+  // Conservative on filesystems without SEEK_DATA support (reports not-hollow, so the caller
+  // harmlessly attempts a punch that then reports unsupported).
+  auto is_hollow_range(uint64_t offset, uint64_t len) const noexcept -> bool;
+
   // ─── Properties ───
   // Bytes used in the T2 file -- via get_memory_handle(), not a separate counter; see
   // T2Memory::bytes_used's declaration.

@@ -119,7 +119,7 @@ entry がインライン化されている場合は，3. は不要であり，Ti
 
 インライン化されている entry では，Update / Delete / Scan も Tier 1 payload だけで完結する．
 
-payload が offset の index については，Update と Delete における古いデータの削除は T1 の offset を書き換えるだけで行われるのが重要なポイントである．T1 の offset がポインタ/参照だとみなしたとき，これらの T2 の削除されたデータは参照カウントがゼロになったものといえる．ただし，これらの Tier 2 データが物理削除される仕組みは現状存在しない（6.1 節参照）．
+payload が offset の index については，Update と Delete における古いデータの削除は T1 の offset を書き換えるだけで行われるのが重要なポイントである．T1 の offset がポインタ/参照だとみなしたとき，これらの T2 の削除されたデータは参照カウントがゼロになったものといえる．参照ゼロになった Tier 2 データの物理削除は `defragment()` が別サイクルで行う（6.1 節参照）．
 
 ## 6. Reorganize, Checkpoint
 
@@ -144,7 +144,8 @@ Tier 1 自体は独立した複数シャードへの範囲パーティション�
 ![reorganize](../images/reorganization.png)
 
 Tier 1 は単独 `reorganize` により ordering fragmentation を軽く抑えられる。
-Tier 2 の storage fragmentation を解消する仕組みは現在存在しない。
+Tier 2 の storage fragmentation は `defragment()` が garbage-heavy な凍結セグメントからの
+live 移設と hole-punch で解消する。
 
 ### 6.2 checkpoint
 

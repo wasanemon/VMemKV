@@ -112,7 +112,7 @@ Tier 1 の `payload_bits` が Tier 2 offset を表す場合(2.1 節)、T2 への
 **Invariants**
 
 - Tier 2 の live record は必ず Tier 1 のいずれかの live `IndexEntry.payload_bits` から到達可能である。
-- Tier 1 から参照されなくなった Tier 2 record は garbage である。現在、Tier 2 のどの機構もこの garbage を物理的に回収しない(4.3 節) -- `bytes_used` は単調増加のみで、reorganize/checkpoint のいずれも縮小させない。
+- Tier 1 から参照されなくなった Tier 2 record は garbage である。`defragment()` がこれを物理的に回収する(4.5 節) -- `bytes_used` は単調増加のみで、reorganize/checkpoint/defragment のいずれも縮小させない。回収は hole-punch で行い、offset 空間の再利用はしない。
 - `update` は可能なら既存 record を in-place で上書きする。
 - 新しい value が `alloc_len` を超える場合は `bytes_used` 位置に新 record を追加し、Tier 1 の `offset` を差し替える。
 - 追記時の `bytes_used` の増分は、`ValueRecordHeader + key bytes + value bytes + padding（alloc_len まで）` に、次の record 開始位置を `alignof(ValueRecordHeader)` 境界に揃えるための調整を加えた合計で決まる。
@@ -181,7 +181,7 @@ struct VMemKV {
 **Notes**
 
 - old Tier 2 record はその場では削除しない。
-- old Tier 2 record は Tier 1 から到達不能になるが、Tier 2 側は物理削除されない -- 4.1 節/4.3 節で述べる通り、Storage Fragmentation を解消する仕組みは現状コードベースに存在しない。
+- old Tier 2 record は Tier 1 から到達不能になるが、Tier 2 側の物理削除は `defragment()` が別サイクルで行う(4.5 節)。
 - Failure Rule は 3.2 節と同様: 2.〜4. が失敗した操作を WAL に記録してはならない。
 - 手順3の in-place 判定には `offset >= base_boundary`(2.2節)の条件も含まれる。この境界未満を指す record への更新は、たとえ `new_value_len <= alloc_len` でも in-place にはせず、手順4の追記パスに強制的に回す。base 領域は専用mmapで直接読む読み取り経路(7.9節)の前提として「二度と書き換わらない」ことに依存しているため。`base_boundary` は `checkpoint_internal()` によってのみ単調に前進するアトミック変数(2.2節)であり、この判定は単一のアトミックロードで読むだけで安全である -- 前進中に古い値を読んでも、判定は常に安全側(tail 領域寄り = 追記パス)に倒れるだけで、base 領域への in-place 書き込みを誤って許可することはない。
 
@@ -220,7 +220,7 @@ struct VMemKV {
 
 `reorganize` は Ordering Fragmentation を解消する: Tier 1 `append_region` の肥大化により候補探索・確認コストが増え、Get / Scan が遅くなる問題である。
 
-Tier 2 側にも delete や append-update の結果として生じる Storage Fragmentation(Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ)が存在する。`checkpoint_internal()`(4.3 節)はこれを解消しない。Tier 2 全体を再配置してこれを解消する仕組みはコードベースに存在しない。
+Tier 2 側にも delete や append-update の結果として生じる Storage Fragmentation(Tier 1 から参照されない古い Tier 2 record の蓄積、および out-of-place 書き込みの蓄積による key 順と物理 offset 順の相関崩れ)が存在する。`checkpoint_internal()`(4.3 節)はこれを解消しない。Tier 2 全体の一括再配置は行わず、代わりに `defragment()`(4.5 節)が garbage の多いセグメントから増分的に live record を移設して回収する。
 
 ### 4.2 T1 Reorganize
 
@@ -255,7 +255,7 @@ T1 `reorganize` は T2 と独立に実行できる。
 
 entry 単位でインライン化されている entry(2.1.1 節、7.3 節)は Tier 2 に一切アクセスしないため、この処理の対象から外れる。
 
-`checkpoint_internal()` は Tier 2 の**単一の永続ファイル**の tail 領域(`[old_base_boundary, bytes_used)`)を `msync()` で永続化する。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- Storage Fragmentation の解消(GC)はこの処理の対象外であり、現状コードベースにその機構は存在しない。
+`checkpoint_internal()` は Tier 2 の**単一の永続ファイル**の tail 領域(`[old_base_boundary, bytes_used)`)を `msync()` で永続化する。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- Storage Fragmentation の解消(GC)はこの処理の対象外であり、`defragment()`(4.5 節)が別機構として担う。
 
 **Input**
 
@@ -298,8 +298,32 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WA
 |---|---|
 | `reorganize()` | T1 の Append→Sorted マージのみ。T2/ディスク非関与 |
 | `checkpoint()` | Tier 2 の tail を in-place で永続化し、manifest を commit して WAL を rotate する |
+| `defragment()` | Tier 2 の garbage-heavy な凍結セグメントから live record を移設し、排出済みセグメントを hole-punch する(4.5 節)。T2/ディスク関与、T1 マージ・manifest 非関与 |
 
-### 4.5 T1 Reorganize Auto-Trigger
+### 4.5 T2 Defragment (`defragment()`)
+
+`defragment()` は Storage Fragmentation を解消する唯一の機構である。T2 を 8MiB 固定の
+セグメント列とみなし、凍結済み (`seg_end <= base_boundary`) かつ garbage率 50% 以上の
+セグメントから live record を append frontier へ移設し、WAL-durable になった排出済み
+セグメントを次サイクルで hole-punch する。`bytes_used` は単調増加のまま
+(offset 空間の再利用はしない)、物理ブロックのみ回収する。
+
+- 移設はキー単位 stripe lock 下での offset 一致検証付き T1 put で行い、前景の同一キー
+  更新と直列化する。検証なしの put は古い値で新しい更新を上書きし得る。
+- 1サイクルの移動量は 1GiB 上限。WAL update 予約をまとめて await する
+  (group commit が fsync を融合)。
+- セグメント境界を跨ぐ record (最大 ~1MiB のはみ出し) のため、収集範囲は各 victim の
+  1MiB 下側 slop を含み、punch はセグメント全体を対象にできる。
+- punch は前サイクル排出分に限り、既 hollow 範囲は数えない。hole-punch 非対応 FS
+  (tmpfs) ではサイクル全体を実行しない。
+- クラッシュ安全性は append-only 由来である: copy と張り替えの間に落ちれば orphan
+  copy が残るだけ、張り替え後の punch 前に落ちれば次サイクルが再発見する。移設は
+  通常 update として WAL replay される。
+- 起動条件は `T2DefragSpaceOverheadPercent`(既定 20%) を唯一の公開ノブとし、
+  背景の専用ワーカースレッドが判定する。詳細は
+  [`../t2_defragment_design.md`](../t2_defragment_design.md) を参照。
+
+### 4.6 T1 Reorganize Auto-Trigger
 
 各シャードの `append_region` は、専用の背景ワーカースレッドプールによって独立に監視される。
 シャードの `append_size()` が `append_capacity()` の `T1ShardSplitThresholdPercent`(config.hpp)
@@ -569,4 +593,7 @@ T2 の「base」領域(2.2節)は書き込み後二度と変更されないた�
 | `T1ShardSplitThresholdPercent` | `T1ShardTargetSizeEntries` に対する split 発火しきい値(%) |
 | `DefaultT2CapacityBytes` | Tier 2 最大仮想アドレス空間 |
 | `WalMaxBytesSinceCheckpoint` | 直前 checkpoint 以降に許容する WAL 蓄積バイト数の上限。超過で checkpoint() へ昇格する |
+| `T2SegmentBytes` | defragment のセグメント固定長。調整ノブではない |
+| `T2DefragSpaceOverheadPercent` | defragment 背景起動の許容 overhead(%)。唯一の公開ノブ |
+| `T2DefragMaxMoveBytesPerCycle` | 1 defrag サイクルの移動上限 |
 

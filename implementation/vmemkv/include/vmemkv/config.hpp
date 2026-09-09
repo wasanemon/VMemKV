@@ -79,6 +79,17 @@ struct Config {
   // 4.4.
   static constexpr size_t WalMaxBytesSinceCheckpoint = 64ULL << 20;  // 64 MiB.
 
+  // T2 defragment (storage reclamation) parameters. Defrag relocates live records out of
+  // garbage-heavy 8MiB segments to the append frontier, then hole-punches the evacuated
+  // segments once their moves are WAL-durable. See docs/t2_defragment_design.md.
+  static constexpr uint64_t T2SegmentBytes = 8ULL << 20;  // 8 MiB. Fixed, not tuned.
+  // Overhead trigger, in percent: a cycle runs once live bytes fall to this fraction of
+  // bytes_used or below (i.e. garbage reaches 100 - this value). Single public knob.
+  static constexpr uint64_t T2DefragSpaceOverheadPercent = 20;
+  // Upper bound on relocated bytes per cycle. Caps one cycle's memcpy + WAL cost so a cycle
+  // stays a bounded background chore rather than a full-corpus rewrite.
+  static constexpr uint64_t T2DefragMaxMoveBytesPerCycle = 1ULL << 30;  // 1 GiB.
+
   static_assert(T1AppendCapacityLog2 > 0 && T1AppendCapacityLog2 < (sizeof(size_t) * kBitsPerByte),
                 "T1AppendCapacityLog2 must be in (0, bitwidth(size_t))");
   static_assert(!(UseReadPolicyRandomOnly && UseReadPolicySeqOnly),
@@ -136,6 +147,15 @@ struct VMemKVStatistics {
   // CgroupMemoryThrottle::throttle_events(): backpressure sleeps taken by bulk_load_impl()
   // against cgroup v2 memory pressure over this store's lifetime. 0 without a cgroup limit.
   uint64_t bulk_load_throttle_events = 0;
+
+  // T2 defragment: completed cycles, and the last cycle's wall-clock cost, relocated bytes,
+  // and hole-punched bytes. t2_live_bytes tracks live T2 bytes (sum of per-record size hints)
+  // for the overhead trigger; rebuilt from the T1 checkpoint plus WAL replay at startup.
+  uint64_t defrag_cycle_count = 0;
+  uint64_t last_defrag_duration_us = 0;
+  uint64_t last_defrag_moved_bytes = 0;
+  uint64_t last_defrag_punched_bytes = 0;
+  uint64_t t2_live_bytes = 0;
 };
 
 }  // namespace vmemkv

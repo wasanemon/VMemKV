@@ -255,4 +255,53 @@ void T2FlatFile::create_empty_file(const std::filesystem::path &path, uint64_t b
   ::close(file_descriptor);
 }
 
+auto T2FlatFile::punch_hole_range(uint64_t offset, uint64_t len) const noexcept -> bool {
+  if (len == 0) {
+    return true;
+  }
+  const T2Memory *mem = get_memory_handle();
+  if (offset + len > mem->capacity) {
+    return false;
+  }
+  const int file_descriptor = ::open(vmemkv::derive_t2_chk_path(path_).c_str(), O_RDWR);
+  if (file_descriptor < 0) {
+    return false;
+  }
+  const int rc = ::fallocate(file_descriptor, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                             static_cast<off_t>(offset), static_cast<off_t>(len));
+  const int fallocate_errno = errno;
+  ::close(file_descriptor);
+  if (rc != 0) {
+    // EOPNOTSUPP/ENOSYS (tmpfs and friends): no hole, leave blocks allocated. The caller
+    // still got its evacuated accounting; only physical reclamation is skipped.
+    (void)fallocate_errno;
+    return false;
+  }
+  // Drop the range from the page cache as well: punch zeroes the file blocks, but already
+  // resident pages would keep serving stale bytes until reclaimed.
+  ::madvise(mem->base + offset, static_cast<size_t>(len), MADV_DONTNEED);
+  return true;
+}
+
+auto T2FlatFile::is_hollow_range(uint64_t offset, uint64_t len) const noexcept -> bool {
+  if (len == 0) {
+    return true;
+  }
+  const int file_descriptor = ::open(vmemkv::derive_t2_chk_path(path_).c_str(), O_RDONLY);
+  if (file_descriptor < 0) {
+    return false;
+  }
+  const off_t data_at =
+      ::lseek(file_descriptor, static_cast<off_t>(offset), SEEK_DATA);
+  const int seek_errno = errno;
+  ::close(file_descriptor);
+  if (data_at < 0) {
+    // ENXIO: no data at or after offset -- hollow (within this file's size, which always
+    // covers the range). Anything else (ENOSYS/EINVAL on filesystems without support):
+    // report not-hollow so the caller falls back to attempting a punch.
+    return seek_errno == ENXIO;
+  }
+  return static_cast<uint64_t>(data_at) >= offset + len;
+}
+
 }  // namespace vmemkv
