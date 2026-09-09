@@ -297,53 +297,44 @@ class LeanStoreStore {
       return;
     }
     // No bulk-insert fast path exists in this backend version, so load goes through regular
-    // transactions: strided across loader threads (content is index-derived, hence identical
-    // regardless of insertion order) with a commit every batch to bound TX WAL size. Each key
-    // probes before inserting: a batch that aborts mid-way retries the whole chunk, and only
-    // the probe makes that retry idempotent (blind re-insert would hit the engine's
-    // duplicate path).
+    // transactions with a commit every batch to bound TX WAL size. Single-threaded ascending
+    // order, like the other engines' bulk loaders: parallel loaders all hammer the B-tree's
+    // right edge and collapse into OCC abort storms (measured 225x slower at 5 loaders), while
+    // one loader sustains ~600K keys/s with no aborts possible. Each key probes before
+    // inserting: a batch that aborts mid-way retries the whole chunk, and only the probe makes
+    // that retry idempotent (blind re-insert would hit the engine's duplicate path).
     constexpr std::size_t kBatchKeys = 10000;
-    const auto loader_threads = static_cast<unsigned>(
-        std::min<std::size_t>(worker_threads(), std::max<std::size_t>(1, key_count / kBatchKeys)));
     std::atomic<bool> failed{false};
-    std::vector<std::thread> loaders;
-    for (unsigned t = 0; t < loader_threads; ++t) {
-      loaders.emplace_back([&, t] {
-        for (std::size_t base = t; base < key_count && !failed.load(std::memory_order_relaxed);) {
-          const std::size_t chunk_end = std::min(key_count, base + kBatchKeys * loader_threads);
-          run_on_worker<int>(
-              [&](leanstore::KVInterface &btree) {
-                for (std::size_t index = base; index < chunk_end; index += loader_threads) {
-                  const std::string key = make_key(index);
-                  const std::string value = make_value(index);
-                  if (value.size() > kMaxValueBytes) {
-                    failed.store(true, std::memory_order_relaxed);
-                    return 0;
-                  }
-                  bool present = false;
-                  scan_exact(
-                      btree, std::span<const std::byte>(reinterpret_cast<const std::byte *>(key.data()), key.size()),
-                      [&](const ::u8 *, ::u16) {}, present);
-                  if (present) {
-                    continue;
-                  }
-                  const auto res = btree.insert(reinterpret_cast<::u8 *>(const_cast<char *>(key.data())),
-                                                checked_len(key.size()),
-                                                reinterpret_cast<::u8 *>(const_cast<char *>(value.data())),
-                                                checked_len(value.size()));
-                  if (res == leanstore::OP_RESULT::ABORT_TX) {
-                    leanstore::cr::Worker::my().abortTX();
-                  }
-                }
+    for (std::size_t base = 0; base < key_count && !failed.load(std::memory_order_relaxed);) {
+      const std::size_t chunk_end = std::min(key_count, base + kBatchKeys);
+      run_on_worker<int>(
+          [&](leanstore::KVInterface &btree) {
+            for (std::size_t index = base; index < chunk_end; ++index) {
+              const std::string key = make_key(index);
+              const std::string value = make_value(index);
+              if (value.size() > kMaxValueBytes) {
+                failed.store(true, std::memory_order_relaxed);
                 return 0;
-              },
-              /*read_only=*/false, static_cast<uint64_t>(t));
-          base = chunk_end;
-        }
-      });
-    }
-    for (auto &th : loaders) {
-      th.join();
+              }
+              bool present = false;
+              scan_exact(
+                  btree, std::span<const std::byte>(reinterpret_cast<const std::byte *>(key.data()), key.size()),
+                  [&](const ::u8 *, ::u16) {}, present);
+              if (present) {
+                continue;
+              }
+              const auto res = btree.insert(reinterpret_cast<::u8 *>(const_cast<char *>(key.data())),
+                                            checked_len(key.size()),
+                                            reinterpret_cast<::u8 *>(const_cast<char *>(value.data())),
+                                            checked_len(value.size()));
+              if (res == leanstore::OP_RESULT::ABORT_TX) {
+                leanstore::cr::Worker::my().abortTX();
+              }
+            }
+            return 0;
+          },
+          /*read_only=*/false, /*slot_hint=*/0);
+      base = chunk_end;
     }
     if (failed.load()) {
       throw std::runtime_error("LeanStore bulk load failed (value over u16 ceiling or backend error)");
