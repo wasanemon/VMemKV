@@ -452,7 +452,20 @@ class LeanStoreStore {
     }
   }
 
+  // Drops all datastructure-instance registrations. LeanStore never unregisters an
+  // instance, so every destroyed instance leaves a dangling entry behind. A later instance
+  // recovering from a clone of the same master re-registers the same persisted id, and the
+  // registry's insert keeps the first (dangling) entry, so recovery would deserialize into
+  // freed memory. At most one instance is alive at any open: benchmark cells serialize
+  // through a single active holder and tests construct stores sequentially. Type
+  // registrations are untouched.
+  static void prune_stale_registrations() {
+    std::lock_guard guard(leanstore::storage::DTRegistry::global_dt_registry.mutex);
+    leanstore::storage::DTRegistry::global_dt_registry.dt_instances_ht.clear();
+  }
+
   void open_fresh(const std::string &stem) {
+    prune_stale_registrations();
     ssd_path_ = stem;
     json_path_ = stem + ".json";
     std::error_code ignored;
@@ -470,6 +483,7 @@ class LeanStoreStore {
   }
 
   void open_recover(const std::string &stem) {
+    prune_stale_registrations();
     ssd_path_ = stem;
     json_path_ = stem + ".json";
     reset_flags(ssd_path_);
@@ -489,13 +503,6 @@ class LeanStoreStore {
   // frames, so the file copy below is self-consistent) before anything copies it, so a crash
   // mid-build never leaves a partial master for a later call to trust. WAL is disabled for
   // the build itself, like the other engines' non-durable bulk loaders.
-  //
-  // Clears the process-global datastructure registry before and after the scratch instance:
-  // LeanStore never unregisters tables, so every constructed instance leaves dangling entries
-  // behind, and this build's persist-on-close serializes the registry by dereferencing every
-  // entry (segfault once heap reuse makes a dead entry fatal). Safe because no other instance
-  // is alive while a master builds (bench/test setup is single-threaded; the clone opens
-  // only after this returns). Type registrations are untouched.
   template <typename KeyFn, typename ValueFn>
   static void ensure_master_built(const std::string &master_path,
                                   std::size_t key_count,
@@ -505,10 +512,7 @@ class LeanStoreStore {
     if (std::filesystem::exists(master_path) && std::filesystem::exists(master_json)) {
       return;
     }
-    {
-      std::lock_guard guard(leanstore::storage::DTRegistry::global_dt_registry.mutex);
-      leanstore::storage::DTRegistry::global_dt_registry.dt_instances_ht.clear();
-    }
+    prune_stale_registrations();
     const std::string building_ssd = master_path + ".building";
     const std::string building_json = building_ssd + ".json";
     std::error_code ignored;
@@ -529,10 +533,7 @@ class LeanStoreStore {
     tmp.warmup_workers();
     tmp.bulk_load_impl(key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
     tmp.close();
-    {
-      std::lock_guard guard(leanstore::storage::DTRegistry::global_dt_registry.mutex);
-      leanstore::storage::DTRegistry::global_dt_registry.dt_instances_ht.clear();
-    }
+    prune_stale_registrations();
 
     std::filesystem::remove(master_path, ignored);
     std::filesystem::remove(master_json, ignored);

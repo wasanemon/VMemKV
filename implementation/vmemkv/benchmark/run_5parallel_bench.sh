@@ -58,6 +58,7 @@ for task in "${TASKS[@]}"; do
   "$SCRIPT_DIR/run_bench_aws_c6id.sh" \
     --scenario "$scenario" \
     --value-size "$val_size" \
+    --headline-reps 3 \
     "${extra_flags[@]}" \
     > "$log_file" 2>&1 &
   pids+=($!)

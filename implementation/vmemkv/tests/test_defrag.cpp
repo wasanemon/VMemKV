@@ -185,6 +185,37 @@ TEST_CASE("defrag state survives checkpoint plus restart") {
   }
 }
 
+TEST_CASE("defrag cycle relocating more than the WAL ring holds still completes") {
+  // Bulk past one full 8MiB segment, delete 60% (every victim segment clears the 50%
+  // garbage bar), freeze with a checkpoint, then relocate ~12k live records in one
+  // cycle -- well past the 4096-slot WAL ring. Reserves must drain incrementally: with
+  // no other thread in await_durable(), a whole-cycle batch wedges reserve() forever.
+  const auto path = reserve_defrag_temp_path();
+  auto store = make_store(path);
+  constexpr size_t kKeys = 30000;
+  constexpr size_t kValBytes = 256;
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); },
+                   [](size_t i) { return make_value(kValBytes, i); });
+  for (size_t i = 0; i < kKeys; ++i) {
+    if (i % 10 < 6) {
+      CHECK(store->remove(make_key(i)));
+    }
+  }
+  store->checkpoint();
+  const uint64_t cycles_before = store->get_statistics().defrag_cycle_count;
+  CHECK(store->defragment());
+  CHECK(store->get_statistics().defrag_cycle_count > cycles_before);
+  for (size_t i = 0; i < kKeys; i += 97) {
+    const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
+    if (i % 10 < 6) {
+      CHECK_FALSE(got.has_value());
+    } else {
+      REQUIRE(got.has_value());
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == make_value(kValBytes, i));
+    }
+  }
+}
+
 TEST_CASE("defrag runs concurrently with updates without losing writes") {
   const auto path = reserve_defrag_temp_path();
   auto store = make_store(path);
@@ -195,7 +226,10 @@ TEST_CASE("defrag runs concurrently with updates without losing writes") {
   store->checkpoint();
 
   constexpr int kWriters = 4;
-  constexpr int kRounds = 200;
+  // 10 rounds (20k updates) keep several seconds of overlap with the background
+  // worker's 1s poll plus the manual cycles below; larger counts only add
+  // fsync-bound wall time (each update awaits WAL durability) without new races.
+  constexpr int kRounds = 10;
   std::atomic<bool> stop{false};
   std::vector<std::thread> writers;
   for (int t = 0; t < kWriters; ++t) {

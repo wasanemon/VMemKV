@@ -1856,24 +1856,33 @@ class VMemKVImpl {
         std::vector<uint64_t> offsets = collect_victim_offsets(victim_segs, used, mem);
         // Phase 2: relocate under per-key stripe locks (same discipline as update_impl).
         // Reserves batch first for group-commit fusion; every reserved record is awaited even
-        // if a later append throws (capacity), before the error propagates.
+        // if a later append throws (capacity), before the error propagates. Awaits run
+        // incrementally (not only at the end): one cycle can relocate up to
+        // T2DefragMaxMoveBytesPerCycle, far more than the WAL ring holds, and reserve()
+        // spins until a drain retires slots -- a drain only happens inside await_durable().
         std::vector<Wal::PendingRecord *> pendings;
+        constexpr std::size_t kDefragAwaitEveryNRelocates = 1024;
+        const auto await_pendings = [&] {
+          for (Wal::PendingRecord *pending : pendings) {
+            wal_.await_durable(pending);
+          }
+          pendings.clear();
+        };
         try {
           for (const uint64_t off : offsets) {
             moved_bytes += defrag_relocate_offset(off, mem, pendings);
+            if (pendings.size() >= kDefragAwaitEveryNRelocates) {
+              await_pendings();
+            }
             if (moved_bytes >= ConfigT::T2DefragMaxMoveBytesPerCycle) {
               break;
             }
           }
         } catch (...) {
-          for (Wal::PendingRecord *pending : pendings) {
-            wal_.await_durable(pending);
-          }
+          await_pendings();
           throw;
         }
-        for (Wal::PendingRecord *pending : pendings) {
-          wal_.await_durable(pending);
-        }
+        await_pendings();
         // Queue verified-evacuated victims for next cycle's punch. A nonzero counter means the
         // bucket missed something (impossible for frozen segments by construction) -- never
         // punch on doubt.

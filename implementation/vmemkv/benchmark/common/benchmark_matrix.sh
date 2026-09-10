@@ -4,6 +4,17 @@
 # Keep the data here so both local and AWS runners stay in sync without
 # duplicating filter strings.
 
+# VMemKV variant set per scenario. The read-policy ablation pins (ReadRandom/ReadSeq)
+# only diverge from the trifecta under memory pressure; in_memory runs measure them
+# identical everywhere, so inmem matrices run the base three variants only (their
+# per-variant masters are never built either). LTM keeps the full set.
+vmemkv_matrix::vmemkv_variant_filter() {
+  case "${1:-}" in
+    in_memory) printf '%s\n' 'Baseline|Bloom|Bloom-T1InlineValue' ;;
+    *) printf '%s\n' 'Baseline|Bloom|Bloom-T1InlineValue|Bloom-T1InlineValue-ReadRandom|Bloom-T1InlineValue-ReadSeq' ;;
+  esac
+}
+
 vmemkv_matrix::scenario_filter() {
   # vmemkv_only ("true"/"1"): drops the four rival backends
   # (RocksDB/RocksDB-BlobDB/LMDB/LeanStore) from
@@ -11,11 +22,14 @@ vmemkv_matrix::scenario_filter() {
   # re-measuring them is pure wasted AWS time/cost for a regression-check run. Their most recent
   # full-matrix numbers (from a run with this left off) are meant to be merged back in afterward
   # rather than re-measured every time; see merge_vmemkv_only_results.py.
-  local vmemkv_only="${1:-}"
+  local scenario_key="${1:-}"
+  local vmemkv_only="${2:-}"
+  local variants
+  variants="$(vmemkv_matrix::vmemkv_variant_filter "$scenario_key")"
   if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
-    printf '%s\n' '(^Store=VMemKV/)'
+    printf '(^Store=VMemKV/Variant=(%s)/)\n' "$variants"
   else
-    printf '%s\n' '(^Store=VMemKV/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/|^Store=LeanStore/)'
+    printf '(^Store=VMemKV/Variant=(%s)/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/|^Store=LeanStore/)\n' "$variants"
   fi
 }
 
@@ -24,11 +38,14 @@ vmemkv_matrix::scenario_filter_no_leanstore() {
   # so the 64KB corpus (65536-byte values) is unstorable there; benchmark_filter_for_case()
   # substitutes this for 64KB cases (RE2 has no negative lookahead, hence the explicit
   # alternation instead of an exclusion pattern).
-  local vmemkv_only="${1:-}"
+  local scenario_key="${1:-}"
+  local vmemkv_only="${2:-}"
+  local variants
+  variants="$(vmemkv_matrix::vmemkv_variant_filter "$scenario_key")"
   if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
-    printf '%s\n' '(^Store=VMemKV/)'
+    printf '(^Store=VMemKV/Variant=(%s)/)\n' "$variants"
   else
-    printf '%s\n' '(^Store=VMemKV/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/)'
+    printf '(^Store=VMemKV/Variant=(%s)/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/)\n' "$variants"
   fi
 }
 
@@ -113,11 +130,11 @@ vmemkv_matrix::benchmark_filter_for_case() {
   local value_regex
 
   if [[ "$value_key" == "64kb" ]]; then
-    scenario_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "$vmemkv_only")"
+    scenario_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "$scenario_key" "$vmemkv_only")"
     value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
     printf '%s\n' "(${scenario_regex}).*${value_regex}"
   else
-    scenario_regex="$(vmemkv_matrix::scenario_filter "$vmemkv_only")"
+    scenario_regex="$(vmemkv_matrix::scenario_filter "$scenario_key" "$vmemkv_only")"
     value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
     printf '%s\n' "(${scenario_regex}).*${value_regex}"
   fi
@@ -145,6 +162,16 @@ vmemkv_matrix::scenario_run_filter() {
     fi
   done
   printf '(%s)\n' "$joined"
+}
+
+vmemkv_matrix::headline_filter() {
+  # Narrows a base scenario filter ($1) to its max-thread-count cells ($2, the host's
+  # hardware thread count): the rival-comparison set error bars are reported for.
+  # Benchmark names always end with /real_time/threads:N, so the anchored suffix selects
+  # exactly the top of the {1, 4, 16, hw} sweep (YCSB-E registers hw only, always included).
+  local base_filter="$1"
+  local max_threads="$2"
+  printf '(%s).*threads:%s$\n' "$base_filter" "$max_threads"
 }
 
 vmemkv_matrix::scenario_effective_filter() {
@@ -178,7 +205,8 @@ vmemkv_matrix::ltm_priming_filter() {
   # measured at 200-1200s, vs. ~20-30s unconstrained.
   local vmemkv_only="${1:-}"
   local scenario_regex
-  scenario_regex="$(vmemkv_matrix::scenario_filter "$vmemkv_only")"
+  # LTM scope: ablation variants still run there, so prime the full variant set.
+  scenario_regex="$(vmemkv_matrix::scenario_filter "ltm" "$vmemkv_only")"
   if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
     printf '(%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$\n' "$scenario_regex"
   else
@@ -187,7 +215,7 @@ vmemkv_matrix::ltm_priming_filter() {
     # lookahead, so the first alternative drops LeanStore while the second spells its storable
     # value sizes explicitly.
     local no_leanstore_regex
-    no_leanstore_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "$vmemkv_only")"
+    no_leanstore_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "ltm" "$vmemkv_only")"
     printf '((%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$|(^Store=LeanStore/).*Op=Get/Mode=Hit/Dist=Zipf/.*Value=(8B|1KB).*threads:1$)\n' \
       "$no_leanstore_regex"
   fi

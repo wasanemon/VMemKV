@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # run_background_jobs_probe.sh - Fixed-corpus (1KB values, 10,000,000 records) reference
-# measurement for VMemKV's two background maintenance jobs: reorganize() and checkpoint(). For
-# each job, measures one call's own duration plus the QPS degradation it causes to concurrent
-# Insert/Update/Scan workloads -- see bench_kv.cpp's run_background_job_probe() for the actual
-# measurement (a matched-duration isolated/concurrent phase pair per workload).
+# measurement for VMemKV's three background maintenance jobs: reorganize(), checkpoint(), and
+# defragment(). For each job, measures one call's own duration plus the QPS degradation it
+# causes to concurrent Insert/Update/Scan workloads -- see bench_kv.cpp's
+# run_background_job_probe() for the actual measurement (a matched-duration isolated/concurrent
+# phase pair per workload).
 #
 # Not a sweep across the CRUD matrix's 4 scenario/value-size combos -- one fixed corpus, measured
-# once per (job, scenario) pair, 4 data points total (reorganize/in_memory, reorganize/ltm,
-# checkpoint/in_memory, checkpoint/ltm). defragment() is not measured here (permanent no-op, see
-# TODO.md).
+# once per (job, scenario) pair, 6 data points total (reorganize/checkpoint/defragment x
+# in_memory/ltm).
 #
 # Usage: run_background_jobs_probe.sh <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter]
 #   scenario_filter: "in_memory" or "ltm" (default: both). Matches run_bench_aws_c6id.sh's
@@ -43,7 +43,7 @@ if [[ -n "$SCENARIO_FILTER" ]]; then
 fi
 
 for scenario in "${SCENARIOS[@]}"; do
-  for job in reorganize checkpoint; do
+  for job in reorganize checkpoint defragment; do
     log "=== ${scenario}/${job} ==="
     run_probe_point "$scenario" "1KB" "background_job_probe" "1.0" "${scenario}/${job}" --job="$job"
   done

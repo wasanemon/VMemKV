@@ -55,6 +55,11 @@ show_help() {
   echo "                   VMemKV-internal-only code change, where the rivals' numbers are"
   echo "                   unaffected and re-measuring them is pure wasted AWS time/cost -- merge"
   echo "                   the prior full run's rival-only results back in afterward."
+  echo "  --headline-reps N  After each scenario's matrix, re-run its max-thread-count cells"
+  echo "                   (the rival-comparison set) with N Google Benchmark repetitions for"
+  echo "                   error bars (mean/stddev aggregates). Downloaded separately as"
+  echo "                   results_{in_memory,ltm}[_SIZE]_headline.json, never merged into the"
+  echo "                   main results. 0 disables (default)."
   exit 0
 }
 
@@ -65,6 +70,7 @@ ORGANIC_SPLIT_PROBE=false
 ORGANIC_SPLIT_PROBE_RANDOM=false
 SKIP_MATRIX=false
 WITHOUT_RIVALS=false
+HEADLINE_REPS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -111,6 +117,10 @@ while [[ $# -gt 0 ]]; do
     --without-rivals)
       WITHOUT_RIVALS=true
       shift
+      ;;
+    --headline-reps)
+      HEADLINE_REPS="$2"
+      shift 2
       ;;
     *)
       echo "[ERROR] Unknown option: $1" >&2
@@ -789,6 +799,148 @@ ${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
   fi
 }
 
+# Re-runs one scenario's max-thread-count cells (the rival-comparison set) with
+# HEADLINE_REPS Google Benchmark repetitions for error bars. Separate JSON output that is
+# never merged into the main results; the report renderer reads it independently.
+# Mirrors run_scenario()'s invocation shapes exactly (unconstrained for in_memory,
+# per-(Store, Variant) cgroup-isolated passes for ltm -- same warmup-pollution rationale),
+# except masters are always reused (VMEMKV_BENCH_SKIP_CLEANUP=1): the main pass just built them.
+# Args: $1 = scenario key (in_memory|ltm), $2 = the scenario's base run filter.
+run_headline_pass() {
+  local scenario_key="$1"
+  local base_filter="$2"
+  local scenario_env_prefix
+  local scenario_context_prefix
+  local scenario_runtime_env_prefix=""
+  local ycsb_populate_env_prefix=""
+  local large_value_first_env=""
+  local headline_stdout_log="/tmp/vmemkv_headline_${scenario_key}_${KEY_NAME}.stdout.log"
+  local headline_stderr_log="/tmp/vmemkv_headline_${scenario_key}_${KEY_NAME}.stderr.log"
+  local headline_result_path="/tmp/headline_${scenario_key}.json"
+
+  if [[ -z "${HW_THREADS_CACHED:-}" ]]; then
+    HW_THREADS_CACHED="$(ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "nproc --all" | tail -n 1)"
+  fi
+  local headline_filter
+  headline_filter="$(vmemkv_matrix::headline_filter "$base_filter" "$HW_THREADS_CACHED")"
+
+  scenario_env_prefix="$(vmemkv_matrix::scenario_env_prefix "$scenario_key")"
+  scenario_context_prefix="$(scenario_context_env_prefix "$scenario_key")"
+  if [[ "$scenario_key" == "in_memory" ]]; then
+    scenario_runtime_env_prefix="VMEMKV_BENCH_FORCE_HOST_MEMORY=1"
+  fi
+  if [[ -n "${YCSB_E_POPULATE:-}" ]]; then
+    ycsb_populate_env_prefix="YCSB_E_POPULATE=${YCSB_E_POPULATE}"
+  fi
+  if [[ "$LARGE_VALUE_FIRST" == "true" ]]; then
+    large_value_first_env="VMEMKV_BENCH_LARGE_VALUE_FIRST=1"
+  fi
+
+  : >"$headline_stdout_log"
+  : >"$headline_stderr_log"
+
+  local headline_count
+  headline_count="$(count_remote_benchmarks "$headline_filter" "$scenario_env_prefix" "${scenario_runtime_env_prefix:-}")"
+  if [[ "$headline_count" -eq 0 ]]; then
+    echo "[runner] headline pass for scenario=$scenario_key matched nothing -- skipping." >&2
+    return 0
+  fi
+  echo "[runner] headline pass for scenario=$scenario_key: ${headline_count} cell(s) x${HEADLINE_REPS}"
+
+  local headline_status=0
+  if [[ "$scenario_key" == "ltm" ]]; then
+    local headline_names
+    headline_names=$(ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+      "bash -lc 'cd ~/faultkv/vmemkv && ${scenario_env_prefix:+${scenario_env_prefix} }./build-rel/benchmark/bench_kv --benchmark_list_tests --benchmark_filter=\"${headline_filter}\" 2>/dev/null'")
+    local -a headline_identities=()
+    while IFS= read -r identity_line; do
+      [[ -z "$identity_line" ]] && continue
+      headline_identities+=("$identity_line")
+    done < <(printf '%s\n' "$headline_names" | sed -nE 's#^(Store=[^/]+/Variant=[^/]+)/.*#\1#p' | sort -u)
+
+    local -a headline_group_paths=()
+    local headline_idx=0 identity group_names group_filter group_path group_cmd group_cmd_quoted group_status
+    for identity in "${headline_identities[@]}"; do
+      headline_idx=$((headline_idx + 1))
+      group_names="$(printf '%s\n' "$headline_names" | grep -F "${identity}/" | sed -E 's/[][(){}.^$*+?\\|]/\\&/g' | paste -sd'|' -)"
+      group_filter="^(${group_names})\$"
+      group_path="/tmp/vmemkv_ltm_headline_group_${headline_idx}_${KEY_NAME}.json"
+      headline_group_paths+=("$group_path")
+
+      echo "[runner] LTM headline pass ${headline_idx}/${#headline_identities[@]}: ${identity}"
+      ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null" \
+        >>"$headline_stdout_log" 2>>"$headline_stderr_log"
+
+      group_cmd="
+cd /home/ubuntu/faultkv/vmemkv &&
+${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} }VMEMKV_BENCH_SKIP_CLEANUP=1 \
+${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
+./benchmark/common/run_scenario.sh \
+  './build-rel/benchmark/bench_kv' \
+  '$group_filter' \
+  '$MIN_TIME' \
+  '$group_path' \
+  '$HEADLINE_REPS'
+      "
+      printf -v group_cmd_quoted '%q' "$group_cmd"
+
+      set +e
+      {
+        ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+          "sudo systemd-run --wait --pipe --quiet -p MemoryAccounting=yes -p MemoryHigh=${LTM_MEMORY_BUDGET_BYTES} -p MemoryMax=$((LTM_MEMORY_BUDGET_BYTES * 2)) -p MemorySwapMax=${LTM_SWAP_BUDGET_BYTES} -- bash -lc ${group_cmd_quoted}" \
+          2> >(tee -a "$headline_stderr_log" >&2)
+      } | tee -a "$headline_stdout_log"
+      group_status=${PIPESTATUS[0]}
+      set -e
+      if [[ "$group_status" -ne 0 ]]; then
+        echo "[ERROR] LTM headline pass for ${identity} failed with exit code $group_status" >&2
+        headline_status="$group_status"
+        break
+      fi
+    done
+
+    if [[ "$headline_status" -eq 0 ]]; then
+      local merge_paths_quoted="" p
+      for p in "${headline_group_paths[@]}"; do
+        merge_paths_quoted+=" $(printf '%q' "$p")"
+      done
+      ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+        "jq -s '{context: .[0].context, benchmarks: (map(.benchmarks) | add)}'${merge_paths_quoted} > $(printf '%q' "$headline_result_path")" \
+        >>"$headline_stdout_log" 2>>"$headline_stderr_log"
+      headline_status=$?
+    fi
+  else
+    local head_remote_cmd="
+cd /home/ubuntu/faultkv/vmemkv &&
+${scenario_context_prefix} ${scenario_runtime_env_prefix:+${scenario_runtime_env_prefix} }VMEMKV_DB_DIR=/mnt/nvme ${scenario_env_prefix:+${scenario_env_prefix} }${large_value_first_env:+${large_value_first_env} }VMEMKV_BENCH_SKIP_CLEANUP=1 \
+${ycsb_populate_env_prefix:+${ycsb_populate_env_prefix} }\
+./benchmark/common/run_scenario.sh \
+  './build-rel/benchmark/bench_kv' \
+  '$headline_filter' \
+  '$MIN_TIME' \
+  '$headline_result_path' \
+  '$HEADLINE_REPS'
+    "
+    local head_remote_cmd_quoted
+    printf -v head_remote_cmd_quoted '%q' "$head_remote_cmd"
+
+    set +e
+    {
+      ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" \
+        "bash -lc ${head_remote_cmd_quoted}" \
+        2> >(tee -a "$headline_stderr_log" >&2)
+    } | tee -a "$headline_stdout_log"
+    headline_status=${PIPESTATUS[0]}
+    set -e
+  fi
+
+  echo "[runner] end headline pass scenario=$scenario_key status=$headline_status"
+  if [[ "$headline_status" -ne 0 ]]; then
+    echo "[ERROR] Headline pass scenario=$scenario_key failed with exit code $headline_status" >&2
+    return "$headline_status"
+  fi
+}
+
 # Runs one "additive extra measurement" probe script against the already-provisioned instance.
 # BACKGROUND_JOBS_PROBE below uses this orchestration -- up to two invocations (in_memory
 # unconstrained, ltm systemd-run-wrapped with the same MemoryHigh/MemoryMax/MemorySwapMax as
@@ -938,21 +1090,54 @@ if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
 fi
 
 GLOBAL_TOTAL=$((total_inmem + total_ltm))
+
+# Headline error-bar pass: same max-thread cells re-run with repetitions. Counted up
+# front so the global progress denominator stays sane. Skipped for --quick (smoke test).
+HW_THREADS_CACHED=""
+headline_inmem_filter=""
+headline_ltm_filter=""
+if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" && "$SKIP_MATRIX" != "true" ]]; then
+  HW_THREADS_CACHED="$(ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "nproc --all" | tail -n 1)"
+  echo "Headline repetitions: x${HEADLINE_REPS} (remote hw threads: ${HW_THREADS_CACHED})"
+  if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+    headline_inmem_filter="$(vmemkv_matrix::headline_filter "$inmem_filter" "$HW_THREADS_CACHED")"
+    count_remote_benchmarks "$headline_inmem_filter" "$(vmemkv_matrix::scenario_env_prefix in_memory)" "VMEMKV_BENCH_FORCE_HOST_MEMORY=1" > "/tmp/vmemkv_headline_inmem_count_${KEY_NAME}.txt" &
+    hpid1=$!
+  else
+    hpid1=""
+  fi
+  if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+    headline_ltm_filter="$(vmemkv_matrix::headline_filter "$ltm_filter" "$HW_THREADS_CACHED")"
+    count_remote_benchmarks "$headline_ltm_filter" "$(vmemkv_matrix::scenario_env_prefix ltm)" > "/tmp/vmemkv_headline_ltm_count_${KEY_NAME}.txt" &
+    hpid2=$!
+  else
+    hpid2=""
+  fi
+  if [[ -n "$hpid1" ]]; then wait "$hpid1"; total_inmem=$((total_inmem + $(cat "/tmp/vmemkv_headline_inmem_count_${KEY_NAME}.txt"))); rm -f "/tmp/vmemkv_headline_inmem_count_${KEY_NAME}.txt"; fi
+  if [[ -n "$hpid2" ]]; then wait "$hpid2"; total_ltm=$((total_ltm + $(cat "/tmp/vmemkv_headline_ltm_count_${KEY_NAME}.txt"))); rm -f "/tmp/vmemkv_headline_ltm_count_${KEY_NAME}.txt"; fi
+  GLOBAL_TOTAL=$((total_inmem + total_ltm))
+fi
 write_progress_state "$GLOBAL_TOTAL"
 echo "Total benchmarks to run: $GLOBAL_TOTAL"
 
 if [[ "$SKIP_MATRIX" != "true" ]]; then
   if [[ "$SCENARIO_LIMIT" == "in_memory" ]]; then
     run_scenario in_memory
+    if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass in_memory "$inmem_filter"; fi
   elif [[ "$SCENARIO_LIMIT" == "ltm" ]]; then
     run_scenario ltm
+    if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass ltm "$ltm_filter"; fi
   else
     if [[ "$ORDER" == "B_FIRST" ]]; then
       run_scenario ltm
+      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass ltm "$ltm_filter"; fi
       run_scenario in_memory
+      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass in_memory "$inmem_filter"; fi
     else
       run_scenario in_memory
+      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass in_memory "$inmem_filter"; fi
       run_scenario ltm
+      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass ltm "$ltm_filter"; fi
     fi
   fi
 fi
@@ -987,6 +1172,25 @@ if [[ "$SKIP_MATRIX" != "true" ]]; then
       dst_name="results_ltm_${VALUE_SIZE_LIMIT}${without_rivals_suffix}.json"
     fi
     scp $SSH_OPTS "ubuntu@$PUBLIC_IP:$(vmemkv_matrix::scenario_result_path ltm)" "${RESULTS_DIR}/${dst_name}"
+  fi
+
+  # Headline error-bar passes (if requested): standalone files, never merged into the above.
+  if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then
+    echo "Downloading headline results..."
+    if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
+      headline_dst="results_in_memory_headline${without_rivals_suffix}.json"
+      if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+        headline_dst="results_in_memory_${VALUE_SIZE_LIMIT}_headline${without_rivals_suffix}.json"
+      fi
+      scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/headline_in_memory.json" "${RESULTS_DIR}/${headline_dst}"
+    fi
+    if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
+      headline_dst="results_ltm_headline${without_rivals_suffix}.json"
+      if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
+        headline_dst="results_ltm_${VALUE_SIZE_LIMIT}_headline${without_rivals_suffix}.json"
+      fi
+      scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/headline_ltm.json" "${RESULTS_DIR}/${headline_dst}"
+    fi
   fi
 
   # Retrieve YCSB-E timeline results if they exist

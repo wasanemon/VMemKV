@@ -12,6 +12,9 @@ BENCH_KV_BIN="$1"
 SCENARIO_RUN_FILTER="$2"
 MIN_TIME="$3"
 SCENARIO_RESULT_PATH="$4"
+# Optional Google Benchmark repetition count for error bars (default 1 = single
+# run, identical to the old invocation shape).
+REPETITIONS="${5:-1}"
 
 # Resolve host hardware and OS metadata dynamically wherever this runs (local dev
 # machine or AWS instance).
@@ -25,5 +28,6 @@ export VMEMKV_CONTEXT_swap_total_bytes="$(awk '/SwapTotal:/ { print $2 * 1024; e
 exec "$BENCH_KV_BIN" \
   --benchmark_min_time="${MIN_TIME}" \
   --benchmark_filter="${SCENARIO_RUN_FILTER}" \
+  --benchmark_repetitions="${REPETITIONS}" \
   --benchmark_out="${SCENARIO_RESULT_PATH}" \
   --benchmark_out_format=json

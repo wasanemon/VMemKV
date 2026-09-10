@@ -29,14 +29,34 @@ STORE_VARIANT_TO_LABEL = {
     ("VMemKV", "Bloom-T1InlineValue-ReadSeq"): "+Seq",
 }
 
-VARIANT_ORDER = ["RocksDB", "LMDB", "RocksDB-BlobDB", "LeanStore", "Baseline", "+BF", "+Inline", "+Prefault", "+Random", "+Seq"]
+VARIANT_ORDER = ["RocksDB", "LMDB", "RocksDB-BlobDB", "LeanStore", "Baseline", "+BF", "+Inline", "+Random", "+Seq"]
 RIVAL_STORES = ["RocksDB", "LMDB", "RocksDB-BlobDB", "LeanStore"]
 COLORS = {
     "RocksDB": "#64748b", "LMDB": "#10b981", "RocksDB-BlobDB": "#a855f7", "LeanStore": "#0d9488",
     "Baseline": "#94a3b8",
-    "+BF": "#f59e0b", "+Inline": "#6366f1", "+Prefault": "#ec4899",
+    "+BF": "#f59e0b", "+Inline": "#6366f1",
     "+Random": "#0ea5e9", "+Seq": "#84cc16",
 }
+# Point markers for the detail charts. Shapes must stay within drawMarkerShape()'s cases;
+# line color (COLORS) is the primary distinguisher, rival (dashed) vs VMemKV (solid) the
+# secondary one, so shape reuse across those two groups is acceptable.
+VARIANT_MARKERS = {
+    "RocksDB": "rect", "LMDB": "triangle", "RocksDB-BlobDB": "rectRot", "LeanStore": "star",
+    "Baseline": "circle", "+BF": "cross", "+Inline": "crossRot",
+    "+Random": "rect", "+Seq": "rectRot",
+}
+# Stacking Variants legend: the currently measured set only.
+VARIANT_DESCRIPTIONS = [
+    ("RocksDB", "LSM-Tree のベースライン比較"),
+    ("LMDB", "B+Tree / mmap ベースの比較対象"),
+    ("RocksDB-BlobDB", "RocksDB の Blob 分離ストレージ変種(大きな Value 向け)"),
+    ("LeanStore", "B+Tree / pointer-swizzling ベースの比較対象 (64KB値は格納不可のため除外)"),
+    ("Baseline", "vmemkv 最適化なし"),
+    ("+BF", "+ T1 Bloom Filter"),
+    ("+Inline", "+BF + T1 Inline Value(<8B のValueをT1のみで処理)"),
+    ("+Random", "+Inline のReadRandomピン (random-access mappingに固定)"),
+    ("+Seq", "+Inline のReadSeqピン (sequential mappingに固定)"),
+]
 WORKLOADS = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"]
 THREADS = [1, 4, 16, 32]
 
@@ -227,19 +247,17 @@ def organic_split_averages(organic_split_data, scenario):
 
 
 def render_organic_split_chart_html(organic_split_data, chart_suffix=""):
-    """Two line charts (pause duration in ms; absolute baseline/during Insert QPS) plotted against
-    shard count reached, one line (two for QPS) per scenario -- the full per-split detail behind
-    the summary rows organic_split_averages() feeds into the Background Jobs table.
+    """Single line chart (writer-visible pause duration in ms) plotted against shard count
+    reached, one line per scenario -- the full per-split detail behind the summary rows
+    organic_split_averages() feeds into the Background Jobs table.
 
     Truncated to shard counts both scenarios actually reached: in a 90s fixed-duration run, LTM's
     somewhat lower insert throughput under memory pressure means it simply runs out of time before
-    its next split, ending on fewer total splits than in-memory (7 vs 8 shards in the run this was
-    written against) -- not a bug, just less corpus grown in the same wall-clock window. Plotting
-    in-memory's extra point(s) anyway would compare an uneven number of shards per scenario instead
-    of the same points side by side.
+    its next split, ending on fewer total splits than in-memory -- not a bug, just less corpus
+    grown in the same wall-clock window.
 
-    Self-contained: canvases plus their own inline <script> (Chart.js is already loaded in <head>
-    by the time this renders, and the Summary tab is visible on load, so creating the charts
+    Self-contained: canvas plus its own inline <script> (Chart.js is already loaded in <head>
+    by the time this renders, and the Summary tab is visible on load, so creating the chart
     immediately is safe -- same reasoning as every other chart on this page, just not routed
     through the shared initCharts() since this section's data has a different shape from the
     workload/thread-count charts there)."""
@@ -248,32 +266,26 @@ def render_organic_split_chart_html(organic_split_data, chart_suffix=""):
     scenario_labels = {"in_memory": "in-memory", "ltm": "LTM"}
     colors = {"in_memory": "#6366f1", "ltm": "#f59e0b"}
     usable = {}
-    summary_lines = []
+    timeout_note = ""
     for scenario in ["in_memory", "ltm"]:
         rec = organic_split_data.get(scenario)
         if not rec:
             continue
         if rec.get("timed_out"):
-            summary_lines.append(f'<p class="text-xs text-rose-600 font-semibold">{scenario_labels[scenario]}: did not complete (timeout)</p>')
+            timeout_note += (f'<p class="text-xs text-rose-600 font-semibold">{scenario_labels[scenario]}: '
+                             f'did not complete (timeout)</p>')
             continue
         splits = rec.get("splits", [])
-        summary_lines.append(f'<p class="text-[11px] text-slate-500">{scenario_labels[scenario]}: {len(splits)} split(s) observed over '
-                              f'{rec.get("duration_sec", "?")}s &middot; {rec.get("total_inserted", 0):,} total inserted '
-                              f'&middot; ended at {rec.get("final_shard_count", "?")} shards</p>')
         if splits:
             usable[scenario] = splits
     if not usable:
-        return "\n".join(summary_lines) if summary_lines else ""
+        return timeout_note
 
     # Common cap: the lowest "highest shard count reached" across scenarios with data, so every
     # plotted point exists for every scenario shown (see the docstring above).
     common_max_shard = min(max(s["shard_count_after"] for s in splits) for splits in usable.values())
-    if len(usable) > 1 and any(max(s["shard_count_after"] for s in splits) != common_max_shard for splits in usable.values()):
-        summary_lines.append(f'<p class="text-[11px] text-slate-400">Charts below truncated to shard count '
-                              f'&le;{common_max_shard} (the highest both scenarios reached in this run) for a like-for-like comparison.</p>')
 
     pause_datasets = []
-    qps_datasets = []
     for scenario, splits in usable.items():
         capped = [s for s in splits if s["shard_count_after"] <= common_max_shard]
         col = colors[scenario]
@@ -283,30 +295,12 @@ def render_organic_split_chart_html(organic_split_data, chart_suffix=""):
             "borderColor": col, "backgroundColor": col, "tension": 0.3,
             "pointRadius": 4, "pointHoverRadius": 6,
         })
-        qps_datasets.append({
-            "label": f"{scenario_labels[scenario]} baseline",
-            "data": [{"x": s["shard_count_after"], "y": s["baseline_qps"]} for s in capped],
-            "borderColor": col, "backgroundColor": col, "tension": 0.3,
-            "pointRadius": 4, "pointHoverRadius": 6,
-        })
-        qps_datasets.append({
-            "label": f"{scenario_labels[scenario]} during pause",
-            "data": [{"x": s["shard_count_after"], "y": s["during_qps"]} for s in capped],
-            "borderColor": col, "backgroundColor": col, "borderDash": [6, 6], "tension": 0.3,
-            "pointRadius": 4, "pointHoverRadius": 6,
-        })
 
-    data_json = json.dumps({"pause": pause_datasets, "qps": qps_datasets})
-    return "\n".join(summary_lines) + f'''
-<div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-3">
-  <div class="space-y-1.5">
-    <h4 class="text-xs font-bold text-slate-600">Writer-visible pause duration</h4>
-    <div class="h-64 relative"><canvas id="organic-split-pause-chart{chart_suffix}"></canvas></div>
-  </div>
-  <div class="space-y-1.5">
-    <h4 class="text-xs font-bold text-slate-600">Insert QPS: just before the pause vs. during it</h4>
-    <div class="h-64 relative"><canvas id="organic-split-qps-chart{chart_suffix}"></canvas></div>
-  </div>
+    data_json = json.dumps({"pause": pause_datasets})
+    return timeout_note + f'''
+<div class="space-y-1.5 mt-3">
+  <h4 class="text-xs font-bold text-slate-600">Writer-visible pause duration</h4>
+  <div class="h-64 relative"><canvas id="organic-split-pause-chart{chart_suffix}"></canvas></div>
 </div>
 <script>
 (function() {{
@@ -326,11 +320,6 @@ def render_organic_split_chart_html(organic_split_data, chart_suffix=""):
   if (pauseCanvas && d.pause.length) {{
     new Chart(pauseCanvas, {{ type: 'line', data: {{ datasets: d.pause }},
       options: commonOptions('Pause duration (ms)', {{ min: 0, max: 10000 }}) }});
-  }}
-  const qpsCanvas = document.getElementById('organic-split-qps-chart{chart_suffix}');
-  if (qpsCanvas && d.qps.length) {{
-    new Chart(qpsCanvas, {{ type: 'line', data: {{ datasets: d.qps }},
-      options: commonOptions('Insert ops/sec', {{ min: 0 }}) }});
   }}
 }})();
 </script>'''
@@ -445,6 +434,7 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
     job_labels = {
         "reorganize": "reorganize() (forced, all shards)",
         "checkpoint": "checkpoint()",
+        "defragment": "defragment() (forced, one cycle)",
     }
     scenario_labels = {"in_memory": "in-memory", "ltm": "LTM"}
     out = ['<div class="overflow-x-auto"><table class="w-full text-left border-collapse text-xs">',
@@ -455,7 +445,7 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
            '<th class="py-2 px-3 font-bold text-slate-700">Update QPS degradation</th>',
            '<th class="py-2 px-3 font-bold text-slate-700">Scan QPS degradation</th>',
            "</tr></thead><tbody class=\"divide-y divide-slate-100\">"]
-    for job in ["reorganize", "checkpoint"]:
+    for job in ["reorganize", "checkpoint", "defragment"]:
         for scenario in ["in_memory", "ltm"]:
             rec = background_jobs_data.get((job, scenario))
             row_label = f'{job_labels[job]} <span class="text-slate-400">/ {scenario_labels[scenario]}</span>'
@@ -598,8 +588,65 @@ def main():
     env_end = html.index("</ul>", env_start)
     html = html[:env_start] + args.env_html + html[env_end:]
 
-    # localStorage memo namespace.
-    html = html.replace(f"vmemkv-{args.template_id}-memo-", f"vmemkv-{args.report_id}-memo-")
+    # Detail-chart store set: older templates predate some backends, so sync the chart
+    # scaffolding from this script's single source of truth instead of trusting the template.
+    # These three are load-bearing (datasets iterate variantOrder) -- fail loudly if the
+    # template ever renames them, rather than silently dropping stores again.
+    for pattern, value in [
+        (r"const colors = \{[^}]*\};", "const colors = " + json.dumps(COLORS) + ";"),
+        (r"const rivalStores = \[[^\]]*\];", "const rivalStores = " + json.dumps(RIVAL_STORES) + ";"),
+        (r"const variantOrder = \[[^\]]*\];", "const variantOrder = " + json.dumps(VARIANT_ORDER) + ";"),
+    ]:
+        html, n = re.subn(pattern, lambda m: value, html, count=1)
+        if n == 0:
+            raise ValueError(f"template lacks expected JS const for pattern: {pattern}")
+    html, n = re.subn(r"const variantMarkers = \{[^}]*\};",
+                      lambda m: "const variantMarkers = " + json.dumps(VARIANT_MARKERS) + ";", html, count=1)
+    if n == 0:
+        print("warning: template lacks variantMarkers const -- markers fall back to circle")
+
+    # Stacking Variants legend: the currently measured set only.
+    stacking_marker = "Stacking Variants"
+    stacking_idx = html.find(stacking_marker)
+    if stacking_idx == -1:
+        print("warning: template lacks Stacking Variants section -- legend not updated")
+    else:
+        ul_start = html.index('<ul class="space-y-1.5 text-slate-500 list-disc pl-4">', stacking_idx)
+        ul_end = html.index("</ul>", ul_start) + len("</ul>")
+        legend_items = "\n".join(
+            f'          <li><strong>{label}</strong>: {desc}</li>' for label, desc in VARIANT_DESCRIPTIONS)
+        html = (html[:ul_start]
+                + '<ul class="space-y-1.5 text-slate-500 list-disc pl-4">\n'
+                + legend_items + '\n        </ul>'
+                + html[ul_end:])
+
+    # Stale history phrasing in the Workloads legend and per-tab Scan overviews.
+    html = html.replace("(旧レポートにあった reorganize モード分割は撤去済み)", "")
+    html = html.replace(
+        "。現行 bench_kv は reorganize 状態を単一の Scan ベンチマークとして測定する形に統合済み"
+        "(旧レポートの Scan_WithReorg / Scan_T1T2Reorg モード分割は撤去済み)。", "。")
+    html = html.replace("一様分布で選ばれたレンジのスキャン(同上)。", "一様分布で選ばれたレンジのスキャン。")
+
+    # Overall Notes & Annotations section and every per-chart memo textarea are retired.
+    notes_idx = html.find("Overall Notes")
+    if notes_idx == -1:
+        print("warning: template lacks Overall Notes section -- nothing to remove")
+    else:
+        sec_start = html.rfind("<section", 0, notes_idx)
+        sec_end = html.index("</section>", notes_idx) + len("</section>")
+        html = html[:sec_start] + html[sec_end:]
+    html, memo_n = re.subn(r'<textarea id="memo-[^"]*"[^>]*></textarea>', "", html)
+    if memo_n == 0:
+        print("warning: template has no memo textareas -- nothing to remove")
+    for memo_fn in ["    function saveMemo(key, val) {\n      try { localStorage.setItem(",
+                     "    function initMemos() {"]:
+        fn_start = html.find(memo_fn)
+        if fn_start == -1:
+            print(f"warning: template lacks memo JS for {memo_fn.split('(')[0].strip()} -- skipping")
+            continue
+        fn_end = html.index("\n    }\n", fn_start) + len("\n    }\n")
+        html = html[:fn_start] + html[fn_end:]
+    html = html.replace("    initMemos();\n", "")
 
     # Winners matrix table body.
     tbody_marker = '<tbody class="divide-y divide-slate-100">\n<tr class="hover:bg-indigo-50/10 transition-colors">'
@@ -689,11 +736,7 @@ def main():
             icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="split",
             title="Organic Per-Shard Splits (random keys)",
             description_html=(
-                "Same 90s sustained-insert probe as above, but with random keys spreading writes "
-                "over all shards concurrently -- the workload that shows whether one split's "
-                "throughput impact shrinks as the shard count grows. Compare against the "
-                "monotonic-key section: with a single hot shard the drop stays large across "
-                "every split by construction."
+                "Pause durations with random keys spreading writes over all shards."
             ),
             table_html=render_organic_split_chart_html(organic_split_random_data, chart_suffix="-random"),
         )
@@ -703,29 +746,16 @@ def main():
         icon_bg="bg-indigo-50", icon_text="text-indigo-600", icon_name="split",
         title="Organic Per-Shard Splits",
         description_html=(
-            "Full per-split detail behind the \"per-shard split (organic)\" summary rows in the "
-            "Background Jobs table above: what actually happens during ordinary operation, as "
-            "opposed to the forced whole-store reorganize() there. Starting from an empty store "
-            "with real background workers active, insert continuously for 90s (fixed 1KB values, "
-            "monotonically increasing keys) and detect each automatic per-shard split as "
-            "ShardedT1Index's own background worker pool completes it. Pause duration is the "
-            "exact, directly-instrumented span writers targeting that shard were blocked "
-            "(get_statistics().t1_last_split_pause_us) -- not an inferred window; the QPS chart "
-            "plots this event's own local Insert ops/sec just before the pause against ops/sec "
-            "across the pause itself, both in absolute terms (see run_organic_split_probe.sh). "
-            "With monotonically increasing keys, exactly one shard is ever \"hot\" at a time "
-            "regardless of how many other shards exist, so the drop stays large across every split "
-            "here rather than shrinking with shard count -- the random-keys section below tests "
-            "whether spreading writes across shards changes that."
+            "Writer-visible pause per automatic per-shard split during 90s sustained inserts."
         ),
         table_html=render_organic_split_chart_html(organic_split_data),
     )
 
     html = upsert_section(
         html,
-        heading="Background Jobs: reorganize() / checkpoint()",
+        heading="Background Jobs: reorganize() / checkpoint() / defragment()",
         icon_bg="bg-rose-50", icon_text="text-rose-600", icon_name="swords",
-        title="Background Jobs: reorganize() / checkpoint()",
+        title="Background Jobs: reorganize() / checkpoint() / defragment()",
         description_html=(
             "Fixed reference point (1KB values, 10,000,000 records; in-memory unconstrained, "
             "LTM cgroup-constrained to the same memory budget as the rest of the suite) -- "
@@ -735,7 +765,7 @@ def main():
             "matched-duration window on both sides (see run_background_jobs_probe.sh). "
             "reorganize() forces every shard through a synchronous merge in one call -- a manual "
             "escape hatch (pre-backup flush, capacity planning), not what happens during ordinary "
-            "operation. The last two rows summarize the organic per-shard split alternative that "
+            "operation. The last rows summarize the organic per-shard split alternative that "
             "actually runs day to day (averaged across every split observed in that run; see the "
             "detail section further down for the full breakdown and charts)."
         ),

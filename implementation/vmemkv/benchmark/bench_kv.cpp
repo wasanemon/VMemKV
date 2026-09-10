@@ -1913,10 +1913,11 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
     fail(
         "usage: --reorg-probe --scenario=<in_memory|ltm> --value-size=<8B|1KB|64KB> "
         "--mode=<background_job_probe|organic_split_probe> "
-        "--ratio=<0.0-1.0> [--job=<reorganize|checkpoint>] [--key-pattern=<monotonic|random>]");
+        "--ratio=<0.0-1.0> [--job=<reorganize|checkpoint|defragment>] [--key-pattern=<monotonic|random>]");
   }
-  if (args.mode == ProbeMode::kBackgroundJobProbe && args.job != "reorganize" && args.job != "checkpoint") {
-    fail("--mode=background_job_probe requires --job=<reorganize|checkpoint>");
+  if (args.mode == ProbeMode::kBackgroundJobProbe && args.job != "reorganize" && args.job != "checkpoint" &&
+      args.job != "defragment") {
+    fail("--mode=background_job_probe requires --job=<reorganize|checkpoint|defragment>");
   }
   if (args.ratio <= 0.0 || args.ratio > 1.0) {
     fail("--ratio must be in (0.0, 1.0]");
@@ -2112,6 +2113,12 @@ constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
   std::function<void()> run_job;
   if (args.job == "reorganize") {
     run_job = [&store]() { store->reorganize(); };
+  } else if (args.job == "defragment") {
+    run_job = [&store]() {
+      if (!store->defragment()) {
+        throw std::runtime_error("defragment probe: cycle refused (punch unsupported or recovering)");
+      }
+    };
   } else {
     run_job = [&store]() { store->checkpoint(); };
   }
