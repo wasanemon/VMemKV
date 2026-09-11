@@ -635,6 +635,18 @@ class LeanStoreStore {
     std::filesystem::remove(dest_stem, ignored);
     std::filesystem::remove(dest_stem + ".json", ignored);
     copy_sparse(source_stem, dest_stem);
+    // Make the clone durable before any timed run starts from it: data and WAL share one
+    // file here, so the first timed fdatasync would otherwise flush this whole just-copied
+    // image (tens of GB) inside the measurement window.
+    const int fd = ::open(dest_stem.c_str(), O_RDONLY);
+    if (fd < 0) {
+      throw std::runtime_error("LeanStore clone sync open failed: " + dest_stem);
+    }
+    if (::fsync(fd) != 0) {
+      ::close(fd);
+      throw std::runtime_error("LeanStore clone sync failed: " + dest_stem);
+    }
+    ::close(fd);
     std::filesystem::copy_file(source_stem + ".json", dest_stem + ".json", ignored);
     if (ignored) {
       throw std::runtime_error("LeanStore clone json copy failed: " + ignored.message());
