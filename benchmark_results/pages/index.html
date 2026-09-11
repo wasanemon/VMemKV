@@ -66,34 +66,15 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-09-10</td>
+              <td class="py-4 pr-4 text-slate-400">2026-09-11</td>
               <td class="py-4 px-4 font-medium">
-                <a href="2026091018_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i x5 (09/10)
+                <a href="2026091111_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i x5 (09/11)
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026090700_charts.html" class="text-indigo-600 hover:underline">09/07</a>時点比):</p>
                 <ul class="list-disc pl-4 space-y-1">
-                  <li>LeanStore rival backend修正後の初完走 (4 combo + probe)。inmem/1KBは2回連続90%超でcrashしていた (Deleteセル実行中のsegfault/abort) が、プロセス内2つ目以降のインスタンスがrecover時にstaleなregistry登録を掴んでいたのが原因 (clone元masterと同idの再登録がno-op化)。全open前のpruneで解消。</li>
-                  <li>LTM 2 comboはWAL ringのwedgeで85%/57%停止していた (1サイクル最大1GiBのrelocate reserveが4096スロットを使い切り、drainするawait不在で永久spin)。relocateループ内の1024件ごと中間awaitで解消。</li>
-                </ul>
-              </td>
-            </tr>
-            <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-09-07</td>
-              <td class="py-4 px-4 font-medium">
-                <a href="2026090700_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i x5 (09/07)
-                </a>
-              </td>
-              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026090301_charts.html" class="text-indigo-600 hover:underline">09/03</a>時点比):</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li><code>ShardedT1Index</code>(T1のrange-sharding、reorganize/checkpointコストのO(コーパスサイズ)問題を解消する設計)を<code>VMemKVImpl</code>へ結線し、split protocolの3件のバグ(重複キュー投入によるsplit中断でシャードが無制限肥大化、abortパスのリセット順序による永久stuck、split境界を跨ぐstraggler書き込みの実データ損失)を発見・修正した上での初のフルCRUDマトリクス+background jobs probe計測。</li>
-                  <li><code>KVStore</code>コンセプトに<code>reorganize</code>/<code>checkpoint</code>/<code>get_statistics</code>を追加。T1の統計を(シャーディング後は自動split経路を一切捕捉できていなかった)<code>t1_reorg_count</code>から実際のsplit回数を数える<code>T1_Splits</code>へ刷新。死んでいた<code>hard_stall_count</code>を削除し、<code>total_hard_stall_duration_us</code>は実態(明示的reorganize/checkpoint呼び出し同士の排他待ち時間)に合わせ<code>total_reorganize_wait_duration_us</code>に改名。YCSB-Eの強制reorganize()トリガーを撤去(シャーディング後は全シャード同期マージでO(コーパス)化しており、"軽量な対照"ではなくなった上、background-jobs-probeと計測が重複していたため)。</li>
-                  <li>Background Jobs計測結果(1KB&times;1,000万件、in_memory/ltm): reorganize() in_memory 1.482秒(Scan劣化15%)、ltm 14.082秒(Scan劣化2%) -- 09/03時点ではltmが60秒タイムアウトで未完了、in_memoryのScan劣化は83%だった。シャーディング導入前に問題視されていた「コーパス増大に伴うreorganize/checkpointコスト増大」が、実測ベースで解消したことを裏付ける結果。</li>
-                  <li>この計測自体は久しぶりのAWSフルベンチ実行だったため、monorepoが<code>implementation/vmemkv</code>へ再編されて以降放置されていたオーケストレーションスクリプトのパスバグを3件発見・修正(rsync同期先が<code>~/faultkv/vmemkv</code>ではなく<code>~/faultkv/implementation/vmemkv</code>を前提にしていた、NVMeデバイス検出がインデックス依存でルートボリュームを誤検出しうる、結果ダウンロード先<code>RESULTS_DIR</code>が同じ<code>REPO_ROOT</code>計算ミスで二重パス化していた)。</li>
+                  <li>LeanStore get単一scan化。headline error-bar pass (max-threadセルx3反復) 追加。inmem read-ablation除外。defragment probe追加。</li>
                 </ul>
               </td>
             </tr>
@@ -105,15 +86,9 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026082101_charts.html" class="text-indigo-600 hover:underline">08/21</a>時点比、設計面の差分のみ。rival数値は2026-08-27の計測を再利用):</p>
                 <ul class="list-disc pl-4 space-y-1">
-                  <li>T2を<code>MAP_PRIVATE</code>→<code>MAP_SHARED</code>化(page cacheへの書き込みが<code>msync()</code>でそのまま永続化される設計に変更)、WALを世代単位でセグメント分割。<code>checkpoint()</code>のWALバイト閾値(<code>WalMaxBytesSinceCheckpoint</code>)が大きい値サイズ(64KB等)で実質発火しなかったバグを修正。</li>
-                  <li><code>defragment()</code>を恒久的no-op化した上でAPI・<code>TailEntryTracker</code>・T2-generation-pairing機構ごと完全削除。<code>T1AppendCapacityLog2</code>を2^22→2^21に縮小(RSSフットプリント対策、TODO.md参照)。</li>
-                </ul>
-                <p class="mb-1.5 mt-3">新しいレポート生成パイプラインでの初回計測でもある(<code>--without-rivals</code>):</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li>Summary tabをWorkload Winners行列と新設のBackground Jobsテーブル(reorganize()/checkpoint() &times; in_memory/ltm、固定1KB&times;1,000万件コーパス)のみに簡素化。</li>
-                  <li>Background Jobs計測結果: in_memoryでは両ジョブとも完了(reorganize() 1.495秒・Insert劣化49%/Update劣化-6%/Scan劣化83%、checkpoint() 4.193秒・Insert劣化49%/Update劣化2%/Scan劣化27%)。ltmでは両ジョブとも内部タイムアウト(60秒)に到達し未完了 -- 1KB&times;1,000万件コーパスに対し、LTM(cgroup制約)下でのreorganize()/checkpoint()が60秒を超えることを示す一点のデータ。原因分析は別途。</li>
+                  <li>T2を<code>MAP_PRIVATE</code>→<code>MAP_SHARED</code>化 (page cache書き込みを<code>msync()</code>で永続化)。WAL世代単位セグメント分割。<code>WalMaxBytesSinceCheckpoint</code>の大値サイズ不発火を修正。</li>
+                  <li><code>defragment()</code>恒久no-op化と関連機構 (<code>TailEntryTracker</code>等) の削除。<code>T1AppendCapacity</code> 2^22→2^21。</li>
                 </ul>
               </td>
             </tr>
@@ -125,88 +100,11 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026081711_charts.html" class="text-indigo-600 hover:underline">08/17</a>時点比、要点のみ):</p>
                 <ul class="list-disc pl-4 space-y-1">
-                  <li>クローン用T2チェックポイントファイルのディスク枯渇バグを2件修正: (1) クローンパスがベンチマークケースごとに増分カウンタで新規生成され、ディスクを使い切るまで蓄積していたのを固定パスの再利用へ変更、(2) <code>std::filesystem::copy_file()</code>がsparse fileのホールを認識せず、論理サイズ1TiBのT2チェックポイントをクローンごとにフル実体化していたのを、<code>pread</code>/<code>pwrite</code>で実データ範囲のみコピーしホールを保持する専用ヘルパーへ変更。これにより、これまで全ての4並列フルベンチ試行を失敗させていたルート原因を解消し、本ラウンドが修正後初めて4シナリオ全てが成功したフルラン。</li>
-                  <li><code>checkpoint()</code>/<code>defragment()</code>実装のDRY/YAGNIレビューを実施し共通ヘルパーを抽出。両者とベンチマークハーネスのコメント・生成レポート文言で<code>defragment()</code>と誤表記されていた箇所(実際は全てreorganize()/checkpoint()呼び出し)を修正。Summaryタブの「Reorganize Duration (T1-only vs T1+T2)」チャートも同様に誤解を招く表記だった(T1+T2側は実際には<code>checkpoint()</code>のブートストラップ呼び出しで、reorganize()ではない)ため凡例・見出しを修正。</li>
-                  <li><code>defragment()</code>単体を測定する新実験(<code>--mode=defrag</code>/<code>defrag_contention</code>)を追加。当初はrun_bench_aws_c6id.sh/run_4parallel_bench.shに組み込まれておらず本ラウンドの4並列フルランでは未計測だったため、<code>--defrag-scaling-probe</code>として両ランナーへ組み込み、加えて新設の<code>--skip-matrix</code>フラグでスタンドアロンインスタンス上で単体実行し、結果を本レポートに追記(Summaryタブ「Defragment Scaling & Contention」)。churn-ratio(0〜1.0)に対して所要時間がほぼ一定(24.4〜25.6秒、8M件corpus)である一方、コーパスサイズには強く依存し、ltmシナリオでは複数点が60秒(または300秒の外側バックストップ)キャップに到達。</li>
-                  <li>XFS+reflink依存を完全撤去(ext4へ移行)。T2ストレージはプレーンなPOSIX I/Oのみで、reflink/punch-holeの<code>ioctl</code>依存は既に無かったため撤去は provisioning/CI/テスト基盤側のみ。</li>
+                  <li>T2 cloneの固定パス再利用 + hole温存コピー (sparse対応)。XFS+reflink依存を撤去しext4へ。</li>
+                  <li>defrag scaling probe追加。</li>
                 </ul>
               </td>
-              </tr>
-            <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-08-17</td>
-              <td class="py-4 px-4 font-medium">
-                <a href="2026081711_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i (08/17)
-                </a>
-              </td>
-              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026081313_charts.html" class="text-indigo-600 hover:underline">08/13</a>時点比、要点のみ):</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li><code>checkpoint()</code>/<code>defragment()</code>をreflink clone + hole punchで統一する再設計を実施(O(N)コピーからO(diff)へ)。実測3件のライブロック(<code>run_reorganize()</code>の自己競合ループ、<code>acquire_write_handle()</code>のバックオフ無しリトライストーム、<code>Wal::drain_pending()</code>のLSN追いかけっこ)を発見・修正し、32並列での正しい動作を確認。</li>
-                  <li>新実験2件を追加: Churn-Ratio Scaling(churn_ratio&ge;0.05で定常defragment()が60秒キャップに到達)、Corpus-Size Invariance across Generations(定常状態のreflink/punch経路をコーパスサイズに対してスイープ)。</li>
-                  <li><code>--without-rivals</code>モードでVMemKVのみ再計測し、RocksDB/RocksDB-BlobDB/LMDBは08/13の数値を再利用してマージ(コスト削減)。</li>
-                </ul>
-              </td>
-              </tr>
-            <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-08-13</td>
-              <td class="py-4 px-4 font-medium">
-                <a href="2026081313_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i (08/13)
-                </a>
-              </td>
-              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026081000_charts.html" class="text-indigo-600 hover:underline">08/10</a>時点比、要点のみ):</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li><code>ScanBaseSequential</code>のbase領域読み取りを、単一固定madviseからレコードサイズ別3経路(<code>base_mmap_scan_seq</code>/<code>base_mmap_scan</code>/<code>read_fd</code>)のper-record動的選択へ変更。旧方式(コーパス先頭レコードのサイズをサンプリングして方針決定)が引き起こしていた1KB LTM Scanの退行(0.40〜0.78x)を解消(64KB LTMのGet/Hitも2.0〜3.3x、Scan(Zipf)も2.2x改善)。</li>
-                  <li>上記の過程で、Getの小レコード(1ページ以下)経路が誤ってScan専用の<code>base_mmap_scan_seq</code>(<code>MADV_SEQUENTIAL</code>)を再利用していたバグを発見・修正。LTM/1KBのGetはランダムアクセスなので広いreadaheadが逆効果(major fault毎のカーネル時間が約10倍)だった。既にMADV_RANDOMを持つプライマリの<code>base</code>マッピングへ直接読みに変更(seqlock無し)し、1KB LTMのGet/HitがZipf 5.2倍、Uniform 6.5倍改善、<code>+Prefault</code>と同等以上に回復。</li>
-                  <li><code>try_scan_base_record()</code>/<code>try_get_base_record()</code>を単一の<code>try_read_base_record()</code>エントリポイントへ統合し、マッピング選択方針を<code>BaseReader</code> switch文の1箇所に集約(再発防止)。</li>
-                </ul>
-              </td>
-              </tr>
-            <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-08-10</td>
-              <td class="py-4 px-4 font-medium">
-                <a href="2026081000_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i (08/10)
-                </a>
-              </td>
-              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                <p class="mb-1.5">(<a href="2026080600_charts.html" class="text-indigo-600 hover:underline">08/06</a>時点比、要点のみ):</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li><code>NoMadvise</code>/<code>SimdScan</code>アブレーションは実測の結果撤去。</li>
-                  <li>T2 reorganize: T2再構築をkey順ソート書き込みから物理オフセット順コンパクションへ再設計し、reorganize所要時間を大幅短縮(WALトリガー間隔に対して追いつかない問題を解消)。</li>
-                  <li>WAL/checkpoint: T1-onlyチェックポイントを導入してWALチェックポイントをT2 GCから分離、<code>reorganize()</code>を<code>reorganize()</code>/<code>defragment()</code>/<code>checkpoint()</code>に分割。</li>
-                  <li>並行性バグ2件を修正(torn read、reorganize残存ウィンドウのrace)。</li>
-                  <li>T2のcheckpoint済み領域をimmutable化し、別のmmapでアクセスするScanBaseSequential アブレーションを追加。</li>
-                </ul>
-              </td>
-              </tr>
-            <tr>
-              <td class="py-4 pr-4 text-slate-400">2026-08-06</td>
-              <td class="py-4 px-4 font-medium">
-                <a href="2026080600_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i (08/06)
-                </a>
-              </td>
-              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                コンパイル時アブレーション実験として <code>madvise(..., MADV_RANDOM)</code> を無効化した
-                <code>NoMadvise</code> バリアントを新規導入。
-              </td>
-              </tr>
-              
-              <tr>
-                <td class="py-4 pr-4 text-slate-400">2026-07-29</td>
-                <td class="py-4 px-4 font-medium">
-                  <a href="2026072900_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                    AWS c6id (07/29)
-                  </a>
-                </td>
-                <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                  WAL / Checkpoint 実装完了。ベンチマークのバグ修正済み。
-                </td>
               </tr>
               
               </tbody>
@@ -237,6 +135,84 @@
                       </thead>
                       <tbody class="divide-y divide-slate-100">
                         <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-09-07</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026090700_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i x5 (09/07)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <ul class="list-disc pl-4 space-y-1">
+                  <li><code>ShardedT1Index</code> (T1 range-sharding) を<code>VMemKVImpl</code>へ結線。reorganize/checkpointをシャード単位にbound。</li>
+                  <li><code>KVStore</code>コンセプトに<code>reorganize</code>/<code>checkpoint</code>/<code>get_statistics</code>追加。<code>T1_Splits</code>計数。YCSB-E強制reorganizeトリガー撤去。</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-17</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026081711_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/17)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <ul class="list-disc pl-4 space-y-1">
+                  <li><code>checkpoint()</code>/<code>defragment()</code>をreflink clone + hole punchに統一。新実験 Churn-Ratio Scaling / Corpus-Size Invariance 追加。<code>--without-rivals</code>でVMemKVのみ再計測。</li>
+                </ul>
+              </td>
+              </tr>
+            <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-13</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026081313_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/13)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <ul class="list-disc pl-4 space-y-1">
+                  <li>base領域読み取りのper-record 3経路動的選択。Get小レコード経路のmapping修正。<code>try_read_base_record()</code>へ統合。</li>
+                </ul>
+              </td>
+              </tr>
+            <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-10</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026081000_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/10)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <ul class="list-disc pl-4 space-y-1">
+                  <li><code>NoMadvise</code>/<code>SimdScan</code>アブレーション撤去。T2 reorganizeを物理オフセット順コンパクションへ再設計。WAL/checkpoint分離と<code>reorganize()</code>/<code>defragment()</code>/<code>checkpoint()</code>分割。<code>ScanBaseSequential</code>追加。</li>
+                </ul>
+              </td>
+              </tr>
+            <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-08-06</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026080600_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i (08/06)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                コンパイル時アブレーション実験として <code>madvise(..., MADV_RANDOM)</code> を無効化した
+                <code>NoMadvise</code> バリアントを新規導入。
+              </td>
+              </tr>
+              
+              <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-07-29</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026072900_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS c6id (07/29)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                WAL / Checkpoint 実装完了。ベンチマークのバグ修正済み。
+              </td>
+              </tr>
+              
+                        <tr>
               <td class="py-4 pr-4 text-slate-400">2026-08-04</td>
               <td class="py-4 px-4 font-medium">
                 <a href="2026080400_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
@@ -244,7 +220,7 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                reorganize_internal()の残存ウィンドウ競合（T1エントリが退避直前のT2世代を指したまま生き残るレース）をドレインバリアで修正。Scan T1Reorg/T1T2Reorgベンチマークの不公平（挿入順序の違いによりT2物理レイアウトが実質同一になっていた）を、共有マスターをランダム順で構築しreorganize()の呼び分けだけで両モードを差別化する方式に修正。そのT1-onlyスナップショット構築が背景reorg_worker_スレッドとレースしエントリを1件だけ恒久的に取りこぼす不具合（ltm/1KBが無限ハング）を発見・修正——専用フックや新規ロック付きラッパーを追加する案を経て、reorganize(false)収束後にT1Index::scan()で読み出すだけで済むと判明し、ライブラリへの新規インタフェース追加なしで解決。YCSB-Eタイムラインでt=15sの強制reorganizeと自然発生reorganizeを区別して縦線表示するよう変更（LTMシナリオは自然発生がほぼ起きないため、強制トリガーを自然発生と誤認しないように）。単発reorganize()の所要時間をコーパスサイズに対してスイープする新実験（T1-only vs T1+T2、各タブのYCSB-E直下に追加）を実施：T1-onlyはLTM下でも8.26M件で2.7秒と軽量だが、T1+T2はLTM下でターゲットの25%（1KB, 206万件）や100%（64KB, 13万件だがT2実データは~8.6GB）で60秒キャップに到達し、実用限界を確認。これに伴い、「T1-onlyでもLTM cgroup制約下で1分優に超える」という誤った旧コメントを削除・訂正（実際に遅いのはpopulate中の並行reorg競合であり、単発reorganize()自体は高速）。
+                T1 race修正 (drain barrier、snapshot取りこぼし)。Scanベンチの不公平修正。単発reorganize所要時間のcorpus sweep実験追加。
               </td>
             </tr>
 
@@ -256,7 +232,7 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                T1Index::scan()が候補を毎回全件ソートしていた無駄を、ソート済みsorted_region分をスキップする直接マージに変更(8B In-MemoryのScanがRocksDB比3.5x→7.5xへ改善)。update_impl()がinline値の更新時に不要なT2メモリハンドルを取得していたのを高速パス化。write_stripeロック保持中のreorganizeチェックをロック外へ移動。THP(Transparent Huge Pages)の実際の設定を確認しmadviseへ強制する仕組みを追加。書き込み系の改善効果はAWS実行間のノイズに埋もれ有意差を確認できず。
+                T1Index::scan()のソート済み分スキップ直接マージ。update inline高速パス。THP設定確認とmadvise強制。
               </td>
             </tr>
 
@@ -268,7 +244,7 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                WAL group commit通知方式をnotify_one()ループからnotify_all()に変更、T1 append領域のbounds-skipスキャン最適化、reorganize()の直接マージ化、チェックポイント書き込み時のメモリ逼迫対策を実施。インスタンスをc6idからi4i(現行世代・最速ローカルNVMe)に変更。
+                WAL group commit通知をnotify_all化。T1 append bounds-skip。c6idからi4iへ移行。
               </td>
             </tr>
 
@@ -281,7 +257,7 @@
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
-                YCSB-E (Scan 95% / Insert 5%)追加。Reorganizeのトリガをadaptiveに変更。ベンチマークにバグあり（slack参照）
+                YCSB-E (Scan 95% / Insert 5%)追加。Reorganizeトリガーをadaptive化。
               </td>
             </tr>
 

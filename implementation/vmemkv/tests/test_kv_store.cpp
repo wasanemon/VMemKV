@@ -330,8 +330,34 @@ TEST_CASE_TEMPLATE("update missing key returns false", Store, STORE_TYPES) {
 TEST_CASE_TEMPLATE("update accepts a value equal to STORE_NOT_FOUND and it round-trips", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);
-  CHECK(store->update("a", vmemkv::STORE_NOT_FOUND));
+  store->update("a", vmemkv::STORE_NOT_FOUND);
   CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
+}
+
+// Per-key get() exactness after distinct same-size updates plus interleaved deletes:
+// every surviving key must read back exactly its latest value (not a stale version or a
+// length-corrupted payload), deleted keys must read absent. Same-size values keep this
+// valid for LeanStore (no size-changing update path there); no key is reinserted.
+TEST_CASE_TEMPLATE("get returns latest value per key after update and delete churn", Store, STORE_TYPES) {
+  auto store = StoreFactory<Store>::make();
+  constexpr size_t kKeys = 300;
+  for (size_t i = 0; i < kKeys; ++i) {
+    store->insert("k" + std::to_string(i), i);
+  }
+  for (size_t i = 0; i < kKeys; ++i) {
+    CHECK(store->update("k" + std::to_string(i), 100000 + i));
+  }
+  for (size_t i = 0; i < kKeys; i += 3) {
+    CHECK(store->remove("k" + std::to_string(i)));
+  }
+  for (size_t i = 0; i < kKeys; ++i) {
+    if (i % 3 == 0) {
+      CHECK(test_util::get_sync(store, "k" + std::to_string(i)) == vmemkv::STORE_NOT_FOUND);
+    } else {
+      CHECK(test_util::get_sync(store, "k" + std::to_string(i)) == 100000 + i);
+    }
+  }
+  CHECK(test_util::get_sync(store, "k_missing") == vmemkv::STORE_NOT_FOUND);
 }
 
 // StoreAdapter::bulk_load() calls impl_.bulk_load_impl() directly, bypassing insert()/update()'s

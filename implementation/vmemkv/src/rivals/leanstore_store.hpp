@@ -167,11 +167,9 @@ class LeanStoreStore {
 
   template <typename Callback>
   auto get_impl(std::span<const std::byte> key, Callback callback) const -> bool {
-    // Neither primitive alone is correct on this backend version (verified empirically):
-    // lookupOptimistic returns the head payload without consulting is_removed (deleted keys
-    // read as live), while the scan fast path overstates chained value lengths by
-    // sizeof(ChainedTuple) (correct pointer, length includes the header). Hence liveness via
-    // scan_exact plus the value via lookup; both inside one TX.
+    // Single scanAsc: it reports only live, visible versions with reconstructed values, so
+    // one traversal covers both liveness and the value (a separate lookup would double the
+    // traversals and reopen a probe-then-lookup race with concurrent removers).
     // The value is copied into heap state before commit (a thread_local buffer would belong
     // to the worker thread, not the caller).
     struct GetState {
@@ -181,23 +179,13 @@ class LeanStoreStore {
     auto state = run_on_worker<GetState>(
         [&](leanstore::KVInterface &btree) {
           GetState out;
-          bool live = false;
-          scan_exact(btree, key, [&](const ::u8 *, ::u16) {}, live);
-          if (!live) {
-            return out;
-          }
-          ::u8 *k = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(key.data()));
-          const auto res = btree.lookup(k, checked_len(key.size()),
-                                        [&](const ::u8 *payload, ::u16 len) {
-                                          out.value.assign(reinterpret_cast<const std::byte *>(payload),
-                                                           reinterpret_cast<const std::byte *>(payload) + len);
-                                        });
-          if (res == leanstore::OP_RESULT::ABORT_TX) {
-            leanstore::cr::Worker::my().abortTX();
-          }
-          // A concurrent remover may have deleted the key between the probe and the lookup;
-          // linearize the delete first.
-          out.found = (res == leanstore::OP_RESULT::OK);
+          scan_exact(
+              btree, key,
+              [&](const ::u8 *sv, ::u16 svlen) {
+                out.value.assign(reinterpret_cast<const std::byte *>(sv),
+                                 reinterpret_cast<const std::byte *>(sv) + svlen);
+              },
+              out.found);
           return out;
         },
         /*read_only=*/true);

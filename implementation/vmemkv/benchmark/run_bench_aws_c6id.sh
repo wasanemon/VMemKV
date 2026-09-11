@@ -1123,21 +1123,33 @@ echo "Total benchmarks to run: $GLOBAL_TOTAL"
 if [[ "$SKIP_MATRIX" != "true" ]]; then
   if [[ "$SCENARIO_LIMIT" == "in_memory" ]]; then
     run_scenario in_memory
-    if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass in_memory "$inmem_filter"; fi
+    if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then
+      run_headline_pass in_memory "$inmem_filter" || echo "[WARN] Headline pass failed -- main results above are still valid" >&2
+    fi
   elif [[ "$SCENARIO_LIMIT" == "ltm" ]]; then
     run_scenario ltm
-    if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass ltm "$ltm_filter"; fi
+    if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then
+      run_headline_pass ltm "$ltm_filter" || echo "[WARN] Headline pass failed -- main results above are still valid" >&2
+    fi
   else
     if [[ "$ORDER" == "B_FIRST" ]]; then
       run_scenario ltm
-      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass ltm "$ltm_filter"; fi
+      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then
+        run_headline_pass ltm "$ltm_filter" || echo "[WARN] Headline pass failed -- main results above are still valid" >&2
+      fi
       run_scenario in_memory
-      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass in_memory "$inmem_filter"; fi
+      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then
+        run_headline_pass in_memory "$inmem_filter" || echo "[WARN] Headline pass failed -- main results above are still valid" >&2
+      fi
     else
       run_scenario in_memory
-      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass in_memory "$inmem_filter"; fi
+      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then
+        run_headline_pass in_memory "$inmem_filter" || echo "[WARN] Headline pass failed -- main results above are still valid" >&2
+      fi
       run_scenario ltm
-      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then run_headline_pass ltm "$ltm_filter"; fi
+      if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then
+        run_headline_pass ltm "$ltm_filter" || echo "[WARN] Headline pass failed -- main results above are still valid" >&2
+      fi
     fi
   fi
 fi
@@ -1175,6 +1187,7 @@ if [[ "$SKIP_MATRIX" != "true" ]]; then
   fi
 
   # Headline error-bar passes (if requested): standalone files, never merged into the above.
+  # Best-effort downloads (|| true): a failed headline pass must never strand the main results.
   if [[ "$HEADLINE_REPS" -gt 0 && "$QUICK" != "true" ]]; then
     echo "Downloading headline results..."
     if [[ "$SCENARIO_LIMIT" == "in_memory" || "$SCENARIO_LIMIT" == "all" ]]; then
@@ -1182,14 +1195,14 @@ if [[ "$SKIP_MATRIX" != "true" ]]; then
       if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
         headline_dst="results_in_memory_${VALUE_SIZE_LIMIT}_headline${without_rivals_suffix}.json"
       fi
-      scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/headline_in_memory.json" "${RESULTS_DIR}/${headline_dst}"
+      scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/headline_in_memory.json" "${RESULTS_DIR}/${headline_dst}" || echo "[WARN] Headline in_memory download missing" >&2
     fi
     if [[ "$SCENARIO_LIMIT" == "ltm" || "$SCENARIO_LIMIT" == "all" ]]; then
       headline_dst="results_ltm_headline${without_rivals_suffix}.json"
       if [[ -n "$VALUE_SIZE_LIMIT" ]]; then
         headline_dst="results_ltm_${VALUE_SIZE_LIMIT}_headline${without_rivals_suffix}.json"
       fi
-      scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/headline_ltm.json" "${RESULTS_DIR}/${headline_dst}"
+      scp $SSH_OPTS "ubuntu@$PUBLIC_IP:/tmp/headline_ltm.json" "${RESULTS_DIR}/${headline_dst}" || echo "[WARN] Headline ltm download missing" >&2
     fi
   fi
 
