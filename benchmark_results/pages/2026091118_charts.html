@@ -48,7 +48,7 @@
           <a href="../2026091118/background_jobs_ltm.jsonl" download class="inline-flex items-center gap-1 text-xs text-slate-500 bg-slate-100 rounded px-2.5 py-1.5 hover:bg-slate-200"><i data-lucide="download" class="w-3.5 h-3.5"></i> Raw JSONL (Background Jobs, LTM)</a>
         </div>
       </div>
-      <p class="text-slate-500 text-sm max-w-3xl">2026091111 data with LeanStore cells re-measured under per-operation group-commit durability (sync-wait) and merged in. LeanStore Delete/1KB cells omitted (n/a, under investigation for pathological per-op latency at 8M scale); inmem read-ablation trim and headline error-bar passes retained.</p></p></p></p></p></p></p>
+      <p class="text-slate-500 text-sm max-w-3xl">2026091111 data with LeanStore cells re-measured under per-operation group-commit durability (sync-wait) and merged in. LeanStore Delete/1KB re-measured after a clone pre-sync fix (the first timed fdatasync had flushed the whole just-copied clone image inside the window); inmem read-ablation trim and headline error-bar passes retained.</p></p></p></p></p></p></p>
     </header>
 
     <section class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs bg-slate-50 border border-slate-200 rounded-xl p-5">
@@ -1478,10 +1478,10 @@
         5736.751418024646
       ],
       "LeanStore": [
-        5740.785225515145,
-        10604.985099046975,
-        13651.93817682856,
-        14233.268061987623
+        5579.830826116919,
+        9930.756209865793,
+        13535.756829902572,
+        14355.122998437279
       ]
     },
     "Get_Hit_Zipf": {
@@ -1522,10 +1522,10 @@
         15577740.112277158
       ],
       "LeanStore": [
-        20016.178776729837,
-        92591.14725523727,
-        280846.8271735504,
-        445497.52659929555
+        20469.527149630103,
+        79310.40636531865,
+        256573.36296190496,
+        479576.54839957017
       ]
     },
     "Get_Hit_Uniform": {
@@ -1566,10 +1566,10 @@
         11925574.411186032
       ],
       "LeanStore": [
-        9422.700354662345,
-        41809.47825705818,
-        129102.64222360312,
-        254942.13851207407
+        9406.921599292365,
+        41503.142532615115,
+        128937.42007660362,
+        281896.9341964888
       ]
     },
     "Get_Miss": {
@@ -1610,10 +1610,10 @@
         38992626.42222017
       ],
       "LeanStore": [
-        63931.73008282518,
-        259375.07125859833,
-        639920.872325431,
-        721512.2952229216
+        63737.80420585588,
+        256019.05283482038,
+        567711.0669839073,
+        752458.689136466
       ]
     },
     "Update": {
@@ -1654,10 +1654,10 @@
         15022.882312097865
       ],
       "LeanStore": [
-        6561.469703348226,
-        15134.524315075287,
-        26747.554713121295,
-        34217.61482951412
+        6494.678526124006,
+        14068.7704663768,
+        26881.960212560738,
+        32887.705670528594
       ]
     },
     "Delete": {
@@ -1696,6 +1696,12 @@
         7087.593451032805,
         8711.298058949249,
         8417.592074243306
+      ],
+      "LeanStore": [
+        5035.968176255331,
+        10200.97901823169,
+        19483.670530889165,
+        24122.322468084185
       ]
     },
     "Scan_Zipf": {
@@ -1736,10 +1742,10 @@
         300529.4420419058
       ],
       "LeanStore": [
-        636.0271782580523,
-        3697.541884623711,
-        20478.545539036586,
-        40335.82644683577
+        1298.229342342254,
+        2981.807562656879,
+        12034.711758921698,
+        24851.34317884622
       ]
     },
     "Scan_Uniform": {
@@ -1780,10 +1786,10 @@
         280412.74314046337
       ],
       "LeanStore": [
-        712.8272007448757,
-        3006.43298974654,
-        22119.032859509538,
-        23601.25559415441
+        521.0745586240072,
+        3173.764395092046,
+        15371.212723606614,
+        29336.81974399816
       ]
     }
   },
@@ -1838,10 +1844,10 @@
         80880.72762215845
       ],
       "LeanStore": [
-        6267.227247087062,
-        13007.312349555317,
-        20647.801702541496,
-        24206.459785280986
+        5657.249207115136,
+        12126.32850509705,
+        22490.228162640815,
+        18858.75581122021
       ]
     },
     "Get_Hit_Zipf": {
@@ -1894,10 +1900,10 @@
         123711.56278413969
       ],
       "LeanStore": [
-        11275.710647092666,
-        59375.17905175136,
-        116920.31577987781,
-        95172.48943220415
+        18857.701787799986,
+        67332.11508831542,
+        106088.64367477703,
+        103877.6786980357
       ]
     },
     "Get_Hit_Uniform": {
@@ -1950,10 +1956,10 @@
         30333.934359064722
       ],
       "LeanStore": [
-        7525.162946016178,
-        31577.90816511312,
-        41919.67510572911,
-        29255.022691461803
+        7547.79934030993,
+        31280.258912117726,
+        38800.24977719656,
+        28661.75549363665
       ]
     },
     "Get_Miss": {
@@ -2006,10 +2012,10 @@
         92661837.76165947
       ],
       "LeanStore": [
-        65294.454951368796,
-        263199.63758375926,
-        536574.3185984159,
-        853113.8680600639
+        64714.34820233444,
+        262049.3409222162,
+        566336.0555294111,
+        770566.8528002489
       ]
     },
     "Update": {
@@ -2062,10 +2068,10 @@
         97916.06415409759
       ],
       "LeanStore": [
-        5003.489051923533,
-        13066.67532035595,
-        13725.65982906175,
-        11783.48858344584
+        5130.633742920119,
+        13104.854868911738,
+        14383.352567020427,
+        12382.98035872613
       ]
     },
     "Delete": {
@@ -2116,6 +2122,12 @@
         13593.296593251898,
         90089.9364515342,
         154803.44361094185
+      ],
+      "LeanStore": [
+        4892.317293001515,
+        9591.03963977531,
+        21246.21675018945,
+        21004.398511480435
       ]
     },
     "Scan_Zipf": {
@@ -2168,10 +2180,10 @@
         81897.52946645915
       ],
       "LeanStore": [
-        802.2988225998554,
-        2706.9972995496564,
-        4327.217032179821,
-        3185.9345362804024
+        1187.1162560461569,
+        2997.583700849458,
+        4737.823003563372,
+        4515.383149712662
       ]
     },
     "Scan_Uniform": {
@@ -2224,10 +2236,10 @@
         24869.643081602924
       ],
       "LeanStore": [
-        185.59171192203488,
-        1002.0636578551973,
-        1106.2552923084795,
-        1158.611728626319
+        184.17422785423096,
+        1057.202267219349,
+        1313.4098317516646,
+        1448.2596312267397
       ]
     }
   },
@@ -4549,211 +4561,211 @@
     "LeanStore": [
       {
         "sec": 1,
-        "scan_ops": 58962,
-        "insert_ops": 3122,
+        "scan_ops": 5912,
+        "insert_ops": 290,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 2,
-        "scan_ops": 51849,
-        "insert_ops": 2761,
+        "scan_ops": 7590,
+        "insert_ops": 403,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 3,
-        "scan_ops": 52021,
-        "insert_ops": 2750,
+        "scan_ops": 8331,
+        "insert_ops": 480,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 4,
-        "scan_ops": 51671,
-        "insert_ops": 2646,
+        "scan_ops": 9390,
+        "insert_ops": 468,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 5,
-        "scan_ops": 50785,
-        "insert_ops": 2657,
+        "scan_ops": 10254,
+        "insert_ops": 546,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 6,
-        "scan_ops": 52326,
-        "insert_ops": 2725,
+        "scan_ops": 11337,
+        "insert_ops": 592,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 7,
-        "scan_ops": 51844,
-        "insert_ops": 2729,
+        "scan_ops": 11761,
+        "insert_ops": 681,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 8,
-        "scan_ops": 50657,
-        "insert_ops": 2670,
+        "scan_ops": 12519,
+        "insert_ops": 634,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 9,
-        "scan_ops": 53045,
-        "insert_ops": 2763,
+        "scan_ops": 12768,
+        "insert_ops": 650,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 10,
-        "scan_ops": 52074,
-        "insert_ops": 2721,
+        "scan_ops": 14007,
+        "insert_ops": 728,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 11,
-        "scan_ops": 52897,
-        "insert_ops": 2832,
+        "scan_ops": 14498,
+        "insert_ops": 789,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 12,
-        "scan_ops": 54006,
-        "insert_ops": 2813,
+        "scan_ops": 15365,
+        "insert_ops": 830,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 13,
-        "scan_ops": 53775,
-        "insert_ops": 2956,
+        "scan_ops": 15288,
+        "insert_ops": 819,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 14,
-        "scan_ops": 53630,
-        "insert_ops": 2873,
+        "scan_ops": 16510,
+        "insert_ops": 908,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 15,
-        "scan_ops": 52560,
-        "insert_ops": 2866,
+        "scan_ops": 17101,
+        "insert_ops": 900,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 16,
-        "scan_ops": 55230,
-        "insert_ops": 2892,
+        "scan_ops": 18098,
+        "insert_ops": 946,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 17,
-        "scan_ops": 53486,
-        "insert_ops": 2796,
+        "scan_ops": 18966,
+        "insert_ops": 979,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 18,
-        "scan_ops": 54867,
-        "insert_ops": 2882,
+        "scan_ops": 19175,
+        "insert_ops": 1028,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 19,
-        "scan_ops": 55710,
-        "insert_ops": 2914,
+        "scan_ops": 20202,
+        "insert_ops": 1079,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 20,
-        "scan_ops": 55542,
-        "insert_ops": 2856,
+        "scan_ops": 20926,
+        "insert_ops": 1143,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 21,
-        "scan_ops": 54602,
-        "insert_ops": 2940,
+        "scan_ops": 21506,
+        "insert_ops": 1122,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 22,
-        "scan_ops": 55127,
-        "insert_ops": 2978,
+        "scan_ops": 22545,
+        "insert_ops": 1191,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 23,
-        "scan_ops": 54073,
-        "insert_ops": 2912,
+        "scan_ops": 23879,
+        "insert_ops": 1241,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 24,
-        "scan_ops": 55884,
-        "insert_ops": 2940,
+        "scan_ops": 24797,
+        "insert_ops": 1321,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 25,
-        "scan_ops": 56201,
-        "insert_ops": 3036,
+        "scan_ops": 25165,
+        "insert_ops": 1315,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 26,
-        "scan_ops": 55329,
-        "insert_ops": 2814,
+        "scan_ops": 27569,
+        "insert_ops": 1447,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 27,
-        "scan_ops": 54466,
-        "insert_ops": 2910,
+        "scan_ops": 27981,
+        "insert_ops": 1442,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 28,
-        "scan_ops": 54777,
-        "insert_ops": 2839,
+        "scan_ops": 28384,
+        "insert_ops": 1499,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 29,
-        "scan_ops": 54254,
-        "insert_ops": 2818,
+        "scan_ops": 29886,
+        "insert_ops": 1510,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 30,
-        "scan_ops": 53918,
-        "insert_ops": 2836,
+        "scan_ops": 30303,
+        "insert_ops": 1596,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       }
@@ -6671,211 +6683,211 @@
     "LeanStore": [
       {
         "sec": 1,
-        "scan_ops": 2489,
-        "insert_ops": 120,
+        "scan_ops": 5053,
+        "insert_ops": 267,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 2,
-        "scan_ops": 2407,
-        "insert_ops": 139,
+        "scan_ops": 5292,
+        "insert_ops": 266,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 3,
-        "scan_ops": 2350,
-        "insert_ops": 114,
+        "scan_ops": 4050,
+        "insert_ops": 194,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 4,
-        "scan_ops": 2233,
-        "insert_ops": 105,
+        "scan_ops": 898,
+        "insert_ops": 52,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 5,
-        "scan_ops": 2482,
-        "insert_ops": 121,
+        "scan_ops": 1055,
+        "insert_ops": 68,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 6,
-        "scan_ops": 1793,
-        "insert_ops": 110,
+        "scan_ops": 1522,
+        "insert_ops": 92,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 7,
-        "scan_ops": 2452,
-        "insert_ops": 150,
+        "scan_ops": 1767,
+        "insert_ops": 113,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 8,
-        "scan_ops": 2510,
-        "insert_ops": 138,
+        "scan_ops": 2032,
+        "insert_ops": 100,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 9,
-        "scan_ops": 2536,
-        "insert_ops": 127,
+        "scan_ops": 2130,
+        "insert_ops": 104,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 10,
-        "scan_ops": 2676,
-        "insert_ops": 140,
+        "scan_ops": 2131,
+        "insert_ops": 99,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 11,
-        "scan_ops": 2557,
-        "insert_ops": 121,
+        "scan_ops": 1999,
+        "insert_ops": 104,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 12,
-        "scan_ops": 2494,
-        "insert_ops": 141,
+        "scan_ops": 2229,
+        "insert_ops": 108,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 13,
-        "scan_ops": 2440,
-        "insert_ops": 140,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 14,
-        "scan_ops": 2793,
-        "insert_ops": 152,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 15,
-        "scan_ops": 2459,
-        "insert_ops": 128,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 16,
-        "scan_ops": 2706,
+        "scan_ops": 2435,
         "insert_ops": 130,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
+        "sec": 14,
+        "scan_ops": 2136,
+        "insert_ops": 108,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
+        "sec": 15,
+        "scan_ops": 2031,
+        "insert_ops": 131,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
+        "sec": 16,
+        "scan_ops": 2340,
+        "insert_ops": 132,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
         "sec": 17,
-        "scan_ops": 2717,
-        "insert_ops": 142,
+        "scan_ops": 2339,
+        "insert_ops": 127,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 18,
-        "scan_ops": 2603,
-        "insert_ops": 114,
+        "scan_ops": 2342,
+        "insert_ops": 123,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 19,
-        "scan_ops": 2504,
-        "insert_ops": 119,
+        "scan_ops": 2370,
+        "insert_ops": 115,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 20,
-        "scan_ops": 2490,
-        "insert_ops": 119,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 21,
-        "scan_ops": 2631,
-        "insert_ops": 137,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 22,
-        "scan_ops": 2776,
-        "insert_ops": 145,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 23,
-        "scan_ops": 2739,
-        "insert_ops": 163,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 24,
-        "scan_ops": 2620,
-        "insert_ops": 128,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 25,
-        "scan_ops": 2221,
-        "insert_ops": 122,
-        "t2_checkpoint_ops": 0,
-        "t2_forced_checkpoint_ops": 0
-      },
-      {
-        "sec": 26,
-        "scan_ops": 2207,
+        "scan_ops": 2181,
         "insert_ops": 112,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
+        "sec": 21,
+        "scan_ops": 2313,
+        "insert_ops": 103,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
+        "sec": 22,
+        "scan_ops": 2106,
+        "insert_ops": 105,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
+        "sec": 23,
+        "scan_ops": 2326,
+        "insert_ops": 124,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
+        "sec": 24,
+        "scan_ops": 2109,
+        "insert_ops": 112,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
+        "sec": 25,
+        "scan_ops": 2150,
+        "insert_ops": 126,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
+        "sec": 26,
+        "scan_ops": 2149,
+        "insert_ops": 140,
+        "t2_checkpoint_ops": 0,
+        "t2_forced_checkpoint_ops": 0
+      },
+      {
         "sec": 27,
-        "scan_ops": 2634,
-        "insert_ops": 152,
+        "scan_ops": 1797,
+        "insert_ops": 96,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 28,
-        "scan_ops": 2495,
-        "insert_ops": 156,
+        "scan_ops": 2320,
+        "insert_ops": 128,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 29,
-        "scan_ops": 2380,
-        "insert_ops": 154,
+        "scan_ops": 2399,
+        "insert_ops": 110,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       },
       {
         "sec": 30,
-        "scan_ops": 2664,
-        "insert_ops": 154,
+        "scan_ops": 2254,
+        "insert_ops": 143,
         "t2_checkpoint_ops": 0,
         "t2_forced_checkpoint_ops": 0
       }
@@ -9351,13 +9363,13 @@
         "scheduled_sec": 10,
         "fired_sec": 10,
         "kind": "checkpoint",
-        "elapsed_sec": 3.3e-08
+        "elapsed_sec": 2.7e-08
       },
       {
         "scheduled_sec": 25,
         "fired_sec": 25,
         "kind": "checkpoint",
-        "elapsed_sec": 2.6e-08
+        "elapsed_sec": 2.9e-08
       }
     ],
     "RocksDB": [
@@ -9493,13 +9505,13 @@
         "scheduled_sec": 10,
         "fired_sec": 10,
         "kind": "checkpoint",
-        "elapsed_sec": 2.9e-08
+        "elapsed_sec": 3e-08
       },
       {
         "scheduled_sec": 25,
         "fired_sec": 25,
         "kind": "checkpoint",
-        "elapsed_sec": 2.6e-08
+        "elapsed_sec": 4.3e-08
       }
     ],
     "Baseline": [

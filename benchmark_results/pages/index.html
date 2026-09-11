@@ -74,7 +74,7 @@
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
                 <ul class="list-disc pl-4 space-y-1">
-                  <li>LeanStore全セルをper-op group-commit durability (sync-wait) 条件で再測定しマージ。LeanStore Delete/1KBはn/a (8M規模での約10秒/op病理、調査中)。</li>
+                  <li>LeanStore全セルをper-op group-commit durability (sync-wait) 条件で再測定しマージ。LeanStore Delete/1KBはclone事前sync修正後に再測定し復活 (初回timed fdatasyncがコピー直後のclone全体をflushしていた)。</li>
                 </ul>
               </td>
             </tr>
