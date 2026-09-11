@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # run_bench_aws_c6id.sh --help). Use this for a regression-check run after a VMemKV-internal-only
 # change, where the rivals' (RocksDB/RocksDB-BlobDB/LMDB/LeanStore) numbers are unaffected and
 # re-measuring them is pure wasted AWS time/cost -- reuse the most recent full-bench run's
-# rival-only numbers instead (see merge_vmemkv_only_results.py, referenced from
+# rival-only numbers instead (see merge_partial_results.py, referenced from
 # vmemkv_matrix::scenario_filter()'s comment).
 # Downloaded results are tagged with a _vmemkv_only suffix so they never collide with a full run's.
 # Meaningless for the 5th (background-jobs-only, --skip-matrix) instance -- no CRUD matrix runs

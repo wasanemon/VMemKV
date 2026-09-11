@@ -21,7 +21,7 @@ vmemkv_matrix::scenario_filter() {
   # the filter -- their numbers are unaffected by a VMemKV-internal-only code change, so
   # re-measuring them is pure wasted AWS time/cost for a regression-check run. Their most recent
   # full-matrix numbers (from a run with this left off) are meant to be merged back in afterward
-  # rather than re-measured every time; see merge_vmemkv_only_results.py.
+  # rather than re-measured every time; see merge_partial_results.py (--keep-prefix Store=VMemKV/).
   local scenario_key="${1:-}"
   local vmemkv_only="${2:-}"
   local variants
@@ -126,24 +126,32 @@ vmemkv_matrix::benchmark_filter_for_case() {
   local scenario_key="$1"
   local value_key="$2"
   local vmemkv_only="${3:-}"
+  local leanstore_only="${4:-}"
   local scenario_regex
-  local value_regex
 
-  if [[ "$value_key" == "64kb" ]]; then
+  if [[ "$leanstore_only" == "true" || "$leanstore_only" == "1" ]]; then
+    # LeanStore-only re-measurement (e.g. after a rival-backend change): VMemKV and rival
+    # numbers are reused from a prior full-matrix run via merge_partial_results.py (--keep-prefix Store=LeanStore/).
+    # LeanStore's BTreeVI key/value lengths are u16, so the 64KB corpus is unstorable there:
+    # match nothing (deliberately, so callers fail visibly instead of throwing mid-run).
+    if [[ "$value_key" == "64kb" ]]; then
+      printf '%s\n' '(^Store=NoSuchStore/)'
+      return 0
+    fi
+    scenario_regex='(^Store=LeanStore/)'
+  elif [[ "$value_key" == "64kb" ]]; then
     scenario_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "$scenario_key" "$vmemkv_only")"
-    value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
-    printf '%s\n' "(${scenario_regex}).*${value_regex}"
   else
     scenario_regex="$(vmemkv_matrix::scenario_filter "$scenario_key" "$vmemkv_only")"
-    value_regex="$(vmemkv_matrix::value_filter_fragment "$value_key")"
-    printf '%s\n' "(${scenario_regex}).*${value_regex}"
   fi
+  printf '%s\n' "(${scenario_regex}).*$(vmemkv_matrix::value_filter_fragment "$value_key")"
 }
 
 vmemkv_matrix::scenario_run_filter() {
   local scenario_key="$1"
   local value_order="$2"
   local vmemkv_only="${3:-}"
+  local leanstore_only="${4:-}"
   local -a values=()
   local -a case_filters=()
   local value_key
@@ -151,7 +159,7 @@ vmemkv_matrix::scenario_run_filter() {
 
   read -r -a values <<<"$value_order"
   for value_key in "${values[@]}"; do
-    case_filters+=("$(vmemkv_matrix::benchmark_filter_for_case "$scenario_key" "$value_key" "$vmemkv_only")")
+    case_filters+=("$(vmemkv_matrix::benchmark_filter_for_case "$scenario_key" "$value_key" "$vmemkv_only" "$leanstore_only")")
   done
 
   for value_key in "${case_filters[@]}"; do
@@ -179,6 +187,7 @@ vmemkv_matrix::scenario_effective_filter() {
   local large_value_first="${2:-0}"
   local quick="${3:-0}"
   local vmemkv_only="${4:-}"
+  local leanstore_only="${5:-}"
 
   if [[ "$quick" == "true" || "$quick" == "1" ]]; then
     # Already VMemKV-only by construction (see scenario_quick_filter()'s own hardcoded
@@ -190,7 +199,8 @@ vmemkv_matrix::scenario_effective_filter() {
   vmemkv_matrix::scenario_run_filter \
     "$scenario_key" \
     "$(vmemkv_matrix::scenario_value_order_keys_from_flag "$scenario_key" "$large_value_first")" \
-    "$vmemkv_only"
+    "$vmemkv_only" \
+    "$leanstore_only"
 }
 
 vmemkv_matrix::ltm_priming_filter() {
@@ -204,6 +214,16 @@ vmemkv_matrix::ltm_priming_filter() {
   # (see run_bench.sh's --cgroup path): a real per-master populate under that same cgroup was
   # measured at 200-1200s, vs. ~20-30s unconstrained.
   local vmemkv_only="${1:-}"
+  local leanstore_only="${2:-}"
+  # LeanStore's priming cells, spelled explicitly (BTreeVI u16 length ceiling: no 64KB
+  # cells can exist there): the leanstore-only fast path and the full run's second
+  # alternative below share this.
+  local leanstore_prime='(^Store=LeanStore/).*Op=Get/Mode=Hit/Dist=Zipf/.*Value=(8B|1KB).*threads:1$'
+  if [[ "$leanstore_only" == "true" || "$leanstore_only" == "1" ]]; then
+    # LeanStore-only re-measurement: only its own masters need priming.
+    printf '(%s)\n' "$leanstore_prime"
+    return 0
+  fi
   local scenario_regex
   # LTM scope: ablation variants still run there, so prime the full variant set.
   scenario_regex="$(vmemkv_matrix::scenario_filter "ltm" "$vmemkv_only")"
@@ -216,8 +236,8 @@ vmemkv_matrix::ltm_priming_filter() {
     # value sizes explicitly.
     local no_leanstore_regex
     no_leanstore_regex="$(vmemkv_matrix::scenario_filter_no_leanstore "ltm" "$vmemkv_only")"
-    printf '((%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$|(^Store=LeanStore/).*Op=Get/Mode=Hit/Dist=Zipf/.*Value=(8B|1KB).*threads:1$)\n' \
-      "$no_leanstore_regex"
+    printf '((%s).*Op=Get/Mode=Hit/Dist=Zipf/.*threads:1$|%s)\n' \
+      "$no_leanstore_regex" "$leanstore_prime"
   fi
 }
 

@@ -25,17 +25,17 @@ STORE_VARIANT_TO_LABEL = {
     ("VMemKV", "Bloom"): "+BF",
     ("VMemKV", "Bloom-T1InlineValue"): "+Inline",
     ("VMemKV", "Bloom-T1InlineValue-Prefaulting"): "+Prefault",
-    ("VMemKV", "Bloom-T1InlineValue-ReadRandom"): "+Random",
-    ("VMemKV", "Bloom-T1InlineValue-ReadSeq"): "+Seq",
+    ("VMemKV", "Bloom-T1InlineValue-ReadRandom"): "+PinRandom",
+    ("VMemKV", "Bloom-T1InlineValue-ReadSeq"): "+PinSeq",
 }
 
-VARIANT_ORDER = ["RocksDB", "LMDB", "RocksDB-BlobDB", "LeanStore", "Baseline", "+BF", "+Inline", "+Random", "+Seq"]
+VARIANT_ORDER = ["RocksDB", "LMDB", "RocksDB-BlobDB", "LeanStore", "Baseline", "+BF", "+Inline", "+PinRandom", "+PinSeq"]
 RIVAL_STORES = ["RocksDB", "LMDB", "RocksDB-BlobDB", "LeanStore"]
 COLORS = {
     "RocksDB": "#64748b", "LMDB": "#10b981", "RocksDB-BlobDB": "#a855f7", "LeanStore": "#0d9488",
     "Baseline": "#94a3b8",
     "+BF": "#f59e0b", "+Inline": "#6366f1",
-    "+Random": "#0ea5e9", "+Seq": "#84cc16",
+    "+PinRandom": "#0ea5e9", "+PinSeq": "#84cc16",
 }
 # Point markers for the detail charts. Shapes must stay within drawMarkerShape()'s cases;
 # line color (COLORS) is the primary distinguisher, rival (dashed) vs VMemKV (solid) the
@@ -43,7 +43,7 @@ COLORS = {
 VARIANT_MARKERS = {
     "RocksDB": "rect", "LMDB": "triangle", "RocksDB-BlobDB": "rectRot", "LeanStore": "star",
     "Baseline": "circle", "+BF": "cross", "+Inline": "crossRot",
-    "+Random": "rect", "+Seq": "rectRot",
+    "+PinRandom": "rect", "+PinSeq": "rectRot",
 }
 # Stacking Variants legend: the currently measured set only.
 VARIANT_DESCRIPTIONS = [
@@ -53,9 +53,9 @@ VARIANT_DESCRIPTIONS = [
     ("LeanStore", "B+Tree / pointer-swizzling ベースの比較対象 (64KB値は格納不可のため除外)"),
     ("Baseline", "vmemkv 最適化なし"),
     ("+BF", "+ T1 Bloom Filter"),
-    ("+Inline", "+BF + T1 Inline Value(<8B のValueをT1のみで処理)"),
-    ("+Random", "+Inline のReadRandomピン (random-access mappingに固定)"),
-    ("+Seq", "+Inline のReadSeqピン (sequential mappingに固定)"),
+    ("+Inline", "+BF + T1 Inline Value + adaptive read policy (trifecta, production config)"),
+    ("+PinRandom", "+Inline のread policyをrandom-access mappingへピン留め (trifecta ablation)"),
+    ("+PinSeq", "+Inline のread policyをsequential mappingへピン留め (trifecta ablation)"),
 ]
 WORKLOADS = ["Insert", "Update", "Delete", "Get_Miss", "Get_Hit_Zipf", "Get_Hit_Uniform", "Scan_Zipf", "Scan_Uniform"]
 THREADS = [1, 4, 16, 32]
@@ -750,6 +750,18 @@ def main():
         ),
         table_html=render_organic_split_chart_html(organic_split_data),
     )
+
+    # Stale predecessor section from the template chain (same topic, older heading):
+    # the upsert below only replaces exact-heading matches, so remove it outright.
+    # Warn-only (idempotent reruns must not fail).
+    stale_heading = "Background Jobs: reorganize() / checkpoint()"
+    stale_idx = html.find(f">{stale_heading}</h3>")
+    if stale_idx == -1:
+        print(f"warning: template lacks stale section {stale_heading} -- nothing to remove")
+    else:
+        stale_start = html.rfind("<section", 0, stale_idx)
+        stale_end = html.index("</section>", stale_idx) + len("</section>")
+        html = html[:stale_start] + html[stale_end:]
 
     html = upsert_section(
         html,

@@ -359,6 +359,62 @@ TEST_CASE_TEMPLATE("get returns latest value per key after update and delete chu
   }
   CHECK(test_util::get_sync(store, "k_missing") == vmemkv::STORE_NOT_FOUND);
 }
+// LeanStore-only: clone-from-master construction round-trips data, isolates mutations to
+// the clone (the master stays intact for later clones), and a second clone of the same
+// master still recovers. Exercises ensure_master_built()/clone_from()/open_recover(),
+// including the registry prune across sequential instances.
+TEST_CASE("LeanStore clone from master round-trips and isolates") {
+  using Store = vmemkv::StoreAdapter<::LeanStoreStore>;
+  const std::string master = reserve_temp_path().string() + "_master";
+  auto make_key = [](std::size_t i) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "k%05zu", i);
+    return std::string(buf);
+  };
+  auto make_value = [](std::size_t i) {
+    std::string v = "v" + std::to_string(i);
+    v.append(24 - v.size(), '.');
+    return v;
+  };
+  constexpr std::size_t kKeys = 200;
+  const auto check_all = [&](Store *store, const std::string &phase) {
+    for (size_t i = 0; i < kKeys; ++i) {
+      const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
+      if (!got.has_value() ||
+          vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) != make_value(i)) {
+        MESSAGE("mismatch phase=" << phase << " i=" << i << " got="
+                                   << (got.has_value() ? vmemkv_test::span_to_string(vmemkv_test::as_span(*got))
+                                                       : "<absent>"));
+      }
+      REQUIRE(got.has_value());
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == make_value(i));
+    }
+  };
+  {
+    // Same data through the plain insert path (no master/clone/recover involved).
+    auto plain = StoreFactory<Store>::make();
+    for (size_t i = 0; i < kKeys; ++i) {
+      plain->insert(make_key(i), make_value(i));
+    }
+    check_all(plain.get(), "plain");
+  }
+  {
+    Store clone(typename ::LeanStoreStore::CloneFromMasterTag{}, master, kKeys, make_key, make_value);
+    check_all(&clone, "clone1");
+    for (size_t i = 0; i < kKeys; i += 2) {
+      CHECK(clone.remove(make_key(i)));
+    }
+  }
+  {
+    Store clone2(typename ::LeanStoreStore::CloneFromMasterTag{}, master, kKeys, make_key, make_value);
+    check_all(&clone2, "clone2");
+  }
+  std::error_code ignored;
+  std::filesystem::remove(master, ignored);
+  std::filesystem::remove(master + ".json", ignored);
+  std::filesystem::remove(master + "_clone.leanstore", ignored);
+  std::filesystem::remove(master + "_clone.leanstore.json", ignored);
+}
 
 // StoreAdapter::bulk_load() calls impl_.bulk_load_impl() directly, bypassing insert()/update()'s
 // own path -- exercises that a bulk-loaded entry whose 8-byte value equals STORE_NOT_FOUND still

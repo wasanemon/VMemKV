@@ -6,11 +6,11 @@
 // model by dispatching each call onto a worker via CRManager::scheduleJobSync() and retrying
 // aborted transactions internally.
 //
-// Durability contract: WAL on with per-group fdatasync (FLAGS_wal_fsync), matching VMemKV's
-// per-write fsync and RocksDB's sync=true as closely as LeanStore allows. Residual gap:
-// LeanStore's commitTX enqueues to its group committer and returns without waiting for that
-// group's fsync, so commit return precedes physical durability by up to one group interval.
-// There is no synchronous-commit knob to close that gap.
+// Durability contract: WAL on with real SSD writes and per-group fdatasync
+// (FLAGS_wal/wal_pwrite/wal_fsync), and every mutating call additionally waits until a group
+// committer round has flushed everything its worker published (witnessed through the
+// worker's WAL consumption cursor) before returning. Matches VMemKV's per-write fsync and
+// RocksDB's sync=true as closely as LeanStore allows.
 //
 // Value-size ceiling: BTreeVI lengths are u16, so values above 65535 bytes cannot be stored.
 // The 64KB benchmark corpus (65536-byte values) is therefore excluded for this backend; see
@@ -25,8 +25,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -38,6 +41,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef ENABLE_LEANSTORE
 #include <leanstore/KVInterface.hpp>
@@ -167,9 +173,11 @@ class LeanStoreStore {
 
   template <typename Callback>
   auto get_impl(std::span<const std::byte> key, Callback callback) const -> bool {
-    // Single scanAsc: it reports only live, visible versions with reconstructed values, so
-    // one traversal covers both liveness and the value (a separate lookup would double the
-    // traversals and reopen a probe-then-lookup race with concurrent removers).
+    // Neither primitive alone is correct on this backend version (verified empirically):
+    // lookupOptimistic returns the head payload without consulting is_removed (deleted keys
+    // read as live), while the scan fast path reports the full slot length including the
+    // chain header for visible heads. Hence liveness via scan_exact plus the value via
+    // lookup; both inside one TX.
     // The value is copied into heap state before commit (a thread_local buffer would belong
     // to the worker thread, not the caller).
     struct GetState {
@@ -179,13 +187,23 @@ class LeanStoreStore {
     auto state = run_on_worker<GetState>(
         [&](leanstore::KVInterface &btree) {
           GetState out;
-          scan_exact(
-              btree, key,
-              [&](const ::u8 *sv, ::u16 svlen) {
-                out.value.assign(reinterpret_cast<const std::byte *>(sv),
-                                 reinterpret_cast<const std::byte *>(sv) + svlen);
-              },
-              out.found);
+          bool live = false;
+          scan_exact(btree, key, [&](const ::u8 *, ::u16) {}, live);
+          if (!live) {
+            return out;
+          }
+          ::u8 *k = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(key.data()));
+          const auto res = btree.lookup(k, checked_len(key.size()),
+                                        [&](const ::u8 *payload, ::u16 len) {
+                                          out.value.assign(reinterpret_cast<const std::byte *>(payload),
+                                                           reinterpret_cast<const std::byte *>(payload) + len);
+                                        });
+          if (res == leanstore::OP_RESULT::ABORT_TX) {
+            leanstore::cr::Worker::my().abortTX();
+          }
+          // A concurrent remover may have deleted the key between the probe and the lookup;
+          // linearize the delete first.
+          out.found = (res == leanstore::OP_RESULT::OK);
           return out;
         },
         /*read_only=*/true);
@@ -421,6 +439,11 @@ class LeanStoreStore {
     FLAGS_recover_file = "./leanstore.json";
     FLAGS_wal = true;
     FLAGS_wal_fsync = true;
+    FLAGS_wal_pwrite = true;
+    // WAL region grows downward from this offset; corpora reach ~17GB, past the 10GiB
+    // default, which would overwrite data pages. Files stay sparse: unwritten ranges
+    // between the data image and this offset consume no blocks.
+    FLAGS_wal_offset_gib = 64;
     FLAGS_worker_threads = worker_threads();
     FLAGS_dram_gib = dram_gib();
     FLAGS_pin_threads = false;
@@ -536,14 +559,82 @@ class LeanStoreStore {
     }
   }
 
+  // Copies a database image preserving holes: with the WAL region parked high above
+  // the data image the files are sparse, and a plain copy would materialize tens of
+  // gigabytes of zeros per clone. Falls back to a full copy where SEEK_DATA is unsupported.
+  static void copy_sparse(const std::string &source, const std::string &dest) {
+    struct Closer {
+      int fd = -1;
+      ~Closer() {
+        if (fd >= 0) {
+          ::close(fd);
+        }
+      }
+    };
+    Closer src{::open(source.c_str(), O_RDONLY)};
+    if (src.fd < 0) {
+      throw std::runtime_error("LeanStore clone open failed: " + source);
+    }
+    const off_t total = ::lseek(src.fd, 0, SEEK_END);
+    if (total < 0) {
+      throw std::runtime_error("LeanStore clone stat failed: " + source);
+    }
+    Closer dst{::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666)};
+    if (dst.fd < 0) {
+      throw std::runtime_error("LeanStore clone create failed: " + dest);
+    }
+    const off_t probe = ::lseek(src.fd, 0, SEEK_DATA);
+    if (probe < 0 && errno == EINVAL) {
+      copy_range(src.fd, dst.fd, 0, total);
+    } else {
+      for (off_t off = 0; off < total;) {
+        const off_t data_at = (off == 0 && probe >= 0) ? probe : ::lseek(src.fd, off, SEEK_DATA);
+        if (data_at < 0) {
+          if (errno == ENXIO) {
+            break;
+          }
+          throw std::runtime_error("LeanStore clone seek failed: " + source);
+        }
+        off_t hole_at = ::lseek(src.fd, data_at, SEEK_HOLE);
+        if (hole_at < 0) {
+          throw std::runtime_error("LeanStore clone seek failed: " + source);
+        }
+        copy_range(src.fd, dst.fd, data_at, std::min(hole_at, total) - data_at);
+        off = std::min(hole_at, total);
+      }
+    }
+    if (::ftruncate(dst.fd, total) != 0) {
+      throw std::runtime_error("LeanStore clone truncate failed: " + dest);
+    }
+  }
+
+  static void copy_range(int src_fd, int dest_fd, off_t offset, off_t count) {
+    std::string buf(1 << 20, '\0');
+    while (count > 0) {
+      const std::size_t chunk = static_cast<std::size_t>(std::min<off_t>(count, 1 << 20));
+      const ssize_t got = ::pread(src_fd, buf.data(), chunk, offset);
+      if (got <= 0) {
+        throw std::runtime_error("LeanStore clone read failed");
+      }
+      ssize_t put = 0;
+      while (put < got) {
+        const ssize_t wrote = ::pwrite(dest_fd, buf.data() + put, static_cast<std::size_t>(got - put),
+                                       offset + put);
+        if (wrote <= 0) {
+          throw std::runtime_error("LeanStore clone write failed");
+        }
+        put += wrote;
+      }
+      offset += got;
+      count -= got;
+    }
+  }
+
   static void clone_from(const std::string &source_stem, const std::string &dest_stem) {
     std::error_code ignored;
     std::filesystem::remove(dest_stem, ignored);
     std::filesystem::remove(dest_stem + ".json", ignored);
-    std::filesystem::copy_file(source_stem, dest_stem, ignored);
-    if (ignored) {
-      throw std::runtime_error("LeanStore clone copy failed: " + ignored.message());
-    }
+    copy_sparse(source_stem, dest_stem);
     std::filesystem::copy_file(source_stem + ".json", dest_stem + ".json", ignored);
     if (ignored) {
       throw std::runtime_error("LeanStore clone json copy failed: " + ignored.message());
@@ -554,6 +645,36 @@ class LeanStoreStore {
 
   auto worker_slot() const -> uint64_t {
     return std::hash<std::thread::id>{}(std::this_thread::get_id()) % worker_threads();
+  }
+
+  // Blocks until a group-commit round has flushed everything this worker published,
+  // witnessed through its WAL consumption cursor: every committer round writes out all
+  // published bytes, fdatasyncs, and only then records the new cursor, so observing the
+  // cursor reach our post-commit end offset proves a covering fdatasync completed. Only
+  // meaningful after a mutating transaction ran on that worker; read-only transactions
+  // enqueue nothing and skip this. Bounded: a committer that never advances means the
+  // engine, not the benchmark, is wedged -- fail loudly instead of billing an infinite hang.
+  void await_group_durable(uint64_t slot_hint) const {
+    leanstore::cr::Worker &worker = *db_->getCRManager().workers[slot_hint];
+    // Frozen from here on: slot_mutex_ serializes all callers sharing this slot, so no
+    // other transaction can publish on this worker meanwhile.
+    const uint64_t committed_end = worker.logging.wt_to_lw.getSync().wal_written_offset;
+    const uint64_t op_seq = op_seq_.fetch_add(1, std::memory_order_relaxed);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (true) {
+      const uint64_t gct = worker.logging.wal_gct_cursor.load(std::memory_order_acquire);
+      if (gct == committed_end) {
+        return;
+      }
+      if (std::chrono::steady_clock::now() > deadline) {
+        std::fprintf(stderr,
+                     "await-timeout op=%llu slot=%lu end=%lu gct=%lu workers=%u\n",
+                     (unsigned long long)op_seq, (unsigned long)slot_hint, (unsigned long)committed_end,
+                     (unsigned long)gct, (unsigned)db_->getCRManager().workers_count);
+        throw std::runtime_error("LeanStore group-durability wait timed out");
+      }
+      std::this_thread::yield();
+    }
   }
 
   // Runs `body` inside a single TX on a LeanStore worker and returns its value, retrying
@@ -581,6 +702,9 @@ class LeanStoreStore {
         jumpmuCatch() {}
       }
     });
+    if (!read_only) {
+      await_group_durable(slot_hint);
+    }
     return std::move(state->value);
   }
 
@@ -600,6 +724,7 @@ class LeanStoreStore {
   std::unique_ptr<leanstore::LeanStore> db_;
   leanstore::KVInterface *table_ = nullptr;
   mutable std::mutex slot_mutex_[kWorkerThreads];
+  mutable std::atomic<uint64_t> op_seq_{0};
   std::string ssd_path_;
   std::string json_path_;
 #else

@@ -37,8 +37,8 @@ This directory contains the benchmark executable, the local runner, the AWS runn
   - Insert-QPS impact of `ShardedT1Index`'s own automatic per-shard background splitting under sustained write load.
 - `generate_report.py`
   - Generates a `benchmark_results/pages/<id>_charts.html` report from a `benchmark_results/<id>/` directory.
-- `merge_vmemkv_only_results.py`
-  - Merges a `--without-rivals` run's VMemKV-only results back into a prior full-matrix run's rival numbers.
+- `merge_partial_results.py`
+  - Merges a partial-matrix run's entries (`--keep-prefix`, default `Store=VMemKV/`) back into a prior full-matrix run's numbers (e.g. `--without-rivals` VMemKV-only or `--leanstore-only` LeanStore-only runs).
 - `aws/aws_clean.sh`
   - Cleanup helper for temporary AWS resources.
 

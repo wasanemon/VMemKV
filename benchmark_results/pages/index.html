@@ -68,13 +68,13 @@
             <tr>
               <td class="py-4 pr-4 text-slate-400">2026-09-11</td>
               <td class="py-4 px-4 font-medium">
-                <a href="2026091111_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
-                  AWS i4i x5 (09/11)
+                <a href="2026091118_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i x5 (09/11, LeanStore synced)
                 </a>
               </td>
               <td class="py-4 pl-4 text-slate-600 leading-relaxed">
                 <ul class="list-disc pl-4 space-y-1">
-                  <li>LeanStore get単一scan化。headline error-bar pass (max-threadセルx3反復) 追加。inmem read-ablation除外。defragment probe追加。</li>
+                  <li>LeanStore全セルをper-op group-commit durability (sync-wait) 条件で再測定しマージ。LeanStore Delete/1KBはn/a (8M規模での約10秒/op病理、調査中)。</li>
                 </ul>
               </td>
             </tr>
@@ -134,6 +134,19 @@
                         </tr>
                       </thead>
                       <tbody class="divide-y divide-slate-100">
+                        <tr>
+              <td class="py-4 pr-4 text-slate-400">2026-09-11</td>
+              <td class="py-4 px-4 font-medium">
+                <a href="2026091111_charts.html" class="text-indigo-600 hover:text-indigo-800 hover:underline">
+                  AWS i4i x5 (09/11)
+                </a>
+              </td>
+              <td class="py-4 pl-4 text-slate-600 leading-relaxed">
+                <ul class="list-disc pl-4 space-y-1">
+                  <li>非同期durability条件での計測 (F1 single-scan get適用版、比較用に保持)。</li>
+                </ul>
+              </td>
+            </tr>
                         <tr>
               <td class="py-4 pr-4 text-slate-400">2026-09-07</td>
               <td class="py-4 px-4 font-medium">

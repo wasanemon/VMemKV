@@ -1,0 +1,41 @@
+{
+  "store": "VMemKV-Baseline",
+  "variant": "Baseline",
+  "value_size": "1KB_20__8B_",
+  "timeline": [
+    {"sec": 1, "scan_ops": 90363, "insert_ops": 4713, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 2, "scan_ops": 90122, "insert_ops": 4744, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 3, "scan_ops": 89317, "insert_ops": 4828, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 4, "scan_ops": 90490, "insert_ops": 4798, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 5, "scan_ops": 89609, "insert_ops": 4670, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 6, "scan_ops": 89652, "insert_ops": 4687, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 7, "scan_ops": 89123, "insert_ops": 4769, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 8, "scan_ops": 88677, "insert_ops": 4601, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 9, "scan_ops": 90233, "insert_ops": 4723, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 10, "scan_ops": 89457, "insert_ops": 4743, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 11, "scan_ops": 84066, "insert_ops": 4319, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 12, "scan_ops": 70213, "insert_ops": 3675, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 13, "scan_ops": 93462, "insert_ops": 5051, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 1},
+    {"sec": 14, "scan_ops": 94481, "insert_ops": 4886, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 15, "scan_ops": 91056, "insert_ops": 4821, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 16, "scan_ops": 90322, "insert_ops": 4623, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 17, "scan_ops": 91176, "insert_ops": 4857, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 18, "scan_ops": 90658, "insert_ops": 4770, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 19, "scan_ops": 90717, "insert_ops": 4708, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 20, "scan_ops": 90051, "insert_ops": 4767, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 21, "scan_ops": 91083, "insert_ops": 4841, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 22, "scan_ops": 89855, "insert_ops": 4768, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 23, "scan_ops": 90927, "insert_ops": 4829, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 24, "scan_ops": 91196, "insert_ops": 4771, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 25, "scan_ops": 90377, "insert_ops": 4686, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 26, "scan_ops": 81379, "insert_ops": 4302, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 27, "scan_ops": 83636, "insert_ops": 4403, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 1},
+    {"sec": 28, "scan_ops": 95851, "insert_ops": 4963, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 29, "scan_ops": 90210, "insert_ops": 4910, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0},
+    {"sec": 30, "scan_ops": 90740, "insert_ops": 4672, "t2_checkpoint_ops": 0, "t2_forced_checkpoint_ops": 0}
+  ],
+  "forced_events": [
+    {"scheduled_sec": 10, "fired_sec": 12, "kind": "checkpoint", "elapsed_sec": 2.10478},
+    {"scheduled_sec": 25, "fired_sec": 26, "kind": "checkpoint", "elapsed_sec": 1.42481}
+  ]
+}
