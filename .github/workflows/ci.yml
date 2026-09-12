@@ -56,6 +56,10 @@ jobs:
         cmake --build build --config Release
 
     - name: Run Tests
+      env:
+        # Unit-test corpora are tiny; LeanStore's adapter otherwise defaults to a 16GiB
+        # buffer pool (dram_gib()) that GitHub runners cannot allocate.
+        LEANSTORE_DRAM_GIB: "1"
       run: |
         cd build
         # Watchdog: 300s is generously past this suite's normal ~1-2min runtime but well short of
