@@ -817,8 +817,7 @@ class VMemKVImpl {
         return false;
       }
 
-      if (write_entry_lockfree(full_key, value,
-                                typename T1IndexT::LookupResult{vmemkv::STORE_NOT_FOUND, 0})) {
+      if (write_entry_lockfree(full_key, value, typename T1IndexT::LookupResult{vmemkv::STORE_NOT_FOUND, 0})) {
         pending = wal_.reserve_insert(full_key, value);
         inserted = true;
       }
@@ -1106,15 +1105,14 @@ class VMemKVImpl {
     // must not share one buffer; static so repeated calls on the same thread reuse
     // already-grown capacity instead of reallocating.
     thread_local static std::vector<std::byte> tl_get_value_buf;
-    bool key_matches = read_t2_record_seqlock(
-        [&]() -> T2RecordView { return t2_.at(offset, mem); },
-        [&](const T2RecordView &record) -> bool {
-          if (!byte_span_equal(record.key, full_key)) {
-            return false;
-          }
-          tl_get_value_buf.assign(record.value.begin(), record.value.end());
-          return true;
-        });
+    bool key_matches = read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(offset, mem); },
+                                              [&](const T2RecordView &record) -> bool {
+                                                if (!byte_span_equal(record.key, full_key)) {
+                                                  return false;
+                                                }
+                                                tl_get_value_buf.assign(record.value.begin(), record.value.end());
+                                                return true;
+                                              });
 
     if (key_matches) {
       callback(std::span<const std::byte>(tl_get_value_buf));
@@ -1695,8 +1693,7 @@ class VMemKVImpl {
     for (const uint64_t seg : pending_punch_) {
       const uint64_t seg_start = seg * ConfigT::T2SegmentBytes;
       const uint64_t seg_end = seg_start + ConfigT::T2SegmentBytes;
-      const bool evacuated = seg < t2_seg_live_.size() &&
-                             t2_seg_live_[seg].load(std::memory_order_relaxed) == 0 &&
+      const bool evacuated = seg < t2_seg_live_.size() && t2_seg_live_[seg].load(std::memory_order_relaxed) == 0 &&
                              seg_end <= mem->base_boundary.load(std::memory_order_acquire);
       if (!evacuated) {
         keep.push_back(seg);
@@ -1774,33 +1771,34 @@ class VMemKVImpl {
                               uint64_t used,
                               const vmemkv::T2Memory *mem) const -> std::vector<uint64_t> {
     std::vector<uint64_t> offsets;
-    t1_.scan(std::span<const std::byte>(kDefragScanLo.data(), kDefragScanLo.size()),
-             std::span<const std::byte>(kDefragScanHi.data(), kDefragScanHi.size()),
-             [&](std::span<const std::byte> /*index_key*/, uint64_t payload, uint64_t hash) {
-               if (payload == vmemkv::STORE_NOT_FOUND || t1_detail::is_inline(hash)) {
-                 return;
-               }
-               const uint64_t off = payload & kOffsetMask;
-               if (off >= used) {
-                 return;
-               }
-                const uint64_t seg = t2_seg_index(off);
-                if (std::binary_search(victim_segs.begin(), victim_segs.end(), seg)) {
-                  offsets.push_back(off);
-                  return;
-                }
-                if (seg + 1 < t2_seg_live_.size() && std::binary_search(victim_segs.begin(), victim_segs.end(), seg + 1)) {
-                  const uint64_t span_start = (seg + 1) * ConfigT::T2SegmentBytes;
-                  if (off + kT2PunchSlopBytes >= span_start && off < span_start) {
-                    const T2RecordView head = t2_.at(off, mem);
-                    const uint64_t aligned = vmemkv::align_up(sizeof(ValueRecordHeader) + head.header->key_len +
-                                                              head.header->value_len);
-                    if (off + aligned > span_start) {
-                      offsets.push_back(off);
-                    }
-                  }
-                }
-              });
+    t1_.scan(
+        std::span<const std::byte>(kDefragScanLo.data(), kDefragScanLo.size()),
+        std::span<const std::byte>(kDefragScanHi.data(), kDefragScanHi.size()),
+        [&](std::span<const std::byte> /*index_key*/, uint64_t payload, uint64_t hash) {
+          if (payload == vmemkv::STORE_NOT_FOUND || t1_detail::is_inline(hash)) {
+            return;
+          }
+          const uint64_t off = payload & kOffsetMask;
+          if (off >= used) {
+            return;
+          }
+          const uint64_t seg = t2_seg_index(off);
+          if (std::binary_search(victim_segs.begin(), victim_segs.end(), seg)) {
+            offsets.push_back(off);
+            return;
+          }
+          if (seg + 1 < t2_seg_live_.size() && std::binary_search(victim_segs.begin(), victim_segs.end(), seg + 1)) {
+            const uint64_t span_start = (seg + 1) * ConfigT::T2SegmentBytes;
+            if (off + kT2PunchSlopBytes >= span_start && off < span_start) {
+              const T2RecordView head = t2_.at(off, mem);
+              const uint64_t aligned =
+                  vmemkv::align_up(sizeof(ValueRecordHeader) + head.header->key_len + head.header->value_len);
+              if (off + aligned > span_start) {
+                offsets.push_back(off);
+              }
+            }
+          }
+        });
     std::sort(offsets.begin(), offsets.end());
     offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
     return offsets;
@@ -1899,11 +1897,10 @@ class VMemKVImpl {
     }
 
     defrag_cycle_count_.fetch_add(1, std::memory_order_relaxed);
-    last_defrag_duration_us_.store(
-        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
-                                                                                     cycle_start)
-                                  .count()),
-        std::memory_order_relaxed);
+    last_defrag_duration_us_.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                             std::chrono::steady_clock::now() - cycle_start)
+                                                             .count()),
+                                   std::memory_order_relaxed);
     last_defrag_moved_bytes_.store(moved_bytes, std::memory_order_relaxed);
     last_defrag_punched_bytes_.store(punched_bytes, std::memory_order_relaxed);
     return scanned;

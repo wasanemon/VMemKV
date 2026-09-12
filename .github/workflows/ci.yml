@@ -28,6 +28,8 @@ jobs:
           clang-tidy \
           librocksdb-dev \
           liblmdb-dev \
+          libtbb-dev \
+          libaio-dev \
           gdb
 
     - name: Verify Code Formatting

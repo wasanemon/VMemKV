@@ -125,8 +125,9 @@ class LMDBStore {
   }
 
   auto remove_impl(std::span<const std::byte> key) -> bool {
-    return with_existence_checked_txn(key, /*existence_required=*/true,
-                                      [&](MDB_txn *txn, MDB_val &mkey) { return mdb_del(txn, dbi_, &mkey, nullptr) == 0; });
+    return with_existence_checked_txn(key, /*existence_required=*/true, [&](MDB_txn *txn, MDB_val &mkey) {
+      return mdb_del(txn, dbi_, &mkey, nullptr) == 0;
+    });
   }
 
   template <typename KeyFn, typename ValueFn>

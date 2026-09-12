@@ -517,7 +517,9 @@ class ShardedT1Index {
   // merged_entries.empty() check can't distinguish that from a genuinely empty shard, so callers
   // that need the real merge output retry through here instead.
   template <typename OffsetMapper, typename OnMerged>
-  static void reorganize_until_captured(Shard &shard, OffsetMapper offset_mapper, OnMerged on_merged,
+  static void reorganize_until_captured(Shard &shard,
+                                        OffsetMapper offset_mapper,
+                                        OnMerged on_merged,
                                         bool parallel_sort) {
     bool captured = false;
     SpinBackoff backoff;
@@ -586,7 +588,8 @@ class ShardedT1Index {
     // unsharded O(corpus) behavior this design exists to avoid.
     std::vector<EntrySnapshot> merged_entries;
     reorganize_until_captured(
-        *target->index, [](std::span<EntrySnapshot> /*merged*/) {},
+        *target->index,
+        [](std::span<EntrySnapshot> /*merged*/) {},
         [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); },
         /*parallel_sort=*/false);  // Many shards' reorganize() run concurrently; see
                                    // T1Index::reorganize()'s own doc comment on this parameter.
@@ -644,7 +647,7 @@ class ShardedT1Index {
     // returns, after the epoch drain and straggler redistribution below, both of which run *after*
     // writers are already unblocked.
     last_split_pause_end_ns_.store(static_cast<uint64_t>(split_pause_end.time_since_epoch().count()),
-                                    std::memory_order_relaxed);
+                                   std::memory_order_relaxed);
 
     Directory *old_dir = publish_directory_after_split(target, low_slot, high_slot, boundary);
 

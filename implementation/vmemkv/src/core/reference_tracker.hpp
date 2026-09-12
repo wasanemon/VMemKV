@@ -177,19 +177,19 @@ class ThreadReferenceTracker {
     return chunk;
   }
 
-  // Invokes `fn(slot)` for every slot in every chunk allocated so far. A null (never-allocated)
+  // Invokes `func(slot)` for every slot in every chunk allocated so far. A null (never-allocated)
   // chunk is skipped outright: no thread has ever registered in its ID range for this instance,
-  // so it can hold no live reference `fn` would need to observe.
+  // so it can hold no live reference `func` would need to observe.
   template <typename Fn>
-  void for_each_slot(Fn &&fn) const {
+  void for_each_slot(Fn &&func) const {
     const size_t chunk_count = high_chunk_.load(std::memory_order_acquire);
-    for (size_t c = 0; c < chunk_count; ++c) {
-      AlignedSlot *chunk = chunks_[c].load(std::memory_order_acquire);
+    for (size_t chunk_idx = 0; chunk_idx < chunk_count; ++chunk_idx) {
+      AlignedSlot *chunk = chunks_[chunk_idx].load(std::memory_order_acquire);
       if (chunk == nullptr) {
         continue;
       }
       for (size_t i = 0; i < kChunkSize; ++i) {
-        fn(chunk[i].value);
+        func(chunk[i].value);
       }
     }
   }

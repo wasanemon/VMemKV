@@ -281,10 +281,10 @@ auto T2FlatFile::punch_if_occupied(uint64_t offset, uint64_t len) const noexcept
     ::close(file_descriptor);
     return PunchOutcome::AlreadyHollow;
   }
-  const int rc = ::fallocate(file_descriptor, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                             static_cast<off_t>(offset), static_cast<off_t>(len));
+  const int punch_rc = ::fallocate(
+      file_descriptor, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset), static_cast<off_t>(len));
   ::close(file_descriptor);
-  if (rc != 0) {
+  if (punch_rc != 0) {
     return PunchOutcome::Failed;
   }
   // Drop the range from the page cache as well: punch zeroes the file blocks, but already

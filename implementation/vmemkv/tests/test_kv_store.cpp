@@ -141,7 +141,7 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 // ─── Store type lists ───────────────────────────────────────────────────────
 
 // VMemKV 自体のバリエーション（Baseline, Cumulative Steps, Ablations, Inlining, Read policy）
-#define VMemKVStores \
+#define VMemKVStores                                                                                                 \
   vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Inline, \
       vmemkv::variants::VMemKV_Var3_ReadRandom, vmemkv::variants::VMemKV_Var4_ReadSeq
 
@@ -380,11 +380,10 @@ TEST_CASE("LeanStore clone from master round-trips and isolates") {
   const auto check_all = [&](Store *store, const std::string &phase) {
     for (size_t i = 0; i < kKeys; ++i) {
       const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
-      if (!got.has_value() ||
-          vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) != make_value(i)) {
+      if (!got.has_value() || vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) != make_value(i)) {
         MESSAGE("mismatch phase=" << phase << " i=" << i << " got="
-                                   << (got.has_value() ? vmemkv_test::span_to_string(vmemkv_test::as_span(*got))
-                                                       : "<absent>"));
+                                  << (got.has_value() ? vmemkv_test::span_to_string(vmemkv_test::as_span(*got))
+                                                      : "<absent>"));
       }
       REQUIRE(got.has_value());
       CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == make_value(i));

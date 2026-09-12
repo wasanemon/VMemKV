@@ -23,6 +23,9 @@
 
 #pragma once
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -41,9 +44,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-#include <fcntl.h>
-#include <unistd.h>
 
 #ifdef ENABLE_LEANSTORE
 #include <leanstore/KVInterface.hpp>
@@ -86,8 +86,7 @@ class LeanStoreStore {
   }
 
   // BTreeVI orders keys by raw memcmp, mirroring LMDBStore::compare_to_bound exactly.
-  static auto compare_to_bound(const ::u8 *key, ::u16 key_len,
-                               std::span<const std::byte> upper_bound) noexcept -> int {
+  static auto compare_to_bound(const ::u8 *key, ::u16 key_len, std::span<const std::byte> upper_bound) noexcept -> int {
     const std::size_t klen = key_len;
     const size_t min_len = std::min(klen, upper_bound.size());
     const int cmp = min_len == 0 ? 0 : std::memcmp(key, upper_bound.data(), min_len);
@@ -104,12 +103,15 @@ class LeanStoreStore {
   // lookup()-based (see get_impl): only the scan path skips removed entries. ABORT_TX
   // funnels through abortTX() for the caller's retry loop.
   template <typename ValueCb>
-  static void scan_exact(leanstore::KVInterface &btree, std::span<const std::byte> key, ValueCb &&on_value,
+  static void scan_exact(leanstore::KVInterface &btree,
+                         std::span<const std::byte> key,
+                         ValueCb &&on_value,
                          bool &found) {
     ::u8 *k = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(key.data()));
     const ::u16 klen = checked_len(key.size());
     const auto res = btree.scanAsc(
-        k, klen,
+        k,
+        klen,
         [&](const ::u8 *sk, ::u16 sklen, const ::u8 *sv, ::u16 svlen) {
           if (sklen != klen || std::memcmp(sk, key.data(), klen) != 0) {
             return false;
@@ -193,11 +195,10 @@ class LeanStoreStore {
             return out;
           }
           ::u8 *k = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(key.data()));
-          const auto res = btree.lookup(k, checked_len(key.size()),
-                                        [&](const ::u8 *payload, ::u16 len) {
-                                          out.value.assign(reinterpret_cast<const std::byte *>(payload),
-                                                           reinterpret_cast<const std::byte *>(payload) + len);
-                                        });
+          const auto res = btree.lookup(k, checked_len(key.size()), [&](const ::u8 *payload, ::u16 len) {
+            out.value.assign(reinterpret_cast<const std::byte *>(payload),
+                             reinterpret_cast<const std::byte *>(payload) + len);
+          });
           if (res == leanstore::OP_RESULT::ABORT_TX) {
             leanstore::cr::Worker::my().abortTX();
           }
@@ -246,8 +247,7 @@ class LeanStoreStore {
       // fast path overstates chained value lengths). Both in one TX.
       ::u16 old_len = 0;
       bool seen = false;
-      scan_exact(
-          btree, key, [&](const ::u8 *, ::u16) {}, seen);
+      scan_exact(btree, key, [&](const ::u8 *, ::u16) {}, seen);
       if (!seen) {
         return false;
       }
@@ -268,10 +268,9 @@ class LeanStoreStore {
       desc.slots[0].offset = 0;
       desc.slots[0].length = checked_len(value.size());
       const auto res = btree.updateSameSizeInPlace(
-          k, checked_len(key.size()),
-          [&](::u8 *payload, ::u16) {
-            std::memcpy(payload, value.data(), value.size());
-          },
+          k,
+          checked_len(key.size()),
+          [&](::u8 *payload, ::u16) { std::memcpy(payload, value.data(), value.size()); },
           desc);
       if (res == leanstore::OP_RESULT::ABORT_TX) {
         leanstore::cr::Worker::my().abortTX();
@@ -325,8 +324,10 @@ class LeanStoreStore {
               }
               bool present = false;
               scan_exact(
-                  btree, std::span<const std::byte>(reinterpret_cast<const std::byte *>(key.data()), key.size()),
-                  [&](const ::u8 *, ::u16) {}, present);
+                  btree,
+                  std::span<const std::byte>(reinterpret_cast<const std::byte *>(key.data()), key.size()),
+                  [&](const ::u8 *, ::u16) {},
+                  present);
               if (present) {
                 continue;
               }
@@ -340,7 +341,8 @@ class LeanStoreStore {
             }
             return 0;
           },
-          /*read_only=*/false, /*slot_hint=*/0);
+          /*read_only=*/false,
+          /*slot_hint=*/0);
       base = chunk_end;
     }
     if (failed.load()) {
@@ -365,7 +367,8 @@ class LeanStoreStore {
           ScanState out;
           ::u8 *lo = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(lower_bound.data()));
           const auto res = btree.scanAsc(
-              lo, checked_len(lower_bound.size()),
+              lo,
+              checked_len(lower_bound.size()),
               [&](const ::u8 *sk, ::u16 sklen, const ::u8 *, ::u16) {
                 if (compare_to_bound(sk, sklen, upper_bound) > 0) {
                   return false;
@@ -382,12 +385,11 @@ class LeanStoreStore {
             value_buf.clear();
             bool live = false;
             ::u8 *lk = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(key.data()));
-            const auto lres = btree.lookup(lk, checked_len(key.size()),
-                                           [&](const ::u8 *payload, ::u16 len) {
-                                             value_buf.assign(reinterpret_cast<const std::byte *>(payload),
-                                                              reinterpret_cast<const std::byte *>(payload) + len);
-                                             live = true;
-                                           });
+            const auto lres = btree.lookup(lk, checked_len(key.size()), [&](const ::u8 *payload, ::u16 len) {
+              value_buf.assign(reinterpret_cast<const std::byte *>(payload),
+                               reinterpret_cast<const std::byte *>(payload) + len);
+              live = true;
+            });
             if (lres == leanstore::OP_RESULT::ABORT_TX) {
               leanstore::cr::Worker::my().abortTX();
             }
@@ -487,9 +489,8 @@ class LeanStoreStore {
     db_ = std::make_unique<leanstore::LeanStore>();
     // Table registration runs on a worker (as in upstream drivers): B-tree creation touches
     // worker-local state and segfaults on a foreign thread.
-    db_->getCRManager().scheduleJobSync(0, [&] {
-      table_ = &db_->registerBTreeVI("kv", {.enable_wal = true, .use_bulk_insert = false});
-    });
+    db_->getCRManager().scheduleJobSync(
+        0, [&] { table_ = &db_->registerBTreeVI("kv", {.enable_wal = true, .use_bulk_insert = false}); });
     warmup_workers();
   }
 
@@ -538,9 +539,8 @@ class LeanStoreStore {
     FLAGS_persist = true;
     FLAGS_persist_file = building_json;
     tmp.db_ = std::make_unique<leanstore::LeanStore>();
-    tmp.db_->getCRManager().scheduleJobSync(0, [&] {
-      tmp.table_ = &tmp.db_->registerBTreeVI("kv", {.enable_wal = false, .use_bulk_insert = false});
-    });
+    tmp.db_->getCRManager().scheduleJobSync(
+        0, [&] { tmp.table_ = &tmp.db_->registerBTreeVI("kv", {.enable_wal = false, .use_bulk_insert = false}); });
     tmp.warmup_workers();
     tmp.bulk_load_impl(key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
     tmp.close();
@@ -618,8 +618,7 @@ class LeanStoreStore {
       }
       ssize_t put = 0;
       while (put < got) {
-        const ssize_t wrote = ::pwrite(dest_fd, buf.data() + put, static_cast<std::size_t>(got - put),
-                                       offset + put);
+        const ssize_t wrote = ::pwrite(dest_fd, buf.data() + put, static_cast<std::size_t>(got - put), offset + put);
         if (wrote <= 0) {
           throw std::runtime_error("LeanStore clone write failed");
         }
@@ -681,8 +680,11 @@ class LeanStoreStore {
       if (std::chrono::steady_clock::now() > deadline) {
         std::fprintf(stderr,
                      "await-timeout op=%llu slot=%lu end=%lu gct=%lu workers=%u\n",
-                     (unsigned long long)op_seq, (unsigned long)slot_hint, (unsigned long)committed_end,
-                     (unsigned long)gct, (unsigned)db_->getCRManager().workers_count);
+                     (unsigned long long)op_seq,
+                     (unsigned long)slot_hint,
+                     (unsigned long)committed_end,
+                     (unsigned long)gct,
+                     (unsigned)db_->getCRManager().workers_count);
         throw std::runtime_error("LeanStore group-durability wait timed out");
       }
       std::this_thread::yield();
@@ -705,8 +707,8 @@ class LeanStoreStore {
     db_->getCRManager().scheduleJobSync(slot_hint, [&] {
       while (!s->done) {
         jumpmuTry() {
-          leanstore::cr::Worker::my().startTX(leanstore::TX_MODE::OLTP,
-                                              leanstore::TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, read_only);
+          leanstore::cr::Worker::my().startTX(
+              leanstore::TX_MODE::OLTP, leanstore::TX_ISOLATION_LEVEL::SNAPSHOT_ISOLATION, read_only);
           s->value = body(*table_);
           leanstore::cr::Worker::my().commitTX();
           s->done = true;

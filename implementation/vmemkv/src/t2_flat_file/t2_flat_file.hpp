@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -277,7 +278,7 @@ class T2FlatFile {
   // in, or spans into, the range, and that every relocated move out of it is already
   // WAL-durable -- see VMemKVImpl::defragment(). Already-hollow ranges report AlreadyHollow
   // (covers restarts, which keep no punch list); filesystems that cannot punch report Failed.
-  enum class PunchOutcome { Punched, AlreadyHollow, Failed };
+  enum class PunchOutcome : std::uint8_t { Punched, AlreadyHollow, Failed };
   auto punch_if_occupied(uint64_t offset, uint64_t len) const noexcept -> PunchOutcome;
 
   // ─── Properties ───

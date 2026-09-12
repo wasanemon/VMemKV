@@ -607,9 +607,9 @@ auto Wal::size_bytes() const -> uint64_t {
   // is negligible -- rotate_segment() takes this lock only around the close() call itself, and
   // size_bytes() is already sampled every kWalCheckStride writes, not per-write.
   std::lock_guard<std::mutex> lock(fd_close_mu_);
-  const int fd = fd_.load(std::memory_order_acquire);
+  const int current_fd = fd_.load(std::memory_order_acquire);
   struct stat file_stat {};
-  if (::fstat(fd, &file_stat) != 0) {
+  if (::fstat(current_fd, &file_stat) != 0) {
     throw std::system_error(errno, std::generic_category(), "fstat wal (size_bytes)");
   }
   return static_cast<uint64_t>(file_stat.st_size);

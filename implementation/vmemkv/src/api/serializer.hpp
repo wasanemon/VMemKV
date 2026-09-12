@@ -47,8 +47,8 @@ inline auto encode_integral_key(Int value) noexcept -> std::array<std::byte, siz
 // share the same behavior here -- only their integral specializations (big-endian + sign-bit flip
 // for keys, little-endian for values) actually differ.
 template <typename T>
-inline constexpr bool is_byte_container_v =
-    std::is_same_v<std::decay_t<T>, std::span<const std::byte>> || std::is_same_v<std::decay_t<T>, std::vector<std::byte>>;
+inline constexpr bool is_byte_container_v = std::is_same_v<std::decay_t<T>, std::span<const std::byte>> ||
+                                            std::is_same_v<std::decay_t<T>, std::vector<std::byte>>;
 
 template <typename T>
 inline constexpr bool is_string_like_v = std::is_convertible_v<std::decay_t<T>, std::string_view>;

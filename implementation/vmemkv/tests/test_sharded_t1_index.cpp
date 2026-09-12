@@ -716,9 +716,9 @@ TEST_CASE(
 
   CHECK(idx->shard_count() > 1);
   std::vector<uint64_t> seen;
-  const size_t matched = idx->scan(to_span(ikey(0)), to_span(ikey(kCount - 1)), [&](auto /*key*/, auto payload, auto /*hash*/) {
-    seen.push_back(payload);
-  });
+  const size_t matched = idx->scan(to_span(ikey(0)),
+                                   to_span(ikey(kCount - 1)),
+                                   [&](auto /*key*/, auto payload, auto /*hash*/) { seen.push_back(payload); });
   CHECK(matched == static_cast<size_t>(kCount));
   REQUIRE(seen.size() == static_cast<size_t>(kCount));
   const std::set<uint64_t> unique_seen(seen.begin(), seen.end());

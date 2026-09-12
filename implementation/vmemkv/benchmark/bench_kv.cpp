@@ -957,10 +957,10 @@ using BenchmarkTypes = vmemkv::variants::AllPossibleTypes;
 // Rival backends take a bare path (they manage their own on-disk capacity/layout);
 // only VMemKV configurations take the extra T2 capacity argument.
 template <typename Store>
-inline constexpr bool kUsesSingleArgConstructor = std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDB> ||
-                                                  std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDBBlobDB> ||
-                                                  std::is_same_v<Store, vmemkv::variants::VMemKV_LMDB> ||
-                                                  std::is_same_v<Store, vmemkv::variants::VMemKV_LeanStore>;
+inline constexpr bool kUsesSingleArgConstructor =
+    std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDB> ||
+    std::is_same_v<Store, vmemkv::variants::VMemKV_RocksDBBlobDB> ||
+    std::is_same_v<Store, vmemkv::variants::VMemKV_LMDB> || std::is_same_v<Store, vmemkv::variants::VMemKV_LeanStore>;
 
 // A per-(val_size, key_count) master-corpus path shared by every scenario in visit_one() below
 // that wants a fully-populated, fully-reorganized/committed corpus (Get/Update/Delete/YCSB-E/
@@ -2268,8 +2268,11 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   auto elapsed_sec = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
   while (elapsed_sec() < kOrganicSplitProbeDurationSec) {
     const auto stats = store->get_statistics();
-    samples.push_back({elapsed_sec(), inserted.load(std::memory_order_relaxed), stats.t1_split_count,
-                       stats.t1_last_split_pause_us, stats.t1_last_split_pause_end_ns});
+    samples.push_back({elapsed_sec(),
+                       inserted.load(std::memory_order_relaxed),
+                       stats.t1_split_count,
+                       stats.t1_last_split_pause_us,
+                       stats.t1_last_split_pause_end_ns});
     std::this_thread::sleep_for(kOrganicSplitPollInterval);
   }
   stop.store(true, std::memory_order_relaxed);
@@ -2281,8 +2284,8 @@ constexpr double kOrganicSplitWindowSec = 1.2;
 
   // Nearest sample at or before `t_sec` (clamped to the first sample if `t_sec` predates the run).
   auto sample_at_or_before = [&](double t_sec) -> const Sample & {
-    auto it = std::upper_bound(
-        samples.begin(), samples.end(), t_sec, [](double t, const Sample &s) { return t < s.t_sec; });
+    auto it =
+        std::upper_bound(samples.begin(), samples.end(), t_sec, [](double t, const Sample &s) { return t < s.t_sec; });
     if (it == samples.begin()) {
       return samples.front();
     }
@@ -2333,9 +2336,8 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   }
 
   std::cout << "{\"job\":\"organic_split\",\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\","
-            << "\"value_size\":" << args.val_size << ",\"writer_threads\":" << writer_threads
-            << ",\"key_pattern\":\"" << args.key_pattern << "\","
-            << "\"duration_sec\":" << kOrganicSplitProbeDurationSec << ","
+            << "\"value_size\":" << args.val_size << ",\"writer_threads\":" << writer_threads << ",\"key_pattern\":\""
+            << args.key_pattern << "\"," << "\"duration_sec\":" << kOrganicSplitProbeDurationSec << ","
             << "\"total_inserted\":" << inserted.load(std::memory_order_relaxed) << ","
             << "\"final_shard_count\":" << (final_split_count + 1) << ",\"splits\":[";
   for (std::size_t i = 0; i < events.size(); ++i) {

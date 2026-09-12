@@ -86,6 +86,68 @@ void write_via_temp_then_rename(const std::filesystem::path &final_path, WriteBo
   }
 }
 
+// Parsed shard sections: each shard's entry span plus the offset where the boundary
+// records begin, with the running checksum/entry tallies folded in.
+struct ParsedShardSections {
+  std::vector<std::span<const T1ChkEntry>> entries;
+  size_t end_offset = 0;
+  uint64_t seen_entries = 0;
+};
+
+// Walks the per-shard entry-count/entry-span records, folding the payload checksum
+// (counts then spans, matching finish()'s convention). Bounds-checked throughout: a
+// corrupt entry_count claiming more data than remains fails here, not at the final
+// checksum comparison. Returns nullopt on any layout violation.
+auto parse_shard_sections(const std::byte *base,
+                          size_t payload_limit,
+                          const ShardedT1ChkFileHeader &header,
+                          uint64_t &checksum) -> std::optional<ParsedShardSections> {
+  ParsedShardSections parsed;
+  parsed.entries.reserve(header.shard_count);
+  size_t offset = 0;
+  for (uint64_t shard_index = 0; shard_index < header.shard_count; ++shard_index) {
+    if (offset + sizeof(uint64_t) > payload_limit) {
+      return std::nullopt;
+    }
+    uint64_t entry_count = 0;
+    std::memcpy(&entry_count, base + offset, sizeof(entry_count));
+    checksum = fnv1a64_update(checksum, base + offset, sizeof(entry_count));
+    offset += sizeof(entry_count);
+    const size_t entry_bytes = entry_count * sizeof(T1ChkEntry);
+    if (offset + entry_bytes > payload_limit) {
+      return std::nullopt;
+    }
+    parsed.entries.emplace_back(reinterpret_cast<const T1ChkEntry *>(base + offset), static_cast<size_t>(entry_count));
+    if (entry_bytes > 0) {
+      checksum = fnv1a64_update(checksum, base + offset, entry_bytes);
+    }
+    offset += entry_bytes;
+    parsed.seen_entries += entry_count;
+  }
+  parsed.end_offset = offset;
+  return parsed;
+}
+
+// Validates the trailing boundary records against the parsed sections (exact fit,
+// entry totals, and the boundaries/shards count relation) and folds them into the
+// checksum. Returns the boundary span start, or nullptr on any violation.
+auto parse_shard_boundaries(const std::byte *base,
+                            size_t offset,
+                            size_t payload_limit,
+                            const ShardedT1ChkFileHeader &header,
+                            uint64_t seen_entries,
+                            uint64_t &checksum) -> const T1ChkKeyPrefix * {
+  const size_t boundary_bytes = header.boundary_count * sizeof(T1ChkKeyPrefix);
+  if (offset + boundary_bytes != payload_limit || seen_entries != header.total_entry_count ||
+      header.boundary_count + 1 != header.shard_count) {
+    return nullptr;
+  }
+  if (boundary_bytes > 0) {
+    checksum = fnv1a64_update(checksum, base + offset, boundary_bytes);
+  }
+  return reinterpret_cast<const T1ChkKeyPrefix *>(base + offset);
+}
+
 }  // namespace
 
 ShardedT1CheckpointWriter::ShardedT1CheckpointWriter(const std::filesystem::path &path)
@@ -102,8 +164,8 @@ ShardedT1CheckpointWriter::~ShardedT1CheckpointWriter() {
   // requirement -- best-effort, matching write_via_temp_then_rename's crash-safety contract.
   if (!finished_ && file_descriptor_ >= 0) {
     ::close(file_descriptor_);
-    std::error_code ec;
-    std::filesystem::remove(temp_path_, ec);
+    std::error_code remove_ec;
+    std::filesystem::remove(temp_path_, remove_ec);
   }
 }
 
@@ -138,9 +200,9 @@ void ShardedT1CheckpointWriter::finish(std::span<const T1ChkKeyPrefix> boundarie
   // write_fsync_close() always closes the fd itself, on both success and failure -- clear our
   // copy *before* calling it (not after), so a throw from it doesn't leave file_descriptor_
   // pointing at an already-closed descriptor for the destructor to close a second time.
-  const int fd = file_descriptor_;
+  const int trailer_fd = file_descriptor_;
   file_descriptor_ = -1;
-  write_fsync_close(fd, &header, sizeof(header), "write sharded t1 checkpoint trailer");
+  write_fsync_close(trailer_fd, &header, sizeof(header), "write sharded t1 checkpoint trailer");
   finished_ = true;
 
   std::error_code rename_ec;
@@ -189,45 +251,16 @@ ShardedT1CheckpointFile::ShardedT1CheckpointFile(const std::filesystem::path &pa
   uint64_t checksum = kFnvOffsetBasis64;
   uint64_t seen_entries = 0;
   std::vector<std::span<const T1ChkEntry>> shard_entries;
-  size_t offset = 0;
+  const T1ChkKeyPrefix *boundaries = nullptr;
   const size_t payload_limit = file_size - kShardedT1ChkFileHeaderBytes;
   if (magic_ok) {
-    shard_entries.reserve(header.shard_count);
-    for (uint64_t shard_index = 0; shard_index < header.shard_count && layout_ok; ++shard_index) {
-      if (offset + sizeof(uint64_t) > payload_limit) {
-        layout_ok = false;
-        break;
-      }
-      uint64_t entry_count = 0;
-      std::memcpy(&entry_count, base + offset, sizeof(entry_count));
-      checksum = fnv1a64_update(checksum, base + offset, sizeof(entry_count));
-      offset += sizeof(entry_count);
-
-      const size_t entry_bytes = entry_count * sizeof(T1ChkEntry);
-      if (offset + entry_bytes > payload_limit) {
-        layout_ok = false;
-        break;
-      }
-      shard_entries.push_back({reinterpret_cast<const T1ChkEntry *>(base + offset), static_cast<size_t>(entry_count)});
-      if (entry_bytes > 0) {
-        checksum = fnv1a64_update(checksum, base + offset, entry_bytes);
-      }
-      offset += entry_bytes;
-      seen_entries += entry_count;
-    }
-  }
-
-  const T1ChkKeyPrefix *boundaries = nullptr;
-  if (magic_ok && layout_ok) {
-    const size_t boundary_bytes = header.boundary_count * sizeof(T1ChkKeyPrefix);
-    if (offset + boundary_bytes != payload_limit || seen_entries != header.total_entry_count ||
-        header.boundary_count + 1 != header.shard_count) {
-      layout_ok = false;
+    if (auto sections = parse_shard_sections(base, payload_limit, header, checksum)) {
+      shard_entries = std::move(sections->entries);
+      seen_entries = sections->seen_entries;
+      boundaries = parse_shard_boundaries(base, sections->end_offset, payload_limit, header, seen_entries, checksum);
+      layout_ok = (boundaries != nullptr);
     } else {
-      boundaries = reinterpret_cast<const T1ChkKeyPrefix *>(base + offset);
-      if (boundary_bytes > 0) {
-        checksum = fnv1a64_update(checksum, base + offset, boundary_bytes);
-      }
+      layout_ok = false;
     }
   }
 

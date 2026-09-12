@@ -5,7 +5,6 @@
 // scale. 1KiB/2KiB values keep fsync counts modest while still freezing whole segments.
 
 #include <doctest/doctest.h>
-
 #include <sys/stat.h>
 
 #include <atomic>
@@ -80,8 +79,7 @@ TEST_CASE("defrag accounting tracks append, overwrite, and delete exactly") {
   constexpr size_t kVal2k = 2048;
   const uint64_t per_record = hint_bytes(make_key(0).size(), kVal1k);
 
-  store->bulk_load(kKeys, [](size_t i) { return make_key(i); },
-                   [](size_t i) { return make_value(kVal1k, i); });
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kVal1k, i); });
   CHECK(store->get_statistics().t2_live_bytes == kKeys * per_record);
 
   // Same-size updates go in place: accounting unchanged.
@@ -111,8 +109,7 @@ TEST_CASE("defrag cycle relocates, punches, and preserves every live record") {
   constexpr size_t kKeys = 4100;
   constexpr size_t kValBytes = 2048;
   constexpr size_t kDelete = 2870;  // 70%: first segment goes majority-garbage.
-  store->bulk_load(kKeys, [](size_t i) { return make_key(i); },
-                   [](size_t i) { return make_value(kValBytes, i); });
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kValBytes, i); });
   store->checkpoint();
   for (size_t i = 0; i < kDelete; ++i) {
     CHECK(store->remove(make_key(i)));
@@ -127,9 +124,8 @@ TEST_CASE("defrag cycle relocates, punches, and preserves every live record") {
     CHECK(store->defragment());
     {
       auto st = store->get_statistics();
-      MESSAGE("cycle: moved=" << st.last_defrag_moved_bytes << " punched=" << st.last_defrag_punched_bytes
-                              << " cycles=" << st.defrag_cycle_count
-                              << " blocks=" << file_blocks(vmemkv::derive_t2_chk_path(path)));
+      MESSAGE("cycle: moved=" << st.last_defrag_moved_bytes << " punched=" << st.last_defrag_punched_bytes << " cycles="
+                              << st.defrag_cycle_count << " blocks=" << file_blocks(vmemkv::derive_t2_chk_path(path)));
       if (st.last_defrag_punched_bytes > 0) {
         punched_observed = true;
       }
@@ -164,8 +160,7 @@ TEST_CASE("defrag state survives checkpoint plus restart") {
   constexpr size_t kDelete = 2870;
   {
     auto store = make_store(path);
-    store->bulk_load(kKeys, [](size_t i) { return make_key(i); },
-                     [](size_t i) { return make_value(kValBytes, i); });
+    store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kValBytes, i); });
     store->checkpoint();
     for (size_t i = 0; i < kDelete; ++i) {
       CHECK(store->remove(make_key(i)));
@@ -194,8 +189,7 @@ TEST_CASE("defrag cycle relocating more than the WAL ring holds still completes"
   auto store = make_store(path);
   constexpr size_t kKeys = 30000;
   constexpr size_t kValBytes = 256;
-  store->bulk_load(kKeys, [](size_t i) { return make_key(i); },
-                   [](size_t i) { return make_value(kValBytes, i); });
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kValBytes, i); });
   for (size_t i = 0; i < kKeys; ++i) {
     if (i % 10 < 6) {
       CHECK(store->remove(make_key(i)));
@@ -221,8 +215,7 @@ TEST_CASE("defrag runs concurrently with updates without losing writes") {
   auto store = make_store(path);
   constexpr size_t kKeys = 2000;
   constexpr size_t kValBytes = 256;
-  store->bulk_load(kKeys, [](size_t i) { return make_key(i); },
-                   [](size_t i) { return make_value(kValBytes, i); });
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kValBytes, i); });
   store->checkpoint();
 
   constexpr int kWriters = 4;

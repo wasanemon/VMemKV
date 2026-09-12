@@ -34,9 +34,8 @@ struct get_config_type<T, std::void_t<typename T::ConfigType>> {
 // Rival (non-VMemKV) backends have no T1/T2 concept: they self-manage storage
 // layout, so reorganize()/get_statistics() are no-ops/empty for all of them.
 template <typename T>
-inline constexpr bool is_rival_store_v =
-    std::is_same_v<T, ::RocksDBStore> || std::is_same_v<T, ::RocksDBBlobDBStore> || std::is_same_v<T, ::LMDBStore> ||
-    std::is_same_v<T, ::LeanStoreStore>;
+inline constexpr bool is_rival_store_v = std::is_same_v<T, ::RocksDBStore> || std::is_same_v<T, ::RocksDBBlobDBStore> ||
+                                         std::is_same_v<T, ::LMDBStore> || std::is_same_v<T, ::LeanStoreStore>;
 }  // namespace detail
 
 template <typename KVSImpl>
