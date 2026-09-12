@@ -135,6 +135,13 @@ struct VMemKV {
 
 本節の手順は、特に断りがなければ `payload_bits` が Tier 2 offset である通常の entry を前提に記述する。entry 単位でインライン化されている entry(2.1.1 節)では Tier 2 に関する手順を省略し、Tier 1 の `payload_bits` を直接読み書きする。
 
+形状言語: `[四角]` = コンポーネント・領域、`([角丸])` = 命令、`{菱形}` = 判断、`[[二重四角]]` = バックグラウンドジョブ。
+
+```mermaid
+flowchart LR
+    AP([apply to T1/T2]) --> WA([WAL append + fsync]) --> OK([return success])
+```
+
 ### 3.1 Get
 
 入力は full key である。Tier 1 では `key_prefix` と `hash` で候補を絞り、Tier 2 で full key 一致を確認する。
@@ -148,6 +155,17 @@ struct VMemKV {
 5. `payload_bits == STORE_NOT_FOUND` なら not found。
 6. `payload_bits` から Tier 2 record を取得する。小レコードは主 mmap(`base`)から直接読み、大レコードは常駐確認(`mincore`)の上で `base_mmap_scan` からの mmap 読みと `read_fd` からの `pread()` を使い分ける(7.5 節)。
 7. Tier 2 record の full key を比較し、一致すれば value を返す。違えば not found。
+
+```mermaid
+flowchart TD
+    T{T1 hit?} -- miss --> NF([not found])
+    T -- inline value --> RV([return payload])
+    T -- offset --> SZ{size hint?}
+    SZ -- "≤1 page" --> B[base mapping\nMADV_RANDOM]
+    SZ -- ">1 page" --> MC{mincore resident?}
+    MC -- yes --> MS[base_mmap_scan]
+    MC -- no --> PF([pread via read_fd])
+```
 
 **Complexity**
 
@@ -284,6 +302,21 @@ entry 単位でインライン化されている entry(2.1.1 節、7.2 節)は T
 - T1 の `append_region` を統合し、T1 checkpoint ファイルを更新する。
 - Storage Fragmentation は解消しない(4.1 節)。
 
+```mermaid
+sequenceDiagram
+    participant C as checkpoint
+    participant W as writers
+    participant T2 as Tier 2
+    participant T1 as Tier 1
+    Note over C,W: appends pause only to record the target offset
+    C->>W: pause appends, record target = bytes_used
+    C->>W: resume appends (in-place updates never stop)
+    C->>T2: msync [old boundary, target)
+    C->>T1: merge append to sorted, write T1 chk file
+    C->>C: publish manifest, advance base_boundary
+    C->>C: rotate WAL past checkpoint_lsn
+```
+
 ### 4.4 Reorganize / Checkpoint Trigger
 
 `checkpoint()` を起動するトリガーは WAL サイズのみである。
@@ -319,6 +352,17 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WA
 - クラッシュ安全性は append-only 由来である: copy と張り替えの間に落ちれば orphan
   copy が残るだけ、張り替え後の punch 前に落ちれば次サイクルが再発見する。移設は
   通常 update として WAL replay される。
+
+```mermaid
+flowchart TD
+    TR{space overhead ≥ 20%?} -- no --> IDLE([stay idle])
+    TR -- yes --> V([select frozen victims\nseg_end ≤ boundary, garbage ≥ 50%])
+    V --> C([collect live offsets\n+ 1MiB slop])
+    C --> R([relocate with offset verification\nunder stripe lock])
+    R --> W([await WAL-durable, grouped])
+    W --> P([next cycle: punch prior victims])
+    P --> TR
+```
 - 起動条件は `T2DefragSpaceOverheadPercent`(既定 20%) を唯一の公開ノブとし、
   背景の専用ワーカースレッドが判定する。詳細は
   [`../t2_defragment_design.md`](../t2_defragment_design.md) を参照。
@@ -352,6 +396,14 @@ T2 の稼働中 mmap は `MAP_SHARED` である(下記 NOTE)。書き込みは�
 
 - checkpoint 直後は `append_region` が空 (size = 0) となるため、T1 checkpoint file には `sorted_region` のデータのみがシーケンシャルに書き出され、`append_index` の状態自体はファイルへシリアライズ(永続化)しない。
 - 起動時、新しくマッピングされた T1 インスタンスは、`append_index` を空に初期化した状態で起動し、その後の WAL リプレイおよび新規クライアント書き込み時に適宜ハッシュインデックスへの登録・更新を行う。
+
+```mermaid
+flowchart TD
+    M{manifest?} -- none --> FULL([full WAL replay from LSN 1])
+    M -- present --> MM([mmap Tier 2 file, adopt boundary])
+    MM --> T1L([load T1 chk + rebuild directory])
+    T1L --> RP([replay WAL tail from checkpoint_lsn])
+```
 
 ### 5.3 Correctness Rule
 

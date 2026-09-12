@@ -34,7 +34,19 @@ VMemKV の中核となる概念は、`sorted_region` と `append_region` の 2 �
 - `sorted_region`: ソート済み領域。検索が O(log N)．
 - `append_region`: 未整列で insert を受ける領域。ハッシュインデックスを併用するため、検索は O(1) expected、書き込みも O(1)．
 
-![snaplog](../images/two_region.png)
+形状言語: `[四角]` = コンポーネント・領域、`([角丸])` = 命令、`{菱形}` = 判断、`[[二重四角]]` = バックグラウンドジョブ。
+
+```mermaid
+flowchart TB
+    subgraph R["one shard"]
+        direction LR
+        S["sorted region\nO(log N) binary search"]
+        A["append region\nO(1) hash lookup"]
+    end
+    G([Get / Scan / Update / Delete]) --> S & A
+    I([Insert]) --> A
+    A --> RG[[reorganize:\nmerge + atomic swap]]
+```
 
 この構造の基本挙動は次のとおりである。
 
@@ -77,7 +89,32 @@ Tier 2 固有のポイントは次の程度である。
 
 Tier 1 と Tier 2 の責務分離と、`offset` で両者を接続するレイアウトを示す。
 
-![VMemKV two tier layout](../images/two_tier.svg)
+```mermaid
+flowchart TB
+    subgraph OPS["client operations"]
+        direction LR
+        R([Get / Scan]) --- W([Insert / Update / Delete])
+    end
+    subgraph T1["Tier 1: sharded index (RAM)"]
+        direction LR
+        S1[shard 0\nsorted + append] --- S2[shard 1\nsorted + append] --- SD[... K shards]
+    end
+    subgraph T2["Tier 2: file-backed mmap (MAP_SHARED)"]
+        direction LR
+        BA[base region\nimmutable] --- TA[tail region\nmutable]
+    end
+    subgraph JOBS["background jobs"]
+        direction LR
+        RG[[reorganize]] --- CK[[checkpoint\nmsync + manifest]] --- DF[[defragment]]
+    end
+    WAL[WAL file]
+    OPS --> T1
+    OPS -.-> T2
+    T1 -- offset --> T2
+    T1 -.->|append growth| JOBS
+    WAL -.->|WAL bytes| JOBS
+    T2 -.->|space overhead| JOBS
+```
 
 ## 5. 操作の例
 
@@ -140,7 +177,14 @@ Tier 1 自体は独立した複数シャードへの範囲パーティション�
 シャード単位で背景ワーカーが自動的に実行する。設計は
 [t1_sharding_design.md](../t1_sharding_design.md) を参照。
 
-![reorganize](../images/reorganization.png)
+```mermaid
+flowchart TD
+    OS[old sorted region] --> MG[[background worker:\nmerge into new sorted array]]
+    OA[append region: freeze new puts] --> MG
+    MG --> SW([atomic pointer swap\nto new generation])
+    SW --> EP([epoch drain of in-flight readers])
+    EP --> RC([reclaim old arrays])
+```
 
 Tier 1 は単独 `reorganize` により ordering fragmentation を軽く抑えられる。
 Tier 2 の storage fragmentation は `defragment()` が garbage-heavy な凍結セグメントからの
