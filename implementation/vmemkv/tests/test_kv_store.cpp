@@ -37,7 +37,7 @@ static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_LMDB>);
 
 namespace test_util {
 template <typename StorePtr, typename Key>
-auto get_sync(const StorePtr &store, const Key &key) -> uint64_t {
+auto get_u64_sync(const StorePtr &store, const Key &key) -> uint64_t {
   uint64_t res = vmemkv::STORE_NOT_FOUND;
   store->get(key, [&](std::span<const std::byte> val) {
     res = 0;
@@ -54,10 +54,6 @@ inline auto decode_scanned_u64(std::span<const std::byte> val) -> uint64_t {
   return res;
 }
 
-template <typename StorePtr, typename Key>
-auto get_bytes_sync(const StorePtr &store, const Key &key) -> std::optional<std::vector<std::byte>> {
-  return vmemkv_test::get_optional_bytes(store, key);
-}
 }  // namespace test_util
 
 namespace {
@@ -81,31 +77,12 @@ constexpr unsigned int kScanUpperBound = 1000U;
 constexpr std::size_t kLongValueBytes = 12;
 }  // namespace
 
-static auto as_string(const std::vector<std::byte> &bytes) -> std::string {
-  if (bytes.empty()) {
-    return {};
-  }
-  return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
-}
-
 template <typename Store>
 struct StoreFactory;
 
 // Helper to reserve temp path for T2 files
 static auto reserve_temp_path() -> std::filesystem::path {
-  const std::filesystem::path temp_path =
-      vmemkv_test::reserve_unique_temp_path("vmemkv_kv", /*also_remove_wal_sibling=*/true);
-  // Also clear leftover .manifest/.chkN.t1/.chkN.t2 files from a reused PID (seen when relaunching
-  // this binary in a tight loop lets a later run adopt an earlier run's stale checkpoint via
-  // load_checkpoint_if_present()). A single full suite run never hits this; cheap insurance.
-  std::error_code ignored;
-  const std::string manifest_prefix = temp_path.filename().string() + ".";
-  for (const auto &entry : std::filesystem::directory_iterator(temp_path.parent_path(), ignored)) {
-    if (entry.path().filename().string().starts_with(manifest_prefix)) {
-      std::filesystem::remove(entry.path(), ignored);
-    }
-  }
-  return temp_path;
+  return vmemkv_test::reserve_unique_temp_path("vmemkv_kv", /*also_remove_wal_sibling=*/true);
 }
 
 template <typename Impl>
@@ -167,8 +144,6 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 #define RivalStores RocksDBRivalStores LMDBRivalStores LeanStoreRivalStores
 
 #define STORE_TYPES VMemKVStores RivalStores
-#define LONG_KEY_STORE_TYPES STORE_TYPES
-#define LARGE_VALUE_STORE_TYPES STORE_TYPES
 
 struct FrequentCheckpointConfig : vmemkv::Config<> {
   // Partial override style: inherit all defaults and only tune checkpoint aggressiveness.
@@ -190,7 +165,7 @@ static void insert_sequential_u64_values(StoreHandle &store, int key_count) {
 template <typename StoreHandle>
 static void check_sequential_u64_values(StoreHandle &store, int key_count) {
   for (int i = 0; i < key_count; ++i) {
-    CHECK(test_util::get_sync(store, "k" + std::to_string(i)) == static_cast<uint64_t>(i));
+    CHECK(test_util::get_u64_sync(store, "k" + std::to_string(i)) == static_cast<uint64_t>(i));
   }
 }
 
@@ -199,25 +174,25 @@ static void check_hot_key_upgrade_is_visible(StoreHandle &store) {
   CHECK(store->insert("hot", std::string("a")));
   const std::string large_value(kValue64Bytes, 'x');
   CHECK(store->update("hot", large_value));
-  const auto got = test_util::get_bytes_sync(store, "hot");
+  const auto got = vmemkv_test::get_optional_bytes(store, "hot");
   REQUIRE(got.has_value());
   if (!got.has_value()) {
     return;
   }
-  CHECK(as_string(got.value()) == large_value);
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(got.value())) == large_value);
 }
 
 // ─── Test cases (one per scenario) ───────────────────────────────────────────
 
 TEST_CASE_TEMPLATE("get on empty store returns STORE_NOT_FOUND", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
-  CHECK(test_util::get_sync(store, "x") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, "x") == vmemkv::STORE_NOT_FOUND);
 }
 
 TEST_CASE_TEMPLATE("insert and get", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   CHECK(store->insert("a", 10));
-  CHECK(test_util::get_sync(store, "a") == 10U);
+  CHECK(test_util::get_u64_sync(store, "a") == 10U);
 }
 
 TEST_CASE("checkpoint churn during writes is transparent") {
@@ -237,14 +212,14 @@ TEST_CASE("partial config inheritance keeps required append-capacity fields") {
   auto store = StoreFactory<VMemKV_FrequentCheckpoint>::make();
   CHECK(FrequentCheckpointConfig::T1AppendCapacityEntries == vmemkv::Config<>::T1AppendCapacityEntries);
   CHECK(store->insert("partial_cfg", 1));
-  CHECK(test_util::get_sync(store, "partial_cfg") == 1U);
+  CHECK(test_util::get_u64_sync(store, "partial_cfg") == 1U);
 }
 
 TEST_CASE_TEMPLATE("insert duplicate returns false, value unchanged", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   CHECK(store->insert("a", 10));
   CHECK_FALSE(store->insert("a", 99));
-  CHECK(test_util::get_sync(store, "a") == 10U);
+  CHECK(test_util::get_u64_sync(store, "a") == 10U);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -253,11 +228,11 @@ TEST_CASE_TEMPLATE("integral keys use the templated convenience API", Store, STO
   constexpr int key = 42;
 
   CHECK(store->insert(key, 10));
-  CHECK(test_util::get_sync(store, key) == 10U);
+  CHECK(test_util::get_u64_sync(store, key) == 10U);
   CHECK(store->update(key, 11));
-  CHECK(test_util::get_sync(store, key) == 11U);
+  CHECK(test_util::get_u64_sync(store, key) == 11U);
   CHECK(store->remove(key));
-  CHECK(test_util::get_sync(store, key) == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, key) == vmemkv::STORE_NOT_FOUND);
 }
 
 namespace test_adl {
@@ -288,8 +263,8 @@ TEST_CASE_TEMPLATE("custom serializers (ADL) for user-defined types", Store, STO
   CHECK(store->insert(key_one, kSmallValue));
   CHECK(store->insert(key_two, kLargeValue));
 
-  CHECK(test_util::get_sync(store, key_one) == kSmallValue);
-  CHECK(test_util::get_sync(store, key_two) == kLargeValue);
+  CHECK(test_util::get_u64_sync(store, key_one) == kSmallValue);
+  CHECK(test_util::get_u64_sync(store, key_two) == kLargeValue);
 
   std::vector<uint64_t> results;
   const size_t scan_count =
@@ -311,14 +286,14 @@ TEST_CASE_TEMPLATE("insert accepts a value equal to STORE_NOT_FOUND and it round
   CHECK(store->insert("a", vmemkv::STORE_NOT_FOUND));
   bool found = store->get("a", [](std::span<const std::byte> /*val*/) {});
   CHECK(found);
-  CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
 }
 
 TEST_CASE_TEMPLATE("update existing key", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);
   CHECK(store->update("a", 2));
-  CHECK(test_util::get_sync(store, "a") == 2U);
+  CHECK(test_util::get_u64_sync(store, "a") == 2U);
 }
 
 TEST_CASE_TEMPLATE("update missing key returns false", Store, STORE_TYPES) {
@@ -331,7 +306,7 @@ TEST_CASE_TEMPLATE("update accepts a value equal to STORE_NOT_FOUND and it round
   auto store = StoreFactory<Store>::make();
   store->insert("a", 1);
   store->update("a", vmemkv::STORE_NOT_FOUND);
-  CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
 }
 
 // Per-key get() exactness after distinct same-size updates plus interleaved deletes:
@@ -352,12 +327,12 @@ TEST_CASE_TEMPLATE("get returns latest value per key after update and delete chu
   }
   for (size_t i = 0; i < kKeys; ++i) {
     if (i % 3 == 0) {
-      CHECK(test_util::get_sync(store, "k" + std::to_string(i)) == vmemkv::STORE_NOT_FOUND);
+      CHECK(test_util::get_u64_sync(store, "k" + std::to_string(i)) == vmemkv::STORE_NOT_FOUND);
     } else {
-      CHECK(test_util::get_sync(store, "k" + std::to_string(i)) == 100000 + i);
+      CHECK(test_util::get_u64_sync(store, "k" + std::to_string(i)) == 100000 + i);
     }
   }
-  CHECK(test_util::get_sync(store, "k_missing") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, "k_missing") == vmemkv::STORE_NOT_FOUND);
 }
 // LeanStore-only: clone-from-master construction round-trips data, isolates mutations to
 // the clone (the master stays intact for later clones), and a second clone of the same
@@ -366,11 +341,7 @@ TEST_CASE_TEMPLATE("get returns latest value per key after update and delete chu
 TEST_CASE("LeanStore clone from master round-trips and isolates") {
   using Store = vmemkv::StoreAdapter<::LeanStoreStore>;
   const std::string master = reserve_temp_path().string() + "_master";
-  auto make_key = [](std::size_t i) {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "k%05zu", i);
-    return std::string(buf);
-  };
+  auto make_key = [](std::size_t i) { return vmemkv_test::padded_key(i, 5); };
   auto make_value = [](std::size_t i) {
     std::string v = "v" + std::to_string(i);
     v.append(24 - v.size(), '.');
@@ -427,7 +398,7 @@ TEST_CASE("bulk_load: an entry whose value equals STORE_NOT_FOUND round-trips vi
 
   bool found = store->get("a", [](std::span<const std::byte> /*val*/) {});
   CHECK(found);
-  CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
 
   size_t scan_hits = 0;
   std::ignore = store->scan("a", "a~", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
@@ -444,7 +415,7 @@ TEST_CASE_TEMPLATE("remove existing key", Store, STORE_TYPES) {
   auto store = StoreFactory<Store>::make();
   store->insert("a", kRemovedValue);
   CHECK(store->remove("a"));
-  CHECK(test_util::get_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, "a") == vmemkv::STORE_NOT_FOUND);
 }
 
 TEST_CASE_TEMPLATE("remove missing key returns false", Store, STORE_TYPES) {
@@ -463,7 +434,7 @@ TEST_CASE_TEMPLATE("re-insert after remove", Store, STORE_TYPES) {
   store->insert("a", 1);
   store->remove("a");
   CHECK(store->insert("a", 2));
-  CHECK(test_util::get_sync(store, "a") == 2U);
+  CHECK(test_util::get_u64_sync(store, "a") == 2U);
 }
 
 TEST_CASE_TEMPLATE("scan empty range returns 0", Store, STORE_TYPES) {
@@ -505,17 +476,13 @@ TEST_CASE_TEMPLATE("scan after churn returns key order with latest values", Stor
   auto store = StoreFactory<Store>::make();
   constexpr int kKeys = 300;
   for (int i = 0; i < kKeys; ++i) {
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "k%08d", i);
-    store->insert(std::string(buf), static_cast<uint64_t>(i));
+    store->insert(vmemkv_test::padded_key(i, 8), static_cast<uint64_t>(i));
   }
   // Descending update order appends tail records in reverse-key sequence, so T2 physical
   // offset order is the opposite of key order: emitting reads in offset order would observably
   // reverse the callback sequence.
   for (int i = kKeys - 1; i >= 0; --i) {
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "k%08d", i);
-    store->update(std::string(buf), static_cast<uint64_t>(kKeys + i));
+    store->update(vmemkv_test::padded_key(i, 8), static_cast<uint64_t>(kKeys + i));
   }
   std::vector<std::pair<std::string, uint64_t>> seen;
   const size_t entry_count = store->scan(
@@ -525,9 +492,7 @@ TEST_CASE_TEMPLATE("scan after churn returns key order with latest values", Stor
   CHECK(entry_count == static_cast<size_t>(kKeys));
   REQUIRE(seen.size() == static_cast<size_t>(kKeys));
   for (int i = 0; i < kKeys; ++i) {
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "k%08d", i);
-    CHECK(seen[static_cast<size_t>(i)].first == std::string(buf));
+    CHECK(seen[static_cast<size_t>(i)].first == vmemkv_test::padded_key(i, 8));
     CHECK(seen[static_cast<size_t>(i)].second == static_cast<uint64_t>(kKeys + i));
   }
 }
@@ -537,8 +502,8 @@ TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
   store->insert("a", 1);
   store->insert("b", 2);
   store->reorganize();
-  CHECK(test_util::get_sync(store, "a") == 1U);
-  CHECK(test_util::get_sync(store, "b") == 2U);
+  CHECK(test_util::get_u64_sync(store, "a") == 1U);
+  CHECK(test_util::get_u64_sync(store, "b") == 2U);
   CHECK(store->insert("c", 3));
   const size_t entry_count = store->scan("a", "c", [](std::span<const std::byte>, std::span<const std::byte>) {});
   CHECK(entry_count == 3U);
@@ -577,7 +542,7 @@ TEST_CASE("VMemKV: update after reorganize redirects out-of-place, Scan sees fre
   CHECK(seen.at("key_b") == value_b);
 
   // Get (main mmap path) must agree with Scan (base_mmap_scan path) on the same key.
-  const auto get_result = test_util::get_bytes_sync(store, "key_a");
+  const auto get_result = vmemkv_test::get_optional_bytes(store, "key_a");
   REQUIRE(get_result.has_value());
   CHECK(std::string(reinterpret_cast<const char *>(get_result->data()), get_result->size()) == value_a_updated);
 
@@ -595,19 +560,48 @@ TEST_CASE("VMemKV: update after reorganize redirects out-of-place, Scan sees fre
   CHECK(seen2.at("key_a") == value_a_updated2);
 }
 
-// Stress/regression test: update() (base-region redirect decision) races scan() (base_mmap_scan
-// read path) races repeated checkpoint() (moves base_boundary in place, no remap) -- the
-// three-way race the base/tail split's correctness depends on. Run under
-// ThreadSanitizer for direct race detection; also self-checks independent of TSan, since every
-// value written here is `kStressValueBytes` copies of one repeated character, so a torn read shows
-// up directly as a non-uniform byte value.
-//
-// kReorgCycles is capped well below what a "why not more?" instinct would suggest: this store's
-// underlying reorganize_internal() has a separate, pre-existing, already-documented race (see its
-// "KNOWN OPEN ISSUE" assert and test_kv_store's own deliberately-failing repro for it) that
-// sustained concurrent reorganize+write pressure can trip. 60 cycles cleared 8/8 TSan runs without
-// tripping it; raising this constant is likely to make this test flaky on that unrelated, unfixed
-// issue rather than exercise more of the code this test actually targets.
+namespace {
+
+// Builds a store pre-filled with key_count uniform 'a' values for the checkpoint stress tests below.
+template <typename TestStore>
+auto make_seeded_checkpoint_stress_store(uint64_t capacity_bytes, int key_count, std::size_t value_bytes) {
+  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), capacity_bytes);
+  for (int i = 0; i < key_count; ++i) {
+    REQUIRE(store->insert("key" + std::to_string(i), std::string(value_bytes, 'a')));
+  }
+  return store;
+}
+
+// Flags corruption_found unless value is exactly value_bytes copies of one repeated character.
+inline void check_uniform_value(std::span<const std::byte> value,
+                                std::size_t value_bytes,
+                                std::atomic<bool> &corruption_found) {
+  if (value.size() != value_bytes) {
+    corruption_found.store(true, std::memory_order_relaxed);
+    return;
+  }
+  const auto expected = value[0];
+  for (std::byte b : value) {
+    if (b != expected) {
+      corruption_found.store(true, std::memory_order_relaxed);
+      break;
+    }
+  }
+}
+
+// Every pre-seeded key must still be present at its full value size after the stress run.
+template <typename StorePtr>
+void check_final_value_sizes(StorePtr &store, int key_count, std::size_t value_bytes) {
+  for (int i = 0; i < key_count; ++i) {
+    const auto final_value = vmemkv_test::get_optional_bytes(store, "key" + std::to_string(i));
+    REQUIRE(final_value.has_value());
+    CHECK(final_value->size() == value_bytes);
+  }
+}
+
+}  // namespace
+
+// update()/scan() racing repeated checkpoint() cycles must never observe a torn value.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("VMemKV: concurrent update+scan survive repeated checkpoint (stress)") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
@@ -616,11 +610,7 @@ TEST_CASE("VMemKV: concurrent update+scan survive repeated checkpoint (stress)")
   constexpr std::size_t kStressValueBytes = 200;  // Non-inline; see other tests' same-size note.
   constexpr int kReorgCycles = 60;
 
-  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
-
-  for (int i = 0; i < kKeyCount; ++i) {
-    REQUIRE(store->insert("key" + std::to_string(i), std::string(kStressValueBytes, 'a')));
-  }
+  auto store = make_seeded_checkpoint_stress_store<TestStore>(kStoreCapacityBytes, kKeyCount, kStressValueBytes);
 
   std::atomic<bool> stop{false};
   std::atomic<bool> corruption_found{false};
@@ -640,17 +630,7 @@ TEST_CASE("VMemKV: concurrent update+scan survive repeated checkpoint (stress)")
     while (!stop.load(std::memory_order_relaxed)) {
       std::ignore =
           store->scan("key0", "key9", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
-            if (value.size() != kStressValueBytes) {
-              corruption_found.store(true, std::memory_order_relaxed);
-              return;
-            }
-            const auto expected = value[0];
-            for (std::byte b : value) {
-              if (b != expected) {
-                corruption_found.store(true, std::memory_order_relaxed);
-                break;
-              }
-            }
+            check_uniform_value(value, kStressValueBytes, corruption_found);
           });
     }
   });
@@ -664,11 +644,7 @@ TEST_CASE("VMemKV: concurrent update+scan survive repeated checkpoint (stress)")
 
   CHECK_FALSE(corruption_found.load());
 
-  for (int i = 0; i < kKeyCount; ++i) {
-    const auto final_value = test_util::get_bytes_sync(store, "key" + std::to_string(i));
-    REQUIRE(final_value.has_value());
-    CHECK(final_value->size() == kStressValueBytes);
-  }
+  check_final_value_sizes(store, kKeyCount, kStressValueBytes);
 }
 
 // Regression test for base_boundary coverage across repeated checkpoint() cycles: each cycle
@@ -681,10 +657,9 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
-  auto padded_key = [](int i) { return "key" + std::string(i < 10 ? "0" : "") + std::to_string(i); };
   const std::string value(kValue200Bytes, 'a');
   for (int i = 0; i < 10; ++i) {
-    REQUIRE(store->insert(padded_key(i), value));
+    REQUIRE(store->insert(vmemkv_test::padded_key("key", i, 2), value));
   }
   store->checkpoint();  // First checkpoint: creates the T2 checkpoint file.
 
@@ -696,7 +671,7 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
 
   // Insert more, then checkpoint again -- base_boundary advances further in place.
   for (int i = 10; i < 20; ++i) {
-    REQUIRE(store->insert(padded_key(i), value));
+    REQUIRE(store->insert(vmemkv_test::padded_key("key", i, 2), value));
   }
   store->checkpoint();
 
@@ -706,32 +681,19 @@ TEST_CASE("VMemKV: checkpoint() extends base_boundary coverage across repeated c
   // Confirm the newly-promoted range is actually reachable and correct via the base_mmap_scan
   // path (Scan), not just the always-correct fallback (Get).
   std::map<std::string, std::string> seen;
-  std::ignore =
-      store->scan(padded_key(0), "key19~", [&](std::span<const std::byte> key, std::span<const std::byte> val) {
-        seen.emplace(std::string(reinterpret_cast<const char *>(key.data()), key.size()),
-                     std::string(reinterpret_cast<const char *>(val.data()), val.size()));
-      });
+  std::ignore = store->scan(vmemkv_test::padded_key("key", 0, 2),
+                            "key19~",
+                            [&](std::span<const std::byte> key, std::span<const std::byte> val) {
+                              seen.emplace(std::string(reinterpret_cast<const char *>(key.data()), key.size()),
+                                           std::string(reinterpret_cast<const char *>(val.data()), val.size()));
+                            });
   for (int i = 0; i < 20; ++i) {
-    REQUIRE(seen.count(padded_key(i)) == 1);
-    CHECK(seen.at(padded_key(i)) == value);
+    REQUIRE(seen.count(vmemkv_test::padded_key("key", i, 2)) == 1);
+    CHECK(seen.at(vmemkv_test::padded_key("key", i, 2)) == value);
   }
 }
 
-// Stress/regression test: update()'s in-place path racing repeated checkpoint() cycles -- a
-// narrower companion to the "concurrent update+scan survive repeated checkpoint (stress)" test
-// above, isolating checkpoint_internal()'s append-quiescence/msync machinery from that test's
-// added scan-path race.
-//
-// Deliberately bounded (kOpsPerCycle updates/scans per cycle, spawned and joined once per
-// checkpoint() call) rather than free-spinning update/scan threads for the whole test duration:
-// a handful of concurrent attempts per cycle, 60 times over, is enough to give any race a fair
-// chance without needing sustained throughput. Free-spinning threads hit the unrelated torn-read
-// race in the ordinary seqlock-protected read path (see the "Torn-read fix" comments in
-// get_impl()/scan_impl() in vmemkv_impl.hpp) at millions of scan calls, with zero
-// checkpoint()/reorganize() activity at all, making this test flaky for a reason that has nothing
-// to do with what it's actually trying to catch. Run under ThreadSanitizer for direct race
-// detection where available; also self-checks independent of TSan via the same uniform-byte-value
-// technique as the "...repeated reorganize" test above.
+// update()'s in-place path racing repeated checkpoint() cycles must never observe a torn value.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE(
     "VMemKV: concurrent update+scan survive repeated cheap checkpoint() "
@@ -743,11 +705,7 @@ TEST_CASE(
   constexpr int kCheckpointCycles = 60;
   constexpr int kOpsPerCycle = 50;
 
-  auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
-
-  for (int i = 0; i < kKeyCount; ++i) {
-    REQUIRE(store->insert("key" + std::to_string(i), std::string(kStressValueBytes, 'a')));
-  }
+  auto store = make_seeded_checkpoint_stress_store<TestStore>(kStoreCapacityBytes, kKeyCount, kStressValueBytes);
   store->checkpoint();  // Establish an initial base region for the cheap path to keep promoting.
 
   std::atomic<bool> corruption_found{false};
@@ -766,17 +724,7 @@ TEST_CASE(
       for (int i = 0; i < kOpsPerCycle; ++i) {
         std::ignore =
             store->scan("key0", "key9", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
-              if (value.size() != kStressValueBytes) {
-                corruption_found.store(true, std::memory_order_relaxed);
-                return;
-              }
-              const auto expected = value[0];
-              for (std::byte b : value) {
-                if (b != expected) {
-                  corruption_found.store(true, std::memory_order_relaxed);
-                  break;
-                }
-              }
+              check_uniform_value(value, kStressValueBytes, corruption_found);
             });
       }
     });
@@ -793,18 +741,10 @@ TEST_CASE(
 
   CHECK_FALSE(corruption_found.load());
 
-  for (int i = 0; i < kKeyCount; ++i) {
-    const auto final_value = test_util::get_bytes_sync(store, "key" + std::to_string(i));
-    REQUIRE(final_value.has_value());
-    CHECK(final_value->size() == kStressValueBytes);
-  }
+  check_final_value_sizes(store, kKeyCount, kStressValueBytes);
 }
 
-// Edge case: checkpoint() called on a store that has never had a single insert (append_size()==0,
-// bytes_used()==0 at checkpoint time). T2FlatFile's constructor unconditionally establishes a
-// real (non-null) base_mmap_scan and a real (>=0) read_fd regardless of bytes_used, so those
-// mappings exist even for a store built this way -- the incremental-promotion mechanism above
-// always has something to extend, never a null mapping to special-case.
+// Edge case: checkpoint() on an empty store still establishes base_mmap_scan/read_fd.
 TEST_CASE("VMemKV: checkpoint() on an empty store still establishes base_mmap_scan/read_fd") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
@@ -836,7 +776,7 @@ TEST_CASE("VMemKV: checkpoint() on an empty store still establishes base_mmap_sc
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE_TEMPLATE("long keys sharing a 16-byte prefix: CRUD", Store, LONG_KEY_STORE_TYPES) {
+TEST_CASE_TEMPLATE("long keys sharing a 16-byte prefix: CRUD", Store, STORE_TYPES) {
   // Same reinsert-after-remove limitation as above (this case reinserts key_one).
   if constexpr (std::is_same_v<Store, vmemkv::variants::VMemKV_LeanStore>) {
     MESSAGE("skipped for LeanStore: engine cannot reinsert removed keys");
@@ -853,27 +793,27 @@ TEST_CASE_TEMPLATE("long keys sharing a 16-byte prefix: CRUD", Store, LONG_KEY_S
   CHECK(store->insert(key_two, 2));
   CHECK(store->insert(key_three, 3));
 
-  CHECK(test_util::get_sync(store, key_one) == 1U);
-  CHECK(test_util::get_sync(store, key_two) == 2U);
-  CHECK(test_util::get_sync(store, key_three) == 3U);
+  CHECK(test_util::get_u64_sync(store, key_one) == 1U);
+  CHECK(test_util::get_u64_sync(store, key_two) == 2U);
+  CHECK(test_util::get_u64_sync(store, key_three) == 3U);
 
-  CHECK(test_util::get_sync(store, prefix) == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, prefix) == vmemkv::STORE_NOT_FOUND);
 
   CHECK_FALSE(store->insert(key_two, 99));
-  CHECK(test_util::get_sync(store, key_two) == 2U);
+  CHECK(test_util::get_u64_sync(store, key_two) == 2U);
 
   CHECK(store->update(key_two, 22));
-  CHECK(test_util::get_sync(store, key_one) == 1U);
-  CHECK(test_util::get_sync(store, key_two) == 22U);
-  CHECK(test_util::get_sync(store, key_three) == 3U);
+  CHECK(test_util::get_u64_sync(store, key_one) == 1U);
+  CHECK(test_util::get_u64_sync(store, key_two) == 22U);
+  CHECK(test_util::get_u64_sync(store, key_three) == 3U);
 
   CHECK(store->remove(key_one));
-  CHECK(test_util::get_sync(store, key_one) == vmemkv::STORE_NOT_FOUND);
-  CHECK(test_util::get_sync(store, key_two) == 22U);
-  CHECK(test_util::get_sync(store, key_three) == 3U);
+  CHECK(test_util::get_u64_sync(store, key_one) == vmemkv::STORE_NOT_FOUND);
+  CHECK(test_util::get_u64_sync(store, key_two) == 22U);
+  CHECK(test_util::get_u64_sync(store, key_three) == 3U);
 
   CHECK(store->insert(key_one, 111));
-  CHECK(test_util::get_sync(store, key_one) == 111U);
+  CHECK(test_util::get_u64_sync(store, key_one) == 111U);
 }
 
 // Offset64 must disambiguate matching prefixes by hash(full_key).
@@ -905,7 +845,7 @@ TEST_CASE("Offset64 + hash-index disambiguates long keys sharing a prefix") {
 
 // Large byte values are only tested for stores backed by Tier 2.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE_TEMPLATE("large value (>= 64B): CRUD still works", Store, LARGE_VALUE_STORE_TYPES) {
+TEST_CASE_TEMPLATE("large value (>= 64B): CRUD still works", Store, STORE_TYPES) {
   // LeanStore's BTreeVI has same-size-only in-place update and no insert-after-remove path,
   // so grow/shrink updates have no correct engine path (benchmark updates are same-size).
   if constexpr (std::is_same_v<Store, vmemkv::variants::VMemKV_LeanStore>) {
@@ -918,50 +858,52 @@ TEST_CASE_TEMPLATE("large value (>= 64B): CRUD still works", Store, LARGE_VALUE_
   const std::string v200(kValue200Bytes, 'b');
 
   CHECK(store->insert("key1", v64));
-  auto got = test_util::get_bytes_sync(store, "key1");
+  auto got = vmemkv_test::get_optional_bytes(store, "key1");
   if (!got.has_value()) {
     FAIL("missing key1 after insert");
   }
-  CHECK(as_string(*got) == v64);  // NOLINT(bugprone-unchecked-optional-access)
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == v64);  // NOLINT(bugprone-unchecked-optional-access)
 
   CHECK_FALSE(store->insert("key1", v200));
-  got = test_util::get_bytes_sync(store, "key1");
+  got = vmemkv_test::get_optional_bytes(store, "key1");
   if (!got.has_value()) {
     FAIL("missing key1 after duplicate insert");
   }
-  CHECK(as_string(*got) == v64);  // NOLINT(bugprone-unchecked-optional-access)
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == v64);  // NOLINT(bugprone-unchecked-optional-access)
 
   CHECK(store->update("key1", v200));
-  got = test_util::get_bytes_sync(store, "key1");
+  got = vmemkv_test::get_optional_bytes(store, "key1");
   if (!got.has_value()) {
     FAIL("missing key1 after grow update");
   }
-  CHECK(as_string(*got) == v200);  // NOLINT(bugprone-unchecked-optional-access)
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == v200);  // NOLINT(bugprone-unchecked-optional-access)
 
   constexpr std::size_t kShrinkValueBytes = 16;
   const std::string v16(kShrinkValueBytes, 'c');
 
   CHECK(store->update("key1", v16));
-  got = test_util::get_bytes_sync(store, "key1");
+  got = vmemkv_test::get_optional_bytes(store, "key1");
   if (!got.has_value()) {
     FAIL("missing key1 after shrink update");
   }
-  CHECK(as_string(*got) == v16);  // NOLINT(bugprone-unchecked-optional-access)
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == v16);  // NOLINT(bugprone-unchecked-optional-access)
 
   CHECK(store->insert("key2", v64));
-  auto got_key2 = test_util::get_bytes_sync(store, "key2");
+  auto got_key2 = vmemkv_test::get_optional_bytes(store, "key2");
   if (!got_key2.has_value()) {
     FAIL("missing key2 after insert");
   }
-  CHECK(as_string(*got_key2) == v64);  // NOLINT(bugprone-unchecked-optional-access)
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got_key2)) ==
+        v64);  // NOLINT(bugprone-unchecked-optional-access)
 
   CHECK(store->remove("key2"));
-  CHECK_FALSE(test_util::get_bytes_sync(store, "key2").has_value());
-  auto got_key1 = test_util::get_bytes_sync(store, "key1");
+  CHECK_FALSE(vmemkv_test::get_optional_bytes(store, "key2").has_value());
+  auto got_key1 = vmemkv_test::get_optional_bytes(store, "key1");
   if (!got_key1.has_value()) {
     FAIL("missing key1 after key2 removal");
   }
-  CHECK(as_string(*got_key1) == v16);  // NOLINT(bugprone-unchecked-optional-access)
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got_key1)) ==
+        v16);  // NOLINT(bugprone-unchecked-optional-access)
 }
 
 TEST_CASE_TEMPLATE("large N: all keys retrievable", Store, STORE_TYPES) {
@@ -971,7 +913,7 @@ TEST_CASE_TEMPLATE("large N: all keys retrievable", Store, STORE_TYPES) {
     store->insert("k" + std::to_string(i), static_cast<uint64_t>(i));
   }
   for (int i = 0; i < key_count; ++i) {
-    CHECK(test_util::get_sync(store, "k" + std::to_string(i)) == static_cast<uint64_t>(i));
+    CHECK(test_util::get_u64_sync(store, "k" + std::to_string(i)) == static_cast<uint64_t>(i));
   }
 }
 
@@ -989,7 +931,7 @@ TEST_CASE_TEMPLATE("[mt] concurrent reads are consistent", Store, STORE_TYPES) {
   for (int thread_index = 0; thread_index < kReaderThreadCount; ++thread_index) {
     threads.emplace_back([&] {
       for (int i = 0; i < key_count; ++i) {
-        uint64_t value = test_util::get_sync(store, "k" + std::to_string(i));
+        uint64_t value = test_util::get_u64_sync(store, "k" + std::to_string(i));
         if (value != static_cast<uint64_t>(i)) {
           all_ok.store(false);
         }
@@ -1023,12 +965,12 @@ TEST_CASE("VMemKV: checkpoint preserves correctness across garbage from update/r
 
   store->checkpoint();
 
-  CHECK_FALSE(test_util::get_bytes_sync(store, "k1").has_value());
-  auto got = test_util::get_bytes_sync(store, "k2");
+  CHECK_FALSE(vmemkv_test::get_optional_bytes(store, "k1").has_value());
+  auto got = vmemkv_test::get_optional_bytes(store, "k2");
   if (!got.has_value()) {
     FAIL("missing k2 after checkpoint");
   }
-  CHECK(as_string(*got) == val2);  // NOLINT(bugprone-unchecked-optional-access)
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == val2);  // NOLINT(bugprone-unchecked-optional-access)
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1088,7 +1030,7 @@ TEST_CASE("Value Inlining: scan() returns the untruncated key for a key ending i
 
   // get() must still find it via the exact key the caller already knows (unaffected by this fix
   // either way, since it never needed to recover the key from T1's prefix).
-  const auto got = test_util::get_bytes_sync(store, 256U);
+  const auto got = vmemkv_test::get_optional_bytes(store, 256U);
   REQUIRE(got.has_value());
 }
 
@@ -1113,7 +1055,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
 
   CHECK(store->t2().bytes_used() == 0);
 
-  auto res = test_util::get_bytes_sync(store, "key1");
+  auto res = vmemkv_test::get_optional_bytes(store, "key1");
   if (!res.has_value()) {
     FAIL("missing key1 inline payload");
   }
@@ -1129,7 +1071,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   store->insert("key_odd", val_odd_bytes);
   CHECK(store->t2().bytes_used() == 0);
 
-  auto res_odd = test_util::get_bytes_sync(store, "key_odd");
+  auto res_odd = vmemkv_test::get_optional_bytes(store, "key_odd");
   if (!res_odd.has_value()) {
     FAIL("missing key_odd inline payload");
   }
@@ -1147,7 +1089,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   store->insert("key_even", val_even_bytes);
   CHECK(store->t2().bytes_used() == 0);
 
-  auto res_even = test_util::get_bytes_sync(store, "key_even");
+  auto res_even = vmemkv_test::get_optional_bytes(store, "key_even");
   if (!res_even.has_value()) {
     FAIL("missing key_even inline payload");
   }
@@ -1167,157 +1109,101 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   vmemkv::remove_wal_segments(vmemkv::derive_wal_path(path));
 }
 
-// get_impl()/scan_impl() must invoke the caller-supplied callback only after
-// read_t2_record_seqlock() returns, from an owned buffer copy_func copied into -- never directly
-// from inside copy_func with a std::span into T2Memory::base, which is live, concurrently
-// update_value_at()-writable memory the seqlock's version re-check hasn't validated yet (see
-// get_impl()/scan_impl()'s own comments).
-//
-// Deliberately no reorganize()/checkpoint() anywhere in either test below: unlike
-// the writer-stop-barrier/residual-window tests elsewhere in this file, this race needs nothing but
-// plain concurrent update()+scan() (or update()+get()) on a single key -- proving the guarantee
-// holds even in that minimal case is the point.
+// Read callbacks observe an owned buffer copy validated by the seqlock, never live T2 memory.
+namespace {
+
+// A value written by these tests is copies of one repeated character; a non-uniform value is a torn read.
+inline auto is_uniform(std::span<const std::byte> value) -> bool {
+  if (value.empty()) {
+    return true;
+  }
+  const auto expected = value[0];
+  for (std::byte b : value) {
+    if (b != expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+constexpr std::size_t kTornReadValueBytes = 200;  // Non-inline; same-size updates stay in the in-place path.
+
+// Runs one updater thread plus one reader thread for 500ms; the reader performs one
+// reader_loop(store, torn_read_found) read-and-check per iteration.
+template <typename StorePtr, typename ReaderLoop>
+void check_no_torn_read(StorePtr &store, ReaderLoop &&reader_loop) {
+  REQUIRE(store->insert("hot", std::string(kTornReadValueBytes, 'a')));
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> torn_read_found{false};
+
+  std::thread updater([&] {
+    uint64_t i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      store->update("hot", std::string(kTornReadValueBytes, static_cast<char>('a' + (i++ % 26))));
+    }
+  });
+
+  std::thread reader([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      reader_loop(store, torn_read_found);
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  stop.store(true, std::memory_order_relaxed);
+  updater.join();
+  reader.join();
+
+  CHECK_FALSE(torn_read_found.load());
+}
+
+}  // namespace
+
 TEST_CASE("VMemKV: scan callback never observes a torn read across a concurrent update (regression)") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
-  constexpr std::size_t kValueBytes = 200;  // Non-inline; same-size updates stay in the in-place path.
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
-  REQUIRE(store->insert("hot", std::string(kValueBytes, 'a')));
-
-  std::atomic<bool> stop{false};
-  std::atomic<bool> torn_read_found{false};
-
-  std::thread updater([&] {
-    uint64_t i = 0;
-    while (!stop.load(std::memory_order_relaxed)) {
-      std::string next_value(kValueBytes, static_cast<char>('a' + (i++ % 26)));
-      store->update("hot", next_value);
-    }
+  check_no_torn_read(store, [](auto &store, std::atomic<bool> &torn_read_found) {
+    std::ignore = store->scan("hot", "hot~", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
+      if (!is_uniform(value)) {
+        torn_read_found.store(true, std::memory_order_relaxed);
+      }
+    });
   });
-
-  std::thread scanner([&] {
-    while (!stop.load(std::memory_order_relaxed)) {
-      std::ignore =
-          store->scan("hot", "hot~", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
-            if (value.empty()) {
-              return;
-            }
-            const auto expected = value[0];
-            for (std::byte b : value) {
-              if (b != expected) {
-                torn_read_found.store(true, std::memory_order_relaxed);
-                return;
-              }
-            }
-          });
-    }
-  });
-
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  stop.store(true, std::memory_order_relaxed);
-  updater.join();
-  scanner.join();
-
-  CHECK_FALSE(torn_read_found.load());
 }
 
-// Same bug, same fix, but via get() instead of scan() -- get_impl()'s copy_func had the identical
-// callback-inside-the-seqlock-window shape as scan_impl()'s.
+// Same guarantee via get() instead of scan().
 TEST_CASE("VMemKV: get callback never observes a torn read across a concurrent update (regression)") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
-  constexpr std::size_t kValueBytes = 200;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
-  REQUIRE(store->insert("hot", std::string(kValueBytes, 'a')));
-
-  std::atomic<bool> stop{false};
-  std::atomic<bool> torn_read_found{false};
-
-  std::thread updater([&] {
-    uint64_t i = 0;
-    while (!stop.load(std::memory_order_relaxed)) {
-      std::string next_value(kValueBytes, static_cast<char>('a' + (i++ % 26)));
-      store->update("hot", next_value);
-    }
+  check_no_torn_read(store, [](auto &store, std::atomic<bool> &torn_read_found) {
+    std::ignore = store->get("hot", [&](std::span<const std::byte> value) {
+      if (!is_uniform(value)) {
+        torn_read_found.store(true, std::memory_order_relaxed);
+      }
+    });
   });
-
-  std::thread getter([&] {
-    while (!stop.load(std::memory_order_relaxed)) {
-      std::ignore = store->get("hot", [&](std::span<const std::byte> value) {
-        if (value.empty()) {
-          return;
-        }
-        const auto expected = value[0];
-        for (std::byte b : value) {
-          if (b != expected) {
-            torn_read_found.store(true, std::memory_order_relaxed);
-            return;
-          }
-        }
-      });
-    }
-  });
-
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  stop.store(true, std::memory_order_relaxed);
-  updater.join();
-  getter.join();
-
-  CHECK_FALSE(torn_read_found.load());
 }
 
-// Free-spinning variant of the same regression, with no reorganize()/checkpoint() at all: prior
-// to the fix above, this exact shape (see the "...repeated cheap checkpoint() promotions
-// (stress)" test's own comment elsewhere in this file) had to be deliberately avoided because it
-// reliably tripped this bug on its own. Now that the underlying bug is fixed, confirm the
-// simplest possible free-spinning form is safe too.
+// Free-spinning variant with no reorganize()/checkpoint() at all.
 TEST_CASE(
     "VMemKV: free-spinning update+scan survive with no reorganize/checkpoint "
     "at all (regression)") {
   using TestStore = vmemkv::variants::VMemKV_Baseline;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
-  constexpr std::size_t kValueBytes = 200;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
-  REQUIRE(store->insert("hot", std::string(kValueBytes, 'a')));
-
-  std::atomic<bool> stop{false};
-  std::atomic<bool> torn_read_found{false};
-
-  std::thread updater([&] {
-    uint64_t i = 0;
-    while (!stop.load(std::memory_order_relaxed)) {
-      std::string next_value(kValueBytes, static_cast<char>('a' + (i++ % 26)));
-      store->update("hot", next_value);
-    }
+  check_no_torn_read(store, [](auto &store, std::atomic<bool> &torn_read_found) {
+    std::ignore = store->scan("hot", "hot~", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
+      if (!is_uniform(value)) {
+        torn_read_found.store(true, std::memory_order_relaxed);
+      }
+    });
   });
-
-  std::thread scanner([&] {
-    while (!stop.load(std::memory_order_relaxed)) {
-      std::ignore =
-          store->scan("hot", "hot~", [&](std::span<const std::byte> /*key*/, std::span<const std::byte> value) {
-            if (value.empty()) {
-              return;
-            }
-            const auto expected = value[0];
-            for (std::byte b : value) {
-              if (b != expected) {
-                torn_read_found.store(true, std::memory_order_relaxed);
-                return;
-              }
-            }
-          });
-    }
-  });
-
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  stop.store(true, std::memory_order_relaxed);
-  updater.join();
-  scanner.join();
-
-  CHECK_FALSE(torn_read_found.load());
 }
 
 namespace {
@@ -1344,33 +1230,14 @@ void publish_straggler_entry(StorePtr &store,
 // no second checkpoint/reorganize cycle needed.
 template <typename StorePtr>
 void verify_straggler_readback(StorePtr &store, const std::string &straggler_value) {
-  const auto straggler_readback = test_util::get_bytes_sync(store, "straggler");
+  const auto straggler_readback = vmemkv_test::get_optional_bytes(store, "straggler");
   REQUIRE(straggler_readback.has_value());
   CHECK(straggler_readback->size() == straggler_value.size());
 }
 
 }  // namespace
 
-// Regression test for checkpoint_internal()'s "residual window" race: a writer must never be
-// able to land a fresh T2 append past the frontier a concurrently-running checkpoint is about to
-// capture as `target`/`base_boundary`.
-//
-// Closed in t2_flat_file.hpp by pairing acquire_write_handle() (write_entry_lockfree()'s only way
-// to get a T2 write handle, held across both the T2 append and the T1 publish attempt) with
-// stop_writers_and_wait() (called here right before the target is captured): it marks writes
-// stopped, so acquire_write_handle() stops handing out new handles, then blocks until every
-// writer that already held a handle -- i.e. started before the flag went up -- has released it,
-// which only happens after that writer's T1 publish attempt has returned.
-//
-// This test proves exactly that handshake, deterministically, using a real writer thread (not a
-// synchronous hook simulating the race, which would deadlock: by the time pre_finish_hook fires,
-// writer_stop_ is already true, and nothing but this same call's own later resume_writers() would
-// ever clear it -- a hook-spawned writer would spin forever waiting for a flag its own spawning
-// call is blocking on). Instead, pre_stop_hook fires *before* the stop flag goes up, spawning a
-// thread that registers a real T2MemoryHandle and pauses briefly before publishing -- exercising
-// the "writer already in flight when the stop starts" case. stop_writers_and_wait() must block
-// until this thread finishes, and this *same* cycle's captured target must then already cover its
-// entry -- reading it back must work immediately, no second cycle needed.
+// checkpoint's writer-stop barrier waits for in-flight writers before capturing the frontier.
 TEST_CASE(
     "VMemKV: checkpoint's writer-stop barrier waits for an in-flight writer instead of "
     "capturing a frontier underneath it (regression)") {
@@ -1485,11 +1352,7 @@ TEST_CASE(
   verify_straggler_readback(store, straggler_value);
 }
 
-// Regression test: checkpoint_internal() publishes T1 via a single, I/O-free call at the very
-// end (see checkpoint_internal()'s own comment). This test injects a fault at the last possible
-// moment before T1 could ever be touched (NoOpPreFinishHook's seam) and confirms the store is
-// still fully functional afterward -- no hang, correct data, and a subsequent checkpoint()
-// succeeds normally.
+// An exception before T1 publish during a T2 rebuild leaves the store fully usable.
 TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the store fully usable") {
   using TestStore = vmemkv::VMemKVStore;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
@@ -1513,7 +1376,7 @@ TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the st
   REQUIRE(threw);
 
   // No hang, no rollback needed: T1 was never touched, so the store is immediately usable.
-  const auto readback = test_util::get_bytes_sync(store, "key");
+  const auto readback = vmemkv_test::get_optional_bytes(store, "key");
   REQUIRE(readback.has_value());
   CHECK(std::string(reinterpret_cast<const char *>(readback->data()), readback->size()) == value);
 
@@ -1521,7 +1384,7 @@ TEST_CASE("VMemKV: exception before T1 publish during a T2 rebuild leaves the st
 
   // A subsequent, unfaulted checkpoint cycle must still succeed normally.
   store->checkpoint();
-  const auto final_readback = test_util::get_bytes_sync(store, "key");
+  const auto final_readback = vmemkv_test::get_optional_bytes(store, "key");
   REQUIRE(final_readback.has_value());
   CHECK(final_readback->size() == 200);
 }

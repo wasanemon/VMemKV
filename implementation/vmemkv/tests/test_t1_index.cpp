@@ -45,6 +45,16 @@ auto make_entry(const std::string &key_string, TestIndex::Payload payload) -> Te
 
 using vmemkv_test::per_entry_offset_mapper;
 
+void fill_sequential(TestIndex &idx, int count) {
+  for (int i = 0; i < count; ++i) {
+    CHECK(idx.put(to_span("k" + std::to_string(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
+  }
+}
+
+auto identity_offset_mapper() {
+  return per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; });
+}
+
 }  // namespace
 
 TEST_CASE("T1Index: get on empty index returns STORE_NOT_FOUND") {
@@ -90,12 +100,10 @@ TEST_CASE("T1Index: append region reports AppendRegionFull once capacity is exha
 TEST_CASE("T1Index: reorganize merges append region into sorted region, keeps live entries readable") {
   auto idx = make_index();
   constexpr int key_count = 100;
-  for (int i = 0; i < key_count; ++i) {
-    CHECK(idx->put(to_span("k" + std::to_string(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sequential(*idx, key_count);
   CHECK(idx->append_size() == static_cast<size_t>(key_count));
 
-  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
+  idx->reorganize(identity_offset_mapper());
 
   CHECK(idx->append_size() == 0);
   for (int i = 0; i < key_count; ++i) {
@@ -109,7 +117,7 @@ TEST_CASE("T1Index: reorganize drops tombstoned entries") {
   CHECK(idx->put(to_span("b"), 2) == TestIndex::PutResult::Applied);
   CHECK(idx->put(to_span("a"), vmemkv::STORE_NOT_FOUND) == TestIndex::PutResult::Applied);
 
-  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
+  idx->reorganize(identity_offset_mapper());
 
   CHECK(idx->get(to_span("a")) == vmemkv::STORE_NOT_FOUND);
   CHECK(idx->get(to_span("b")) == 2U);
@@ -181,7 +189,7 @@ TEST_CASE("T1Index: concurrent put/get_with_hash/append_size survive racing reor
 
   std::thread reorganizer([&]() {
     while (!stop.load(std::memory_order_relaxed)) {
-      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
+      idx->reorganize(identity_offset_mapper());
       reorganize_count.fetch_add(1, std::memory_order_relaxed);
     }
   });
@@ -276,9 +284,9 @@ TEST_CASE(
   // reorg #2 merges both generations; exactly one (the latest, 222) should survive if the merge
   // correctly recognizes them as the same logical key.
   std::vector<InlineTestIndex::EntrySnapshot> merged_out;
-  idx->reorganize(
-      per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }),
-      [&](std::span<const InlineTestIndex::EntrySnapshot> merged) { merged_out.assign(merged.begin(), merged.end()); });
+  idx->reorganize(identity_offset_mapper(), [&](std::span<const InlineTestIndex::EntrySnapshot> merged) {
+    merged_out.assign(merged.begin(), merged.end());
+  });
 
   const auto k_prefix = t1_detail::prefix_from_bytes(to_span("k"));
   const auto count_for_k = std::ranges::count(merged_out, k_prefix, &InlineTestIndex::EntrySnapshot::key);
@@ -300,7 +308,7 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
   }
   // Moves every key into sorted_region, so put()'s in-place update reaches store_hash() on a
   // SortedSlot -- the path under test.
-  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
+  idx->reorganize(identity_offset_mapper());
   REQUIRE(idx->append_size() == 0);
 
   std::atomic<bool> stop{false};
@@ -308,7 +316,7 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
 
   std::thread reorganizer([&]() {
     while (!stop.load(std::memory_order_relaxed)) {
-      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
+      idx->reorganize(identity_offset_mapper());
       reorganize_count.fetch_add(1, std::memory_order_relaxed);
     }
   });
@@ -360,7 +368,7 @@ TEST_CASE("T1Index: get() never observes a live key as absent while a concurrent
 
   std::thread reorganizer([&]() {
     while (!stop.load(std::memory_order_relaxed)) {
-      idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }));
+      idx->reorganize(identity_offset_mapper());
     }
   });
 
@@ -413,7 +421,7 @@ TEST_CASE("T1Index: dedicated single writer per key survives racing reorganize w
   for (int i = 0; i < key_count; ++i) {
     REQUIRE(idx->put(to_span("k" + std::to_string(i)), 0) == TestIndex::PutResult::Applied);
   }
-  idx->reorganize(per_entry_offset_mapper([](uint64_t payload, uint64_t) { return payload; }));
+  idx->reorganize(identity_offset_mapper());
 
   std::atomic<bool> stop{false};
   std::thread reorganizer([&]() {
@@ -511,9 +519,9 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
     CHECK(idx->get(to_span(hot_key)) != vmemkv::STORE_NOT_FOUND);
 
     std::vector<TestIndex::EntrySnapshot> merged_out;
-    idx->reorganize(
-        per_entry_offset_mapper([](uint64_t payload, uint64_t /*hash*/) { return payload; }),
-        [&](std::span<const TestIndex::EntrySnapshot> merged) { merged_out.assign(merged.begin(), merged.end()); });
+    idx->reorganize(identity_offset_mapper(), [&](std::span<const TestIndex::EntrySnapshot> merged) {
+      merged_out.assign(merged.begin(), merged.end());
+    });
 
     const auto hot_prefix = t1_detail::prefix_from_bytes(to_span(hot_key));
     const auto count_for_hot = std::ranges::count(merged_out, hot_prefix, &TestIndex::EntrySnapshot::key);

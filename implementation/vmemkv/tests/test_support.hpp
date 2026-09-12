@@ -1,15 +1,20 @@
 // test_support.hpp - Shared helpers for the test_kv_store binary's constituent .cpp files.
 #pragma once
 
+#include <doctest/doctest.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <checkpoint/checkpoint.hpp>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -19,10 +24,7 @@
 
 namespace vmemkv_test {
 
-// Config override providing a small T1 append-region capacity (2^Log2 entries) so
-// reorganize()/split triggers without needing thousands of puts per test run. Both fields must be
-// redeclared: Entries is computed from Log2 inside Config<>'s own scope, so overriding Log2 alone
-// would silently leave Entries at the base 2^22 default.
+// Config override providing a small T1 append-region capacity (2^Log2 entries).
 template <size_t Log2>
 struct TinyAppendConfig : vmemkv::Config<> {
   static constexpr size_t T1AppendCapacityLog2 = Log2;
@@ -33,11 +35,7 @@ inline auto to_span(const std::string &text) -> std::span<const std::byte> {
   return std::span<const std::byte>(reinterpret_cast<const std::byte *>(text.data()), text.size());
 }
 
-// Wraps a per-entry function into T1Index::reorganize()'s/ShardedT1Index::checkpoint_all_shards()'s
-// OffsetMapper contract (a single batch call over the whole merged span): invokes `fn` once per
-// entry, in order, so a test's mapper can block *inside* it to freeze a reorganize() call
-// mid-flight for a race test with exact per-entry timing. A generic (`auto`) span parameter lets
-// one adapter serve every EntrySnapshot type across callers.
+// Adapts a per-entry function to T1Index::reorganize()'s OffsetMapper contract.
 template <typename PerEntryFn>
 auto per_entry_offset_mapper(PerEntryFn fn) {
   return [fn = std::move(fn)](auto merged) {
@@ -47,8 +45,7 @@ auto per_entry_offset_mapper(PerEntryFn fn) {
   };
 }
 
-// Base directory for test-created T2/WAL/checkpoint files. Sourced from VMEMKV_TEST_TMPDIR if
-// set, falling back to the system temp directory otherwise.
+// Base directory for test-created T2/WAL/checkpoint files.
 inline auto test_temp_root() -> const std::filesystem::path & {
   static const std::filesystem::path root = [] {
     if (const char *env = std::getenv("VMEMKV_TEST_TMPDIR"); env != nullptr && *env != '\0') {
@@ -59,9 +56,7 @@ inline auto test_temp_root() -> const std::filesystem::path & {
   return root;
 }
 
-// Builds a unique-per-process-per-call temp file path under `prefix` (pid + a monotonic counter
-// shared across every test file that calls this), and removes any stale file left at that path
-// (and, if requested, its WAL sibling) by a previous run.
+// Builds a unique-per-process-per-call temp file path under `prefix`.
 inline auto reserve_unique_temp_path(std::string_view prefix,
                                      bool also_remove_wal_sibling = false) -> std::filesystem::path {
   static std::atomic<uint64_t> counter{0};
@@ -77,8 +72,7 @@ inline auto reserve_unique_temp_path(std::string_view prefix,
   return temp_path;
 }
 
-// Removes every file a VMemKVImpl store could have created at `t2_path`: the T2 data file, its
-// WAL segments, manifest, and T1/T2 checkpoint files.
+// Removes every file a VMemKVImpl store could have created at `t2_path`.
 inline void remove_store_files(const std::filesystem::path &t2_path) {
   std::error_code ignored;
   std::filesystem::remove(t2_path, ignored);
@@ -88,12 +82,7 @@ inline void remove_store_files(const std::filesystem::path &t2_path) {
   std::filesystem::remove(vmemkv::derive_t2_chk_path(t2_path), ignored);
 }
 
-// RAII guard around a path from reserve_unique_temp_path(): implicitly converts to the reserved
-// path (so it drops into a call expecting a std::filesystem::path unchanged) and runs `cleanup`
-// on it both immediately (covering a stale leftover from a previous run, like
-// reserve_unique_temp_path()'s own `also_remove_wal_sibling`) and again on destruction --
-// including when a REQUIRE failure unwinds out of the test case, which an end-of-test cleanup
-// call would otherwise miss.
+// RAII guard around a path from reserve_unique_temp_path().
 class ScopedTempPath {
  public:
   ScopedTempPath(std::string_view prefix, std::function<void(const std::filesystem::path &)> cleanup)
@@ -132,9 +121,6 @@ inline auto span_to_string(std::span<const std::byte> value) -> std::string {
   return {reinterpret_cast<const char *>(value.data()), value.size()};
 }
 
-// Shared core of test_kv_store.cpp's get_bytes_sync() and test_crash_recovery.cpp's get_bytes():
-// both do the same store->get()-with-callback dance and only differ in the collection type they
-// hand back, so each is a thin wrapper around this.
 template <typename StorePtr, typename Key>
 auto get_optional_bytes(const StorePtr &store, const Key &key) -> std::optional<std::vector<std::byte>> {
   std::optional<std::vector<std::byte>> result;
@@ -144,6 +130,65 @@ auto get_optional_bytes(const StorePtr &store, const Key &key) -> std::optional<
     return result;
   }
   return std::nullopt;
+}
+
+// Fixed-width decimal key maker: prefix followed by the zero-padded index.
+inline auto padded_key(std::string_view prefix, long long index, int width) -> std::string {
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%.*s%0*lld", static_cast<int>(prefix.size()), prefix.data(), width, index);
+  return {buf};
+}
+
+// Fixed-width decimal key maker with the default "k" prefix.
+inline auto padded_key(long long index, int width) -> std::string { return padded_key("k", index, width); }
+
+// Value maker used by crash-recovery tests: always >= 9 bytes, forcing every write through T2.
+inline auto indexed_value(long long index) -> std::string { return "value_" + std::to_string(index) + "_pad"; }
+
+// Flips a single byte at `offset` in the file at `path`.
+inline void flip_byte_at(const std::filesystem::path &path, std::streamoff offset) {
+  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+  file.seekg(offset);
+  char original = 0;
+  file.read(&original, 1);
+  const char flipped = static_cast<char>(~original);
+  file.seekp(offset);
+  file.write(&flipped, 1);
+}
+
+// Resolves the WAL's active segment for either a WAL identity path or a T2 store path.
+inline auto resolve_active_wal_segment(const std::filesystem::path &path) -> std::filesystem::path {
+  if (const auto direct = vmemkv::find_active_wal_segment(path); direct.has_value()) {
+    return *direct;
+  }
+  const auto derived = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(path));
+  REQUIRE(derived.has_value());
+  return *derived;
+}
+
+// Appends raw bytes shorter than a full WAL record header to the active segment.
+inline void append_torn_header(const std::filesystem::path &path) {
+  const auto active = resolve_active_wal_segment(path);
+  std::ofstream out(active, std::ios::binary | std::ios::app);
+  constexpr std::array<char, 10> garbage{};
+  out.write(garbage.data(), garbage.size());
+}
+
+// Appends a full header declaring a longer payload than what actually follows.
+inline void append_torn_payload(const std::filesystem::path &path) {
+  vmemkv::WalRecordHeader header{};
+  header.lsn = 0;
+  header.checksum = 0;
+  header.magic = vmemkv::kWalRecordMagic;
+  header.key_len = 5;
+  header.value_len = 5;
+  header.type = static_cast<uint8_t>(vmemkv::WalRecordType::Insert);
+
+  const auto active = resolve_active_wal_segment(path);
+  std::ofstream out(active, std::ios::binary | std::ios::app);
+  out.write(reinterpret_cast<const char *>(&header), sizeof(header));
+  constexpr std::array<char, 3> partial_payload{'x', 'y', 'z'};
+  out.write(partial_payload.data(), partial_payload.size());
 }
 
 }  // namespace vmemkv_test

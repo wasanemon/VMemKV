@@ -46,10 +46,41 @@ const auto no_op_offset_mapper =
 
 // Sortable, fixed-width keys ("k" + zero-padded index) so directory boundary comparisons and
 // scan range order match numeric order.
-auto ikey(int i) -> std::string {
-  char buf[16];
-  std::snprintf(buf, sizeof(buf), "k%08d", i);
-  return std::string(buf);
+auto ikey(int i) -> std::string { return vmemkv_test::padded_key(i, 8); }
+
+void fill_sharded(TestIndex &idx, int count) {
+  for (int i = 0; i < count; ++i) {
+    CHECK(idx.put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
+  }
+}
+
+struct ShardSnapshot {
+  std::vector<TestIndex::Key> boundaries;
+  std::vector<std::vector<TestIndex::EntrySnapshot>> per_shard;
+};
+
+auto capture_all(TestIndex &idx) -> ShardSnapshot {
+  ShardSnapshot out;
+  out.boundaries =
+      idx.checkpoint_all_shards(no_op_offset_mapper, [&](std::span<const TestIndex::EntrySnapshot> merged) {
+        out.per_shard.emplace_back(merged.begin(), merged.end());
+      });
+  return out;
+}
+
+void check_scan_sorted_unique(
+    TestIndex &idx, int first, int last, std::size_t expected_count, bool require_sorted = true) {
+  std::vector<uint64_t> seen;
+  const size_t matched = idx.scan(to_span(ikey(first)),
+                                  to_span(ikey(last)),
+                                  [&](auto /*key*/, auto payload, auto /*hash*/) { seen.push_back(payload); });
+  CHECK(matched == expected_count);
+  REQUIRE(seen.size() == expected_count);
+  if (require_sorted) {
+    CHECK(std::is_sorted(seen.begin(), seen.end()));
+  }
+  const std::set<uint64_t> unique_seen(seen.begin(), seen.end());
+  CHECK(unique_seen.size() == seen.size());
 }
 
 }  // namespace
@@ -77,9 +108,7 @@ TEST_CASE("ShardedT1Index: put with STORE_NOT_FOUND tombstones the key") {
 TEST_CASE("ShardedT1Index: scan on a single shard returns all live entries in order") {
   auto idx = make_index();
   constexpr int kCount = 50;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
   std::vector<uint64_t> seen;
   const size_t matched = idx->scan(to_span(ikey(0)),
                                    to_span(ikey(kCount - 1)),
@@ -92,9 +121,7 @@ TEST_CASE("ShardedT1Index: scan on a single shard returns all live entries in or
 TEST_CASE("ShardedT1Index: split_shard_containing doubles the shard count and preserves all keys") {
   auto idx = make_index();
   constexpr int kCount = 400;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
 
   idx->split_shard_containing(to_span(ikey(0)));
   CHECK(idx->shard_count() == 2);
@@ -107,29 +134,17 @@ TEST_CASE("ShardedT1Index: split_shard_containing doubles the shard count and pr
 TEST_CASE("ShardedT1Index: scan across a split boundary is gap-free, duplicate-free, and sorted") {
   auto idx = make_index();
   constexpr int kCount = 400;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
   idx->split_shard_containing(to_span(ikey(0)));
   REQUIRE(idx->shard_count() == 2);
 
-  std::vector<uint64_t> seen;
-  const size_t matched = idx->scan(to_span(ikey(0)),
-                                   to_span(ikey(kCount - 1)),
-                                   [&](auto /*key*/, auto payload, auto /*hash*/) { seen.push_back(payload); });
-  CHECK(matched == static_cast<size_t>(kCount));
-  REQUIRE(seen.size() == static_cast<size_t>(kCount));
-  CHECK(std::is_sorted(seen.begin(), seen.end()));
-  const std::set<uint64_t> unique_seen(seen.begin(), seen.end());
-  CHECK(unique_seen.size() == seen.size());
+  check_scan_sorted_unique(*idx, 0, kCount - 1, static_cast<size_t>(kCount));
 }
 
 TEST_CASE("ShardedT1Index: put after split routes to the correct new shard and is visible") {
   auto idx = make_index();
   constexpr int kCount = 400;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
   idx->split_shard_containing(to_span(ikey(0)));
   REQUIRE(idx->shard_count() == 2);
 
@@ -143,9 +158,7 @@ TEST_CASE("ShardedT1Index: put after split routes to the correct new shard and i
 TEST_CASE("ShardedT1Index: splitting an already-splitting shard is a single-flight no-op") {
   auto idx = make_index();
   constexpr int kCount = 400;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
   idx->split_shard_containing(to_span(ikey(0)));
   REQUIRE(idx->shard_count() == 2);
   // Calling again on a key whose shard was never re-split is a correctness no-op (the target
@@ -159,9 +172,7 @@ TEST_CASE("ShardedT1Index: splitting an already-splitting shard is a single-flig
 TEST_CASE("ShardedT1Index: concurrent put/get/scan survive a racing split_shard_containing") {
   auto idx = make_index();
   constexpr int kCount = 800;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
 
   std::atomic<bool> stop{false};
   std::atomic<bool> saw_torn_read{false};
@@ -225,28 +236,7 @@ TEST_CASE("ShardedT1Index: concurrent put/get/scan survive a racing split_shard_
 }
 
 TEST_CASE("ShardedT1Index: a shard keeps splitting under sustained heavy concurrent writes, never stalling") {
-  // continue_split()'s second reorganize() -- taken after already winning the Closing CAS, to
-  // capture the shard's truly-final state -- can lose T1Index::reorganize()'s internal
-  // reorg_in_progress_ CAS to a redundant, concurrently-dequeued run_maintenance() attempt for the
-  // *same* shard (a duplicate queue entry, which the design otherwise treats as harmless);
-  // reorganize_until_captured() retries until the callback actually fires, so a lost race is never
-  // mistaken for the shard genuinely being too small to split. This test drives many writer and
-  // worker threads against a small split threshold so splits are attempted constantly, and asserts
-  // shard_count() actually keeps climbing rather than stalling near its earliest value.
-  //
-  // Sustained pressure matters here, not just a large one-shot key count: request_maintenance_if_
-  // needed() only re-fires once a shard's *append region* crosses its own soft threshold again,
-  // which needs fresh writes landing in that specific shard -- a burst of unique-key inserts
-  // followed by silence lets already-oversized shards sit unsplit forever with nothing left to
-  // trigger them, which would fail this test for an unrelated reason. So writers keep cycling
-  // put() over a fixed key range for as long as it takes shard_count() to climb past the target
-  // (or a generous round budget, as a hang-safety fallback) -- both organic reinsertion (any
-  // existing key's update also churns its shard's append region) and the sheer volume keep
-  // maintenance continuously re-triggered.
-  //
-  // kTargetShardCount is a conservative progress bar, not a throughput characterization: this
-  // test's job is to catch splitting stalling outright, not to fully characterize splitting
-  // throughput under extreme, unrealistic-scale contention.
+  // Splits are attempted constantly under sustained cycling writes; shard_count() must keep climbing.
   constexpr size_t kTargetShardSize = 300;  // Split threshold 200% -> 600 entries.
   constexpr size_t kWorkerThreads = 8;      // High enough for duplicate queue entries to be common.
   constexpr int kWriterThreads = 16;
@@ -277,26 +267,12 @@ TEST_CASE("ShardedT1Index: a shard keeps splitting under sustained heavy concurr
     writer.join();
   }
 
-  // A healthy split rate clears this conservative bar almost immediately.
-  //
-  // Deliberately does NOT also verify get() correctness for every key here: with 16 writers
-  // cycling non-monotonic values over the same range, no single final value is correct for any
-  // key, so a data check cannot distinguish a real inconsistency from a lost race between two
-  // live writers. Cycling-write consistency itself is covered by the "keep every key at its
-  // latest value" test below, where keys are partitioned across writers with monotonic values.
+  // Cycling writes carry no single correct final value per key, so only split progress is asserted.
   CHECK(shard_count >= kTargetShardCount);
 }
 
 TEST_CASE("ShardedT1Index: a split under concurrent writes loses no straggler entry") {
-  // A write that resolved a shard just before it entered Closing can still be "in flight" when
-  // continue_split()'s pre-split snapshot is taken, and land afterward -- put() re-checks its
-  // written slot's superseded and forwards its own write to the live shard before returning (see
-  // its own comment), since T1Index's own concurrency handling has no visibility into a caller
-  // that hasn't reached T1Index::put() yet. This test does a single-pass unique-key insert (each
-  // key written exactly once, unlike the cycling-writes shape of this file's other stress tests,
-  // which is what this straggler window needs to surface) at a scale small enough to run quickly
-  // in-tree; the same shape has also been validated clean at production scale (~5M keys, default
-  // target_shard_size).
+  // A single-pass unique-key insert surfaces the in-flight-write-across-split window.
   constexpr size_t kTargetShardSize = 5000;  // Split threshold 200% -> 10000 entries.
   constexpr int kWriterThreads = 4;
   constexpr int kKeyCount = 30000;  // Comfortably past several splits' worth at this target size.
@@ -388,38 +364,26 @@ TEST_CASE("ShardedT1Index: checkpoint on clean shards matches a full merge") {
   constexpr int kKeyCount = 3000;
   auto idx = make_index_with_target_size(kTargetShardSize, /*worker_threads=*/2);
 
-  for (int i = 0; i < kKeyCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kKeyCount);
 
-  using Snapshot = TestIndex::EntrySnapshot;
-  auto capture = [&](std::vector<std::vector<Snapshot>> &out) {
-    out.clear();
-    std::vector<TestIndex::Key> boundaries = idx->checkpoint_all_shards(
-        no_op_offset_mapper, [&](std::span<const Snapshot> merged) { out.emplace_back(merged.begin(), merged.end()); });
-    return boundaries;
-  };
-
-  std::vector<std::vector<Snapshot>> merged_out;
-  const std::vector<TestIndex::Key> merged_boundaries = capture(merged_out);
+  const ShardSnapshot merged = capture_all(*idx);
   size_t merged_total = 0;
-  for (const auto &shard : merged_out) {
+  for (const auto &shard : merged.per_shard) {
     merged_total += shard.size();
   }
   CHECK(merged_total == static_cast<size_t>(kKeyCount));
 
   // No writes since: every shard's append region is empty, so this is the dump path throughout.
   CHECK(idx->append_size() == 0);
-  std::vector<std::vector<Snapshot>> dumped_out;
-  const std::vector<TestIndex::Key> dumped_boundaries = capture(dumped_out);
-  CHECK(dumped_boundaries == merged_boundaries);
-  REQUIRE(dumped_out.size() == merged_out.size());
-  for (size_t s = 0; s < dumped_out.size(); ++s) {
-    REQUIRE(dumped_out[s].size() == merged_out[s].size());
-    for (size_t i = 0; i < dumped_out[s].size(); ++i) {
-      CHECK(dumped_out[s][i].key == merged_out[s][i].key);
-      CHECK(dumped_out[s][i].payload_bits == merged_out[s][i].payload_bits);
-      CHECK(dumped_out[s][i].hash == merged_out[s][i].hash);
+  const ShardSnapshot dumped = capture_all(*idx);
+  CHECK(dumped.boundaries == merged.boundaries);
+  REQUIRE(dumped.per_shard.size() == merged.per_shard.size());
+  for (size_t s = 0; s < dumped.per_shard.size(); ++s) {
+    REQUIRE(dumped.per_shard[s].size() == merged.per_shard[s].size());
+    for (size_t i = 0; i < dumped.per_shard[s].size(); ++i) {
+      CHECK(dumped.per_shard[s][i].key == merged.per_shard[s][i].key);
+      CHECK(dumped.per_shard[s][i].payload_bits == merged.per_shard[s][i].payload_bits);
+      CHECK(dumped.per_shard[s][i].hash == merged.per_shard[s][i].hash);
     }
   }
 }
@@ -483,9 +447,7 @@ TEST_CASE("ShardedT1Index: background worker automatically splits an oversized s
   // background worker picks it up without any explicit split_shard_containing() call.
   auto idx = make_index_with_target_size(/*target_shard_size=*/50);
   constexpr int kCount = 600;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
 
   bool split_happened = false;
   for (int attempt = 0; attempt < 200 && !split_happened; ++attempt) {
@@ -526,34 +488,22 @@ TEST_CASE("ShardedT1Index: concurrent inserts trigger multiple automatic splits 
     CHECK(idx->get(to_span(ikey(i))) == static_cast<uint64_t>(i));
   }
 
-  std::vector<uint64_t> seen;
-  const size_t matched = idx->scan(to_span(ikey(0)),
-                                   to_span(ikey(kTotalKeys - 1)),
-                                   [&](auto /*key*/, auto payload, auto /*hash*/) { seen.push_back(payload); });
-  CHECK(matched == static_cast<size_t>(kTotalKeys));
-  REQUIRE(seen.size() == static_cast<size_t>(kTotalKeys));
-  const std::set<uint64_t> unique_seen(seen.begin(), seen.end());
-  CHECK(unique_seen.size() == seen.size());
+  check_scan_sorted_unique(*idx, 0, kTotalKeys - 1, static_cast<size_t>(kTotalKeys), /*require_sorted=*/false);
 }
 
 TEST_CASE("ShardedT1Index: checkpoint_all_shards captures every live key across all shards") {
   auto idx = make_index();
   constexpr int kCount = 400;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
   idx->split_shard_containing(to_span(ikey(0)));
   REQUIRE(idx->shard_count() == 2);
 
-  std::vector<std::vector<TestIndex::EntrySnapshot>> per_shard;
-  const std::vector<TestIndex::Key> boundaries = idx->checkpoint_all_shards(
-      no_op_offset_mapper,
-      [&](std::span<const TestIndex::EntrySnapshot> merged) { per_shard.emplace_back(merged.begin(), merged.end()); });
+  const ShardSnapshot snapshot = capture_all(*idx);
 
-  REQUIRE(boundaries.size() == 1);
-  REQUIRE(per_shard.size() == 2);
+  REQUIRE(snapshot.boundaries.size() == 1);
+  REQUIRE(snapshot.per_shard.size() == 2);
   size_t total_entries = 0;
-  for (const auto &shard_entries : per_shard) {
+  for (const auto &shard_entries : snapshot.per_shard) {
     total_entries += shard_entries.size();
   }
   CHECK(total_entries == static_cast<size_t>(kCount));
@@ -562,19 +512,14 @@ TEST_CASE("ShardedT1Index: checkpoint_all_shards captures every live key across 
 TEST_CASE("ShardedT1Index: recovers via load_from_checkpoint into a fresh instance") {
   auto idx = make_index();
   constexpr int kCount = 400;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
   idx->split_shard_containing(to_span(ikey(0)));
   REQUIRE(idx->shard_count() == 2);
 
-  std::vector<std::vector<TestIndex::EntrySnapshot>> per_shard;
-  const std::vector<TestIndex::Key> boundaries = idx->checkpoint_all_shards(
-      no_op_offset_mapper,
-      [&](std::span<const TestIndex::EntrySnapshot> merged) { per_shard.emplace_back(merged.begin(), merged.end()); });
+  const ShardSnapshot snapshot = capture_all(*idx);
 
   auto recovered = make_index();
-  recovered->load_from_checkpoint(boundaries, per_shard);
+  recovered->load_from_checkpoint(snapshot.boundaries, snapshot.per_shard);
 
   CHECK(recovered->shard_count() == 2);
   for (int i = 0; i < kCount; ++i) {
@@ -589,9 +534,7 @@ TEST_CASE("ShardedT1Index: recovers via load_from_checkpoint into a fresh instan
 TEST_CASE("ShardedT1Index: checkpoint concurrent with put/get/scan/split loses no live key") {
   auto idx = make_index();
   constexpr int kCount = 800;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
 
   std::atomic<bool> stop{false};
   std::thread writer([&] {
@@ -640,9 +583,7 @@ TEST_CASE("ShardedT1Index: worker_threads=0 defers background maintenance until 
                                          /*target_shard_size=*/50,
                                          /*worker_threads=*/0);
   constexpr int kCount = 600;
-  for (int i = 0; i < kCount; ++i) {
-    CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
-  }
+  fill_sharded(*idx, kCount);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   CHECK(idx->shard_count() == 1);  // No worker running yet -- no automatic split could have happened.
@@ -715,14 +656,7 @@ TEST_CASE(
   reader.join();
 
   CHECK(idx->shard_count() > 1);
-  std::vector<uint64_t> seen;
-  const size_t matched = idx->scan(to_span(ikey(0)),
-                                   to_span(ikey(kCount - 1)),
-                                   [&](auto /*key*/, auto payload, auto /*hash*/) { seen.push_back(payload); });
-  CHECK(matched == static_cast<size_t>(kCount));
-  REQUIRE(seen.size() == static_cast<size_t>(kCount));
-  const std::set<uint64_t> unique_seen(seen.begin(), seen.end());
-  CHECK(unique_seen.size() == seen.size());
+  check_scan_sorted_unique(*idx, 0, kCount - 1, static_cast<size_t>(kCount), /*require_sorted=*/false);
   for (int i = 0; i < kCount; ++i) {
     CHECK(idx->get(to_span(ikey(i))) == static_cast<uint64_t>(i));
   }

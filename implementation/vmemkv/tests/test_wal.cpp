@@ -77,11 +77,6 @@ auto join_all_with_timeout(std::vector<std::thread> &threads, std::chrono::milli
   return completed;
 }
 
-auto reserve_wal_path() -> vmemkv_test::ScopedTempPath {
-  return vmemkv_test::ScopedTempPath("vmemkv_wal_test",
-                                     [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
-}
-
 using vmemkv_test::as_span;
 using vmemkv_test::bytes_of;
 using vmemkv_test::span_to_string;
@@ -108,10 +103,61 @@ struct ReplayedRecord {
   uint64_t lsn;
 };
 
+// Spawns thread_count threads each running per_thread iteration(t, i) calls; returns them joinable.
+template <typename Iteration>
+auto run_concurrent_appends(int thread_count, int per_thread, Iteration &&iteration) -> std::vector<std::thread> {
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<size_t>(thread_count));
+  for (int thread_index = 0; thread_index < thread_count; ++thread_index) {
+    threads.emplace_back([&, thread_index]() {
+      for (int i = 0; i < per_thread; ++i) {
+        iteration(thread_index, i);
+      }
+    });
+  }
+  return threads;
+}
+
+// Replays wal into an LSN-keyed map and checks it matches the recorded map entry for entry.
+void check_replay_matches(vmemkv::Wal &wal, const std::unordered_map<uint64_t, ReplayedRecord> &recorded_by_lsn) {
+  std::unordered_map<uint64_t, ReplayedRecord> replayed_by_lsn;
+  wal.replay(
+      [&](vmemkv::WalRecordType type, std::span<const std::byte> key, std::span<const std::byte> value, uint64_t lsn) {
+        replayed_by_lsn[lsn] = ReplayedRecord{type, span_to_string(key), span_to_string(value), lsn};
+      });
+
+  REQUIRE(replayed_by_lsn.size() == recorded_by_lsn.size());
+  for (const auto &[lsn, expected] : recorded_by_lsn) {
+    const auto it = replayed_by_lsn.find(lsn);
+    REQUIRE(it != replayed_by_lsn.end());
+    CHECK(it->second.type == expected.type);
+    CHECK(it->second.key == expected.key);
+    CHECK(it->second.value == expected.value);
+  }
+}
+
+// Replays wal into an LSN-keyed key map and checks every recorded key round-trips under its own LSN.
+void check_replay_matches(vmemkv::Wal &wal, const std::unordered_map<uint64_t, std::string> &recorded_by_lsn) {
+  std::unordered_map<uint64_t, std::string> replayed_by_lsn;
+  const uint64_t count = wal.replay([&](vmemkv::WalRecordType /*type*/,
+                                        std::span<const std::byte> key,
+                                        std::span<const std::byte> /*value*/,
+                                        uint64_t lsn) { replayed_by_lsn[lsn] = span_to_string(key); });
+
+  CHECK(count == static_cast<uint64_t>(recorded_by_lsn.size()));
+  REQUIRE(replayed_by_lsn.size() == recorded_by_lsn.size());
+  for (const auto &[lsn, expected_key] : recorded_by_lsn) {
+    const auto it = replayed_by_lsn.find(lsn);
+    REQUIRE(it != replayed_by_lsn.end());
+    CHECK(it->second == expected_key);
+  }
+}
+
 }  // namespace
 
 TEST_CASE("Wal: fresh file starts at LSN 1 with empty replay") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
   CHECK(wal.next_lsn() == 1);
 
@@ -123,7 +169,8 @@ TEST_CASE("Wal: fresh file starts at LSN 1 with empty replay") {
 }
 
 TEST_CASE("Wal: insert/update/delete assign strictly increasing LSNs") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
 
   const auto key = bytes_of("k1");
@@ -142,7 +189,8 @@ TEST_CASE("Wal: insert/update/delete assign strictly increasing LSNs") {
 }
 
 TEST_CASE("Wal: replay after reopen round-trips type/key/value/order") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   {
     vmemkv::Wal wal(path);
     append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
@@ -179,7 +227,8 @@ TEST_CASE("Wal: replay after reopen round-trips type/key/value/order") {
 }
 
 TEST_CASE("Wal: delete record replays with empty value span") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
   append_delete(wal, as_span(bytes_of("gone")));
 
@@ -197,7 +246,8 @@ TEST_CASE("Wal: delete record replays with empty value span") {
 }
 
 TEST_CASE("Wal: LSN numbering continues across reopen, does not reset") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   uint64_t last_lsn_before_reopen = 0;
   {
     vmemkv::Wal wal(path);
@@ -212,7 +262,8 @@ TEST_CASE("Wal: LSN numbering continues across reopen, does not reset") {
 }
 
 TEST_CASE("Wal: repeated open/close with zero appends stays empty") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   { vmemkv::Wal wal(path); }
   {
     vmemkv::Wal wal(path);
@@ -228,7 +279,8 @@ TEST_CASE("Wal: repeated open/close with zero appends stays empty") {
 }
 
 TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   const auto seg1 = vmemkv::derive_wal_segment_path(path, 1);
   uint64_t valid_end = 0;
   uint64_t first_lsn = 0;
@@ -239,11 +291,7 @@ TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
   }
 
   // Simulate a crash mid-append: append raw bytes shorter than a full header, bypassing Wal entirely.
-  {
-    std::ofstream out(seg1, std::ios::binary | std::ios::app);
-    constexpr std::array<char, 10> garbage{};
-    out.write(garbage.data(), garbage.size());
-  }
+  vmemkv_test::append_torn_header(path);
   REQUIRE(std::filesystem::file_size(seg1) == valid_end + 10);
 
   vmemkv::Wal wal(path);
@@ -264,7 +312,8 @@ TEST_CASE("Wal: torn trailing partial header is discarded and file truncated") {
 }
 
 TEST_CASE("Wal: torn trailing record with full header but truncated payload is discarded") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   const auto seg1 = vmemkv::derive_wal_segment_path(path, 1);
   uint64_t valid_end = 0;
   uint64_t first_lsn = 0;
@@ -274,23 +323,8 @@ TEST_CASE("Wal: torn trailing record with full header but truncated payload is d
     valid_end = std::filesystem::file_size(seg1);
   }
 
-  {
-    // The declared lsn on this fabricated header is never read back -- the torn payload check
-    // discards the record before its lsn would ever be trusted -- so any value works here.
-    vmemkv::WalRecordHeader header{};
-    header.lsn = first_lsn + 1;
-    header.checksum = 0;
-    header.magic = vmemkv::kWalRecordMagic;
-    header.key_len = 5;
-    header.value_len = 5;
-    header.type = static_cast<uint8_t>(vmemkv::WalRecordType::Insert);
-
-    std::ofstream out(seg1, std::ios::binary | std::ios::app);
-    out.write(reinterpret_cast<const char *>(&header), sizeof(header));
-    // Declares a 10-byte payload but only 3 bytes actually follow -- torn payload.
-    constexpr std::array<char, 3> partial_payload{'x', 'y', 'z'};
-    out.write(partial_payload.data(), partial_payload.size());
-  }
+  // Declares a 10-byte payload but only 3 bytes actually follow -- torn payload.
+  vmemkv_test::append_torn_payload(path);
 
   vmemkv::Wal wal(path);
   CHECK(std::filesystem::file_size(seg1) == valid_end);
@@ -298,7 +332,8 @@ TEST_CASE("Wal: torn trailing record with full header but truncated payload is d
 }
 
 TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier records survive") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   const auto seg1 = vmemkv::derive_wal_segment_path(path, 1);
   uint64_t after_first = 0;
   uint64_t first_lsn = 0;
@@ -309,17 +344,9 @@ TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier reco
     append_insert(wal, as_span(bytes_of("corrupt")), as_span(bytes_of("v2")));
   }
 
-  {
-    const auto offset = static_cast<std::streamoff>(after_first) +
-                        static_cast<std::streamoff>(offsetof(vmemkv::WalRecordHeader, checksum));
-    std::fstream file(seg1, std::ios::binary | std::ios::in | std::ios::out);
-    file.seekg(offset);
-    char original = 0;
-    file.read(&original, 1);
-    const char flipped = static_cast<char>(~original);
-    file.seekp(offset);
-    file.write(&flipped, 1);
-  }
+  vmemkv_test::flip_byte_at(seg1,
+                            static_cast<std::streamoff>(after_first) +
+                                static_cast<std::streamoff>(offsetof(vmemkv::WalRecordHeader, checksum)));
 
   vmemkv::Wal wal(path);
   CHECK(std::filesystem::file_size(seg1) == after_first);
@@ -335,7 +362,8 @@ TEST_CASE("Wal: corrupted checksum on trailing record is discarded, earlier reco
 }
 
 TEST_CASE("Wal: concurrent appends from multiple threads yield unique LSNs that all survive replay") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   constexpr int kThreadCount = 8;
   constexpr int kPerThread = 200;
   constexpr int kTotal = kThreadCount * kPerThread;
@@ -347,19 +375,11 @@ TEST_CASE("Wal: concurrent appends from multiple threads yield unique LSNs that 
   // so asserting strict contiguity here would test more than the class actually promises.
   vmemkv::Wal wal(path);
   std::vector<std::vector<uint64_t>> per_thread_lsns(kThreadCount);
-  std::vector<std::thread> threads;
-  threads.reserve(kThreadCount);
-  for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
-    threads.emplace_back([&wal, thread_index, &per_thread_lsns]() {
-      auto &lsns = per_thread_lsns[static_cast<size_t>(thread_index)];
-      lsns.reserve(kPerThread);
-      for (int i = 0; i < kPerThread; ++i) {
-        const auto key = bytes_of("t" + std::to_string(thread_index) + "_" + std::to_string(i));
-        const auto val = bytes_of("v");
-        lsns.push_back(append_insert(wal, as_span(key), as_span(val)));
-      }
-    });
-  }
+  auto threads = run_concurrent_appends(kThreadCount, kPerThread, [&](int thread_index, int i) {
+    const auto key = bytes_of("t" + std::to_string(thread_index) + "_" + std::to_string(i));
+    const auto val = bytes_of("v");
+    per_thread_lsns[static_cast<size_t>(thread_index)].push_back(append_insert(wal, as_span(key), as_span(val)));
+  });
   for (auto &thread : threads) {
     thread.join();
   }
@@ -386,7 +406,8 @@ TEST_CASE("Wal: concurrent appends from multiple threads yield unique LSNs that 
 }
 
 TEST_CASE("Wal: zero-length value on Insert round-trips distinctly from Delete") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   {
     vmemkv::Wal wal(path);
     const std::vector<std::byte> empty_value;
@@ -408,7 +429,8 @@ TEST_CASE("Wal: zero-length value on Insert round-trips distinctly from Delete")
 }
 
 TEST_CASE("Wal: large (>64KB) key/value payloads round-trip") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   constexpr size_t kLargeSize = 70 * 1024;
   const std::vector<std::byte> big_key(kLargeSize, std::byte{0xAB});
   const std::vector<std::byte> big_value(kLargeSize, std::byte{0xCD});
@@ -435,7 +457,8 @@ TEST_CASE("Wal: large (>64KB) key/value payloads round-trip") {
 
 TEST_CASE(
     "Wal: rotate_segment() rolls onto a new segment, replay() still sees everything (nothing 2 rollovers old yet)") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
 
   append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
@@ -458,7 +481,8 @@ TEST_CASE(
 }
 
 TEST_CASE("Wal: rotate_segment() deletes the generation two rollovers back") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
 
   const uint64_t lsn_a = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
@@ -482,7 +506,8 @@ TEST_CASE("Wal: rotate_segment() deletes the generation two rollovers back") {
 }
 
 TEST_CASE("Wal: rotate_segment() keeps LSN numbering continuous, does not reset") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
 
   append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
@@ -496,7 +521,8 @@ TEST_CASE("Wal: rotate_segment() keeps LSN numbering continuous, does not reset"
 }
 
 TEST_CASE("Wal: rotate_segment() with nothing written since the last rollover still preserves LSN continuity") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
 
   const uint64_t lsn_a = append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
@@ -517,7 +543,8 @@ TEST_CASE("Wal: rotate_segment() with nothing written since the last rollover st
 }
 
 TEST_CASE("Wal: rotate_segment() starts the new active segment empty") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   uint64_t size_before = 0;
   {
     vmemkv::Wal wal(path);
@@ -547,7 +574,8 @@ TEST_CASE("Wal: rotate_segment() starts the new active segment empty") {
 }
 
 TEST_CASE("Wal: rotate_segment() survives reopen -- every existing segment replays from a new Wal instance") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   uint64_t lsn_c = 0;
   {
     vmemkv::Wal wal(path);
@@ -579,7 +607,8 @@ TEST_CASE("Wal: append after reopening a non-empty WAL does not hang") {
   // Regression test: next_to_flush_ must be initialized from next_lsn_ after recovery, not left
   // at its default of 1, or the first append as leader on a reopened non-empty WAL spins forever
   // waiting for ring slots never published in this process.
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   {
     vmemkv::Wal wal(path);
     append_insert(wal, as_span(bytes_of("a")), as_span(bytes_of("1")));
@@ -604,7 +633,8 @@ TEST_CASE("Wal: concurrent appends replay with exactly the content each thread w
   // Strengthens the "concurrent appends yield unique LSNs" test above by also verifying
   // per-record content -- catches a group-commit batching bug (e.g. two records' bytes swapped
   // between slots) that a set-of-LSNs check alone would miss.
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   constexpr int kThreadCount = 32;
   constexpr int kPerThread = 50;
 
@@ -612,41 +642,22 @@ TEST_CASE("Wal: concurrent appends replay with exactly the content each thread w
   std::mutex recorded_mutex;
   std::unordered_map<uint64_t, ReplayedRecord> recorded_by_lsn;
 
-  std::vector<std::thread> threads;
-  threads.reserve(kThreadCount);
-  for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
-    threads.emplace_back([&, thread_index]() {
-      for (int i = 0; i < kPerThread; ++i) {
-        const std::string key_str = "t" + std::to_string(thread_index) + "_" + std::to_string(i);
-        const std::string value_str = "v" + std::to_string(thread_index) + "_" + std::to_string(i);
-        const auto key = bytes_of(key_str);
-        const auto val = bytes_of(value_str);
-        const uint64_t lsn = append_insert(wal, as_span(key), as_span(val));
-        std::lock_guard<std::mutex> lock(recorded_mutex);
-        recorded_by_lsn[lsn] = ReplayedRecord{vmemkv::WalRecordType::Insert, key_str, value_str, lsn};
-      }
-    });
-  }
+  auto threads = run_concurrent_appends(kThreadCount, kPerThread, [&](int thread_index, int i) {
+    const std::string key_str = "t" + std::to_string(thread_index) + "_" + std::to_string(i);
+    const std::string value_str = "v" + std::to_string(thread_index) + "_" + std::to_string(i);
+    const auto key = bytes_of(key_str);
+    const auto val = bytes_of(value_str);
+    const uint64_t lsn = append_insert(wal, as_span(key), as_span(val));
+    std::lock_guard<std::mutex> lock(recorded_mutex);
+    recorded_by_lsn[lsn] = ReplayedRecord{vmemkv::WalRecordType::Insert, key_str, value_str, lsn};
+  });
   for (auto &thread : threads) {
     thread.join();
   }
 
   REQUIRE(recorded_by_lsn.size() == static_cast<size_t>(kThreadCount * kPerThread));
 
-  std::unordered_map<uint64_t, ReplayedRecord> replayed_by_lsn;
-  wal.replay(
-      [&](vmemkv::WalRecordType type, std::span<const std::byte> key, std::span<const std::byte> value, uint64_t lsn) {
-        replayed_by_lsn[lsn] = ReplayedRecord{type, span_to_string(key), span_to_string(value), lsn};
-      });
-
-  REQUIRE(replayed_by_lsn.size() == recorded_by_lsn.size());
-  for (const auto &[lsn, expected] : recorded_by_lsn) {
-    const auto it = replayed_by_lsn.find(lsn);
-    REQUIRE(it != replayed_by_lsn.end());
-    CHECK(it->second.type == expected.type);
-    CHECK(it->second.key == expected.key);
-    CHECK(it->second.value == expected.value);
-  }
+  check_replay_matches(wal, recorded_by_lsn);
 }
 
 TEST_CASE("Wal: append storm exceeding ring capacity does not corrupt or duplicate records") {
@@ -657,7 +668,8 @@ TEST_CASE("Wal: append storm exceeding ring capacity does not corrupt or duplica
   //
   // Threads are joined via join_all_with_timeout() rather than detached (see its comment) to
   // avoid a TSan-caught false data race from a still-tearing-down detached thread.
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
 
   // Must exceed the ring's capacity (currently 4096 -- see wal.hpp's kWalRingCapacity) by a
@@ -667,43 +679,26 @@ TEST_CASE("Wal: append storm exceeding ring capacity does not corrupt or duplica
   std::mutex recorded_mutex;
   std::unordered_map<uint64_t, std::string> recorded_by_lsn;
 
-  std::vector<std::thread> threads;
-  threads.reserve(kAppendCount);
-  for (int i = 0; i < kAppendCount; ++i) {
-    threads.emplace_back([&, i]() {
-      const std::string key_str = "k" + std::to_string(i);
-      const auto key = bytes_of(key_str);
-      const auto val = bytes_of("v");
-      const uint64_t lsn = append_insert(wal, as_span(key), as_span(val));
-      std::lock_guard<std::mutex> lock(recorded_mutex);
-      recorded_by_lsn[lsn] = key_str;
-    });
-  }
+  auto threads = run_concurrent_appends(kAppendCount, 1, [&](int thread_index, int /*i*/) {
+    const std::string key_str = "k" + std::to_string(thread_index);
+    const auto key = bytes_of(key_str);
+    const auto val = bytes_of("v");
+    const uint64_t lsn = append_insert(wal, as_span(key), as_span(val));
+    std::lock_guard<std::mutex> lock(recorded_mutex);
+    recorded_by_lsn[lsn] = key_str;
+  });
 
   // Generous timeout: this test's high thread count is exactly what TSan's per-thread bookkeeping
   // overhead hits hardest -- comfortably under a second normally, over a minute under TSan.
   REQUIRE(join_all_with_timeout(threads, std::chrono::minutes(10)));
   REQUIRE(recorded_by_lsn.size() == static_cast<size_t>(kAppendCount));  // every LSN was unique
 
-  std::unordered_map<uint64_t, std::string> replayed_by_lsn;
-  const uint64_t count = wal.replay([&](vmemkv::WalRecordType /*type*/,
-                                        std::span<const std::byte> key,
-                                        std::span<const std::byte> /*value*/,
-                                        uint64_t lsn) { replayed_by_lsn[lsn] = span_to_string(key); });
-
-  CHECK(count == static_cast<uint64_t>(kAppendCount));
-  REQUIRE(replayed_by_lsn.size() == recorded_by_lsn.size());
-  for (const auto &[lsn, expected_key] : recorded_by_lsn) {
-    const auto it = replayed_by_lsn.find(lsn);
-    REQUIRE(it != replayed_by_lsn.end());
-    // Exactly the key this LSN's caller wrote -- not some other, stale record aliased in from a
-    // wrapped-around ring slot.
-    CHECK(it->second == expected_key);
-  }
+  check_replay_matches(wal, recorded_by_lsn);
 }
 
 TEST_CASE("Wal: rotate_segment() under concurrent appends returns promptly and loses nothing") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
 
   std::atomic<bool> stop{false};
@@ -764,7 +759,8 @@ TEST_CASE("Wal: rotate_segment() under concurrent appends returns promptly and l
 }
 
 TEST_CASE("Wal: write/fsync failure poisons the Wal and fails outstanding callers without hanging") {
-  const auto path = reserve_wal_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_wal_test",
+                                                [](const std::filesystem::path &p) { vmemkv::remove_wal_segments(p); });
   vmemkv::Wal wal(path);
 
   // Establish a small baseline so later writes past this size trigger EFBIG.

@@ -30,70 +30,41 @@
 
 namespace {
 
-auto reserve_crash_temp_path() -> vmemkv_test::ScopedTempPath {
-  return vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
-}
-
-// Values are always >= 9 bytes so T1InlineValue's <=8B inlining never applies,
-// forcing every write through T2 across all variants (including the fully-optimized one).
-auto make_value(int index) -> std::string { return "value_" + std::to_string(index) + "_pad"; }
-
-template <typename StorePtr>
-auto get_bytes(StorePtr &store, const std::string &key) -> std::optional<std::string> {
-  const auto bytes = vmemkv_test::get_optional_bytes(store, key);
-  if (!bytes.has_value()) {
-    return std::nullopt;
-  }
-  return vmemkv_test::span_to_string(vmemkv_test::as_span(*bytes));
-}
-
-// Simulates a crash mid-append: raw bytes shorter than a full WAL record header, appended
-// directly to the WAL's active segment file, bypassing vmemkv::Wal.
-void append_torn_header_bytes(const std::filesystem::path &t2_path) {
-  const auto active = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(t2_path));
-  REQUIRE(active.has_value());
-  std::ofstream out(*active, std::ios::binary | std::ios::app);
-  constexpr std::array<char, 10> garbage{};
-  out.write(garbage.data(), garbage.size());
-}
-
-// Simulates a crash after a well-formed header reached disk but its payload was cut short:
-// a full header (correct magic) declaring a longer payload than what actually follows.
-void append_torn_payload_bytes(const std::filesystem::path &t2_path) {
-  vmemkv::WalRecordHeader header{};
-  header.lsn = 0;  // Irrelevant: this record is always discarded as the torn tail.
-  header.checksum = 0;
-  header.magic = vmemkv::kWalRecordMagic;
-  header.key_len = 5;
-  header.value_len = 5;
-  header.type = static_cast<uint8_t>(vmemkv::WalRecordType::Insert);
-
-  const auto active = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(t2_path));
-  REQUIRE(active.has_value());
-  std::ofstream out(*active, std::ios::binary | std::ios::app);
-  out.write(reinterpret_cast<const char *>(&header), sizeof(header));
-  constexpr std::array<char, 3> partial_payload{'x', 'y', 'z'};
-  out.write(partial_payload.data(), partial_payload.size());
-}
-
-// Flips the checksum field of the WAL record starting at `record_start_offset` in the active
-// segment, corrupting it while leaving header/payload lengths intact -- simulates bit rot on an
-// already-fsynced record rather than a literal crash.
-void corrupt_record_checksum(const std::filesystem::path &t2_path, uint64_t record_start_offset) {
-  const auto active = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(t2_path));
-  REQUIRE(active.has_value());
-  const auto offset = static_cast<std::streamoff>(record_start_offset) +
-                      static_cast<std::streamoff>(offsetof(vmemkv::WalRecordHeader, checksum));
-  std::fstream file(*active, std::ios::binary | std::ios::in | std::ios::out);
-  file.seekg(offset);
-  char original = 0;
-  file.read(&original, 1);
-  const char flipped = static_cast<char>(~original);
-  file.seekp(offset);
-  file.write(&flipped, 1);
-}
-
 constexpr uint64_t kStoreCapacityBytes = 64ULL * 1024 * 1024;
+
+template <typename Store>
+void insert_range(Store &store, int key_count) {
+  for (int i = 0; i < key_count; ++i) {
+    REQUIRE(store.insert("k" + std::to_string(i), vmemkv_test::indexed_value(i)));
+  }
+}
+
+template <typename Store>
+void check_range(Store &store, int key_count) {
+  for (int i = 0; i < key_count; ++i) {
+    const auto bytes = vmemkv_test::get_optional_bytes(&store, "k" + std::to_string(i));
+    REQUIRE(bytes.has_value());
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*bytes)) == vmemkv_test::indexed_value(i));
+  }
+}
+
+// Inserts key_count keys, simulates a torn-tail crash via inject_fn, then recovers and verifies.
+template <typename Store, typename InjectFn>
+void check_torn_tail_discarded(const vmemkv_test::ScopedTempPath &path, int key_count, InjectFn &&inject) {
+  {
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
+    insert_range(*store, key_count);
+  }
+  inject(path);
+  {
+    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
+    check_range(*store, key_count);
+    REQUIRE(store->insert("new_key", vmemkv_test::indexed_value(999)));
+    const auto bytes = vmemkv_test::get_optional_bytes(store, "new_key");
+    REQUIRE(bytes.has_value());
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*bytes)) == vmemkv_test::indexed_value(999));
+  }
+}
 
 }  // namespace
 
@@ -101,210 +72,162 @@ constexpr uint64_t kStoreCapacityBytes = 64ULL * 1024 * 1024;
   vmemkv::variants::VMemKV_Var0_Baseline, vmemkv::variants::VMemKV_Var1_Bloom, vmemkv::variants::VMemKV_Var2_Inline
 
 TEST_CASE_TEMPLATE("crash recovery: clean restart, empty store stays empty", Store, CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   { auto store = std::make_unique<Store>(path, kStoreCapacityBytes); }
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    CHECK_FALSE(get_bytes(store, "anything").has_value());
-    CHECK(store->insert("k", make_value(0)));
+    CHECK_FALSE(vmemkv_test::get_optional_bytes(store, "anything").has_value());
+    CHECK(store->insert("k", vmemkv_test::indexed_value(0)));
   }
 }
 
 TEST_CASE_TEMPLATE("crash recovery: clean restart recovers 100 inserted keys", Store, CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kKeyCount = 100;
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
-    }
+    insert_range(*store, kKeyCount);
   }
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
-      REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
-    }
+    check_range(*store, kKeyCount);
   }
 }
 
 TEST_CASE_TEMPLATE("crash recovery: update then restart persists only the latest value",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    REQUIRE(store->insert("k", make_value(0)));
-    REQUIRE(store->update("k", make_value(1)));
-    REQUIRE(store->update("k", make_value(2)));
+    REQUIRE(store->insert("k", vmemkv_test::indexed_value(0)));
+    REQUIRE(store->update("k", vmemkv_test::indexed_value(1)));
+    REQUIRE(store->update("k", vmemkv_test::indexed_value(2)));
   }
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    const auto val = get_bytes(store, "k");
+    const auto val = vmemkv_test::get_optional_bytes(store, "k");
     REQUIRE(val.has_value());
-    CHECK(*val == make_value(2));
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(2));
   }
 }
 
 TEST_CASE_TEMPLATE("crash recovery: delete then restart tombstone is durable, re-insert works",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    REQUIRE(store->insert("k", make_value(0)));
+    REQUIRE(store->insert("k", vmemkv_test::indexed_value(0)));
     REQUIRE(store->remove("k"));
   }
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    CHECK_FALSE(get_bytes(store, "k").has_value());
-    REQUIRE(store->insert("k", make_value(1)));
-    const auto val = get_bytes(store, "k");
+    CHECK_FALSE(vmemkv_test::get_optional_bytes(store, "k").has_value());
+    REQUIRE(store->insert("k", vmemkv_test::indexed_value(1)));
+    const auto val = vmemkv_test::get_optional_bytes(store, "k");
     REQUIRE(val.has_value());
-    CHECK(*val == make_value(1));
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(1));
   }
 }
 
 TEST_CASE_TEMPLATE("crash recovery: insert-delete-reinsert-update replays to final state only",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    REQUIRE(store->insert("k", make_value(0)));
+    REQUIRE(store->insert("k", vmemkv_test::indexed_value(0)));
     REQUIRE(store->remove("k"));
-    REQUIRE(store->insert("k", make_value(1)));
-    REQUIRE(store->update("k", make_value(2)));
+    REQUIRE(store->insert("k", vmemkv_test::indexed_value(1)));
+    REQUIRE(store->update("k", vmemkv_test::indexed_value(2)));
   }
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    const auto val = get_bytes(store, "k");
+    const auto val = vmemkv_test::get_optional_bytes(store, "k");
     REQUIRE(val.has_value());
-    CHECK(*val == make_value(2));
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(2));
   }
 }
 
 TEST_CASE_TEMPLATE("crash recovery: torn trailing partial header discarded, prior writes recovered, store usable",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
-  constexpr int kKeyCount = 20;
-  {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
-    }
-  }
-  append_torn_header_bytes(path);
-  {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
-      REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
-    }
-    REQUIRE(store->insert("new_key", make_value(999)));
-    const auto val = get_bytes(store, "new_key");
-    REQUIRE(val.has_value());
-    CHECK(*val == make_value(999));
-  }
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
+  check_torn_tail_discarded<Store>(path, 20, [](const auto &wal_path) { vmemkv_test::append_torn_header(wal_path); });
 }
 
 TEST_CASE_TEMPLATE(
     "crash recovery: torn trailing full-header-truncated-payload discarded, prior writes recovered, store usable",
     Store,
     CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
-  constexpr int kKeyCount = 20;
-  {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
-    }
-  }
-  append_torn_payload_bytes(path);
-  {
-    auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
-      REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
-    }
-    REQUIRE(store->insert("new_key", make_value(999)));
-    const auto val = get_bytes(store, "new_key");
-    REQUIRE(val.has_value());
-    CHECK(*val == make_value(999));
-  }
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
+  check_torn_tail_discarded<Store>(path, 20, [](const auto &wal_path) { vmemkv_test::append_torn_payload(wal_path); });
 }
 
 TEST_CASE_TEMPLATE("crash recovery: corrupted checksum on last record discarded, earlier keys intact",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kKeyCount = 10;
   uint64_t offset_before_last = 0;
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
-    }
+    insert_range(*store, kKeyCount);
     const auto active = vmemkv::find_active_wal_segment(vmemkv::derive_wal_path(path));
     REQUIRE(active.has_value());
     offset_before_last = std::filesystem::file_size(*active);
-    REQUIRE(store->insert("doomed", make_value(999)));
+    REQUIRE(store->insert("doomed", vmemkv_test::indexed_value(999)));
   }
-  corrupt_record_checksum(path, offset_before_last);
+  vmemkv_test::flip_byte_at(vmemkv_test::resolve_active_wal_segment(path),
+                            static_cast<std::streamoff>(offset_before_last) +
+                                static_cast<std::streamoff>(offsetof(vmemkv::WalRecordHeader, checksum)));
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
-      REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
-    }
-    CHECK_FALSE(get_bytes(store, "doomed").has_value());
+    check_range(*store, kKeyCount);
+    CHECK_FALSE(vmemkv_test::get_optional_bytes(store, "doomed").has_value());
   }
 }
 
 TEST_CASE_TEMPLATE("crash recovery: writes after recovery remain durable across a second restart",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kFirstBatch = 20;
   constexpr int kSecondBatch = 20;
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
-      REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
+      REQUIRE(store->insert("a" + std::to_string(i), vmemkv_test::indexed_value(i)));
     }
   }
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
-      REQUIRE(get_bytes(store, "a" + std::to_string(i)).has_value());
+      REQUIRE(vmemkv_test::get_optional_bytes(store, "a" + std::to_string(i)).has_value());
     }
     for (int i = 0; i < kSecondBatch; ++i) {
-      REQUIRE(store->insert("b" + std::to_string(i), make_value(1000 + i)));
+      REQUIRE(store->insert("b" + std::to_string(i), vmemkv_test::indexed_value(1000 + i)));
     }
   }
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
-      const auto val = get_bytes(store, "a" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "a" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
     }
     for (int i = 0; i < kSecondBatch; ++i) {
-      const auto val = get_bytes(store, "b" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "b" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(1000 + i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(1000 + i));
     }
   }
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE_TEMPLATE("crash recovery: concurrent inserts before crash all recover", Store, CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kThreadCount = 8;
   constexpr int kPerThread = 200;
   std::atomic<bool> all_inserts_ok{true};
@@ -316,7 +239,7 @@ TEST_CASE_TEMPLATE("crash recovery: concurrent inserts before crash all recover"
       threads.emplace_back([&store, &all_inserts_ok, thread_index]() {
         for (int i = 0; i < kPerThread; ++i) {
           const std::string key = "t" + std::to_string(thread_index) + "_" + std::to_string(i);
-          if (!store->insert(key, make_value(thread_index * kPerThread + i))) {
+          if (!store->insert(key, vmemkv_test::indexed_value(thread_index * kPerThread + i))) {
             all_inserts_ok.store(false, std::memory_order_relaxed);
           }
         }
@@ -333,9 +256,10 @@ TEST_CASE_TEMPLATE("crash recovery: concurrent inserts before crash all recover"
     for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
       for (int i = 0; i < kPerThread; ++i) {
         const std::string key = "t" + std::to_string(thread_index) + "_" + std::to_string(i);
-        const auto val = get_bytes(store, key);
+        const auto val = vmemkv_test::get_optional_bytes(store, key);
         REQUIRE(val.has_value());
-        CHECK(*val == make_value(thread_index * kPerThread + i));
+        CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) ==
+              vmemkv_test::indexed_value(thread_index * kPerThread + i));
       }
     }
   }
@@ -344,13 +268,13 @@ TEST_CASE_TEMPLATE("crash recovery: concurrent inserts before crash all recover"
 TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct split, reorganize still works",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kInsertCount = 100;
   constexpr int kRemoveCount = 50;
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     for (int i = 0; i < kInsertCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+      REQUIRE(store->insert("k" + std::to_string(i), vmemkv_test::indexed_value(i)));
     }
     for (int i = 0; i < kRemoveCount; ++i) {
       REQUIRE(store->remove("k" + std::to_string(i)));
@@ -360,12 +284,12 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
     int live_count = 0;
     for (int i = 0; i < kInsertCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "k" + std::to_string(i));
       if (i < kRemoveCount) {
         CHECK_FALSE(val.has_value());
       } else {
         REQUIRE(val.has_value());
-        CHECK(*val == make_value(i));
+        CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
         ++live_count;
       }
     }
@@ -374,9 +298,9 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
     store->reorganize();  // T1-only fast path.
 
     for (int i = kRemoveCount; i < kInsertCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
     }
   }
 }
@@ -393,20 +317,20 @@ using VMemKV_TinyAppend = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyAppendConf
 // worker to clear reorg_running_) would hang forever once the WAL holds more live distinct keys
 // than one (tiny, 256-entry) append region can hold.
 TEST_CASE("crash recovery: recovery under tiny T1 append-region capacity does not hang") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kKeyCount = 5000;
   {
     auto store = std::make_unique<VMemKV_TinyAppend>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+      REQUIRE(store->insert("k" + std::to_string(i), vmemkv_test::indexed_value(i)));
     }
   }
   {
     auto store = std::make_unique<VMemKV_TinyAppend>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
     }
   }
 }
@@ -424,13 +348,13 @@ using VMemKV_TinyShard = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyShardConfig
 // and load_from_checkpoint()/ShardedT1CheckpointFile are exercised with more than one shard, not
 // just the K=1 case every other test in this file happens to stay within.
 TEST_CASE("checkpoint: sharded T1 survives checkpoint and restart with multiple shards") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kKeyCount = 2000;
   size_t shard_count_before_restart = 0;
   {
     auto store = std::make_unique<VMemKV_TinyShard>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+      REQUIRE(store->insert("k" + std::to_string(i), vmemkv_test::indexed_value(i)));
     }
     // Give the background worker pool time to notice and split.
     for (int attempt = 0; attempt < 200 && store->impl().t1().shard_count() == 1; ++attempt) {
@@ -444,9 +368,9 @@ TEST_CASE("checkpoint: sharded T1 survives checkpoint and restart with multiple 
     auto store = std::make_unique<VMemKV_TinyShard>(path, kStoreCapacityBytes);
     CHECK(store->impl().t1().shard_count() == shard_count_before_restart);
     for (int i = 0; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
     }
   }
 }
@@ -462,7 +386,7 @@ auto capacity_test_key(int index) -> std::string { return "key_over16bytes_" + s
 // T2 capacity exceeded), whose replay would hit the identical throw on every future restart,
 // permanently bricking the store.
 TEST_CASE("crash recovery: insert failing on T2 capacity exceeded leaves no phantom WAL record") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr uint64_t kTinyT2Capacity = 200;  // Room for 3 of these ~56B records, not 4.
 
   bool insert_threw = false;
@@ -483,17 +407,17 @@ TEST_CASE("crash recovery: insert failing on T2 capacity exceeded leaves no phan
   // for the key whose insert() threw), and that key must be absent from the recovered store.
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity);
   for (int i = 0; i < 3; ++i) {
-    const auto val = get_bytes(store, capacity_test_key(i));
+    const auto val = vmemkv_test::get_optional_bytes(store, capacity_test_key(i));
     REQUIRE(val.has_value());
-    CHECK(*val == "01234567");
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == "01234567");
   }
-  CHECK_FALSE(get_bytes(store, capacity_test_key(99)).has_value());
+  CHECK_FALSE(vmemkv_test::get_optional_bytes(store, capacity_test_key(99)).has_value());
 }
 
 // Same bug, but through update_impl()'s write_entry_lockfree() fallback path (value grew too
 // large for the in-place t2_.update_value_at() branch, forcing a fresh T2 append instead).
 TEST_CASE("crash recovery: update failing on T2 capacity exceeded leaves no phantom WAL record") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr uint64_t kTinyT2Capacity = 200;  // 2 inserts (112B) leaves 88B -- not enough for a 96B growth append.
 
   bool update_threw = false;
@@ -512,12 +436,12 @@ TEST_CASE("crash recovery: update failing on T2 capacity exceeded leaves no phan
   // Restarting must succeed, and key 0 must still hold its pre-update value (the failed update
   // left no phantom WAL record to replay).
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kTinyT2Capacity);
-  const auto val0 = get_bytes(store, capacity_test_key(0));
+  const auto val0 = vmemkv_test::get_optional_bytes(store, capacity_test_key(0));
   REQUIRE(val0.has_value());
-  CHECK(*val0 == "01234567");
-  const auto val1 = get_bytes(store, capacity_test_key(1));
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val0)) == "01234567");
+  const auto val1 = vmemkv_test::get_optional_bytes(store, capacity_test_key(1));
   REQUIRE(val1.has_value());
-  CHECK(*val1 == "01234567");
+  CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val1)) == "01234567");
 }
 
 // ─── Checkpoint / Reload integration tests ──────────────────────────────────────────────────
@@ -528,32 +452,26 @@ TEST_CASE("crash recovery: update failing on T2 capacity exceeded leaves no phan
 TEST_CASE_TEMPLATE("checkpoint: explicit checkpoint() persists a manifest and survives restart",
                    Store,
                    CRASH_RECOVERY_STORE_TYPES) {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kKeyCount = 50;
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
-    }
+    insert_range(*store, kKeyCount);
     store->impl().checkpoint();
     CHECK(std::filesystem::exists(vmemkv::derive_manifest_path(path)));
   }
   {
     auto store = std::make_unique<Store>(path, kStoreCapacityBytes);
-    for (int i = 0; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
-      REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
-    }
+    check_range(*store, kKeyCount);
   }
 }
 
 TEST_CASE("checkpoint: rolls the WAL onto a fresh, empty active segment") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kKeyCount = 200;
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < kKeyCount; ++i) {
-    REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+    REQUIRE(store->insert("k" + std::to_string(i), vmemkv_test::indexed_value(i)));
   }
   const auto wal_path = vmemkv::derive_wal_path(path);
   const auto active_before = vmemkv::find_active_wal_segment(wal_path);
@@ -570,10 +488,10 @@ TEST_CASE("checkpoint: rolls the WAL onto a fresh, empty active segment") {
 }
 
 TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 checkpoint files") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < 20; ++i) {
-    REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
+    REQUIRE(store->insert("a" + std::to_string(i), vmemkv_test::indexed_value(i)));
   }
   store->impl().checkpoint();
   const auto manifest1 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
@@ -584,7 +502,7 @@ TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 checkpoint file
   REQUIRE(std::filesystem::exists(t2_chk_path));
 
   for (int i = 0; i < 20; ++i) {
-    REQUIRE(store->insert("b" + std::to_string(i), make_value(1000 + i)));
+    REQUIRE(store->insert("b" + std::to_string(i), vmemkv_test::indexed_value(1000 + i)));
   }
   store->impl().checkpoint();
   const auto manifest2 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
@@ -598,12 +516,12 @@ TEST_CASE("checkpoint: a second checkpoint reuses the same T1/T2 checkpoint file
 }
 
 TEST_CASE("checkpoint: deletes and updates after a checkpoint are correctly reflected after restart") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kKeyCount = 30;
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
-      REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+      REQUIRE(store->insert("k" + std::to_string(i), vmemkv_test::indexed_value(i)));
     }
     store->impl().checkpoint();  // Checkpoint captures all 30 keys.
 
@@ -612,56 +530,56 @@ TEST_CASE("checkpoint: deletes and updates after a checkpoint are correctly refl
       REQUIRE(store->remove("k" + std::to_string(i)));
     }
     for (int i = kKeyCount / 2; i < kKeyCount; ++i) {
-      REQUIRE(store->update("k" + std::to_string(i), make_value(1000 + i)));
+      REQUIRE(store->update("k" + std::to_string(i), vmemkv_test::indexed_value(1000 + i)));
     }
   }
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount / 2; ++i) {
-      CHECK_FALSE(get_bytes(store, "k" + std::to_string(i)).has_value());
+      CHECK_FALSE(vmemkv_test::get_optional_bytes(store, "k" + std::to_string(i)).has_value());
     }
     for (int i = kKeyCount / 2; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, "k" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "k" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(1000 + i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(1000 + i));
     }
   }
 }
 
 TEST_CASE("checkpoint: insert/checkpoint/insert-more/restart preserves both pre- and post-checkpoint keys") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kFirstBatch = 20;
   constexpr int kSecondBatch = 20;
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
-      REQUIRE(store->insert("a" + std::to_string(i), make_value(i)));
+      REQUIRE(store->insert("a" + std::to_string(i), vmemkv_test::indexed_value(i)));
     }
     store->impl().checkpoint();
     for (int i = 0; i < kSecondBatch; ++i) {
-      REQUIRE(store->insert("b" + std::to_string(i), make_value(1000 + i)));
+      REQUIRE(store->insert("b" + std::to_string(i), vmemkv_test::indexed_value(1000 + i)));
     }
   }
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kFirstBatch; ++i) {
-      const auto val = get_bytes(store, "a" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "a" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
     }
     for (int i = 0; i < kSecondBatch; ++i) {
-      const auto val = get_bytes(store, "b" + std::to_string(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, "b" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(1000 + i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(1000 + i));
     }
   }
 }
 
 TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file fails construction loudly") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
-    REQUIRE(store->insert("k", make_value(0)));
+    REQUIRE(store->insert("k", vmemkv_test::indexed_value(0)));
     store->impl().checkpoint();
   }
   const auto manifest = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
@@ -682,10 +600,10 @@ TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file
 // threshold would let reorg_worker_loop()'s own auto-trigger race that explicit call (both
 // incrementing the same counter), making the exact-count assertion flaky.
 TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint file") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
   for (int i = 0; i < 200; ++i) {
-    REQUIRE(store->insert("k" + std::to_string(i), make_value(i)));
+    REQUIRE(store->insert("k" + std::to_string(i), vmemkv_test::indexed_value(i)));
   }
   const auto stats_before = store->impl().get_statistics();
   store->impl().checkpoint();
@@ -696,9 +614,9 @@ TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint f
   CHECK(std::filesystem::exists(vmemkv::derive_t2_chk_path(path)));
 
   for (int i = 0; i < 200; ++i) {
-    const auto val = get_bytes(store, "k" + std::to_string(i));
+    const auto val = vmemkv_test::get_optional_bytes(store, "k" + std::to_string(i));
     REQUIRE(val.has_value());
-    CHECK(*val == make_value(i));
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
   }
 }
 
@@ -708,10 +626,10 @@ TEST_CASE("checkpoint(): first call on a fresh store creates the T2 checkpoint f
 // (large) WalMaxBytesSinceCheckpoint -- see the previous test case's own comment for why a tiny
 // override would make this test's exact checkpoint_count assertion race auto-triggered cycles.
 TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survive restart") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
 
-  REQUIRE(store->insert("seed", make_value(-1)));
+  REQUIRE(store->insert("seed", vmemkv_test::indexed_value(-1)));
   store->impl().checkpoint();
   const auto manifest1 = vmemkv::read_manifest(vmemkv::derive_manifest_path(path));
   REQUIRE(manifest1.has_value());
@@ -726,7 +644,7 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
   uint64_t last_generation = manifest1->generation;
   for (int cycle = 0; cycle < kCycles; ++cycle) {
     for (int i = 0; i < kKeysPerCycle; ++i) {
-      REQUIRE(store->insert("c" + std::to_string(cycle) + "_" + std::to_string(i), make_value(i)));
+      REQUIRE(store->insert("c" + std::to_string(cycle) + "_" + std::to_string(i), vmemkv_test::indexed_value(i)));
     }
     store->impl().checkpoint();
 
@@ -744,12 +662,13 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
   // A genuine restart adopts the final checkpoint correctly.
   store.reset();
   auto restarted = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
-  CHECK(get_bytes(restarted, "seed").has_value());
+  CHECK(vmemkv_test::get_optional_bytes(restarted, "seed").has_value());
   for (int cycle = 0; cycle < kCycles; ++cycle) {
     for (int i = 0; i < kKeysPerCycle; ++i) {
-      const auto val = get_bytes(restarted, "c" + std::to_string(cycle) + "_" + std::to_string(i));
+      const auto val =
+          vmemkv_test::get_optional_bytes(restarted, "c" + std::to_string(cycle) + "_" + std::to_string(i));
       REQUIRE(val.has_value());
-      CHECK(*val == make_value(i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
     }
   }
 }
@@ -763,7 +682,7 @@ TEST_CASE("checkpoint: repeated checkpoint() calls durabilize in place and survi
 // known precisely (update() only returns once its WAL record is fsynced, low_level_design.md 3.2
 // 節), and a separate thread hammers checkpoint() throughout.
 TEST_CASE("checkpoint: in-place updates racing concurrent checkpoint() stay correct live and survive a restart") {
-  const auto path = reserve_crash_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv_test::remove_store_files);
   constexpr int kKeyCount = 8;
   constexpr int kUpdatesPerKey = 500;
   constexpr std::size_t kValueBytes = 200;
@@ -809,9 +728,9 @@ TEST_CASE("checkpoint: in-place updates racing concurrent checkpoint() stay corr
     // Live reads must reflect each key's actual last-written value, never a stale snapshot from
     // a checkpoint cycle that raced it.
     for (int i = 0; i < kKeyCount; ++i) {
-      const auto live = get_bytes(store, key_for(i));
+      const auto live = vmemkv_test::get_optional_bytes(store, key_for(i));
       REQUIRE(live.has_value());
-      CHECK(*live == last_written[static_cast<std::size_t>(i)]);
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*live)) == last_written[static_cast<std::size_t>(i)]);
     }
   }
   // Restart without a final checkpoint: recovery must reach the same state via WAL replay,
@@ -819,9 +738,9 @@ TEST_CASE("checkpoint: in-place updates racing concurrent checkpoint() stay corr
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Var0_Baseline>(path, kStoreCapacityBytes);
     for (int i = 0; i < kKeyCount; ++i) {
-      const auto val = get_bytes(store, key_for(i));
+      const auto val = vmemkv_test::get_optional_bytes(store, key_for(i));
       REQUIRE(val.has_value());
-      CHECK(*val == last_written[static_cast<std::size_t>(i)]);
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == last_written[static_cast<std::size_t>(i)]);
     }
   }
 }

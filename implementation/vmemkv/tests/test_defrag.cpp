@@ -24,24 +24,13 @@ namespace {
 using Store = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<vmemkv::Config<>>>;
 constexpr uint64_t kTestCapacityBytes = 64ULL * 1024 * 1024;
 
-auto reserve_defrag_temp_path() -> vmemkv_test::ScopedTempPath {
-  return vmemkv_test::ScopedTempPath("vmemkv_defrag", [](const std::filesystem::path &path) {
-    std::error_code ignored;
-    std::filesystem::remove(path, ignored);
-    std::filesystem::remove(vmemkv::derive_t2_chk_path(path), ignored);
-    std::filesystem::remove(vmemkv::derive_manifest_path(path), ignored);
-    std::filesystem::remove(vmemkv::derive_t1_chk_path(path), ignored);
-    vmemkv::remove_wal_segments(vmemkv::derive_wal_path(path));
-  });
-}
-
 auto make_store(const std::filesystem::path &path) -> std::unique_ptr<Store> {
   return std::make_unique<Store>(path, kTestCapacityBytes);
 }
 
 auto make_key(size_t index) -> std::string { return "k" + std::to_string(100000 + index); }
 
-auto make_value(size_t value_bytes, size_t index) -> std::string {
+auto pattern_value(size_t value_bytes, size_t index) -> std::string {
   std::string value(value_bytes, '\0');
   uint64_t state = static_cast<uint64_t>(index) * 0x9E3779B97F4A7C15ULL + 1;
   for (size_t off = 0; off < value_bytes; off += sizeof(uint64_t)) {
@@ -71,26 +60,26 @@ auto file_blocks(const std::filesystem::path &path) -> uint64_t {
 }  // namespace
 
 TEST_CASE("defrag accounting tracks append, overwrite, and delete exactly") {
-  const auto path = reserve_defrag_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_defrag", vmemkv_test::remove_store_files);
   auto store = make_store(path);
   constexpr size_t kKeys = 1000;
   constexpr size_t kVal1k = 1024;
   constexpr size_t kVal2k = 2048;
   const uint64_t per_record = hint_bytes(make_key(0).size(), kVal1k);
 
-  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kVal1k, i); });
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return pattern_value(kVal1k, i); });
   CHECK(store->get_statistics().t2_live_bytes == kKeys * per_record);
 
   // Same-size updates go in place: accounting unchanged.
   for (size_t i = 0; i < 100; ++i) {
-    CHECK(store->update(make_key(i), make_value(kVal1k, 100000 + i)));
+    CHECK(store->update(make_key(i), pattern_value(kVal1k, 100000 + i)));
   }
   CHECK(store->get_statistics().t2_live_bytes == kKeys * per_record);
 
   // Growing updates take the append path: old hint out, new hint in.
   const uint64_t per_record_big = hint_bytes(make_key(0).size(), kVal2k);
   for (size_t i = 0; i < 100; ++i) {
-    CHECK(store->update(make_key(i), make_value(kVal2k, 200000 + i)));
+    CHECK(store->update(make_key(i), pattern_value(kVal2k, 200000 + i)));
   }
   CHECK(store->get_statistics().t2_live_bytes == (kKeys - 100) * per_record + 100 * per_record_big);
 
@@ -102,13 +91,13 @@ TEST_CASE("defrag accounting tracks append, overwrite, and delete exactly") {
 }
 
 TEST_CASE("defrag cycle relocates, punches, and preserves every live record") {
-  const auto path = reserve_defrag_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_defrag", vmemkv_test::remove_store_files);
   auto store = make_store(path);
   // 4100 x ~2KiB records ~= 8.6MiB: segment 0 frozen full, segment 1 partial after checkpoint.
   constexpr size_t kKeys = 4100;
   constexpr size_t kValBytes = 2048;
   constexpr size_t kDelete = 2870;  // 70%: first segment goes majority-garbage.
-  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kValBytes, i); });
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return pattern_value(kValBytes, i); });
   store->checkpoint();
   for (size_t i = 0; i < kDelete; ++i) {
     CHECK(store->remove(make_key(i)));
@@ -136,7 +125,7 @@ TEST_CASE("defrag cycle relocates, punches, and preserves every live record") {
   for (size_t i = kDelete; i < kKeys; ++i) {
     const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
     REQUIRE(got.has_value());
-    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == make_value(kValBytes, i));
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == pattern_value(kValBytes, i));
   }
   for (size_t i = 0; i < kDelete; ++i) {
     CHECK_FALSE(vmemkv_test::get_optional_bytes(store, make_key(i)).has_value());
@@ -153,13 +142,13 @@ TEST_CASE("defrag cycle relocates, punches, and preserves every live record") {
 }
 
 TEST_CASE("defrag state survives checkpoint plus restart") {
-  const auto path = reserve_defrag_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_defrag", vmemkv_test::remove_store_files);
   constexpr size_t kKeys = 4100;
   constexpr size_t kValBytes = 2048;
   constexpr size_t kDelete = 2870;
   {
     auto store = make_store(path);
-    store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kValBytes, i); });
+    store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return pattern_value(kValBytes, i); });
     store->checkpoint();
     for (size_t i = 0; i < kDelete; ++i) {
       CHECK(store->remove(make_key(i)));
@@ -172,7 +161,7 @@ TEST_CASE("defrag state survives checkpoint plus restart") {
     for (size_t i = kDelete; i < kKeys; ++i) {
       const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
       REQUIRE(got.has_value());
-      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == make_value(kValBytes, i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == pattern_value(kValBytes, i));
     }
     const uint64_t per_record = hint_bytes(make_key(0).size(), kValBytes);
     CHECK(store->get_statistics().t2_live_bytes == (kKeys - kDelete) * per_record);
@@ -184,11 +173,11 @@ TEST_CASE("defrag cycle relocating more than the WAL ring holds still completes"
   // garbage bar), freeze with a checkpoint, then relocate ~12k live records in one
   // cycle -- well past the 4096-slot WAL ring. Reserves must drain incrementally: with
   // no other thread in await_durable(), a whole-cycle batch wedges reserve() forever.
-  const auto path = reserve_defrag_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_defrag", vmemkv_test::remove_store_files);
   auto store = make_store(path);
   constexpr size_t kKeys = 30000;
   constexpr size_t kValBytes = 256;
-  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kValBytes, i); });
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return pattern_value(kValBytes, i); });
   for (size_t i = 0; i < kKeys; ++i) {
     if (i % 10 < 6) {
       CHECK(store->remove(make_key(i)));
@@ -204,17 +193,17 @@ TEST_CASE("defrag cycle relocating more than the WAL ring holds still completes"
       CHECK_FALSE(got.has_value());
     } else {
       REQUIRE(got.has_value());
-      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == make_value(kValBytes, i));
+      CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == pattern_value(kValBytes, i));
     }
   }
 }
 
 TEST_CASE("defrag runs concurrently with updates without losing writes") {
-  const auto path = reserve_defrag_temp_path();
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_defrag", vmemkv_test::remove_store_files);
   auto store = make_store(path);
   constexpr size_t kKeys = 2000;
   constexpr size_t kValBytes = 256;
-  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return make_value(kValBytes, i); });
+  store->bulk_load(kKeys, [](size_t i) { return make_key(i); }, [](size_t i) { return pattern_value(kValBytes, i); });
   store->checkpoint();
 
   constexpr int kWriters = 4;
@@ -231,7 +220,7 @@ TEST_CASE("defrag runs concurrently with updates without losing writes") {
           if (i % 7 == 0 && r == 0) {
             store->remove(make_key(i));
           } else {
-            store->update(make_key(i), make_value(kValBytes, 1000000 + static_cast<size_t>(t) * 10000 + r));
+            store->update(make_key(i), pattern_value(kValBytes, 1000000 + static_cast<size_t>(t) * 10000 + r));
           }
         }
       }
@@ -255,7 +244,7 @@ TEST_CASE("defrag runs concurrently with updates without losing writes") {
     } else {
       REQUIRE(got.has_value());
       CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) ==
-            make_value(kValBytes, 1000000 + static_cast<size_t>(owner) * 10000 + (kRounds - 1)));
+            pattern_value(kValBytes, 1000000 + static_cast<size_t>(owner) * 10000 + (kRounds - 1)));
     }
   }
 }

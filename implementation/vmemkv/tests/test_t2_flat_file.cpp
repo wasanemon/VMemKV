@@ -17,8 +17,6 @@
 
 namespace {
 
-auto reserve_t2_path() -> std::filesystem::path { return vmemkv_test::reserve_unique_temp_path("vmemkv_t2_test"); }
-
 using vmemkv_test::as_span;
 using vmemkv_test::bytes_of;
 using vmemkv_test::span_to_string;
@@ -26,7 +24,7 @@ using vmemkv_test::span_to_string;
 constexpr uint64_t kTestCapacityBytes = 4ULL * 1024 * 1024;
 
 struct TempT2File {
-  std::filesystem::path path = reserve_t2_path();
+  std::filesystem::path path = vmemkv_test::reserve_unique_temp_path("vmemkv_t2_test");
   vmemkv::T2FlatFile file{path, kTestCapacityBytes};
 
   ~TempT2File() {
