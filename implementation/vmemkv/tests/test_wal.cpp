@@ -24,6 +24,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <wal/wal.hpp>
 
@@ -104,14 +105,16 @@ struct ReplayedRecord {
 };
 
 // Spawns thread_count threads each running per_thread iteration(t, i) calls; returns them joinable.
+// The iteration callable is moved into each thread: it may be a temporary at the call site, which
+// would dangle by the time the returned (still-joinable) threads run.
 template <typename Iteration>
 auto run_concurrent_appends(int thread_count, int per_thread, Iteration &&iteration) -> std::vector<std::thread> {
   std::vector<std::thread> threads;
   threads.reserve(static_cast<size_t>(thread_count));
   for (int thread_index = 0; thread_index < thread_count; ++thread_index) {
-    threads.emplace_back([&, thread_index]() {
+    threads.emplace_back([call = std::forward<Iteration>(iteration), thread_index, per_thread]() mutable {
       for (int i = 0; i < per_thread; ++i) {
-        iteration(thread_index, i);
+        call(thread_index, i);
       }
     });
   }
