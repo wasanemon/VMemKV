@@ -20,13 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common/reorg_probe_common.sh
 source "$SCRIPT_DIR/common/reorg_probe_common.sh"
 
-PROBE_LOG_PREFIX="background-jobs-probe"
-BENCH_KV_BIN="${1:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter]}"
-OUTPUT_PATH="${2:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter]}"
-DB_DIR="${3:-/tmp}"
-SCENARIO_FILTER="${4:-}"
-
-: > "$OUTPUT_PATH"
+init_probe_driver "background-jobs-probe" "$@"
+SCENARIO_FILTER="$COMBO_FILTER"
 
 # Generous: populating 10,000,000 records plus a full checkpoint()/reorganize() cycle under LTM
 # memory pressure can legitimately take longer than the smaller sweeps the other (retired) probes

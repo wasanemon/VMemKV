@@ -30,44 +30,44 @@ vmemkv_git_dirty() {
   fi
 }
 
-vmemkv_scenario_order_label() {
+vmemkv_join_arrow() {
   local joined=""
-  local scenario_key
+  local item
 
-  for scenario_key in "$@"; do
+  for item in "$@"; do
     if [[ -z "$joined" ]]; then
-      joined="$scenario_key"
+      joined="$item"
     else
-      joined+="->$scenario_key"
+      joined+="->$item"
     fi
   done
   printf '%s\n' "$joined"
+}
+
+vmemkv_scenario_order_label() {
+  vmemkv_join_arrow "$@"
 }
 
 vmemkv_value_order_label() {
-  local joined=""
+  local mapped=()
   local value_key
 
   for value_key in "$@"; do
-    if [[ -z "$joined" ]]; then
-      case "$value_key" in
-        64kb) joined="64KB" ;;
-        1kb) joined="1KB" ;;
-        *) joined="8B" ;;
-      esac
-    else
-      case "$value_key" in
-        64kb) joined+="->64KB" ;;
-        1kb) joined+="->1KB" ;;
-        *) joined+="->8B" ;;
-      esac
-    fi
+    case "$value_key" in
+      64kb) mapped+=("64KB") ;;
+      1kb) mapped+=("1KB") ;;
+      *) mapped+=("8B") ;;
+    esac
   done
-  printf '%s\n' "$joined"
+  if ((${#mapped[@]})); then
+    vmemkv_join_arrow "${mapped[@]}"
+  else
+    printf '\n'
+  fi
 }
 
 vmemkv_target_profile_label() {
-  local joined=""
+  local mapped=()
   local scenario_key
   local ratio
 
@@ -77,14 +77,13 @@ vmemkv_target_profile_label() {
       ltm) ratio="8.0" ;;
       *) ratio="?" ;;
     esac
-
-    if [[ -z "$joined" ]]; then
-      joined="$scenario_key=$ratio"
-    else
-      joined+="->$scenario_key=$ratio"
-    fi
+    mapped+=("$scenario_key=$ratio")
   done
-  printf '%s\n' "$joined"
+  if ((${#mapped[@]})); then
+    vmemkv_join_arrow "${mapped[@]}"
+  else
+    printf '\n'
+  fi
 }
 
 vmemkv_benchmark_memo() {

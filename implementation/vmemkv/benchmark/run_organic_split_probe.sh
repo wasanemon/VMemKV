@@ -21,17 +21,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common/reorg_probe_common.sh
 source "$SCRIPT_DIR/common/reorg_probe_common.sh"
 
-PROBE_LOG_PREFIX="organic-split-probe"
-BENCH_KV_BIN="${1:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter]}"
-OUTPUT_PATH="${2:?usage: $0 <bench_kv_binary> <output_jsonl_path> [db_dir] [scenario_filter]}"
-DB_DIR="${3:-/tmp}"
-SCENARIO_FILTER="${4:-}"
+init_probe_driver "organic-split-probe" "$@"
+SCENARIO_FILTER="$COMBO_FILTER"
 KEY_PATTERN="${5:-monotonic}"
 # Accept both the bare pattern ("random") and the bench_kv flag form ("--key-pattern=random")
 # so remote callers can forward the flag verbatim.
 KEY_PATTERN="${KEY_PATTERN#--key-pattern=}"
-
-: > "$OUTPUT_PATH"
 
 # Generous: the probe itself runs a fixed ~90s (bench_kv.cpp's kOrganicSplitProbeDurationSec) of
 # sustained inserts, so there's real headroom needed beyond that alone.

@@ -15,6 +15,23 @@ vmemkv_matrix::vmemkv_variant_filter() {
   esac
 }
 
+vmemkv_matrix::_store_filter() {
+  # Shared body for scenario_filter() / scenario_filter_no_leanstore(): include_leanstore
+  # ("true"/"1") keeps the LeanStore alternative in the rival branch.
+  local scenario_key="${1:-}"
+  local vmemkv_only="${2:-}"
+  local include_leanstore="${3:-true}"
+  local variants
+  variants="$(vmemkv_matrix::vmemkv_variant_filter "$scenario_key")"
+  if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
+    printf '(^Store=VMemKV/Variant=(%s)/)\n' "$variants"
+  elif [[ "$include_leanstore" == "true" || "$include_leanstore" == "1" ]]; then
+    printf '(^Store=VMemKV/Variant=(%s)/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/|^Store=LeanStore/)\n' "$variants"
+  else
+    printf '(^Store=VMemKV/Variant=(%s)/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/)\n' "$variants"
+  fi
+}
+
 vmemkv_matrix::scenario_filter() {
   # vmemkv_only ("true"/"1"): drops the four rival backends
   # (RocksDB/RocksDB-BlobDB/LMDB/LeanStore) from
@@ -22,15 +39,7 @@ vmemkv_matrix::scenario_filter() {
   # re-measuring them is pure wasted AWS time/cost for a regression-check run. Their most recent
   # full-matrix numbers (from a run with this left off) are meant to be merged back in afterward
   # rather than re-measured every time; see merge_partial_results.py (--keep-prefix Store=VMemKV/).
-  local scenario_key="${1:-}"
-  local vmemkv_only="${2:-}"
-  local variants
-  variants="$(vmemkv_matrix::vmemkv_variant_filter "$scenario_key")"
-  if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
-    printf '(^Store=VMemKV/Variant=(%s)/)\n' "$variants"
-  else
-    printf '(^Store=VMemKV/Variant=(%s)/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/|^Store=LeanStore/)\n' "$variants"
-  fi
+  vmemkv_matrix::_store_filter "${1:-}" "${2:-}" true
 }
 
 vmemkv_matrix::scenario_filter_no_leanstore() {
@@ -38,15 +47,7 @@ vmemkv_matrix::scenario_filter_no_leanstore() {
   # so the 64KB corpus (65536-byte values) is unstorable there; benchmark_filter_for_case()
   # substitutes this for 64KB cases (RE2 has no negative lookahead, hence the explicit
   # alternation instead of an exclusion pattern).
-  local scenario_key="${1:-}"
-  local vmemkv_only="${2:-}"
-  local variants
-  variants="$(vmemkv_matrix::vmemkv_variant_filter "$scenario_key")"
-  if [[ "$vmemkv_only" == "true" || "$vmemkv_only" == "1" ]]; then
-    printf '(^Store=VMemKV/Variant=(%s)/)\n' "$variants"
-  else
-    printf '(^Store=VMemKV/Variant=(%s)/|^Store=RocksDB/|^Store=RocksDB-BlobDB/|^Store=LMDB/)\n' "$variants"
-  fi
+  vmemkv_matrix::_store_filter "${1:-}" "${2:-}" false
 }
 
 # LTM scenario memory parameters: a small *declared* budget (fed to bench_kv as

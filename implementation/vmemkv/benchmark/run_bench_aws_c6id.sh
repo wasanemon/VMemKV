@@ -164,25 +164,9 @@ fi
 
 # ── Configuration Parameters ──────────────────────────────────────────────
 AWS_REGION="ap-northeast-1"
-# i4i: current-generation storage-optimized family (3rd-gen Nitro SSD local NVMe), switched from
-# c6id.8xlarge on 2026-07-30 after c6id spot capacity in this region dried up (placement scores of
-# 1/10 across all 3 AZs). i4i.8xlarge matches c6id.8xlarge's 32 vCPUs (keeps the existing
-# 1/4/16/32-thread concurrency sweep unchanged) and is a more direct fit for this project's actual
-# claim (how well OS-managed paging/swap performs against fast local NVMe) than a compute-
-# optimized family where NVMe is a secondary feature. At switch time it was *also* both more
-# available (placement score 3/10 vs 1/10, all 3 AZs) and cheaper on spot (~$0.60-0.64/hr vs
-# ~$0.74-0.75/hr) than c6id.8xlarge, despite a higher on-demand list price ($3.22 vs $2.05/hr) --
-# re-check both `get-spot-placement-scores` and `describe-spot-price-history` before assuming
-# either holds, they shift over time.
+# i4i.8xlarge (32 vCPU, local NVMe): storage-optimized family sized for the 1/4/16/32-thread sweep and the LTM/swap workload.
 INSTANCE_TYPE="i4i.8xlarge"
-# Pin the spot request to whichever AZ currently has the best odds, rather than leaving subnet
-# selection to run-instances' own (uncontrollable, for a single non-Fleet request) default.
-# `aws ec2 get-spot-placement-scores --instance-types i4i.8xlarge --target-capacity 1
-# --region-names ap-northeast-1 --single-availability-zone` scores all 3 AZs equally (3/10) as of
-# 2026-08-17, so among AZs with equal interruption odds, pick by `describe-spot-price-history`
-# instead: ap-northeast-1d ran ~5-15% cheaper than -1a and ~16% cheaper than -1c over the trailing
-# 7 days (~$0.55-0.56/hr vs ~$0.58-0.65/hr vs ~$0.64-0.68/hr). Re-run both commands before assuming
-# either still holds; they shift over time.
+# Pin the spot request to one AZ; re-check placement scores and spot-price history before assuming this choice still holds.
 PREFERRED_AZ="ap-northeast-1d"
 MIN_TIME="5.0s"
 LTM_MEMORY_BUDGET_BYTES="$(vmemkv_matrix::ltm_memory_budget_bytes)"
@@ -380,20 +364,7 @@ install_remote_dependencies() {
 prepare_remote_storage() {
   echo "Locating and mounting local NVMe SSD..."
   ssh $SSH_OPTS "ubuntu@$PUBLIC_IP" "
-    # Picks the nvme*n1 device that is both unpartitioned and not itself mounted, rather than
-    # assuming a fixed index (nvme0n1 = root, nvme1n1 = local NVMe) or comparing raw size: a
-    # freshly-launched instance's local instance-store NVMe is always raw and untouched at boot,
-    # while the root EBS volume always carries at least one partition (boot/root, or a separate
-    # /boot). This survived two narrower earlier attempts that both broke on real launches: (1)
-    # excluding whichever device's PKNAME matched / /boot /boot/efi missed a whole-disk-mounted
-    # root (no partition, so no PKNAME -- lsblk -no PKNAME,MOUNTPOINT's empty PKNAME field then
-    # shifts the mountpoint into the wrong awk column when field-split on whitespace); (2) picking
-    # the largest device by size alone correctly identified the real local NVMe, but the *existing*
-    # already-mounted-elsewhere fallback below (now removed) matched by a bare \"nvme[1-9]n1\"
-    # regex against /proc/mounts with no regard for which device it actually found -- when /boot
-    # lived on a *partition* of the selected device (so findmnt -S <whole device> correctly found
-    # nothing), that fallback matched instead on an unrelated device/partition also mounted at
-    # /boot, and reported it as if it were the selected device's own mount.
+    # Select the nvme*n1 device that is both unpartitioned and not itself mounted (root EBS always carries a partition or a whole-disk mount; the local instance-store NVMe is raw at boot).
     DEV=\"\"
     for CAND in \$(lsblk -dbno NAME,SIZE | grep -E '^nvme[0-9]+n1' | sort -k2 -n -r | awk '{print \$1}'); do
       PART_COUNT=\$(lsblk -ln -o NAME \"/dev/\$CAND\" | wc -l)

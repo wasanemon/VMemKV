@@ -137,22 +137,48 @@ def _normalize_value_size(file_val_size):
     return file_val_size
 
 
-def build_timeline_data(report_dir):
-    timeline_data = {}
+def _resolve_variant_label(store, variant):
+    base_store = store.split("-", 1)[0] if store.startswith("VMemKV") else store
+    return STORE_VARIANT_TO_LABEL.get((base_store, variant))
+
+
+def _load_per_variant(report_dir, glob, key_fn):
+    """Yield (key, record) pairs for per-variant data files.
+
+    Iterates SCENARIO_LABELS in order; per entry, globs glob.format(scenario=scenario,
+    val_size=val_size). JSON files yield their whole document as one record, JSONL files
+    one record per non-blank line. key_fn(scenario_key, record, val_size, path) returns
+    the dict key, or None to skip the record.
+    """
     for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
-        variants = {}
-        for f in report_dir.glob(f"ycsb_e_timeline_{scenario}_*.json"):
-            d = json.loads(f.read_text())
-            store = d["store"]
-            variant = d["variant"]
-            if _normalize_value_size(d["value_size"]) != val_size:
-                continue
-            base_store = store.split("-", 1)[0] if store.startswith("VMemKV") else store
-            label = STORE_VARIANT_TO_LABEL.get((base_store, variant))
-            if label is None:
-                continue
-            variants[label] = d["timeline"]
-        timeline_data[scenario_key] = variants
+        for path in report_dir.glob(glob.format(scenario=scenario, val_size=val_size)):
+            if path.suffix == ".jsonl":
+                records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+            else:
+                records = [json.loads(path.read_text())]
+            for record in records:
+                key = key_fn(scenario_key, record, val_size, path)
+                if key is not None:
+                    yield key, record
+
+
+def _timeline_variant_key(scenario_key, record, val_size, path):
+    store = record["store"]
+    variant = record["variant"]
+    if _normalize_value_size(record["value_size"]) != val_size:
+        return None
+    label = _resolve_variant_label(store, variant)
+    if label is None:
+        return None
+    return (scenario_key, label)
+
+
+def build_timeline_data(report_dir):
+    timeline_data = {scenario_key: {} for (_, _), scenario_key in SCENARIO_LABELS.items()}
+    for key, record in _load_per_variant(report_dir, "ycsb_e_timeline_{scenario}_*.json",
+                                         _timeline_variant_key):
+        scenario_key, label = key
+        timeline_data[scenario_key][label] = record["timeline"]
     return timeline_data
 
 
@@ -160,52 +186,43 @@ def build_forced_events_data(report_dir):
     """Per (scenario, variant): the actual forced_events list (scheduled_sec, fired_sec, kind,
     elapsed_sec). Fired second can lag scheduled second arbitrarily under sustained write
     contention (cascading is intentionally unguarded -- see kForcedTriggers in bench_kv.cpp)."""
-    forced_events_data = {}
-    for (scenario, val_size), scenario_key in SCENARIO_LABELS.items():
-        variants = {}
-        for f in report_dir.glob(f"ycsb_e_timeline_{scenario}_*.json"):
-            d = json.loads(f.read_text())
-            store = d["store"]
-            variant = d["variant"]
-            if _normalize_value_size(d["value_size"]) != val_size:
-                continue
-            base_store = store.split("-", 1)[0] if store.startswith("VMemKV") else store
-            label = STORE_VARIANT_TO_LABEL.get((base_store, variant))
-            if label is None:
-                continue
-            variants[label] = d.get("forced_events", [])
-        forced_events_data[scenario_key] = variants
+    forced_events_data = {scenario_key: {} for (_, _), scenario_key in SCENARIO_LABELS.items()}
+    for key, record in _load_per_variant(report_dir, "ycsb_e_timeline_{scenario}_*.json",
+                                         _timeline_variant_key):
+        scenario_key, label = key
+        forced_events_data[scenario_key][label] = record.get("forced_events", [])
     return forced_events_data
+
+
+def _background_job_key(scenario_key, record, val_size, path):
+    # run_probe_point()'s (common/reorg_probe_common.sh) synthesized outer-timeout fallback
+    # (setup itself hung, before bench_kv could print its own record) doesn't know this
+    # script's "job" field -- skip rather than KeyError; the table just renders that combo
+    # as n/a (build_background_jobs_data() finds no entry for it), same as a missing file.
+    if "job" not in record or "scenario" not in record:
+        return None
+    return (record["job"], record["scenario"])
 
 
 def build_background_jobs_data(report_dir):
     """Reads background_jobs_in_memory.jsonl / background_jobs_ltm.jsonl
-    (run_background_jobs_probe.sh via run_bench_aws_c6id.sh's run_remote_probe(), matching
-    the file-per-scenario convention the retired reorg-scaling/checkpoint-throughput/
-    maintenance-contention probes used) into {(job, scenario): rec}. Each rec carries
+    (run_background_jobs_probe.sh via run_bench_aws_c6id.sh's run_remote_probe(), one file
+    per scenario) into {(job, scenario): rec}. Each rec carries
     job_elapsed_sec plus insert/update/scan_degradation_pct, measured against a fixed 1KB x
     10,000,000-record corpus (in_memory unconstrained, ltm cgroup-constrained to the same
     LTM_MEMORY_BUDGET_BYTES as the rest of the suite) -- a single reproducible reference point
     rather than a sweep across the matrix's 4 scenario/value-size combos, see
     render_background_jobs_summary_html()."""
-    data = {}
-    lines = []
-    for fname in ["background_jobs_in_memory.jsonl", "background_jobs_ltm.jsonl"]:
-        path = report_dir / fname
-        if path.exists():
-            lines.extend(path.read_text().splitlines())
-    for line in lines:
-        if not line.strip():
-            continue
-        rec = json.loads(line)
-        # run_probe_point()'s (common/reorg_probe_common.sh) synthesized outer-timeout fallback
-        # (setup itself hung, before bench_kv could print its own record) doesn't know this
-        # script's "job" field -- skip rather than KeyError; the table just renders that combo
-        # as n/a (build_background_jobs_data() finds no entry for it), same as a missing file.
-        if "job" not in rec or "scenario" not in rec:
-            continue
-        data[(rec["job"], rec["scenario"])] = rec
-    return data
+    return dict(_load_per_variant(report_dir, "background_jobs_{scenario}.jsonl",
+                                  _background_job_key))
+
+
+def _organic_split_key(scenario_key, record, val_size, path):
+    # Same reasoning as _background_job_key(): a synthesized outer-timeout fallback
+    # record lacks "scenario" -- skip rather than KeyError, renders as n/a like a missing file.
+    if "scenario" not in record:
+        return None
+    return record["scenario"]
 
 
 def build_organic_split_data(report_dir, prefix="organic_split"):
@@ -214,21 +231,7 @@ def build_organic_split_data(report_dir, prefix="organic_split"):
     "organic_split_random" for random keys) into {scenario: rec}. Each rec's "splits" list
     holds one entry per organic per-shard split observed during a fixed 90s sustained-insert run,
     see render_organic_split_summary_html()."""
-    data = {}
-    for fname in [f"{prefix}_in_memory.jsonl", f"{prefix}_ltm.jsonl"]:
-        path = report_dir / fname
-        if not path.exists():
-            continue
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            # Same reasoning as build_background_jobs_data(): a synthesized outer-timeout fallback
-            # record lacks "scenario" -- skip rather than KeyError, renders as n/a like a missing file.
-            if "scenario" not in rec:
-                continue
-            data[rec["scenario"]] = rec
-    return data
+    return dict(_load_per_variant(report_dir, f"{prefix}_{{scenario}}.jsonl", _organic_split_key))
 
 
 def organic_split_averages(organic_split_data, scenario):
@@ -362,19 +365,40 @@ def compute_winners_matrix(raw_data):
     return rows
 
 
+def _badge_tier(value, tiers):
+    """First-match tier lookup over ascending (bound, inclusive, result) triples."""
+    for bound, inclusive, result in tiers:
+        if value < bound or (inclusive and value == bound):
+            return result
+    raise ValueError(f"value {value!r} matched no tier")
+
+
+_RATIO_TIERS = [
+    (0.85, True, ("❌ LOSE", "bg-rose-600 text-white border-transparent shadow-sm")),
+    (0.95, False, ("LOSE", "bg-rose-50 text-rose-700 border-rose-200")),
+    (1.05, True, ("≈ EVEN", "bg-slate-100 text-slate-600 border-slate-200")),
+    (1.15, False, ("WIN", "bg-emerald-50 text-emerald-700 border-emerald-200")),
+    (float("inf"), True, ("✅ WIN", "bg-emerald-600 text-white border-transparent shadow-sm")),
+]
+
+_SLOWDOWN_TIERS = [
+    (20, False, "bg-emerald-50 text-emerald-700 border-emerald-200"),
+    (50, False, "bg-amber-50 text-amber-700 border-amber-200"),
+    (float("inf"), True, "bg-rose-600 text-white border-transparent shadow-sm"),
+]
+
+
+def badge_html(text, cls):
+    """Inline badge <span> shared by the winners matrix and the background-jobs table."""
+    return (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
+            f'{cls}">{text}</span>')
+
+
 def _badge_for_ratio(ratio):
     """Matches the 5-tier scheme established by prior reports (e.g. 2026081313): a ±5% band
     around 1.0x is noise-level ("EVEN", gray); beyond that a weak (pale) or strong (solid,
     with emoji) WIN/LOSE badge depending on whether the deviation exceeds 15%."""
-    if ratio <= 0.85:
-        return ("❌ LOSE", "bg-rose-600 text-white border-transparent shadow-sm")
-    if ratio < 0.95:
-        return ("LOSE", "bg-rose-50 text-rose-700 border-rose-200")
-    if ratio <= 1.05:
-        return ("≈ EVEN", "bg-slate-100 text-slate-600 border-slate-200")
-    if ratio < 1.15:
-        return ("WIN", "bg-emerald-50 text-emerald-700 border-emerald-200")
-    return ("✅ WIN", "bg-emerald-600 text-white border-transparent shadow-sm")
+    return _badge_tier(ratio, _RATIO_TIERS)
 
 
 def render_winners_matrix_html(rows):
@@ -394,9 +418,7 @@ def render_winners_matrix_html(rows):
             label_text, badge_class = _badge_for_ratio(ratio)
             out.append(f'''<td class="py-3.5 px-4 transition-colors">
   <div class="flex flex-col gap-0.5">
-    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border {badge_class} font-bold  w-fit">
-      {label_text} ({ratio:.2f}x)
-    </span>
+    {badge_html(f"\n      {label_text} ({ratio:.2f}x)\n    ", f"{badge_class} font-bold  w-fit")}
     <span class="text-[11px] text-slate-500 font-medium">vmemkv ({cell["vmemkv_label"]})</span>
     <span class="text-[10px] text-slate-400">vs {cell["rival_label"]}</span>
   </div>
@@ -409,11 +431,7 @@ def _badge_for_slowdown(pct):
     """pct: percentage drop in concurrent workload QPS vs. isolated (higher = worse). Same 3-tier
     color language as _badge_for_ratio()'s strong tiers, just collapsed to 3 steps since slowdown
     has no "better than isolated" side to distinguish."""
-    if pct >= 50:
-        return "bg-rose-600 text-white border-transparent shadow-sm"
-    if pct >= 20:
-        return "bg-amber-50 text-amber-700 border-amber-200"
-    return "bg-emerald-50 text-emerald-700 border-emerald-200"
+    return _badge_tier(pct, _SLOWDOWN_TIERS)
 
 
 def render_background_jobs_summary_html(background_jobs_data, organic_split_data=None,
@@ -472,8 +490,8 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
                 if pct is None:
                     cells.append('<span class="text-slate-300">n/a</span>')
                 else:
-                    cells.append(f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
-                                  f'{_badge_for_slowdown(pct)} font-bold w-fit">{pct:.0f}%</span>')
+                    cells.append(badge_html(f"{pct:.0f}%",
+                                            f"{_badge_for_slowdown(pct)} font-bold w-fit"))
             out.append(f'<tr><td class="py-2 px-3">{row_label}</td>' +
                         "".join(f'<td class="py-2 px-3">{c}</td>' for c in cells) + '</tr>')
 
@@ -491,8 +509,7 @@ def render_background_jobs_summary_html(background_jobs_data, organic_split_data
                 continue
             avg_pause_us, avg_degr, n = averages
             duration_cell = f'{avg_pause_us / 1000:.0f}ms<div class="text-[10px] text-slate-400 font-normal">avg of {n} splits</div>'
-            degr_badge = (f'<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border '
-                          f'{_badge_for_slowdown(avg_degr)} font-bold w-fit">{avg_degr:.0f}%</span>')
+            degr_badge = badge_html(f"{avg_degr:.0f}%", f"{_badge_for_slowdown(avg_degr)} font-bold w-fit")
             # Update/Scan degradation deliberately not measured here (permanently n/a, not a
             # missing-data gap) -- see bench_kv.cpp's kOrganicSplitProbeDurationSec comment: adding
             # concurrent Update/Scan worker pools would oversubscribe the box enough to measurably

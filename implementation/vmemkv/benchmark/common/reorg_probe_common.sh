@@ -5,10 +5,10 @@
 # and driver-setup boilerplate they share.
 
 # Shared driver-script setup for the three scripts above: parses the common <bench_kv_bin>
-# <output_jsonl_path> [db_dir] [combo_filter] positional-arg convention, builds $COMBOS from
-# $COMBO_FILTER, truncates $OUTPUT_PATH, and sets $PROBE_LOG_PREFIX (consumed by log() below).
+# <output_jsonl_path> [db_dir] [combo_filter] positional-arg convention, truncates
+# $OUTPUT_PATH, and sets $PROBE_LOG_PREFIX (consumed by log() below).
 # Sets (global, not local -- callers need these after this function returns): BENCH_KV_BIN,
-# OUTPUT_PATH, DB_DIR, COMBO_FILTER, ALL_COMBOS, COMBOS, PROBE_LOG_PREFIX.
+# OUTPUT_PATH, DB_DIR, COMBO_FILTER, ALL_COMBOS, PROBE_LOG_PREFIX.
 #
 # Must be called *after* sourcing this file -- SCRIPT_DIR resolution and the `source` line itself
 # can't live inside this function, since a script needs SCRIPT_DIR to find this file before it can
@@ -36,12 +36,6 @@ init_probe_driver() {
   COMBO_FILTER="${4:-}"
 
   ALL_COMBOS=("in_memory:8B" "in_memory:1KB" "ltm:1KB" "ltm:64KB")
-  COMBOS=()
-  for combo in "${ALL_COMBOS[@]}"; do
-    if [[ -z "$COMBO_FILTER" || "$combo" == "$COMBO_FILTER" || "$combo" == "${COMBO_FILTER}:"* ]]; then
-      COMBOS+=("$combo")
-    fi
-  done
 
   : > "$OUTPUT_PATH"
 }

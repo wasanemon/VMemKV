@@ -16,13 +16,17 @@ SCENARIO_RESULT_PATH="$4"
 # run, identical to the old invocation shape).
 REPETITIONS="${5:-1}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=benchmark_common.sh
+source "$SCRIPT_DIR/benchmark_common.sh"
+
 # Resolve host hardware and OS metadata dynamically wherever this runs (local dev
 # machine or AWS instance).
 export VMEMKV_CONTEXT_kernel_release="$(uname -r)"
-export VMEMKV_CONTEXT_cpu_model="$(grep 'model name' /proc/cpuinfo | head -n 1 | cut -d: -f2 | xargs)"
+export VMEMKV_CONTEXT_cpu_model="$(vmemkv_cpu_model)"
 export VMEMKV_CONTEXT_cpu_count="$(nproc --all)"
-export VMEMKV_CONTEXT_mem_total_bytes="$(awk '/MemTotal:/ { print $2 * 1024; exit }' /proc/meminfo)"
-export VMEMKV_CONTEXT_swap_total_bytes="$(awk '/SwapTotal:/ { print $2 * 1024; exit }' /proc/meminfo)"
+export VMEMKV_CONTEXT_mem_total_bytes="$(vmemkv_mem_total_bytes)"
+export VMEMKV_CONTEXT_swap_total_bytes="$(vmemkv_swap_total_bytes)"
 
 # Run bench_kv with unbuffered stdout to prevent lag in systemd-run/SSH pipes.
 exec "$BENCH_KV_BIN" \
