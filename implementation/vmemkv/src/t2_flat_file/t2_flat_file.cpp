@@ -171,9 +171,7 @@ void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capa
     ::close(file_descriptor);
     throw std::system_error(mmap_errno, std::generic_category(), "mmap");
   }
-  // Unconditional (low_level_design.md 7.7): kept on because its win at low concurrency inverts
-  // to a loss under sustained concurrent access, and no known deployment runs at the low, fixed
-  // concurrency where turning it off would win -- see docs/benchmark/20260810_t2_no_madvise_random.md.
+  // Unconditional (low_level_design.md 7.4).
   if (::madvise(mapped, static_cast<size_t>(bytes_capacity), MADV_RANDOM) != 0) {
     const int err = errno;
     ::munmap(mapped, static_cast<size_t>(bytes_capacity));

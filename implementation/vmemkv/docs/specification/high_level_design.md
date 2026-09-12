@@ -59,7 +59,6 @@ Tier 1 固有のポイントは以下
 
 - fixed-size entry なので、高密度な配列として保持しやすい
 - `sorted_region` は key 順のIndexEntry配列、`append_region` は unorderedなIndexEntry配列．
-- すべての操作が触るホットな層なので、`mlock` や huge page などのメモリ最適化対象になる
 
 また，opt-in 最適化として，値が 8 バイト以下の entry について payload を `offset` ではなく 64-bit value として解釈する **entry-level adaptive covering** をサポートする．該当 entry では Tier 1 のヒットだけで `Get()` が完結し，Tier 2 アクセスを省略できる．詳細は low_level_design.md 2.1.1 節を参照．
 
@@ -162,17 +161,13 @@ Tier 2 の稼働中 mmap は `MAP_SHARED` である。書き込みはページ�
 
 ## 8. 最適化の全体像
 
-いくつかの最適化が存在する。すべて独立の opt-in で、無効でも正しく動作する。
+いくつかの最適化が存在する（後二者は opt-in で、無効でも正しく動作する）。
 詳細は [low_level_design.md](./low_level_design.md) を参照。
 
-- Tier 1 `mlock` / `MADV_HUGEPAGE` / 一時的 `MADV_SEQUENTIAL`（未実装・将来検討）
-- Tier 2 `madvise(MADV_RANDOM)`（常時有効。In-Memory 読出で約5%の性能向上に貢献する）
+- Tier 2 `madvise(MADV_RANDOM)`（常時有効）
 - WAL Group Commit（実装済み。ロックフリー固定長リングバッファ方式。詳細は low_level_design.md 7.1 節）
-- Early Lock Release / Flush Pipelining（未実装・将来検討）
-- SIMD による Tier 1 scan 高速化
 - entry-level adaptive covering
 - `sorted_region` ネガティブルックアップ用 Bloom filter による miss時の O(1)化
-- Tier 2 `MADV_HUGEPAGE`（検証済み・不採用 — スワップ発生時は 2MB 単位を保てず効果なし。詳細は low_level_design.md 7.4.1 節）
 
 ## Appendix A. LineairDB との関係
 
@@ -182,9 +177,3 @@ VMemKV は LineairDB の KVS 部分を置き換える想定で設計される。
 - To-be: VMemKV 単体を KVS 本体として使用
 
 LineairDB は VMemKV に concurrency control やテーブル・セカンダリインデックス機能を提供するラッパーとして扱われることになる。
-
-## TODO
-
-- セカンダリインデックスのための設計を追加すべき
-  - セカンダリインデックスは T2 を持たなくてもいい。セカンダリの T1 `IndexEntry` からプライマリの T1 `IndexEntry` に飛べればよい。`IndexEntry` の prefix を 64 bits にして、余った 64 bits にプライマリへの参照を持たせるのも良いだろう。ただし構造体のサイズは (AVX 命令の都合上) 32 bytes に揃えたいので、それ以上の領域は割けない。
-- `mmap` I/O エラーは `SIGBUS` として扱うため signal handler 設計が必要

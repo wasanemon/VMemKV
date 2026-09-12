@@ -28,7 +28,7 @@ struct IndexEntry {
     uint64_t payload_bits;      // Tier 2 offset, or an entry-level inlined value (2.1.1 節)
 };
 
-constexpr uint64_t TOMBSTONE_PAYLOAD = UINT64_MAX;
+constexpr uint64_t STORE_NOT_FOUND = ~0ULL; // tombstone marker
 ```
 
 | Field | Meaning |
@@ -52,13 +52,13 @@ checkpoint には不要なため永続化しない(5.4節)。
 - `sorted_region` は `key_prefix` 昇順である。
 - `append_region` は未整列である。
 - Tier 1 の live entry は、`sorted_region` と `append_region` を合わせて logical key ごとに高々 1 個であることを期待する。
-- `payload_bits == TOMBSTONE_OFFSET` の entry は delete 済みであり、Get / Scan の結果に含めない。
+- `payload_bits == STORE_NOT_FOUND` の entry は delete 済みであり、Get / Scan の結果に含めない。
 
 ### 2.1.1 Dynamic Inline Optimizations
 
 Tier 1 は 64-bit payload を保持するインデックスである。T1/T2ハイブリッド構成において、値のサイズが 64-bit（8バイト）以下のときにディスク（Tier 2）へのアペンド書き込みをバイパスして、T1 の payload 領域内に直接バリューをインライン格納する「動的インライン最適化」がサポートされている。これによって、小さなサイズの値に対してディスクI/Oや mmap デリファレンスを完全に省略し、インメモリKVS並みの極限の検索速度を実現できる。
 
-（動的インライン最適化の具体的な実装アプローチとそれぞれのトレードオフについては、後述の **「7.3 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)」** を参照。）
+（動的インライン最適化の具体的な実装アプローチとそれぞれのトレードオフについては、後述の **「7.2 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)」** を参照。）
 
 
 ### 2.2 Tier 2
@@ -103,10 +103,10 @@ Tier 1 の `payload_bits` が Tier 2 offset を表す場合(2.1 節)、T2 への
 
 **Base/Tail Split**
 
-`T2Store` は `base_boundary` を保持する: `[0, base_boundary)` の範囲が、baseリージョン専用の読み取り経路(7.9節 -- 用途・レコードサイズ別に3つある)経由で seqlock なしに安全に読める、という不変条件を表す境界値である。`base_boundary` は `checkpoint_internal()`(4.3 節)の実行によってのみアトミックに前進する。
+`T2Store` は `base_boundary` を保持する: `[0, base_boundary)` の範囲が、baseリージョン専用の読み取り経路(7.5節 -- 用途・レコードサイズ別に3つある)経由で seqlock なしに安全に読める、という不変条件を表す境界値である。`base_boundary` は `checkpoint_internal()`(4.3 節)の実行によってのみアトミックに前進する。
 
 - `offset < base_boundary` の record を **base** 領域、`offset >= base_boundary` の record を **tail** 領域と呼ぶ。
-- base 領域は、一度 `base_boundary` に含まれた後は二度と in-place では書き換えられない(3.3節)。そのため base 領域は、mmap の `MADV_RANDOM`(7.7節)を経由しない専用の読み取り経路で読んでも安全であり、seqlock も不要になる(経路の選び方は7.9節)。
+- base 領域は、一度 `base_boundary` に含まれた後は二度と in-place では書き換えられない(3.3節)。そのため base 領域は、mmap の `MADV_RANDOM`(7.4節)を経由しない専用の読み取り経路で読んでも安全であり、seqlock も不要になる(経路の選び方は7.5節)。
 - tail 領域は通常通り in-place 更新の対象になり得るため、主 mmap 経由(COW反映済みの最新ビュー、seqlock保護)でしか安全に読めない。
 
 **Invariants**
@@ -123,7 +123,7 @@ Tier 1 の `payload_bits` が Tier 2 offset を表す場合(2.1 節)、T2 への
 
 ```c++
 struct VMemKV {
-    T1Index t1;
+    ShardedT1Index t1;
     T2Store t2;
     Wal wal;
 };
@@ -143,10 +143,10 @@ struct VMemKV {
 
 1. `key_prefix = prefix(full_key)` と `hash = hash(full_key)` を計算する。
 2. `t1.append_region` に紐づくハッシュインデックス（`append_index`）を検索し、`key_prefix` および `hash` が一致する候補を探す。
-3. append 側で見つからなければ、`t1.sorted_region` を `key_prefix` で二分探索し、候補 range を得る。
+3. append 側で見つからなければ、`t1.sorted_region` を `key_prefix` で二分探索し、候補 range を得る（opt-in の Bloom filter 有効時は miss を O(1) で打ち切る）。
 4. 候補 `IndexEntry` について `hash` を照合する。
-5. `payload_bits == TOMBSTONE_OFFSET` なら not found。
-6. `t2.at(payload_bits)` で Tier 2 record を取得する。
+5. `payload_bits == STORE_NOT_FOUND` なら not found。
+6. `payload_bits` から Tier 2 record を取得する。小レコードは主 mmap(`base`)から直接読み、大レコードは常駐確認(`mincore`)の上で `base_mmap_scan` からの mmap 読みと `read_fd` からの `pread()` を使い分ける(7.5 節)。
 7. Tier 2 record の full key を比較し、一致すれば value を返す。違えば not found。
 
 **Complexity**
@@ -183,7 +183,7 @@ struct VMemKV {
 - old Tier 2 record はその場では削除しない。
 - old Tier 2 record は Tier 1 から到達不能になるが、Tier 2 側の物理削除は `defragment()` が別サイクルで行う(4.5 節)。
 - Failure Rule は 3.2 節と同様: 2.〜4. が失敗した操作を WAL に記録してはならない。
-- 手順3の in-place 判定には `offset >= base_boundary`(2.2節)の条件も含まれる。この境界未満を指す record への更新は、たとえ `new_value_len <= alloc_len` でも in-place にはせず、手順4の追記パスに強制的に回す。base 領域は専用mmapで直接読む読み取り経路(7.9節)の前提として「二度と書き換わらない」ことに依存しているため。`base_boundary` は `checkpoint_internal()` によってのみ単調に前進するアトミック変数(2.2節)であり、この判定は単一のアトミックロードで読むだけで安全である -- 前進中に古い値を読んでも、判定は常に安全側(tail 領域寄り = 追記パス)に倒れるだけで、base 領域への in-place 書き込みを誤って許可することはない。
+- 手順3の in-place 判定には `offset >= base_boundary`(2.2節)の条件も含まれる。この境界未満を指す record への更新は、たとえ `new_value_len <= alloc_len` でも in-place にはせず、手順4の追記パスに強制的に回す。base 領域は専用mmapで直接読む読み取り経路(7.5節)の前提として「二度と書き換わらない」ことに依存しているため。`base_boundary` は `checkpoint_internal()` によってのみ単調に前進するアトミック変数(2.2節)であり、この判定は単一のアトミックロードで読むだけで安全である -- 前進中に古い値を読んでも、判定は常に安全側(tail 領域寄り = 追記パス)に倒れるだけで、base 領域への in-place 書き込みを誤って許可することはない。
 
 ### 3.4 Delete
 
@@ -253,7 +253,7 @@ T1 `reorganize` は T2 と独立に実行できる。
 
 ### 4.3 T2 Checkpoint (`checkpoint_internal()`)
 
-entry 単位でインライン化されている entry(2.1.1 節、7.3 節)は Tier 2 に一切アクセスしないため、この処理の対象から外れる。
+entry 単位でインライン化されている entry(2.1.1 節、7.2 節)は Tier 2 に一切アクセスしないため、この処理の対象から外れる。
 
 `checkpoint_internal()` は Tier 2 の**単一の永続ファイル**の tail 領域(`[old_base_boundary, bytes_used)`)を `msync()` で永続化する。record のリロケーション(offset の付け替え)や、参照を失った record の物理的な回収は行わない -- Storage Fragmentation の解消(GC)はこの処理の対象外であり、`defragment()`(4.5 節)が別機構として担う。
 
@@ -393,12 +393,11 @@ struct ShardedT1ChkFileHeader {
 
 **Design Rationale**
 
-- **per-record ヘッダが不要な理由**: Tier 2 の record は可変長 (key_len / value_len が個体ごとに異なる) なので `ValueRecordHeader` が各 record に必要だが、`IndexEntry` は既に固定長 32B (2.1 節、AVX 命令の都合による制約) であるため、シャードごとに 1 個の `entry_count` のみで足りる。
-- **per-record checksum / torn-tail 検出が不要な理由**: T1 chk は WAL と異なり、生きているプロセスの中で継続的に追記されるファイルではない。1 回の checkpoint 処理でシーケンシャルに書き切り、完成後にのみ manifest から参照される(5.3 節)。したがって「書き込み途中でクラッシュした半端なファイル」が観測されることは、manifest の `rename` が完了しない限り起こらない。ファイル全体に対する 1 個の checksum は、書き込み完了後の bit rot 検出のためだけに存在する。
-- **ヘッダを trailer にする理由**: 書き手(`ShardedT1CheckpointWriter`)は `checkpoint_all_shards()` が各シャードのコールバックを呼ぶたびに、そのシャードの entry 列を直接ファイルへ逐次書き込む。全シャードを書き終えるまで `shard_count`/`total_entry_count`/`checksum` は確定しないため、確定後にまとめて書ける末尾に置く。読み手は `file_size - sizeof(header)` の位置から `mmap` 越しに直接ヘッダを読める。
-- **ロード手順**: 起動時、manifest が指す T1 chk ファイルを `mmap(MAP_PRIVATE)` し、trailer の magic / format_version / checksum / レイアウト(各シャード区間・境界キーの合計サイズが `file_size` に一致するか)を検証する。検証後、シャード区間を先頭から順に走査して各シャードの `IndexEntry` 配列を `EntrySnapshot` へ変換し、シャードごとに新しい `sorted_region`(`SortedSlot` 配列)を構築、境界キー配列とあわせてディレクトリを再構築する。パースや個別のハッシュテーブル挿入ループ(1 entry ずつのハッシュ計算・衝突解決)は不要であり、これによって典型的な WAL 全量 replay や B-Tree 逐次挿入よりも大幅に軽い Fast Boot を実現する。
-- **`append_index` はシリアライズしない**: 5.2 節の Hash Index Lifecycle の通り、checkpoint 直後は `append_region` が空であるため、ハッシュインデックス自体は永続化不要で、起動時に空の状態から再構築される。
-- **runtime 表現との関係**: プロセス内で通常の(checkpoint を伴わない)T1-only reorganize が作る `sorted_region` は、従来通り heap 上の配列のままでよい。checkpoint 時にのみ、各シャードの配列内容を上記フォーマットでファイルへコピーする。次回起動時の T1 chk 読み込みだけがこのファイルを直接 `mmap` して使う。同一プロセス内で checkpoint 直後にランタイム表現自体を mmap 領域へ切り替えるゼロコピー最適化は、今回はスコープ外とする。
+- T1 chk は WAL と異なり、1 回の checkpoint 処理でシーケンシャルに書き切り、完成後にのみ manifest から参照される。ファイル全体に対する 1 個の checksum は、書き込み完了後の bit rot 検出のために存在する。
+- ヘッダは trailer である: `shard_count`/`total_entry_count`/`checksum` は全シャードの書き込み完了後に確定する。
+- **ロード手順**: 起動時、manifest が指す T1 chk ファイルを `mmap(MAP_PRIVATE)` し、trailer の magic / format_version / checksum / レイアウトを検証する。検証後、シャード区間を先頭から順に走査して各シャードの `sorted_region` を構築し、境界キー配列とあわせてディレクトリを再構築する。
+- **`append_index` はシリアライズしない**: checkpoint 直後は `append_region` が空であり、起動時に空の状態から再構築される。
+- checkpoint 時のランタイム表現は heap 上の配列のままファイルへコピーする。次回起動時の読み込みだけがこのファイルを直接 `mmap` して使う。
 
 ### 5.5 WAL Rotation
 
@@ -490,25 +489,15 @@ T1 `reorganize` は atomic pointer swap 機構で実現され、同様に専用�
 - 新規 append は `stop_writers_and_wait()` のウィンドウの間だけ一時的に発行が止まり、`bytes_used` を確定させ次第すぐに再開する。
 - `base_boundary` の前進は、manifest の `rename()` が完了した後にのみ行う(5.3 節)。
 
-### 6.5 Implementation Candidates
+### 6.5 Implementation Contract
 
-本書は mutex-free 実装を必須とはしない。
-上記の並行性契約を満たすなら、次のいずれも許容する。
-
-- coarse-grained lock
-- per-region lock
-- per-entry seqlock
-- pointer swap + epoch based reclamation
-- reader snapshot + writer retry
-
-`seqlock` は有力な実装候補だが、設計仕様として必須ではない。
-low-level design が要求するのは同期機構の名前ではなく、6.2 から 6.4 に記した concurrency contract である。
+本書は mutex-free 実装を必須とはしない。6.2 から 6.4 に記した concurrency contract を満たすことが要求であり、同期機構の名前ではない。
 
 ## 7. Opt-in Optimizations
 
-本節の最適化は 7.9 節を除きすべて opt-in であり、無効でも正しく動作する。7.9 節は base/tail split(2.2節)・in-place 更新の base 領域への強制迂回(3.3節)を前提とする常時有効の読み取り経路であり、無効化する経路は存在しない(7.7 節の `MADV_RANDOM` と同様の扱い)。
+本節のうち adaptive covering と Bloom filter は opt-in で、無効でも正しく動作する。Group Commit・`MADV_RANDOM`・base 領域専用読み取り経路は常時有効である。
 
-### 7.1 Group Commit（実装済み）/ Early Lock Release / Flush Pipelining（未実装・将来検討）
+### 7.1 Group Commit
 
 **Group Commit は実装済み。** `wal.hpp`/`wal.cpp`の`Wal`クラスを参照。ロックフリー（ホットパスに`std::mutex`を一切使わない）な固定長リングバッファ方式で実装されている。詳細は [Aether](https://dl.acm.org/doi/10.14778/1920841.1920928) の設計を参考にしたが、完全に同一の方式ではない：
 
@@ -518,69 +507,43 @@ low-level design が要求するのは同期機構の名前ではなく、6.2 �
   - fsync完了後の起床は、レコード毎の`done`フラグ + 個別`notify_one()`ではなく、バッチの最高LSNを1つの共有カウンタ（`highest_settled_lsn_`）に書き込み`notify_all()`する方式を用いる（follower側は自分のLSN以下になるまで`wait()`）。レコード毎`notify_one()`はバッチサイズに対してループコストが超線形に増大する(batch=32では`fdatasync()`自体の約13倍のコストになる)ため、共有カウンタ方式でバッチ内の起床を1回のnotifyへ集約する。
 - レコードの生存期間はイントルーシブな参照カウント（`std::atomic<int>`一発の`fetch_sub`）で管理する。`std::atomic<std::shared_ptr<T>>`は使わない（多くの実装で内部的にスピンロックを使うため、真のロックフリー性を損なう）。
 
-以下は本実装のスコープ外、別の最適化として引き続き未実装のまま：
-
-- エントリロック解放を WAL flush 完了前に前倒しする（early lock release）。
-- 読み取りも waiter を介して未 flush データの整合を取る（flush pipelining）。
-
-### 7.2 SIMD Tier 1 Scan
-
-`IndexEntry` は fixed-size かつ連続配置なので、Tier 1 の append scan や range scan は SIMD 最最適化しやすい。
-
-### 7.3 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
+### 7.2 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
 
 エントリーごとに T2 オフセットとインライン 64-bit 値を動的に切り替える最適化である。値が 8バイト（64ビット）以下のときに Tier 2 への書き出しをバイパスして Tier 1 インデックスの payload 領域内に直接バリューをインライン格納する。
 
 本最適化は `vmemkv::Config` のテンプレート引数タグ（`T1InlineValue`）を介して制御される。
 
-#### 7.3.1 メタデータとハッシュのエンコーディング
+#### 7.2.1 メタデータとハッシュのエンコーディング
 T1のインデックススロットに十分な空きビット領域がないため、64ビットのハッシュフィールド（`hash`）の最上位4ビットをメタデータ領域として再利用し、フラグとサイズ情報を格納する。
 
 - **Bit 63 (`is_inline`)**: `1` の場合はインラインデータ、`0` の場合は T2オフセットを表す。
 - **Bits 62-60 (`inline_size`)**: インラインデータのバイトサイズ（1〜8バイト）を表す。サイズ `8` は `0` としてエンコードされる。
 - **Bits 59-0 (`clean_hash`)**: 実際の60ビットFnvハッシュキー。インデックスの検索、Bloom filterの登録・判定、SIMDスキャン等のハッシュ比較時には、上位4ビットをマスクしてこの60ビット部分のみを比較する。
 
-#### 7.3.2 インライン化の動作
+#### 7.2.2 インライン化の動作
 - **T2 オフセットとの識別 (判定)**:
   - 読み出し時、T1から取得したスロットハッシュの最上位ビット（Bit 63）を確認するだけで、T2をフェッチせずにインラインかオフセットかを100%確実に識別できる。
 - **値が 1〜8 バイトの場合**:
   - `payload_bits` に対するビットシフトやビットの埋め込みは行わず、64ビットのビットパターンをそのまま無加工で格納し、デコード時は `inline_size` に従いバイトコピーを行う。これにより、`double`、`time`、連番のサロゲートキー（偶数・奇数を問わず）など、あらゆる64ビット以内のデータ型を完全にインライン化できる。
 
-### 7.4 T2 書き込み時の Chunk Allocation / Pre-faulting は不採用
-
-各書き込みスレッドがT2領域へ`append`する際にスレッドごと大きなブロック(2MB)を一括予約し、直後に4KBページ単位でダミーライトして物理メモリページを一括割り当てさせる手法は、ページタッチ処理を`acquire_write_handle()`で取得したT2書き込みハンドル保持中に行うことになる。これは`checkpoint_internal()`の`stop_writers_and_wait()`(進行中のwriterが全員ハンドルを手放すまで待つdrain処理)を直接長引かせ、持続的な同時書き込み負荷下でscanスループットの停止を引き起こす(詳細は`benchmark_results/pages/2026081711_charts.html`のYCSB-Eタブを参照)。唯一の恩恵(Zipf分布のホットな読み取りにおける初回page fault遅延の回避)は低スレッド数に偏っており、32スレッドの現実的な並行度ではほぼ消失する。
-
-読み込み側の`base_mmap_scan`/`base_mmap_scan_seq`ウォームアップ(7.9節)は、書き込みハンドルとは無関係なタイミング・機構で実行されるため、この問題を持たず、常時有効である。
-
-#### 7.4.1 T2 の Huge Page 化 (`MADV_HUGEPAGE`) は不採用
-
-THP はスワップアウト時に 2MB 単位を保たず、512 個の 4KB ページに分割されてから個別にスワップされる。そのため、LTM Get_Hit のようにスワップが継続的に発生するシナリオでは、フォールト単位を 2MB に引き上げてもフォールト回数の削減には寄与しない。詳細は `implementation/vmemkv/docs/benchmark/20260805_t2_huge_page_investigation.md` を参照。
-
-### 7.5 Sorted Bloom Filter
+### 7.3 Sorted Bloom Filter
 
 `sorted_region` 全体に Bloom filter を付与し、negative lookup を高速化できる。
 
-### 7.6 WAL Rotation via `FALLOC_FL_COLLAPSE_RANGE`（未実装・将来検討）
-
-5.5 節の WAL Rotation はレコードコピー方式(移植性重視)を基本とするが、対応ファイルシステム(ext4, xfs 等。tmpfs 等では非対応)では `fallocate(FALLOC_FL_COLLAPSE_RANGE)` によりファイル先頭のバイト範囲をコピー無しで直接除去できる。コピーを伴わないためローテーションの停止時間をさらに縮小できるが、Linux カーネル・ファイルシステム依存の機能であるため opt-in とする。
-
-### 7.7 Tier 2 madvise(MADV_RANDOM) Optimization
+### 7.4 Tier 2 madvise(MADV_RANDOM) Optimization
 
 Tier 2 の主 mmap(`base`、2.2節)に対して、仮想メモリマップ時のReadahead（カーネル先読み）を抑止しランダムアクセス性能を最適化する。
-- **最適化の内容**: mmap領域のマップ直後に `madvise(..., MADV_RANDOM)` を呼び出し、OSカーネルの不要なページ先読み・カーネル空間メモリバス帯域の浪費を防ぐ。in-memory Get_Hit において約5%の性能向上をもたらす。常時有効であり、無効化する経路は存在しない。
+- **最適化の内容**: mmap領域のマップ直後に `madvise(..., MADV_RANDOM)` を呼び出し、OSカーネルの不要なページ先読み・カーネル空間メモリバス帯域の浪費を防ぐ。常時有効であり、無効化する経路は存在しない。
 
-### 7.8 Scan の io_uring 並列プリフェッチは不採用
+### 7.5 Scan/Get の base 領域専用読み取り経路
 
-`madvise(MADV_POPULATE_READ)` によるページキャッシュ温めは所有権のあるコピーを伴わないため、cgroup の継続的な回収圧力下では読み取り前に再度追い出される(prefetch-then-evict)。Scan の高速化は 7.9 節の base 専用 mmap(所有権付きの実データ読み取り)によって行う。詳細は `implementation/vmemkv/docs/benchmark/20260806_scan_madvise_tradeoff.md` を参照。
-
-### 7.9 Scan/Get の base 領域専用読み取り経路
-
-T2 の「base」領域(2.2節)は書き込み後二度と変更されないため、主 mmap の `MADV_RANDOM`(7.7節)を経由しない専用の読み取り経路から直接読み取ることができ、seqlockによる再試行は不要になる(3.3節の in-place 更新の base 領域への強制迂回がこの不変性を保証する)。
+T2 の「base」領域(2.2節)は書き込み後二度と変更されないため、主 mmap の `MADV_RANDOM`(7.4節)を経由しない専用の読み取り経路から直接読み取ることができ、seqlockによる再試行は不要になる(3.3節の in-place 更新の base 領域への強制迂回がこの不変性を保証する)。
 
 - **前提となる T2 の変更**: base/tail split(2.2節)と、in-place 更新の base 領域への強制迂回(3.3節)。
 - **3つの読み取り経路を、レコードごとにそのレコード自身の長さ(2.1節の Embedded Block Count)で選ぶ**。madvise は VMA(マッピング全体)単位の属性であり、個々の読み取り単位のものではないため、小さいレコードと大きいレコードの両方にうまく対応するには複数の経路が要る。どの経路を選んでも指す先は同一のバイト列なので、選択を誤ってもreadahead方針のミスマッチにしかならず、データが誤ることはない:
-  - `base_mmap_scan_seq`(read-only mmap、`MADV_SEQUENTIAL`): 埋め込みサイズヒントが1ページ以下のレコード用。広い先読み窓で多数の小さいレコードのフォルトを少数の major fault にまとめられる。`scan_impl()`・`get_impl()`双方の小レコード読み取りで使う。
-  - `base_mmap_scan`(read-only mmap、カーネルのデフォルト(適応的)readahead方針): それより大きいレコード用。`scan_impl()`の大レコード読み取りと、`get_impl()`の大レコード読み取りのうちページキャッシュ常駐が確認できた場合(`mincore()`)に使う。無条件に`MADV_SEQUENTIAL`を付けると、大きいレコードのコーパスをZipfのような偏ったアクセスで読む場合に読み取りバイト数が余分に増えることが測定で判明したため、こちらは意図的に控えめな方針にしてある。
+  - `base`(主 mmap、`MADV_RANDOM`): 1ページ以下のレコードの Get 読み取り用。1 op 1 record のランダムアクセスでは先読みが報われないため、seqlock も mincore も pread も介さず直接読む。
+  - `base_mmap_scan_seq`(read-only mmap、`MADV_SEQUENTIAL`): 1ページ以下のレコードの Scan 読み取り用。広い先読み窓で多数の小さいレコードのフォルトを少数の major fault にまとめる。Get の read-policy ablation(`SeqOnly`)もこちらに固定する。
+  - `base_mmap_scan`(read-only mmap、カーネルのデフォルト(適応的)readahead方針): 1ページより大きいレコードの Scan 読み取りと、`get_impl()` の大レコード読み取りのうちページキャッシュ常駐が確認できた場合(`mincore()`)に使う。
   - `read_fd`(`dup()`したファイルディスクリプタ経由の`pread()`): `get_impl()`の大レコード読み取りで、上記のページキャッシュ常駐確認が取れなかった場合に、そのレコード1つぶんにサイズを絞って読む。
 - **測定方法・結果**: `implementation/vmemkv/docs/benchmark/20260807_scan_t2_base_tail_io_uring_read.md`(base/tail split と実データ読み取りの元設計)、`implementation/vmemkv/docs/benchmark/20260810_t2_no_madvise_random.md`を参照。`Scan` は他の Op と共通のマスターコーパスを使用する。
 
