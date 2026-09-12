@@ -63,8 +63,7 @@ struct ShardedT1ChkFileHeader {
   uint64_t total_entry_count = 0;  // Sum of every shard's entry_count -- lets a reader sanity
                                    // check its walk consumed exactly the expected data.
   // FNV-1a64, folded in write order: every shard section (entry_count then entries) + boundaries
-  // + this header with checksum zeroed *last* -- reversed from the other formats' "header first"
-  // convention, since this header's own fields aren't known until every shard has been written.
+  // + this header with checksum zeroed *last*.
   uint64_t checksum = 0;
 };
 inline constexpr size_t kShardedT1ChkFileHeaderBytes = 40;

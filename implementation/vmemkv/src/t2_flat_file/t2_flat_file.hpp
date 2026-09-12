@@ -43,6 +43,16 @@ struct T2RecordView {
   std::span<const std::byte> value;
 };
 
+// Builds the (key, value) spans that follow a ValueRecordHeader in memory -- the common tail
+// end of every base-region read path, once each has independently validated `header`'s bounds
+// against whatever it read the bytes from (the checks differ, so callers do them).
+inline auto make_record_view(const ValueRecordHeader *header) noexcept -> T2RecordView {
+  const auto *key_begin = reinterpret_cast<const std::byte *>(header + 1);
+  std::span<const std::byte> key(key_begin, header->key_len);
+  std::span<const std::byte> value(key.data() + header->key_len, header->value_len);
+  return T2RecordView{header, key, value};
+}
+
 namespace vmemkv {
 
 struct T2Memory {

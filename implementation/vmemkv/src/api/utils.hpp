@@ -3,6 +3,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <system_error>
 
 namespace vmemkv {
 
@@ -38,6 +40,13 @@ template <typename Header>
 inline auto checksum_header(Header header) noexcept -> uint64_t {
   header.checksum = 0;
   return fnv1a64_update(kFnvOffsetBasis64, &header, sizeof(header));
+}
+
+// Best-effort file removal; failures are intentionally ignored (a leftover file is
+// harmless clutter at every call site, never an error).
+inline void remove_quiet(const std::filesystem::path &path) noexcept {
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
 }
 
 }  // namespace vmemkv

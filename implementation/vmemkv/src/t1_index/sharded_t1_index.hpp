@@ -245,44 +245,37 @@ class ShardedT1Index {
     return last_split_pause_end_ns_.load(std::memory_order_relaxed);
   }
 
-  // Sum of every shard's *current* append-region occupancy -- "is there anything anywhere left to
-  // merge" for a caller deciding whether a T1-only reorganize would be a no-op (e.g.
-  // VMemKVImpl::run_reorganize()'s own skip-if-nothing-to-do check, mirroring what it did against
-  // the old unsharded T1Index's own append_size()).
-  [[nodiscard]] auto append_size() const -> size_t {
-    return with_routing_guard([&]() -> size_t {
-      size_t total = 0;
+  // Sums one per-shard counter across every shard under a single routing guard (for
+  // dereferencing directory_ safely -- same reason shard_count() needs one).
+  template <typename Total, typename Counter>
+  auto reduce_shards(Counter counter) const -> Total {
+    return with_routing_guard([&]() -> Total {
+      Total total = 0;
       for (ShardSlot *slot : directory_.load(std::memory_order_acquire)->shards) {
-        total += slot->index->append_size();
+        total += (slot->index.get()->*counter)();
       }
       return total;
     });
   }
 
+  // Sum of every shard's *current* append-region occupancy -- "is there anything anywhere left to
+  // merge" for a caller deciding whether a T1-only reorganize would be a no-op (e.g.
+  // VMemKVImpl::run_reorganize()'s own skip-if-nothing-to-do check, mirroring what it did against
+  // the old unsharded T1Index's own append_size()).
+  [[nodiscard]] auto append_size() const -> size_t { return reduce_shards<size_t>(&Shard::append_size); }
+
   // Whole-store aggregates of each shard's own (per-T1Index) RSS/instance-churn counters -- see
   // T1Index::append_region_live_count()'s own comment. Sums are taken under one routing guard for
   // the same reason shard_count() needs one: dereferencing directory_ safely.
   [[nodiscard]] auto append_region_live_count() const -> int64_t {
-    return with_routing_guard([&]() -> int64_t {
-      int64_t total = 0;
-      for (ShardSlot *slot : directory_.load(std::memory_order_acquire)->shards) {
-        total += slot->index->append_region_live_count();
-      }
-      return total;
-    });
+    return reduce_shards<int64_t>(&Shard::append_region_live_count);
   }
 
   // Approximate: sums each *currently live* shard's own peak, so a shard retired by a split after
   // reaching a high peak doesn't contribute it here. Acceptable for its monitoring use (see
   // T1Index::append_region_live_count()'s comment) -- not a precise store-lifetime maximum.
   [[nodiscard]] auto append_region_peak_count() const -> int64_t {
-    return with_routing_guard([&]() -> int64_t {
-      int64_t total = 0;
-      for (ShardSlot *slot : directory_.load(std::memory_order_acquire)->shards) {
-        total += slot->index->append_region_peak_count();
-      }
-      return total;
-    });
+    return reduce_shards<int64_t>(&Shard::append_region_peak_count);
   }
 
   // Test/maintenance hook: performs a full Closing -> (re-)reorganize -> Split on the shard

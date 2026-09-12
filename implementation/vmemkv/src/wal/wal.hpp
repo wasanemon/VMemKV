@@ -14,6 +14,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "../api/utils.hpp"
+
 namespace vmemkv {
 
 enum class WalRecordType : uint8_t { Insert = 1, Update = 2, Delete = 3 };
@@ -284,8 +286,7 @@ inline auto find_active_wal_segment(const std::filesystem::path &wal_path) -> st
 // Test/tooling helper: removes every existing segment file for this WAL identity.
 inline void remove_wal_segments(const std::filesystem::path &wal_path) {
   for (const uint64_t generation : Wal::discover_segments(wal_path)) {
-    std::error_code ignored;
-    std::filesystem::remove(derive_wal_segment_path(wal_path, generation), ignored);
+    remove_quiet(derive_wal_segment_path(wal_path, generation));
   }
 }
 

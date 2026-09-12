@@ -304,8 +304,7 @@ class VMemKVImpl {
         // T1-only reorganize (zero I/O): T2 isn't touched, so the mapper leaves every entry's
         // payload untouched. checkpoint_all_shards() with a no-op per-shard writer gives the
         // same synchronous, deterministic "every shard fully merged before this call returns"
-        // contract a bare reorganize() had on the old, unsharded T1Index -- callers relying on
-        // that (e.g. tests asserting scan order right after reorganize()) see no behavior change.
+        // contract.
         t1_.checkpoint_all_shards([](std::span<typename T1IndexT::EntrySnapshot> /*merged*/) {},
                                   [](std::span<const typename T1IndexT::EntrySnapshot> /*merged*/) {});
         break;
@@ -558,12 +557,9 @@ class VMemKVImpl {
   // order of a reorganize's own duration (milliseconds to seconds) already -- kIdlePollInterval's
   // latency is not perceptible against that, unlike a genuinely hot per-call path.
   //
-  // insert/update/delete never call this: T1's old append-region hard threshold used to block
-  // writers here directly, but that's gone now that ShardedT1Index handles its own per-shard
-  // backpressure internally (see request_maintenance_if_needed()/run_maintenance() in
-  // sharded_t1_index.hpp) -- this function now only serializes explicit reorganize()/checkpoint()
-  // callers (run_reorganize()'s single-flight-per-cycle contract) against a concurrently running
-  // cycle, whatever triggered it.
+  // insert/update/delete never call this: this function only serializes explicit
+  // reorganize()/checkpoint() callers (run_reorganize()'s single-flight-per-cycle contract)
+  // against a concurrently running cycle, whatever triggered it.
   void wait_until_reorg_not_running() const {
     constexpr auto kIdlePollInterval = std::chrono::milliseconds(10);
     const auto wait_start = std::chrono::steady_clock::now();
@@ -844,19 +840,9 @@ class VMemKVImpl {
   // for how each is set up) -- which one a given call should use is decided per record (a real
   // corpus isn't guaranteed uniform record sizes even though this project's benchmarks happen to
   // use one size per run) by try_read_base_record()'s switch below. That switch is the single
-  // place this decision is made, and callers never choose a mapping themselves.
+  // place this decision is made, and callers never choose a mapping themselves. Span
+  // construction itself is ::make_record_view (t2_flat_file.hpp), shared with T2FlatFile::at().
   // -------------------------------------------------------------------------------------------
-
-  // Builds the (key, value) spans that follow a ValueRecordHeader in memory -- the common tail
-  // end of every base-region read path below, once each has independently validated `header`'s
-  // bounds against whatever it read the bytes from (base_boundary or a pread()'d buffer's actual
-  // length; the checks differ, so callers do them, not this helper).
-  static auto make_record_view(const ValueRecordHeader *header) noexcept -> T2RecordView {
-    const auto *key_begin = reinterpret_cast<const std::byte *>(header + 1);
-    std::span<const std::byte> key(key_begin, header->key_len);
-    std::span<const std::byte> value(key.data() + header->key_len, header->value_len);
-    return T2RecordView{header, key, value};
-  }
 
   // Blind (no mincore, no fallback) direct read through a given base-region mapping -- the
   // common tail end of every path in try_read_base_record() below.
@@ -1464,12 +1450,7 @@ class VMemKVImpl {
   // t1_'s *own* background worker pool, in contrast, is already running by this point (started
   // right after load_checkpoint_if_present(), before this call -- see the constructor's own
   // comment): write_entry_lockfree()/t1_.put() below rely on it to drain a shard's append region
-  // if replay pushes it toward AppendRegionFull, the same way live traffic does. This replaces
-  // the old unsharded design's explicit `t1_.append_size() + 1 >= t1_.append_capacity()` check
-  // (which forced a synchronous reorganize mid-replay specifically because no worker existed yet
-  // at this point) -- that check no longer applies (append_size()/append_capacity() aren't even
-  // whole-store concepts anymore), and isn't needed: ShardedT1Index::put() already retries
-  // AppendRegionFull internally against its own running worker pool.
+  // if replay pushes it toward AppendRegionFull, the same way live traffic does.
   void recover_from_wal() {
     wal_.replay([&](vmemkv::WalRecordType type,
                     std::span<const std::byte> key,

@@ -54,8 +54,7 @@ T2FlatFile::T2FlatFile(const std::filesystem::path &path,
     : path_(path) {
   const std::filesystem::path data_path = vmemkv::derive_t2_chk_path(path);
   if (!initial_bytes_used.has_value()) {
-    std::error_code ignored;
-    std::filesystem::remove(data_path, ignored);
+    remove_quiet(data_path);
     create_empty_file(data_path, bytes_capacity);
   }
   map_file(data_path, bytes_capacity, initial_bytes_used.value_or(0));
@@ -74,15 +73,7 @@ T2FlatFile::~T2FlatFile() noexcept {
 
 auto T2FlatFile::at(uint64_t payload, const T2Memory *mem) noexcept -> T2RecordView {
   const std::byte *record_base = resolve_record(payload, mem);
-  const auto *header = reinterpret_cast<const ValueRecordHeader *>(record_base);
-  const auto *key_begin = reinterpret_cast<const std::byte *>(header + 1);
-  const std::byte *value_begin = key_begin + header->key_len;
-
-  return T2RecordView{
-      header,
-      std::span<const std::byte>(key_begin, header->key_len),
-      std::span<const std::byte>(value_begin, header->value_len),
-  };
+  return make_record_view(reinterpret_cast<const ValueRecordHeader *>(record_base));
 }
 
 auto T2FlatFile::append_default(const T2Memory *mem,
@@ -247,8 +238,7 @@ void T2FlatFile::create_empty_file(const std::filesystem::path &path, uint64_t b
   if (::ftruncate(file_descriptor, static_cast<off_t>(bytes_capacity)) != 0) {
     const int err = errno;
     ::close(file_descriptor);
-    std::error_code ignored;
-    std::filesystem::remove(path, ignored);
+    remove_quiet(path);
     throw std::system_error(err, std::generic_category(), "ftruncate");
   }
 

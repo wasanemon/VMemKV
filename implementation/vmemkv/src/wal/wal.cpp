@@ -591,8 +591,7 @@ void Wal::rotate_segment() {
   // Safe even if generation (new_generation - 2) doesn't exist (first two cycles) or was already
   // deleted by an interrupted prior cycle -- see this function's own doc comment.
   if (new_generation >= 2) {
-    std::error_code ignored;
-    std::filesystem::remove(derive_wal_segment_path(path_, new_generation - 2), ignored);
+    remove_quiet(derive_wal_segment_path(path_, new_generation - 2));
   }
 }
 

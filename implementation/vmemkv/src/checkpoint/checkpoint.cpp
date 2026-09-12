@@ -164,8 +164,7 @@ ShardedT1CheckpointWriter::~ShardedT1CheckpointWriter() {
   // requirement -- best-effort, matching write_via_temp_then_rename's crash-safety contract.
   if (!finished_ && file_descriptor_ >= 0) {
     ::close(file_descriptor_);
-    std::error_code remove_ec;
-    std::filesystem::remove(temp_path_, remove_ec);
+    remove_quiet(temp_path_);
   }
 }
 
