@@ -7,7 +7,6 @@
 #include <doctest/doctest.h>
 #include <sys/stat.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -223,7 +222,6 @@ TEST_CASE("defrag runs concurrently with updates without losing writes") {
   // worker's 1s poll plus the manual cycles below; larger counts only add
   // fsync-bound wall time (each update awaits WAL durability) without new races.
   constexpr int kRounds = 10;
-  std::atomic<bool> stop{false};
   std::vector<std::thread> writers;
   for (int t = 0; t < kWriters; ++t) {
     writers.emplace_back([&, t] {
