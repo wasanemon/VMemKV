@@ -53,7 +53,18 @@
 #include <leanstore/utils/JumpMU.hpp>
 #endif
 
+#include "rival_common.hpp"
 #include "rival_store_disabled_stub.hpp"
+
+// RAII file-descriptor guard for the sparse-copy helpers below.
+struct ScopeFd {
+  int fd = -1;
+  ~ScopeFd() {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+};
 
 class LeanStoreStore {
  public:
@@ -65,43 +76,34 @@ class LeanStoreStore {
 #endif
 
 #ifdef ENABLE_LEANSTORE
-  // Number of LeanStore worker threads owned by each instance. Matches the harness's maximum
-  // benchmark thread count so every caller thread can spread onto its own worker; fewer caller
-  // threads simply leave workers idle.
+  // Worker threads per instance; sized to cover the harness's maximum benchmark thread count.
   static constexpr uint64_t kWorkerThreads = 32;
-  // BTreeVI key/value lengths are u16. Keys here are short; values above this cannot be stored.
+  // BTreeVI key/value lengths are u16; values above this cannot be stored.
   static constexpr std::size_t kMaxValueBytes = 65535;
 
   static auto checked_len(std::size_t n) -> ::u16 {
     if (n > kMaxValueBytes) {
-      throw std::runtime_error("LeanStore key/value over u16 ceiling");
+      throw std::runtime_error("LeanStore cannot store values over 65535 bytes (64KB corpus excluded)");
     }
     return static_cast<::u16>(n);
   }
 
-  static void check_value_size(std::size_t n) {
-    if (n > kMaxValueBytes) {
-      throw std::runtime_error("LeanStore cannot store values over 65535 bytes (64KB corpus excluded)");
-    }
-  }
-
   // BTreeVI orders keys by raw memcmp, mirroring LMDBStore::compare_to_bound exactly.
   static auto compare_to_bound(const ::u8 *key, ::u16 key_len, std::span<const std::byte> upper_bound) noexcept -> int {
-    const std::size_t klen = key_len;
-    const size_t min_len = std::min(klen, upper_bound.size());
-    const int cmp = min_len == 0 ? 0 : std::memcmp(key, upper_bound.data(), min_len);
-    if (cmp != 0) {
-      return cmp;
+    return vmemkv::rivals::compare_bytes(std::span<const std::byte>(reinterpret_cast<const std::byte *>(key), key_len),
+                                         upper_bound);
+  }
+
+  // Aborts the current worker TX on ABORT_TX; abortTX() longjmps, so this stays trivial.
+  static void throw_on_abort(leanstore::OP_RESULT res) {
+    if (res == leanstore::OP_RESULT::ABORT_TX) {
+      leanstore::cr::Worker::my().abortTX();
     }
-    if (klen == upper_bound.size()) {
-      return 0;
-    }
-    return klen < upper_bound.size() ? -1 : 1;
   }
 
   // Exact-match existence probe with optional value capture. Scan-based rather than
   // lookup()-based (see get_impl): only the scan path skips removed entries. ABORT_TX
-  // funnels through abortTX() for the caller's retry loop.
+  // funnels through throw_on_abort() for the caller's retry loop.
   template <typename ValueCb>
   static void scan_exact(leanstore::KVInterface &btree,
                          std::span<const std::byte> key,
@@ -121,17 +123,20 @@ class LeanStoreStore {
           return false;
         },
         [] {});
-    if (res == leanstore::OP_RESULT::ABORT_TX) {
-      leanstore::cr::Worker::my().abortTX();
-    }
+    throw_on_abort(res);
+  }
+
+  // Exact-match liveness probe used by insert/update/remove.
+  static auto require_live(leanstore::KVInterface &btree, std::span<const std::byte> key) -> bool {
+    bool seen = false;
+    scan_exact(btree, key, [](const ::u8 *, ::u16) {}, seen);
+    return seen;
   }
 
   // Opens a fresh database at a unique subpath, mirroring LMDBStore's per-instance uniquing.
   explicit LeanStoreStore(std::string path) {
-    static std::atomic<uint64_t> instance_counter{0};
-    const std::string stem =
-        std::move(path) + "_" + std::to_string(instance_counter.fetch_add(1, std::memory_order_relaxed)) + ".leanstore";
-    open_fresh(stem);
+    const std::string stem = vmemkv::rivals::make_unique_instance_path(std::move(path), ".leanstore");
+    open(stem, OpenMode::Fresh);
   }
 
   ~LeanStoreStore() {
@@ -148,11 +153,8 @@ class LeanStoreStore {
   // variadic forwarding constructor can name it directly.
   struct CloneFromMasterTag {};
 
-  // Builds `master_path` once via bulk_load, then clones it into this instance's own path with
-  // a plain file copy -- much cheaper than re-running bulk_load_impl against an empty
-  // environment each time. Must be a real copy, not a hardlink: LeanStore writes its B-Tree
-  // pages in place, so a hardlinked clone and its master would corrupt each other on the
-  // first write (same reasoning as LMDBStore's clone_from()).
+  // Builds `master_path` once via bulk_load, then clones it with a plain file copy (never a
+  // hardlink: pages are written in place).
   template <typename KeyFn, typename ValueFn>
   LeanStoreStore(CloneFromMasterTag /*tag*/,
                  const std::string &master_path,
@@ -164,7 +166,7 @@ class LeanStoreStore {
     // interchangeable, and a fixed name keeps at most one clone generation on disk.
     const std::string stem = master_path + "_clone.leanstore";
     clone_from(master_path, stem);
-    open_recover(stem);
+    open(stem, OpenMode::Recover);
   }
 
   // No-op: LeanStore reclaims via its buffer manager/page recycling internally; there is no
@@ -175,13 +177,8 @@ class LeanStoreStore {
 
   template <typename Callback>
   auto get_impl(std::span<const std::byte> key, Callback callback) const -> bool {
-    // Neither primitive alone is correct on this backend version (verified empirically):
-    // lookupOptimistic returns the head payload without consulting is_removed (deleted keys
-    // read as live), while the scan fast path reports the full slot length including the
-    // chain header for visible heads. Hence liveness via scan_exact plus the value via
-    // lookup; both inside one TX.
-    // The value is copied into heap state before commit (a thread_local buffer would belong
-    // to the worker thread, not the caller).
+    // Liveness via scan_exact plus value via lookup, both inside one TX. The value is copied
+    // into heap state before commit.
     struct GetState {
       std::vector<std::byte> value;
       bool found = false;
@@ -199,9 +196,7 @@ class LeanStoreStore {
             out.value.assign(reinterpret_cast<const std::byte *>(payload),
                              reinterpret_cast<const std::byte *>(payload) + len);
           });
-          if (res == leanstore::OP_RESULT::ABORT_TX) {
-            leanstore::cr::Worker::my().abortTX();
-          }
+          throw_on_abort(res);
           // A concurrent remover may have deleted the key between the probe and the lookup;
           // linearize the delete first.
           out.found = (res == leanstore::OP_RESULT::OK);
@@ -215,28 +210,24 @@ class LeanStoreStore {
   }
 
   auto insert_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-    check_value_size(value.size());
+    checked_len(value.size());
     // BTreeVI::insert on an existing key hits an unimplemented path, so existence is checked
     // first within the same TX: a concurrent inserter wins the race as ABORT_TX and this call
     // retries, observing the key the second time.
     return run_on_worker<bool>([&](leanstore::KVInterface &btree) {
       ::u8 *k = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(key.data()));
       ::u8 *v = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(value.data()));
-      bool seen = false;
-      scan_exact(btree, key, [&](const ::u8 *, ::u16) {}, seen);
-      if (seen) {
+      if (require_live(btree, key)) {
         return false;
       }
       const auto res = btree.insert(k, checked_len(key.size()), v, checked_len(value.size()));
-      if (res == leanstore::OP_RESULT::ABORT_TX) {
-        leanstore::cr::Worker::my().abortTX();
-      }
+      throw_on_abort(res);
       return res == leanstore::OP_RESULT::OK;
     });
   }
 
   auto update_impl(std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-    check_value_size(value.size());
+    checked_len(value.size());
     // Same-size in-place update: remove + insert is unimplemented in this backend version
     // ("Implement inserts after remove cases" TODO in BTreeVI), so size-changing updates have
     // no correct path. The harness always updates with the key's own index-derived size, hence
@@ -246,15 +237,11 @@ class LeanStoreStore {
       // Liveness via scan (lookup is tombstone-blind); the exact length via lookup (the scan
       // fast path overstates chained value lengths). Both in one TX.
       ::u16 old_len = 0;
-      bool seen = false;
-      scan_exact(btree, key, [&](const ::u8 *, ::u16) {}, seen);
-      if (!seen) {
+      if (!require_live(btree, key)) {
         return false;
       }
       const auto lres = btree.lookup(k, checked_len(key.size()), [&](const ::u8 *, ::u16 len) { old_len = len; });
-      if (lres == leanstore::OP_RESULT::ABORT_TX) {
-        leanstore::cr::Worker::my().abortTX();
-      }
+      throw_on_abort(lres);
       if (lres != leanstore::OP_RESULT::OK) {
         return false;
       }
@@ -272,9 +259,7 @@ class LeanStoreStore {
           checked_len(key.size()),
           [&](::u8 *payload, ::u16) { std::memcpy(payload, value.data(), value.size()); },
           desc);
-      if (res == leanstore::OP_RESULT::ABORT_TX) {
-        leanstore::cr::Worker::my().abortTX();
-      }
+      throw_on_abort(res);
       return res == leanstore::OP_RESULT::OK;
     });
   }
@@ -284,15 +269,11 @@ class LeanStoreStore {
     // engine ensure() instead of returning NOT_FOUND.
     return run_on_worker<bool>([&](leanstore::KVInterface &btree) {
       ::u8 *k = const_cast<::u8 *>(reinterpret_cast<const ::u8 *>(key.data()));
-      bool seen = false;
-      scan_exact(btree, key, [&](const ::u8 *, ::u16) {}, seen);
-      if (!seen) {
+      if (!require_live(btree, key)) {
         return false;
       }
       const auto res = btree.remove(k, checked_len(key.size()));
-      if (res == leanstore::OP_RESULT::ABORT_TX) {
-        leanstore::cr::Worker::my().abortTX();
-      }
+      throw_on_abort(res);
       return res == leanstore::OP_RESULT::OK;
     });
   }
@@ -302,13 +283,8 @@ class LeanStoreStore {
     if (key_count == 0) {
       return;
     }
-    // No bulk-insert fast path exists in this backend version, so load goes through regular
-    // transactions with a commit every batch to bound TX WAL size. Single-threaded ascending
-    // order, like the other engines' bulk loaders: parallel loaders all hammer the B-tree's
-    // right edge and collapse into OCC abort storms (measured 225x slower at 5 loaders), while
-    // one loader sustains ~600K keys/s with no aborts possible. Each key probes before
-    // inserting: a batch that aborts mid-way retries the whole chunk, and only the probe makes
-    // that retry idempotent (blind re-insert would hit the engine's duplicate path).
+    // Bulk load goes through regular transactions with a commit every batch; single-threaded
+    // ascending order, probing before each insert.
     constexpr std::size_t kBatchKeys = 10000;
     std::atomic<bool> failed{false};
     for (std::size_t base = 0; base < key_count && !failed.load(std::memory_order_relaxed);) {
@@ -335,9 +311,7 @@ class LeanStoreStore {
                                             checked_len(key.size()),
                                             reinterpret_cast<::u8 *>(const_cast<char *>(value.data())),
                                             checked_len(value.size()));
-              if (res == leanstore::OP_RESULT::ABORT_TX) {
-                leanstore::cr::Worker::my().abortTX();
-              }
+              throw_on_abort(res);
             }
             return 0;
           },
@@ -377,9 +351,7 @@ class LeanStoreStore {
                 return true;
               },
               [] {});
-          if (res == leanstore::OP_RESULT::ABORT_TX) {
-            leanstore::cr::Worker::my().abortTX();
-          }
+          throw_on_abort(res);
           std::vector<std::byte> value_buf;
           for (const std::string &key : out.keys) {
             value_buf.clear();
@@ -390,9 +362,7 @@ class LeanStoreStore {
                                reinterpret_cast<const std::byte *>(payload) + len);
               live = true;
             });
-            if (lres == leanstore::OP_RESULT::ABORT_TX) {
-              leanstore::cr::Worker::my().abortTX();
-            }
+            throw_on_abort(lres);
             if (!live) {
               continue;
             }
@@ -422,11 +392,16 @@ class LeanStoreStore {
   }
 
   static auto worker_threads() -> uint32_t {
-    if (const char *env = std::getenv("LEANSTORE_WORKER_THREADS")) {
-      // Clamped to the slot-mutex array bound; fewer workers only (bisect/debug knob).
-      return std::min(static_cast<uint32_t>(kWorkerThreads), static_cast<uint32_t>(std::strtoul(env, nullptr, 10)));
+    // Clamped to the slot-mutex array bound; fewer workers only (bisect/debug knob).
+    return getenv_u32(
+        "LEANSTORE_WORKER_THREADS", static_cast<uint32_t>(kWorkerThreads), static_cast<uint32_t>(kWorkerThreads));
+  }
+
+  static auto getenv_u32(const char *name, uint32_t dflt, uint32_t clamp_max) -> uint32_t {
+    if (const char *env = std::getenv(name)) {
+      return std::min(clamp_max, static_cast<uint32_t>(std::strtoul(env, nullptr, 10)));
     }
-    return static_cast<uint32_t>(kWorkerThreads);
+    return dflt;
   }
 
   // LeanStore derives recover/persist from non-default file paths at construction
@@ -450,15 +425,11 @@ class LeanStoreStore {
     FLAGS_dram_gib = dram_gib();
     FLAGS_pin_threads = false;
     FLAGS_cpu_counters = false;
-    if (const char *pp = std::getenv("LEANSTORE_PP_THREADS")) {
-      FLAGS_pp_threads = static_cast<uint32_t>(std::strtoul(pp, nullptr, 10));
-    }
+    // Unset env keeps the current value.
+    FLAGS_pp_threads = getenv_u32("LEANSTORE_PP_THREADS", FLAGS_pp_threads, UINT32_MAX);
   }
 
-  // Blocks until every worker has executed one job. Construction returns while workers
-  // are still starting otherwise, and a fast destroy then races their startup barrier against
-  // the teardown spin (hang). A completed round trip proves all workers -- and the group
-  // committer they rendezvous with -- are past startup.
+  // Blocks until every worker has executed one job, proving all workers are past startup.
   void warmup_workers() {
     for (uint64_t t = 0; t < worker_threads(); ++t) {
       db_->getCRManager().scheduleJobSync(t, [] {});
@@ -477,32 +448,32 @@ class LeanStoreStore {
     leanstore::storage::DTRegistry::global_dt_registry.dt_instances_ht.clear();
   }
 
-  void open_fresh(const std::string &stem) {
-    prune_stale_registrations();
-    ssd_path_ = stem;
-    json_path_ = stem + ".json";
-    std::error_code ignored;
-    std::filesystem::remove(ssd_path_, ignored);
-    std::filesystem::remove(json_path_, ignored);
-    reset_flags(ssd_path_);
-    FLAGS_trunc = true;
-    db_ = std::make_unique<leanstore::LeanStore>();
-    // Table registration runs on a worker (as in upstream drivers): B-tree creation touches
-    // worker-local state and segfaults on a foreign thread.
-    db_->getCRManager().scheduleJobSync(
-        0, [&] { table_ = &db_->registerBTreeVI("kv", {.enable_wal = true, .use_bulk_insert = false}); });
-    warmup_workers();
-  }
+  enum class OpenMode { Fresh, Recover };
 
-  void open_recover(const std::string &stem) {
+  void open(const std::string &stem, OpenMode mode) {
     prune_stale_registrations();
     ssd_path_ = stem;
     json_path_ = stem + ".json";
+    if (mode == OpenMode::Fresh) {
+      std::error_code ignored;
+      std::filesystem::remove(ssd_path_, ignored);
+      std::filesystem::remove(json_path_, ignored);
+    }
     reset_flags(ssd_path_);
-    FLAGS_recover = true;
-    FLAGS_recover_file = json_path_;
+    if (mode == OpenMode::Fresh) {
+      FLAGS_trunc = true;
+    } else {
+      FLAGS_recover = true;
+      FLAGS_recover_file = json_path_;
+    }
     db_ = std::make_unique<leanstore::LeanStore>();
-    db_->getCRManager().scheduleJobSync(0, [&] { table_ = &db_->retrieveBTreeVI("kv"); });
+    if (mode == OpenMode::Fresh) {
+      // Table registration runs on a worker: B-tree creation requires worker-local state.
+      db_->getCRManager().scheduleJobSync(
+          0, [&] { table_ = &db_->registerBTreeVI("kv", {.enable_wal = true, .use_bulk_insert = false}); });
+    } else {
+      db_->getCRManager().scheduleJobSync(0, [&] { table_ = &db_->retrieveBTreeVI("kv"); });
+    }
     warmup_workers();
   }
 
@@ -525,7 +496,7 @@ class LeanStoreStore {
       return;
     }
     prune_stale_registrations();
-    const std::string building_ssd = master_path + ".building";
+    const std::string building_ssd = vmemkv::rivals::building_path(master_path);
     const std::string building_json = building_ssd + ".json";
     std::error_code ignored;
     std::filesystem::remove(building_ssd, ignored);
@@ -548,30 +519,15 @@ class LeanStoreStore {
 
     std::filesystem::remove(master_path, ignored);
     std::filesystem::remove(master_json, ignored);
-    std::error_code rename_error;
-    std::filesystem::rename(building_ssd, master_path, rename_error);
-    if (rename_error) {
-      throw std::runtime_error("LeanStore master build rename failed: " + rename_error.message());
-    }
-    std::filesystem::rename(building_json, master_json, rename_error);
-    if (rename_error) {
-      throw std::runtime_error("LeanStore master json rename failed: " + rename_error.message());
-    }
+    vmemkv::rivals::atomic_rename(building_ssd, master_path, "LeanStore master build rename failed");
+    vmemkv::rivals::atomic_rename(building_json, master_json, "LeanStore master json rename failed");
   }
 
   // Copies a database image preserving holes: with the WAL region parked high above
   // the data image the files are sparse, and a plain copy would materialize tens of
   // gigabytes of zeros per clone. Falls back to a full copy where SEEK_DATA is unsupported.
   static void copy_sparse(const std::string &source, const std::string &dest) {
-    struct Closer {
-      int fd = -1;
-      ~Closer() {
-        if (fd >= 0) {
-          ::close(fd);
-        }
-      }
-    };
-    Closer src{::open(source.c_str(), O_RDONLY)};
+    ScopeFd src{::open(source.c_str(), O_RDONLY)};
     if (src.fd < 0) {
       throw std::runtime_error("LeanStore clone open failed: " + source);
     }
@@ -579,13 +535,14 @@ class LeanStoreStore {
     if (total < 0) {
       throw std::runtime_error("LeanStore clone stat failed: " + source);
     }
-    Closer dst{::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666)};
+    ScopeFd dst{::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666)};
     if (dst.fd < 0) {
       throw std::runtime_error("LeanStore clone create failed: " + dest);
     }
+    std::string scratch(1 << 20, '\0');
     const off_t probe = ::lseek(src.fd, 0, SEEK_DATA);
     if (probe < 0 && errno == EINVAL) {
-      copy_range(src.fd, dst.fd, 0, total);
+      copy_range(src.fd, dst.fd, 0, total, scratch);
     } else {
       for (off_t off = 0; off < total;) {
         const off_t data_at = (off == 0 && probe >= 0) ? probe : ::lseek(src.fd, off, SEEK_DATA);
@@ -599,7 +556,7 @@ class LeanStoreStore {
         if (hole_at < 0) {
           throw std::runtime_error("LeanStore clone seek failed: " + source);
         }
-        copy_range(src.fd, dst.fd, data_at, std::min(hole_at, total) - data_at);
+        copy_range(src.fd, dst.fd, data_at, std::min(hole_at, total) - data_at, scratch);
         off = std::min(hole_at, total);
       }
     }
@@ -608,10 +565,9 @@ class LeanStoreStore {
     }
   }
 
-  static void copy_range(int src_fd, int dest_fd, off_t offset, off_t count) {
-    std::string buf(1 << 20, '\0');
+  static void copy_range(int src_fd, int dest_fd, off_t offset, off_t count, std::string &buf) {
     while (count > 0) {
-      const std::size_t chunk = static_cast<std::size_t>(std::min<off_t>(count, 1 << 20));
+      const std::size_t chunk = static_cast<std::size_t>(std::min<off_t>(count, static_cast<off_t>(buf.size())));
       const ssize_t got = ::pread(src_fd, buf.data(), chunk, offset);
       if (got <= 0) {
         throw std::runtime_error("LeanStore clone read failed");
@@ -637,15 +593,13 @@ class LeanStoreStore {
     // Make the clone durable before any timed run starts from it: data and WAL share one
     // file here, so the first timed fdatasync would otherwise flush this whole just-copied
     // image (tens of GB) inside the measurement window.
-    const int fd = ::open(dest_stem.c_str(), O_RDONLY);
-    if (fd < 0) {
+    ScopeFd fd{::open(dest_stem.c_str(), O_RDONLY)};
+    if (fd.fd < 0) {
       throw std::runtime_error("LeanStore clone sync open failed: " + dest_stem);
     }
-    if (::fsync(fd) != 0) {
-      ::close(fd);
+    if (::fsync(fd.fd) != 0) {
       throw std::runtime_error("LeanStore clone sync failed: " + dest_stem);
     }
-    ::close(fd);
     std::filesystem::copy_file(source_stem + ".json", dest_stem + ".json", ignored);
     if (ignored) {
       throw std::runtime_error("LeanStore clone json copy failed: " + ignored.message());
@@ -725,11 +679,6 @@ class LeanStoreStore {
   template <typename T, typename Body>
   auto run_on_worker(Body &&body, bool read_only = false) const -> T {
     return run_on_worker<T>(std::forward<Body>(body), read_only, worker_slot());
-  }
-
-  template <typename T, typename Body>
-  auto run_on_worker(Body &&body, uint64_t slot_hint) const -> T {
-    return run_on_worker<T>(std::forward<Body>(body), /*read_only=*/false, slot_hint);
   }
 
   // Private default ctor for ensure_master_built()'s scratch instance.

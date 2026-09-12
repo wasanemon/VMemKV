@@ -78,11 +78,7 @@ class StoreAdapter {
     });
   }
 
-  // Shared body for insert()/update() below: both serialize key/value the same way before
-  // dispatching to whichever KVSImpl method the caller names via `ImplMethod`. An 8-byte value
-  // that's all-1-bits (bit-for-bit identical to T1's own STORE_NOT_FOUND sentinel) is handled by
-  // VMemKVImpl::try_make_inline_payload() declining to inline it and routing it through the
-  // ordinary T2-record path instead, uniformly across every write path including bulk_load().
+  // Shared body for insert()/update(): serializes key/value, then dispatches to the ImplMethod KVSImpl method.
   template <auto ImplMethod, typename Key, typename Value>
   auto insert_or_update(const Key &key, Value &&value) -> bool {
     return kvs_detail::with_key_serialized(key, [this, &value](std::span<const std::byte> key_bytes) -> bool {
@@ -109,11 +105,8 @@ class StoreAdapter {
         key, [this](std::span<const std::byte> key_bytes) -> bool { return impl_.remove_impl(key_bytes); });
   }
 
-  // Bulk-loads `count` entries generated on demand by make_key(index)/make_value(index). Throws
-  // on failure. Much faster than `count` individual insert() calls, but unlike insert()/update()
-  // gives no durability guarantee by itself -- see each backend's bulk_load_impl() (VMemKVImpl,
-  // e.g., skips its WAL entirely; callers needing crash survival must checkpoint() afterward).
-  // Upsert semantics (no existing-key check), and not safe for concurrent access during the call.
+  // Bulk-loads `count` entries from make_key/make_value; upsert semantics, no durability guarantee, not safe for
+  // concurrent access during the call.
   template <typename KeyFn, typename ValueFn>
   void bulk_load(std::size_t count, KeyFn &&make_key, ValueFn &&make_value) {
     impl_.bulk_load_impl(count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
@@ -134,16 +127,8 @@ class StoreAdapter {
   auto impl() noexcept -> KVSImpl & { return impl_; }
   [[nodiscard]] auto impl() const noexcept -> const KVSImpl & { return impl_; }
 
-  // T1-only in-memory merge. Never touches T2, never persists a checkpoint. Rival backends
-  // define their own no-op reorganize() (they self-manage compaction), so this delegates
-  // unconditionally rather than needing an is_rival_store_v branch.
-  //
-  // Forces every T1 shard through a full synchronous merge, so cost is O(total corpus), not O(one
-  // shard) -- the automatic per-shard background maintenance in ShardedT1Index already keeps
-  // steady-state maintenance cost bounded regardless of corpus size, so production code should
-  // rely on that rather than call this. This method exists for callers that need every entry
-  // deterministically merged right now (tests asserting exact post-merge state, or benchmarks
-  // deliberately measuring the cost of a full forced maintenance pass).
+  // T1-only in-memory merge; rival backends define their own no-op reorganize(). Forces every T1 shard through a full
+  // synchronous merge.
   void reorganize() { impl_.reorganize(); }
 
   // Always persists a checkpoint via the cheapest available path (see VMemKVImpl::checkpoint()).

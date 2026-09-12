@@ -20,6 +20,8 @@
 #include <string>
 #include <utility>
 
+#include "rival_common.hpp"
+
 namespace vmemkv::rivals::rocksdb_common {
 
 #ifdef ENABLE_ROCKSDB
@@ -38,11 +40,7 @@ inline auto make_bulk_load_write_options() -> rocksdb::WriteOptions {
   return opts;
 }
 
-// Insert/Update/Delete must fsync the WAL before returning, matching VMemKV's own per-write
-// fsync contract (wal.hpp). RocksDB's default WriteOptions{} has sync=false (page-cache only),
-// which would understate RocksDB's cost relative to the durability level this project targets
-// (eventually backing a MySQL storage engine à la MyRocks, which pays the same commit-time
-// fsync).
+// Insert/Update/Delete fsync the WAL before returning, matching VMemKV's per-write fsync contract.
 inline auto make_durable_write_options() -> rocksdb::WriteOptions {
   rocksdb::WriteOptions opts;
   opts.sync = true;
@@ -84,8 +82,7 @@ void bulk_load_into(
   if (key_count == 0) {
     return;
   }
-  // Keep each WriteBatch within a fixed byte budget so many small values can be grouped much
-  // more aggressively than few large ones without needing to know sizes up front.
+  // Keep each WriteBatch within a fixed byte budget.
   constexpr std::size_t kBatchBytes = 64ULL * 1024ULL * 1024ULL;
   rocksdb::WriteOptions write_opts = make_bulk_load_write_options();
 
@@ -122,17 +119,13 @@ void ensure_master_built(const rocksdb::Options &opts,
   if (std::filesystem::exists(master_path)) {
     return;
   }
-  const std::string building_path = master_path + ".building";
-  rocksdb::DestroyDB(building_path, {});
-  rocksdb::DB *db_handle = open_db(opts, building_path, engine_label);
+  const std::string building = building_path(master_path);
+  rocksdb::DestroyDB(building, {});
+  rocksdb::DB *db_handle = open_db(opts, building, engine_label);
   bulk_load_into(db_handle, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value), engine_label);
   delete db_handle;
   rocksdb::DestroyDB(master_path, {});
-  std::error_code rename_error;
-  std::filesystem::rename(building_path, master_path, rename_error);
-  if (rename_error) {
-    throw std::runtime_error(std::string(engine_label) + " master build rename failed: " + rename_error.message());
-  }
+  atomic_rename(building, master_path, std::string(engine_label) + " master build rename failed");
 }
 
 // Briefly opens `source_path` read-only, checkpoints it to `dest_path` (destroying any stale

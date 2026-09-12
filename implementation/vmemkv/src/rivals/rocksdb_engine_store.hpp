@@ -4,7 +4,6 @@
 // rocksdb_blobdb_store.hpp) for what actually varies.
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -18,6 +17,7 @@
 #include <rocksdb/options.h>
 #endif
 
+#include "rival_common.hpp"
 #include "rocksdb_common.hpp"
 
 namespace vmemkv::rivals {
@@ -37,8 +37,7 @@ class RocksDBEngineStore {
 #ifdef ENABLE_ROCKSDB
   // Opens a fresh DB at a unique subpath, preventing transient lock contention (ENOLCK) across thread sweeps.
   explicit RocksDBEngineStore(std::string path) {
-    static std::atomic<uint64_t> instance_counter{0};
-    path_ = std::move(path) + "_" + std::to_string(instance_counter.fetch_add(1, std::memory_order_relaxed));
+    path_ = make_unique_instance_path(std::move(path), "");
     rocksdb::DestroyDB(path_, {});
     db_.reset(rocksdb_common::open_db(Policy::make_options(), path_, Policy::kLabel));
   }

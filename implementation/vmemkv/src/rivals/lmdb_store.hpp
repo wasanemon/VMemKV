@@ -1,16 +1,10 @@
-// lmdb_store.hpp — Thin LMDB (Lightning Memory-Mapped Database) wrapper exposing
-// byte-span APIs for comparison.
+// lmdb_store.hpp — Thin LMDB (Lightning Memory-Mapped Database) wrapper exposing byte-span APIs.
 //
-// Thread safety: LMDB allows unlimited concurrent readers (MVCC snapshots that never
-// block or are blocked) but exactly one writer transaction at a time; concurrent
-// Insert/Update/Delete calls serialize on LMDB's internal writer lock. This is
-// reported as-is rather than worked around, since it is an inherent characteristic
-// of LMDB's B+Tree/copy-on-write design being compared against the other engines.
+// Thread safety: unlimited concurrent readers; exactly one writer transaction at a time.
 
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +17,7 @@
 #include <lmdb.h>
 #endif
 
+#include "rival_common.hpp"
 #include "rival_store_disabled_stub.hpp"
 
 class LMDBStore {
@@ -38,8 +33,7 @@ class LMDBStore {
   // Opens a fresh environment at a unique subpath (single-file DB via MDB_NOSUBDIR),
   // mirroring RocksDBStore's per-instance path uniquing.
   explicit LMDBStore(std::string path) {
-    static std::atomic<uint64_t> instance_counter{0};
-    path_ = std::move(path) + "_" + std::to_string(instance_counter.fetch_add(1, std::memory_order_relaxed)) + ".lmdb";
+    path_ = vmemkv::rivals::make_unique_instance_path(std::move(path), ".lmdb");
     std::filesystem::remove(path_);
     std::filesystem::remove(path_ + "-lock");
 
@@ -266,25 +260,21 @@ class LMDBStore {
     if (std::filesystem::exists(master_path)) {
       return;
     }
-    const std::string building_path = master_path + ".building";
+    const std::string building = vmemkv::rivals::building_path(master_path);
     std::error_code ignored;
-    std::filesystem::remove(building_path, ignored);
-    std::filesystem::remove(building_path + "-lock", ignored);
+    std::filesystem::remove(building, ignored);
+    std::filesystem::remove(building + "-lock", ignored);
 
     MDB_env *build_env = nullptr;
     MDB_dbi build_dbi = 0;
-    open_env_and_dbi(building_path, MDB_NOSUBDIR | MDB_WRITEMAP, " (master build)", build_env, build_dbi);
+    open_env_and_dbi(building, MDB_NOSUBDIR | MDB_WRITEMAP, " (master build)", build_env, build_dbi);
 
     bulk_load_into(build_env, build_dbi, key_count, std::forward<KeyFn>(make_key), std::forward<ValueFn>(make_value));
     mdb_env_close(build_env);
 
     std::filesystem::remove(master_path, ignored);
     std::filesystem::remove(master_path + "-lock", ignored);
-    std::error_code rename_error;
-    std::filesystem::rename(building_path, master_path, rename_error);
-    if (rename_error) {
-      throw std::runtime_error("LMDB master build rename failed: " + rename_error.message());
-    }
+    vmemkv::rivals::atomic_rename(building, master_path, "LMDB master build rename failed");
   }
 
   // Copies `source_path` to `dest_path` via mdb_env_copy2(..., MDB_CP_COMPACT), which also
@@ -340,16 +330,8 @@ class LMDBStore {
   // LMDB's default (unnamed) database uses plain memcmp byte-string ordering, so
   // this mirrors that exactly to decide whether `key` is past `upper_bound`.
   static auto compare_to_bound(const MDB_val &key, std::span<const std::byte> upper_bound) noexcept -> int {
-    const auto *key_bytes = static_cast<const std::byte *>(key.mv_data);
-    const size_t min_len = std::min(key.mv_size, upper_bound.size());
-    const int cmp = min_len == 0 ? 0 : std::memcmp(key_bytes, upper_bound.data(), min_len);
-    if (cmp != 0) {
-      return cmp;
-    }
-    if (key.mv_size == upper_bound.size()) {
-      return 0;
-    }
-    return key.mv_size < upper_bound.size() ? -1 : 1;
+    return vmemkv::rivals::compare_bytes(
+        std::span<const std::byte>(static_cast<const std::byte *>(key.mv_data), key.mv_size), upper_bound);
   }
 
   MDB_env *env_ = nullptr;
