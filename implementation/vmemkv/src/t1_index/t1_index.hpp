@@ -85,8 +85,10 @@ inline auto entry_identity_equal(const StoreKey &a_key,
   return a_key == b_key && (a_hash & kCleanHashMask) == (b_hash & kCleanHashMask);
 }
 
-inline auto entry_less(const StoreKey &a_key, uint64_t a_hash, const StoreKey &b_key, uint64_t b_hash) noexcept
-    -> bool {
+inline auto entry_less(const StoreKey &a_key,
+                       uint64_t a_hash,
+                       const StoreKey &b_key,
+                       uint64_t b_hash) noexcept -> bool {
   if (a_key != b_key) {
     return a_key < b_key;
   }
@@ -938,9 +940,7 @@ class T1Index {
     // initial state (see LockFreeHashTable's constructor) -- unpublished slots are never
     // faulted in or zeroed up front.
     explicit AppendRegion(size_t capacity)
-        : capacity_(capacity),
-          slots_(static_cast<AppendSlot *>(mmap_anon_or_throw(capacity_ * sizeof(AppendSlot)))) {
-    }
+        : capacity_(capacity), slots_(static_cast<AppendSlot *>(mmap_anon_or_throw(capacity_ * sizeof(AppendSlot)))) {}
 
     ~AppendRegion() { ::munmap(slots_, capacity_ * sizeof(AppendSlot)); }
 
@@ -1189,10 +1189,10 @@ class T1Index {
 
   static void assert_no_duplicates(const std::vector<EntrySnapshot> &entries) {
     // Clean-hash identity, matching the merge's dedup (see T1MergePolicy).
-    const auto duplicate = std::adjacent_find(entries.begin(), entries.end(), [](const EntrySnapshot &a,
-                                                                                 const EntrySnapshot &b) {
-      return T1MergePolicy::identity_equal(a, b);
-    });
+    const auto duplicate =
+        std::adjacent_find(entries.begin(), entries.end(), [](const EntrySnapshot &a, const EntrySnapshot &b) {
+          return T1MergePolicy::identity_equal(a, b);
+        });
     assert(duplicate == entries.end() &&
            "T1Index invariant violated: duplicate key prefix + clean hash detected in merge output");
     (void)duplicate;

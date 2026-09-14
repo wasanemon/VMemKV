@@ -74,9 +74,7 @@ inline void snapshot_checkpoint_stats(const ReorgState &state, VMemKVStatistics 
 
 namespace checkpoint_detail {
 
-inline auto auto_reorg_suppressed() noexcept -> bool {
-  return std::getenv("VMEMKV_SUPPRESS_AUTO_REORG") != nullptr;
-}
+inline auto auto_reorg_suppressed() noexcept -> bool { return std::getenv("VMEMKV_SUPPRESS_AUTO_REORG") != nullptr; }
 
 inline auto wal_over_threshold(const Wal &wal) -> bool {
   return wal.size_bytes() >= WalConfig::kMaxBytesSinceCheckpoint;
@@ -127,8 +125,9 @@ struct CheckpointTarget {
 // guaranteed to be a fully-written frontier, never a merely-reserved one. Writers resume
 // before this returns -- msync() below runs fully concurrently with new writes.
 template <typename PreStopHook>
-auto capture_checkpoint_target(T2FlatFile &t2, PreStopHook pre_stop_hook, std::chrono::nanoseconds &stop_phase)
-    -> CheckpointTarget {
+auto capture_checkpoint_target(T2FlatFile &t2,
+                               PreStopHook pre_stop_hook,
+                               std::chrono::nanoseconds &stop_phase) -> CheckpointTarget {
   CheckpointTarget out;
   out.old_base_boundary = t2.get_memory()->base_boundary.load(std::memory_order_acquire);
   const vmemkv::T2Memory *mem_to_drain = t2.get_memory();

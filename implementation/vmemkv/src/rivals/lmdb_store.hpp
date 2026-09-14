@@ -17,8 +17,8 @@
 #include <lmdb.h>
 #endif
 
-#include "rival_common.hpp"
 #include "master_clone.hpp"
+#include "rival_common.hpp"
 #include "rival_store_disabled_stub.hpp"
 
 class LMDBStore {

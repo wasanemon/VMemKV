@@ -355,20 +355,20 @@ void flush_scan_batch(std::vector<ScanBatchSlot> &batch,
     // bounds what happens *around* copy_func's call. Spans into the arena materialize only
     // after the read loop (the arena never grows past that point, so they stay stable
     // through the callbacks).
-    slot.skipped = !read_t2_record_seqlock(
-        [&]() -> T2RecordView { return t2.at(slot.payload & detail::kPayloadOffsetMask, mem); },
-        [&](const T2RecordView &record) -> bool {
-          if (!key_in_range(record.key, lower_bound, upper_bound)) {
-            return false;
-          }
-          slot.arena_key_off = arena.size();
-          slot.arena_key_len = record.key.size();
-          slot.arena_val_len = record.value.size();
-          arena.insert(arena.end(), record.key.begin(), record.key.end());
-          arena.insert(arena.end(), record.value.begin(), record.value.end());
-          slot.copied = true;
-          return true;
-        });
+    slot.skipped =
+        !read_t2_record_seqlock([&]() -> T2RecordView { return t2.at(slot.payload & detail::kPayloadOffsetMask, mem); },
+                                [&](const T2RecordView &record) -> bool {
+                                  if (!key_in_range(record.key, lower_bound, upper_bound)) {
+                                    return false;
+                                  }
+                                  slot.arena_key_off = arena.size();
+                                  slot.arena_key_len = record.key.size();
+                                  slot.arena_val_len = record.value.size();
+                                  arena.insert(arena.end(), record.key.begin(), record.key.end());
+                                  arena.insert(arena.end(), record.value.begin(), record.value.end());
+                                  slot.copied = true;
+                                  return true;
+                                });
   }
   for (ScanBatchSlot &slot : batch) {
     // copied implies !skipped (copy_func only sets copied when returning true).

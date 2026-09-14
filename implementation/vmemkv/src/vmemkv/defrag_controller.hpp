@@ -163,10 +163,8 @@ auto is_evacuated_segment(const T2Ownership<ConfigT> &own, const T2Memory *mem, 
 // copied out first and every fallocate() runs lock-free, then the queue is reconciled by
 // removing exactly the punched segments (so segments queued meanwhile are never lost).
 template <typename ConfigT>
-auto punch_evacuated_segments(DefragState &state,
-                              T2Ownership<ConfigT> &own,
-                              const T2FlatFile &t2,
-                              const T2Memory *mem) -> uint64_t {
+auto punch_evacuated_segments(DefragState &state, T2Ownership<ConfigT> &own, const T2FlatFile &t2, const T2Memory *mem)
+    -> uint64_t {
   std::vector<uint64_t> segs;
   {
     std::lock_guard<std::mutex> punch_lock(state.punch_mu);
@@ -264,34 +262,33 @@ auto collect_victim_offsets(T1 &t1,
                             uint64_t used,
                             const vmemkv::T2Memory *mem) -> std::vector<uint64_t> {
   std::vector<uint64_t> offsets;
-  t1.scan(
-      std::span<const std::byte>(kDefragScanLo.data(), kDefragScanLo.size()),
-      std::span<const std::byte>(kDefragScanHi.data(), kDefragScanHi.size()),
-      [&](std::span<const std::byte> /*index_key*/, uint64_t payload, uint64_t hash) {
-        if (payload == vmemkv::STORE_NOT_FOUND || t1_detail::is_inline(hash)) {
-          return;
-        }
-        const uint64_t off = payload & detail::kPayloadOffsetMask;
-        if (off >= used) {
-          return;
-        }
-        const uint64_t seg = T2Ownership<ConfigT>::seg_index(off);
-        if (std::binary_search(victim_segs.begin(), victim_segs.end(), seg)) {
-          offsets.push_back(off);
-          return;
-        }
-        if (seg + 1 < own.segment_count() && std::binary_search(victim_segs.begin(), victim_segs.end(), seg + 1)) {
-          const uint64_t span_start = (seg + 1) * ConfigT::T2SegmentBytes;
-          if (off + kPunchSlopBytes >= span_start && off < span_start) {
-            const T2RecordView head = t2.at(off, mem);
-            const uint64_t aligned =
-                vmemkv::align_up(sizeof(ValueRecordHeader) + head.header->key_len + head.header->value_len);
-            if (off + aligned > span_start) {
-              offsets.push_back(off);
+  t1.scan(std::span<const std::byte>(kDefragScanLo.data(), kDefragScanLo.size()),
+          std::span<const std::byte>(kDefragScanHi.data(), kDefragScanHi.size()),
+          [&](std::span<const std::byte> /*index_key*/, uint64_t payload, uint64_t hash) {
+            if (payload == vmemkv::STORE_NOT_FOUND || t1_detail::is_inline(hash)) {
+              return;
             }
-          }
-        }
-      });
+            const uint64_t off = payload & detail::kPayloadOffsetMask;
+            if (off >= used) {
+              return;
+            }
+            const uint64_t seg = T2Ownership<ConfigT>::seg_index(off);
+            if (std::binary_search(victim_segs.begin(), victim_segs.end(), seg)) {
+              offsets.push_back(off);
+              return;
+            }
+            if (seg + 1 < own.segment_count() && std::binary_search(victim_segs.begin(), victim_segs.end(), seg + 1)) {
+              const uint64_t span_start = (seg + 1) * ConfigT::T2SegmentBytes;
+              if (off + kPunchSlopBytes >= span_start && off < span_start) {
+                const T2RecordView head = t2.at(off, mem);
+                const uint64_t aligned =
+                    vmemkv::align_up(sizeof(ValueRecordHeader) + head.header->key_len + head.header->value_len);
+                if (off + aligned > span_start) {
+                  offsets.push_back(off);
+                }
+              }
+            }
+          });
   std::sort(offsets.begin(), offsets.end());
   offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
   return offsets;
@@ -397,8 +394,8 @@ auto defrag_cycle(DefragState &state,
                   const std::filesystem::path &t2_path,
                   LockStripe &&lock_stripe,
                   MaybeReorg &&maybe_reorg,
-                   uint64_t checkpoint_count,
-                   bool force) -> bool {
+                  uint64_t checkpoint_count,
+                  bool force) -> bool {
   auto running_guard = SingleFlightGuard::try_acquire(state.running);
   if (!running_guard.holds) {
     return false;
@@ -439,11 +436,10 @@ auto defrag_cycle(DefragState &state,
   }
 
   state.cycle_count.fetch_add(1, std::memory_order_relaxed);
-  state.last_duration_us.store(
-      static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - cycle_start)
-              .count()),
-      std::memory_order_relaxed);
+  state.last_duration_us.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                         std::chrono::steady_clock::now() - cycle_start)
+                                                         .count()),
+                               std::memory_order_relaxed);
   state.last_moved_bytes.store(moved_bytes, std::memory_order_relaxed);
   state.last_punched_bytes.store(punched_bytes, std::memory_order_relaxed);
   return scanned;

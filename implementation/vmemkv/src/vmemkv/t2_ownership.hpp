@@ -37,9 +37,7 @@ class T2Ownership {
   }
 
   // T2 segment index for a masked (kPayloadOffsetMask-applied) byte offset.
-  static auto seg_index(uint64_t masked_offset) noexcept -> uint64_t {
-    return masked_offset / ConfigT::T2SegmentBytes;
-  }
+  static auto seg_index(uint64_t masked_offset) noexcept -> uint64_t { return masked_offset / ConfigT::T2SegmentBytes; }
 
   // Live-byte size a T2-offset payload contributes to segment accounting. Same 16-byte
   // granularity as the embedded hint (low_level_design.md 2.2): systematically at or under
@@ -76,9 +74,7 @@ class T2Ownership {
     }
   }
 
-  auto seg_live(uint64_t seg) const noexcept -> uint64_t {
-    return seg_live_[seg].load(std::memory_order_relaxed);
-  }
+  auto seg_live(uint64_t seg) const noexcept -> uint64_t { return seg_live_[seg].load(std::memory_order_relaxed); }
 
   auto segment_count() const noexcept -> size_t { return seg_live_.size(); }
 
@@ -98,9 +94,7 @@ class T2Ownership {
   // separate atomics touched by both sides).
   void claim_watermark(uint64_t target) noexcept { watermark_.store(target, std::memory_order_seq_cst); }
 
-  void revert_watermark(uint64_t old_boundary) noexcept {
-    watermark_.store(old_boundary, std::memory_order_seq_cst);
-  }
+  void revert_watermark(uint64_t old_boundary) noexcept { watermark_.store(old_boundary, std::memory_order_seq_cst); }
 
   auto load_watermark() const noexcept -> uint64_t { return watermark_.load(std::memory_order_seq_cst); }
 

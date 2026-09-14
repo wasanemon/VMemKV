@@ -854,21 +854,20 @@ class ShardedT1Index {
 
     std::vector<EntrySnapshot> merged_entries;
     bool reorganized = false;
-    slot->index->reorganize(
-        [](std::span<EntrySnapshot> /*merged*/) {},
-        [&](std::span<const EntrySnapshot> merged) {
-          merged_entries.assign(merged.begin(), merged.end());
-          reorganized = true;
-        },
-        /*parallel_sort=*/false);
+    slot->index->reorganize([](std::span<EntrySnapshot> /*merged*/) {},
+                            [&](std::span<const EntrySnapshot> merged) {
+                              merged_entries.assign(merged.begin(), merged.end());
+                              reorganized = true;
+                            },
+                            /*parallel_sort=*/false);
     if (reorganized) {
       slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
     }
 
     ShardSlot *claimed_target = nullptr;
     with_routing_guard([&] {
-      const bool big_enough = merged_entries.size() >= split_threshold(target_shard_size_,
-                                                                       Config::T1ShardSplitThresholdPercent);
+      const bool big_enough =
+          merged_entries.size() >= split_threshold(target_shard_size_, Config::T1ShardSplitThresholdPercent);
       if (big_enough && !splits_paused_.load(std::memory_order_acquire) &&
           slot->superseded.load(std::memory_order_acquire) == nullptr) {
         Split *expected = nullptr;

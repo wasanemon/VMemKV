@@ -20,8 +20,8 @@
 #include <string>
 #include <utility>
 
-#include "rival_common.hpp"
 #include "master_clone.hpp"
+#include "rival_common.hpp"
 
 namespace vmemkv::rivals::rocksdb_common {
 

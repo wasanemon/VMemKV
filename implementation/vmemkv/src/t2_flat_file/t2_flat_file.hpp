@@ -351,9 +351,7 @@ class T2FlatFile {
   // ─── Properties ───
   // Bytes used in the T2 file -- via get_memory(), not a separate counter; see
   // T2Memory::bytes_used's declaration.
-  auto bytes_used() const noexcept -> uint64_t {
-    return get_memory()->bytes_used.load(std::memory_order_acquire);
-  }
+  auto bytes_used() const noexcept -> uint64_t { return get_memory()->bytes_used.load(std::memory_order_acquire); }
   auto path() const noexcept -> const std::filesystem::path & { return path_; }
 
  private:

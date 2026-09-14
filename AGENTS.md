@@ -1,4 +1,5 @@
 - Do not `git commit` or `git push`
+- Use `pip install clang-format==18.1.3` for formatting (pinned; must match CI — never the distro package, whose version drifts).
 - Following the rules:
     - YAGNI
     - DRY

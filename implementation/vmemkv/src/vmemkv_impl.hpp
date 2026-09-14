@@ -26,13 +26,16 @@
 // Below is the Concurrency Matrix detailing synchronization across macro operations:
 //
 // +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
-// | Operation A \ Operation B | Get / Scan | Write (Same Key)   | Write (Diff Key)    | Reorganize (T1-only)        | Checkpoint                  |
+// | Operation A \ Operation B | Get / Scan | Write (Same Key)   | Write (Diff Key)    | Reorganize (T1-only)        |
+// Checkpoint                  |
 // +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
-// | Get / Scan               | Concurrent | Concurrent         | Concurrent          | Concurrent (retry/snapshot) | Concurrent                  |
-// | Write (Same Key)         | Concurrent | Serial (Stripes)   | Concurrent          | Concurrent                  | Concurrent (brief append stall) |
-// | Write (Diff Key)         | Concurrent | Concurrent         | Concurrent (atomic) | Concurrent                  | Concurrent (brief append stall) |
-// | Reorganize (T1-only)     | Concurrent | Concurrent         | Concurrent          | Single-flight (reorg_.running) | Single-flight (reorg_.running) |
-// | Checkpoint               | Concurrent | Concurrent         | Concurrent          | Single-flight (reorg_.running) | Single-flight (reorg_.running) |
+// | Get / Scan               | Concurrent | Concurrent         | Concurrent          | Concurrent (retry/snapshot) |
+// Concurrent                  | | Write (Same Key)         | Concurrent | Serial (Stripes)   | Concurrent          |
+// Concurrent                  | Concurrent (brief append stall) | | Write (Diff Key)         | Concurrent | Concurrent
+// | Concurrent (atomic) | Concurrent                  | Concurrent (brief append stall) | | Reorganize (T1-only)     |
+// Concurrent | Concurrent         | Concurrent          | Single-flight (reorg_.running) | Single-flight
+// (reorg_.running) | | Checkpoint               | Concurrent | Concurrent         | Concurrent          | Single-flight
+// (reorg_.running) | Single-flight (reorg_.running) |
 // +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
 //
 // Reorg/checkpoint single-flight is shared (checkpoint_coordinator.hpp). T1 background
@@ -336,8 +339,8 @@ class VMemKVImpl {
     // the same reason as tl_get_value_buf below (per-thread reuse, no per-call heap
     // allocation).
     thread_local static std::vector<std::byte> tl_get_base_buf;
-    if (const auto base_record = vmemkv::try_read_base_record<ConfigT>(mem, res.payload_bits, BaseReader::kGet,
-                                                                       &tl_get_base_buf);
+    if (const auto base_record =
+            vmemkv::try_read_base_record<ConfigT>(mem, res.payload_bits, BaseReader::kGet, &tl_get_base_buf);
         base_record.has_value()) {
       if (vmemkv::byte_span_equal(base_record->key, full_key)) {
         callback(base_record->value);
@@ -358,14 +361,15 @@ class VMemKVImpl {
     // different threads must not share one buffer; static so repeated calls on the same thread
     // reuse already-grown capacity instead of reallocating.
     thread_local static std::vector<std::byte> tl_get_value_buf;
-    bool key_matches = vmemkv::read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(offset, mem); },
-                                                      [&](const T2RecordView &record) -> bool {
-                                                        if (!vmemkv::byte_span_equal(record.key, full_key)) {
-                                                          return false;
-                                                        }
-                                                        tl_get_value_buf.assign(record.value.begin(), record.value.end());
-                                                        return true;
-                                                      });
+    bool key_matches =
+        vmemkv::read_t2_record_seqlock([&]() -> T2RecordView { return t2_.at(offset, mem); },
+                                       [&](const T2RecordView &record) -> bool {
+                                         if (!vmemkv::byte_span_equal(record.key, full_key)) {
+                                           return false;
+                                         }
+                                         tl_get_value_buf.assign(record.value.begin(), record.value.end());
+                                         return true;
+                                       });
 
     if (key_matches) {
       callback(std::span<const std::byte>(tl_get_value_buf));
@@ -528,7 +532,9 @@ class VMemKVImpl {
 
   void maybe_reorganize_if_needed() { checkpoint_detail::maybe_reorganize_if_needed(reorg_, wal_); }
 
-  auto maybe_reorg_fn() { return [this] { maybe_reorganize_if_needed(); }; }
+  auto maybe_reorg_fn() {
+    return [this] { maybe_reorganize_if_needed(); };
+  }
 
   auto lock_stripe_fn() {
     return [this](std::span<const std::byte> key) -> std::mutex & { return key_mutex(key); };
@@ -649,11 +655,8 @@ class VMemKVImpl {
       if (recovering_) {
         continue;
       }
-      if (!defrag_detail::defrag_wanted<ConfigT>(defrag_,
-                                                 t2_own_,
-                                                 t2_,
-                                                 recovering_,
-                                                 reorg_.checkpoint_count.load(std::memory_order_relaxed))) {
+      if (!defrag_detail::defrag_wanted<ConfigT>(
+              defrag_, t2_own_, t2_, recovering_, reorg_.checkpoint_count.load(std::memory_order_relaxed))) {
         continue;
       }
       try {
