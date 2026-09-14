@@ -639,7 +639,6 @@ class LeanStoreStore {
     const uint64_t committed_end = worker.logging.wt_to_lw.getSync().wal_written_offset;
     const uint64_t op_seq = op_seq_.fetch_add(1, std::memory_order_relaxed);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    vmemkv::SpinBackoff backoff;
     while (true) {
       const uint64_t gct = worker.logging.wal_gct_cursor.load(std::memory_order_acquire);
       if (gct == committed_end) {
@@ -655,7 +654,9 @@ class LeanStoreStore {
                      (unsigned)db_->getCRManager().workers_count);
         throw std::runtime_error("LeanStore group-durability wait timed out");
       }
-      backoff.wait();
+      // Plain yield, not SpinBackoff: the watched event (group-committer round, tens of
+      // microseconds) is far shorter than any sleep quantum, so sleeping would dominate the wait.
+      std::this_thread::yield();
     }
   }
 
