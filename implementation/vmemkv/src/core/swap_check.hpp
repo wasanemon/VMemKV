@@ -9,13 +9,15 @@
 
 #include <atomic>
 #include <cstdint>
-#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+
+#include "core/env.hpp"
 
 namespace vmemkv {
 
@@ -41,8 +43,8 @@ inline void validate_swap_for_ltm(const std::string &meminfo_path = "/proc/memin
   if (!swap_total.has_value()) {
     return;
   }
-  if (const char *env = std::getenv("VMEMKV_REQUIRE_SWAP_BYTES"); env != nullptr && *env != '\0') {
-    const uint64_t required = std::strtoull(env, nullptr, 10);
+  if (const std::string_view env = getenv_view("VMEMKV_REQUIRE_SWAP_BYTES"); !env.empty()) {
+    const uint64_t required = getenv_uint64("VMEMKV_REQUIRE_SWAP_BYTES", 0);
     if (*swap_total < required) {
       throw std::runtime_error("VMemKV requires " + std::to_string(required) +
                                " swap bytes (VMEMKV_REQUIRE_SWAP_BYTES) but the host provides only " +

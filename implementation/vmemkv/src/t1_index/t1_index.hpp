@@ -22,8 +22,11 @@
 #include <vmemkv/config.hpp>
 
 #include "../api/utils.hpp"
+#include "../core/bytes.hpp"
 #include "../core/lock_free_hash_table.hpp"
+#include "../core/mmap.hpp"
 #include "../core/reference_tracker.hpp"
+#include "../core/spin_backoff.hpp"
 #include "../optimizations/bloom_filter.hpp"
 
 inline constexpr std::size_t kStoreKeyBytes = 16;
@@ -73,11 +76,58 @@ inline auto embed_metadata(uint64_t hash, uint8_t size) noexcept -> uint64_t {
          (static_cast<uint64_t>(size & kInlineSizeMask) << kMetadataShiftBits);
 }
 
+// Logical entry identity used by merge dedup and its invariant check: key plus
+// clean hash (raw hash embeds transient inline metadata that must not affect identity).
+inline auto entry_identity_equal(const StoreKey &a_key,
+                                 uint64_t a_hash,
+                                 const StoreKey &b_key,
+                                 uint64_t b_hash) noexcept -> bool {
+  return a_key == b_key && (a_hash & kCleanHashMask) == (b_hash & kCleanHashMask);
+}
+
+inline auto entry_less(const StoreKey &a_key, uint64_t a_hash, const StoreKey &b_key, uint64_t b_hash) noexcept
+    -> bool {
+  if (a_key != b_key) {
+    return a_key < b_key;
+  }
+  return (a_hash & kCleanHashMask) < (b_hash & kCleanHashMask);
+}
+
+// Range/bounds disjointness shared by scan()'s fast path and per-region skip.
+inline auto range_disjoint(const StoreKey &region_min,
+                           const StoreKey &region_max,
+                           const StoreKey &lo,
+                           const StoreKey &hi) noexcept -> bool {
+  return hi < region_min || region_max < lo;
+}
+
 }  // namespace t1_detail
 
 namespace vmemkv {
 
 static constexpr uint64_t STORE_NOT_FOUND = ~0ULL;
+
+// Merge ordering/identity shared by reorganize() and its invariant check.
+struct T1MergePolicy {
+  template <typename Entry>
+  static auto less(const Entry &lhs, const Entry &rhs) noexcept -> bool {
+    return t1_detail::entry_less(lhs.key, lhs.hash, rhs.key, rhs.hash);
+  }
+  template <typename Entry>
+  static auto identity_equal(const Entry &lhs, const Entry &rhs) noexcept -> bool {
+    return t1_detail::entry_identity_equal(lhs.key, lhs.hash, rhs.key, rhs.hash);
+  }
+};
+
+// Scan range pipeline shared by scan()'s fast path and per-region extraction.
+struct T1ScanPipeline {
+  static auto region_disjoint(const StoreKey &region_min,
+                              const StoreKey &region_max,
+                              const StoreKey &lo,
+                              const StoreKey &hi) noexcept -> bool {
+    return t1_detail::range_disjoint(region_min, region_max, lo, hi);
+  }
+};
 
 // ─── T1Index Structure Overview ─────────────────────────────────────────────
 //
@@ -374,7 +424,7 @@ class T1Index {
         Key region_min{};
         Key region_max{};
         if (!region->bounds(region_min, region_max)) return true;
-        return upper_bound < region_min || region_max < lower_bound;
+        return T1ScanPipeline::region_disjoint(region_min, region_max, lower_bound, upper_bound);
       };
       if (region_disjoint(active) && region_disjoint(imm)) {
         size_t match_count = 0;
@@ -414,7 +464,7 @@ class T1Index {
           Key region_min{};
           Key region_max{};
           if (region->bounds(region_min, region_max)) {
-            if (upper_bound < region_min || region_max < lower_bound) {
+            if (T1ScanPipeline::region_disjoint(region_min, region_max, lower_bound, upper_bound)) {
               return;
             }
           }
@@ -561,12 +611,7 @@ class T1Index {
     // Ordered by *clean* hash, not raw: raw hash embeds transient inline-value metadata (see
     // t1_detail::embed_metadata) that shifts independently of key identity, which the merge's
     // dedup relies on not happening. Matches every other identity check in this file.
-    auto comp = [](const EntrySnapshot &lhs, const EntrySnapshot &rhs) {
-      if (lhs.key != rhs.key) {
-        return lhs.key < rhs.key;
-      }
-      return (lhs.hash & t1_detail::kCleanHashMask) < (rhs.hash & t1_detail::kCleanHashMask);
-    };
+    auto comp = [](const EntrySnapshot &lhs, const EntrySnapshot &rhs) { return T1MergePolicy::less(lhs, rhs); };
 
     // Sort the smaller append immutable entries -- in parallel unless the caller says not to
     // (see this method's own doc comment on `parallel_sort`).
@@ -599,9 +644,7 @@ class T1Index {
         const SortedSlot &s = sorted->slots[si];
         const EntrySnapshot &m = imm_entries[ii];
         const auto [s_hash, s_payload] = load_slot_consistent(s);
-        const uint64_t s_clean_hash = s_hash & t1_detail::kCleanHashMask;
-        const uint64_t m_clean_hash = m.hash & t1_detail::kCleanHashMask;
-        if (s.key == m.key && s_clean_hash == m_clean_hash) {
+        if (t1_detail::entry_identity_equal(s.key, s_hash, m.key, m.hash)) {
           // Same logical entry on both sides (updated/reinserted since last reorg) -- imm_entries
           // (newer) wins. Compared by *clean* hash, not raw, since an inline<->non-inline
           // transition changes the raw hash (t1_detail::embed_metadata) without changing key
@@ -611,7 +654,7 @@ class T1Index {
           ++si;
           ++ii;
           skip_dead();
-        } else if (s.key != m.key ? s.key < m.key : s_clean_hash < m_clean_hash) {
+        } else if (t1_detail::entry_less(s.key, s_hash, m.key, m.hash)) {
           merged.push_back(EntrySnapshot{s.key, s_payload, s_hash});
           ++si;
           skip_dead();
@@ -872,10 +915,11 @@ class T1Index {
   // bracket (see SortedSlot::version).
   template <typename SlotT>
   [[nodiscard]] static auto load_slot_consistent(const SlotT &slot) noexcept -> std::pair<uint64_t, Payload> {
+    SpinBackoff backoff;
     while (true) {
       const uint64_t v1 = slot.version.load(std::memory_order_acquire);
       if (v1 % 2 != 0) {
-        std::this_thread::yield();
+        backoff.wait();
         continue;
       }
       const uint64_t hash = slot.hash.load(std::memory_order_acquire);
@@ -895,15 +939,7 @@ class T1Index {
     // faulted in or zeroed up front.
     explicit AppendRegion(size_t capacity)
         : capacity_(capacity),
-          slots_(static_cast<AppendSlot *>(::mmap(nullptr,
-                                                  capacity_ * sizeof(AppendSlot),
-                                                  PROT_READ | PROT_WRITE,
-                                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                                                  -1,
-                                                  0))) {
-      if (slots_ == MAP_FAILED) {
-        throw std::system_error(errno, std::generic_category(), "mmap");
-      }
+          slots_(static_cast<AppendSlot *>(mmap_anon_or_throw(capacity_ * sizeof(AppendSlot)))) {
     }
 
     ~AppendRegion() { ::munmap(slots_, capacity_ * sizeof(AppendSlot)); }
@@ -947,8 +983,9 @@ class T1Index {
     // guards just this {min, max} pair, independent of the lock-free insert path (reserve()/
     // publish() elsewhere).
     void update_bounds(Key key) noexcept {
+      SpinBackoff backoff;
       while (bounds_lock_.test_and_set(std::memory_order_acquire)) {
-        std::this_thread::yield();
+        backoff.wait();
       }
       if (!has_bounds_) {
         bounds_min_ = key;
@@ -963,8 +1000,9 @@ class T1Index {
 
     // Returns false if no key has ever been published (caller falls through to normal scan).
     [[nodiscard]] auto bounds(Key &out_min, Key &out_max) const noexcept -> bool {
+      SpinBackoff backoff;
       while (bounds_lock_.test_and_set(std::memory_order_acquire)) {
-        std::this_thread::yield();
+        backoff.wait();
       }
       const bool present = has_bounds_;
       if (present) {
@@ -1150,16 +1188,14 @@ class T1Index {
   }
 
   static void assert_no_duplicates(const std::vector<EntrySnapshot> &entries) {
-    if (entries.size() < 2) {
-      return;
-    }
-    for (size_t i = 1; i < entries.size(); ++i) {
-      // Clean hash, matching the merge's dedup identity -- raw hash would miss an
-      // inline<->non-inline duplicate.
-      assert(!(entries[i - 1].key == entries[i].key &&
-               (entries[i - 1].hash & t1_detail::kCleanHashMask) == (entries[i].hash & t1_detail::kCleanHashMask)) &&
-             "T1Index invariant violated: duplicate key prefix + clean hash detected in merge output");
-    }
+    // Clean-hash identity, matching the merge's dedup (see T1MergePolicy).
+    const auto duplicate = std::adjacent_find(entries.begin(), entries.end(), [](const EntrySnapshot &a,
+                                                                                 const EntrySnapshot &b) {
+      return T1MergePolicy::identity_equal(a, b);
+    });
+    assert(duplicate == entries.end() &&
+           "T1Index invariant violated: duplicate key prefix + clean hash detected in merge output");
+    (void)duplicate;
   }
 
   // ─── Member Variables ──────────────────────────────────────────────────

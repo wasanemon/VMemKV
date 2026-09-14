@@ -18,7 +18,15 @@
 #endif
 
 #include "rival_common.hpp"
+#include "master_clone.hpp"
 #include "rival_store_disabled_stub.hpp"
+
+namespace vmemkv::rivals {
+struct LMDBPolicy {
+  static constexpr const char *kLabel = "LMDB";
+  static constexpr const char *kCloneLabel = "LMDB (clone)";
+};
+}  // namespace vmemkv::rivals
 
 class LMDBStore {
  public:
@@ -28,6 +36,9 @@ class LMDBStore {
 #else
       false;
 #endif
+  static constexpr bool kIsRival = true;
+  static void checkpoint() noexcept {}
+  static auto defragment() noexcept -> bool { return false; }
 
 #ifdef ENABLE_LMDB
   // Opens a fresh environment at a unique subpath (single-file DB via MDB_NOSUBDIR),
@@ -57,10 +68,8 @@ class LMDBStore {
   LMDBStore(const LMDBStore &) = delete;
   auto operator=(const LMDBStore &) -> LMDBStore & = delete;
 
-  // Tag type selecting the clone-from-master constructor below. Public so StoreAdapter's
-  // variadic forwarding constructor can name it directly -- see
-  // for_each_store_variant()'s make_fresh_corpus()/make_fresh_corpus_checkpoint() in bench_kv.cpp.
-  struct CloneFromMasterTag {};
+  // Shared tag selecting the clone-from-master constructor (see master_clone.hpp).
+  using CloneFromMasterTag = vmemkv::rivals::CloneFromMasterTag;
 
   // Builds `master_path` once via bulk_load, then clones it into this instance's own path with
   // mdb_env_copy2(..., MDB_CP_COMPACT) -- much cheaper than re-running bulk_load_impl against an

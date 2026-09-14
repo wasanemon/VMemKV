@@ -35,12 +35,12 @@ T2のStorage Fragmentation(T1から参照されなくなった旧版・削除済
 
 ## 起動・停止
 
-- 許容space overheadを唯一の公開パラメータとする(既定20%)。
+- 許容live比率を唯一の公開パラメータとする(既定20%。live が `bytes_used` の20%以下で初回発火)。
 - 背景の専用ワーカースレッドが1秒ごとに安価な判定 (atomic のみ) を行う。T1のプールは
   シャード型専用のため共用しない。reorg worker とも分離し、長時間の移設が checkpoint
   駆動を遅らせないようにする。
-- 全走査サイクルは、強制呼び出し、overhead がしきい値を初めて上回ったとき、前回から
-  5ポイント以上悪化したとき、checkpoint が frozen 領域を増やしたとき(かつ5%以上)の
+- 全走査サイクルは、強制呼び出し、live が `bytes_used` の20%以下(= garbage 80%以上)に初めて達したとき、前回から
+  5ポイント以上悪化したとき、checkpoint が frozen 領域を増やしたときの
   いずれかでのみ走る。punch 待ちがある場合は走査なしの punch のみ行う。
 
 ## クラッシュ安全性
@@ -60,7 +60,7 @@ T2のStorage Fragmentation(T1から参照されなくなった旧版・削除済
 
 | Parameter | Meaning | Default |
 | --- | --- | --- |
-| `T2DefragSpaceOverheadPercent` | 許容space overhead(%)。背景起動判定の唯一の基準 | 20 |
+| `T2DefragSpaceOverheadPercent` | live 比率下限(%)。live が `bytes_used` のこの値以下で初回発火(ヒステリシス付き) | 20 |
 
 セグメントサイズ(8MB)、1サイクル移動上限(1GiB)、punch slop(1MiB)、quarantine(1サイクル)は
 固定値とし、調整ノブに出さない。

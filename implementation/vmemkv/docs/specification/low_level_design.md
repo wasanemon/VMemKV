@@ -35,7 +35,7 @@ constexpr uint64_t STORE_NOT_FOUND = ~0ULL; // tombstone marker
 | --- | --- |
 | `key_prefix` | 主ソートキー。Tier 1 の並び順を決める。 |
 | `hash` | フルキーのハッシュ値。prefix だけでは区別できない候補の絞り込みに使う。 |
-| `payload_bits` | 通常は Tier 2 の byte offset。entry 単位でインライン化されている場合は値そのもの(2.1.1 節)。`UINT64_MAX` は tombstone。 |
+| `payload_bits` | 通常は Tier 2 の byte offset。entry 単位でインライン化されている場合は値そのもの(2.1.1 節)。`STORE_NOT_FOUND` は tombstone。 |
 
 **ランタイム表現**: `sorted_region` は `SortedSlot`(40バイト: 上記コアフィールド32バイト +
 `version`)、`append_region` は `AppendSlot`(48バイト: `SortedSlot` の全フィールド +
@@ -183,7 +183,6 @@ flowchart TD
 **Failure Rule**
 
 - WAL append は、Tier 1 / Tier 2 への適用(2.〜3.)が成功したことが確定した後にのみ行う。例外・失敗で完了しなかった操作を WAL に記録してはならない。
-- 理由: Tier 1 / Tier 2 は volatile であり (5.1 節)、それ自体がディスクへ書き戻される経路を持たないため、古典的 WAL が要求する「ログ永続化 ≺ データページのディスクへの書き戻し」という制約はここでは構造的に自明に満たされる。したがって WAL を先に書く必然性はなく、むしろ適用失敗時に WAL へ記録が残ると、次回起動時の replay で同じ失敗が再現し続け、リカバリ自体が永久に失敗する("poison pill")リスクがある。
 - 2. で容量不足 (`bytes_used + required_bytes > bytes_capacity`) となった場合、この操作は失敗として扱い、WAL には何も記録しない(2.2 節)。
 
 ### 3.3 Update
@@ -208,7 +207,7 @@ flowchart TD
 **Procedure**
 
 1. `Get(full_key)` で対象 entry を特定する。見つからなければ not found。
-2. Tier 1 の該当 `IndexEntry.payload_bits` を `TOMBSTONE_OFFSET` に書き換える。
+2. Tier 1 の該当 `IndexEntry.payload_bits` を `STORE_NOT_FOUND` に書き換える。
 3. WAL に delete record を append し、`fsync` する。呼び出し元への成功応答はこの `fsync` 完了後にのみ返す。
 
 **Notes**
@@ -221,16 +220,23 @@ flowchart TD
 
 **Procedure**
 
-1. Tier 1 `append_region` の全体を走査し、範囲内の `IndexEntry` を候補に集める。
-2. Tier 1 `sorted_region` を `key_prefix` で二分探索し、範囲内候補を列挙する。
-3. 候補ごとに `payload_bits != TOMBSTONE_OFFSET` を確認する。
-4. `payload_bits` から Tier 2 record を取得する。
-5. full key を比較し、範囲内の record だけを返す。
+1. `ScanActiveGuard` を取得する。取得中はシャードのメンテナンス soft threshold が L2 キャッシュサイズ上限に下がる。
+2. Tier 1 `append_region` の全体を走査し、範囲内の `IndexEntry` を候補に集める。
+3. Tier 1 `sorted_region` を `key_prefix` で二分探索し、範囲内候補を列挙する。
+4. 候補ごとに `payload_bits != STORE_NOT_FOUND` を確認する。inline entry は `payload_bits` を `inline_size` に従いバイトコピーして値を復元し、16 バイト prefix の末尾ゼロ trim でキーを復元する。
+5. 非 inline 候補は `kScanBatchSize`(128) 件ごとにバッチ化し、T2 物理 offset 昇順に読み替えてからキー順に戻して返す。
+6. `payload_bits` から Tier 2 record を取得する。
+7. full key を比較し、範囲内の record だけを返す。
 
 **Notes**
 
 - `key_prefix` はあくまで coarse filter である。
-- full key 比較は Tier 2 で行う。
+- full key 比較は Tier 2 で行う。inline entry は Tier 1 のみで完結する。
+- バッチ読替は Scan 内部のみの順序最適化であり、コールバック順序と件数の意味は変わらない。
+
+### 3.6 Bulk Load
+
+`bulk_load()` は `write_entry_lockfree()` で entry を投入し、WAL をバイパスする。クラッシュ後の耐久保証はない。呼び出し後に `checkpoint()` を行った分のみ耐久される。T1-only reorganize は soft threshold で通常どおり発火する。他 writer との並行呼び出しは不可である。
 
 ## 4. Reorganize
 
@@ -257,7 +263,7 @@ T1 `reorganize` は T2 と独立に実行できる。
 **Procedure**
 
 1. `sorted_region` と `append_region` の全 `IndexEntry` を読み出す。
-2. `payload_bits == TOMBSTONE_OFFSET` の entry を除外する。
+2. `payload_bits == STORE_NOT_FOUND` の entry を除外する。
 3. `key_prefix` 順にソートする。
 4. 必要なら重複 key を解消する。
 5. 新しい `sorted_region` を構築する。
@@ -290,11 +296,12 @@ entry 単位でインライン化されている entry(2.1.1 節、7.2 節)は T
 1. `checkpoint_lsn = wal.next_lsn() - 1` を読む(5.3 節)。
 2. 新規 append を短時間止め(`stop_writers_and_wait()`)、この時点の `bytes_used` を `target` として確定する。
 3. 直ちに新規 append を再開する(`resume_writers()`)。in-place 更新はこの手順の間も一切止まらない。
-4. `[old_base_boundary, target)` を `msync(MS_SYNC)` する。
-5. `t1_.reorganize()` を呼ぶ。`append_region` を `sorted_region` へ統合し、T1 checkpoint ファイルを書き出す(temp + `rename`、5.4 節)。`payload_bits` を書き換えない恒等写像を渡す。
-6. manifest に `checkpoint_lsn` と `target` を書く(5.3 節)。
-7. `base_boundary` を `target` へアトミックに前進させる。
-8. WAL を `checkpoint_lsn` までローテートする(5.5 節)。
+4. `capture_watermark_` に `target` を格納し、`InPlaceUpdateBarrier::wait_until_retired(target)` で対象範囲への飛行中 in-place 書き込みを drain する。以降の in-place 更新は `offset >= base_boundary` かつ `offset >= capture_watermark_` の場合のみ許可される。
+5. `[old_base_boundary, target)` を `msync(MS_SYNC)` する。
+6. `t1_.reorganize()` を呼ぶ。`append_region` を `sorted_region` へ統合し、T1 checkpoint ファイルを書き出す(temp + `rename`、5.4 節)。`payload_bits` を書き換えない恒等写像を渡す。
+7. manifest に `checkpoint_lsn` と `target` を書く(5.3 節)。
+8. `base_boundary` を `target` へアトミックに前進させる。
+9. `Wal::rotate_segment()` を呼ぶ(5.5 節)。引数なし。世代連番の切替えのみであり、`checkpoint_lsn` を渡さない。
 
 **Effect**
 
@@ -355,7 +362,7 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WA
 
 ```mermaid
 flowchart TD
-    TR{space overhead ≥ 20%?} -- no --> IDLE([stay idle])
+    TR{live ≤ 20% of bytes_used?} -- no --> IDLE([stay idle])
     TR -- yes --> V([select frozen victims\nseg_end ≤ boundary, garbage ≥ 50%])
     V --> C([collect live offsets\n+ 1MiB slop])
     C --> R([relocate with offset verification\nunder stripe lock])
@@ -363,15 +370,13 @@ flowchart TD
     W --> P([next cycle: punch prior victims])
     P --> TR
 ```
-- 起動条件は `T2DefragSpaceOverheadPercent`(既定 20%) を唯一の公開ノブとし、
-  背景の専用ワーカースレッドが判定する。詳細は
+- 起動条件は `T2DefragSpaceOverheadPercent`(既定 20%) を唯一の公開ノブとする。live が `bytes_used` の 20% 以下(= garbage 80% 以上)で初回発火し、以降は 5 ポイント以上の悪化・checkpoint による凍結域の増加・punch 待ちのいずれかで再発火する(ヒステリシス付き)。背景の専用ワーカースレッドが判定する。詳細は
   [`../t2_defragment_design.md`](../t2_defragment_design.md) を参照。
 
 ### 4.6 T1 Reorganize Auto-Trigger
 
 各シャードの `append_region` は、専用の背景ワーカースレッドプールによって独立に監視される。
-シャードの `append_size()` が `append_capacity()` の `T1ShardSplitThresholdPercent`(config.hpp)
-に達すると、そのシャードだけがメンテナンスキューに投入され、ワーカーが `reorganize()` を実行して
+シャードの `append_size()` が `maintenance_soft_threshold(append_capacity, scan_active)` に達すると、そのシャードだけがメンテナンスキューに投入され、ワーカーが `reorganize()` を実行して
 必要なら split する。他のシャードや呼び出し元スレッドをブロックしない。詳細は
 [`../t1_sharding_design.md`](../t1_sharding_design.md) の「背景ワーカーのスレッドプール」節を参照。
 
@@ -443,33 +448,24 @@ struct ShardedT1ChkFileHeader {
 // IndexEntry は 2.1 節と同一レイアウト、32B 固定長
 ```
 
-**Design Rationale**
-
-- T1 chk は WAL と異なり、1 回の checkpoint 処理でシーケンシャルに書き切り、完成後にのみ manifest から参照される。ファイル全体に対する 1 個の checksum は、書き込み完了後の bit rot 検出のために存在する。
-- ヘッダは trailer である: `shard_count`/`total_entry_count`/`checksum` は全シャードの書き込み完了後に確定する。
-- **ロード手順**: 起動時、manifest が指す T1 chk ファイルを `mmap(MAP_PRIVATE)` し、trailer の magic / format_version / checksum / レイアウトを検証する。検証後、シャード区間を先頭から順に走査して各シャードの `sorted_region` を構築し、境界キー配列とあわせてディレクトリを再構築する。
-- **`append_index` はシリアライズしない**: checkpoint 直後は `append_region` が空であり、起動時に空の状態から再構築される。
-- checkpoint 時のランタイム表現は heap 上の配列のままファイルへコピーする。次回起動時の読み込みだけがこのファイルを直接 `mmap` して使う。
-
 ### 5.5 WAL Rotation
 
-WAL は先頭からの truncate を行わない(可変長レコード列の先頭を削るのは高コストなため)。代わりに、checkpoint 完了後にレコードを新しいファイルへ移し替える「ローテーション」を行う。
+WAL は `<wal_path>.<generation>` の連番セグメント列である。`Wal::rotate_segment()` は引数を取らない。`checkpoint_lsn` の知識を必要とせず、レコード単位の走査を行わない。
 
 **Procedure**
 
-`Wal::rotate(checkpoint_lsn)` は、`await_durable()` と同じリーダー選出(`flushing_` フラグのアトミック交換)でリーダー権を取り、以下を実行する。
+`Wal::rotate_segment()` は group-commit のリーダー権(`flushing_` のアトミック交換)を獲得して以下を実行する。
 
-1. まず `drain_pending()` を呼び、rotate 開始時点までに reserve 済みの未フラッシュレコードを通常どおり writev()+fdatasync() で吐き切る。
-2. 現在の WAL ファイルから `lsn > checkpoint_lsn` のレコードのみを新しい一時ファイル(`<path>.rotate_tmp`)へ順次コピーする。
-3. 新ファイルを `fsync` し、`rename()` で正式な WAL パスへアトミックに差し替える。旧 fd を close し、`Wal` の内部 `fd_` を新 fd へ切り替える。
-4. リーダー権を解放する。解放直後に `next_lsn_` が rotate 開始時点から進んでいれば(rotate 実行中に新規 reserve が入っていれば)、リーダー権を再取得して `drain_pending()` をもう一度実行し、その分をフラッシュしてから最終的に解放する。
+1. 新世代 `active_generation_ + 1` のセグメントを `O_CREAT | O_EXCL | O_APPEND` で開く。
+2. 新 fd を active fd として公開し、`active_generation_` を進め、リーダー権を解放する。事前の `drain_pending()` は行わない。swap 直前に reserve されたレコードが旧・新いずれのセグメントに書き込まれても正しい。`replay()` はディスク上の全セグメントを世代順に読む。
+3. 旧 fd を `fd_close_mu_` 配下で close する。
+4. 2 世代前 `(new_generation - 2)` のセグメントを削除する。定常状態でディスク上に残るのは最大 2 世代である。
 
 **Notes**
 
-- レコードの reserve(LSN 発行 + リングへの publish)自体はリーダー選出と独立してロックフリーに進むため、rotate() 実行中も新規の reserve は一切ブロックされない。ブロックされ得るのは、rotate() がリーダーである間に `await_durable()` を呼んでフォロワーになったスレッドの durability wait だけである。
-- コピー対象レコードは元の `lsn` をヘッダに保持したまま新ファイルへ入るため、`Wal` のコンストラクタが既に持つ「末尾の有効 record から `next_lsn_` を復元する」ロジックがそのまま機能する。
-- `next_lsn_` は rotate() の中では一切変更しない: rotate 実行中に新たに reserve される LSN はまだディスク上に無くこのファイルベースのコピーからは見えないため、コピー結果から `next_lsn_` を再計算すると既に払い出し済みの LSN より後退しかねない。`next_lsn_` は常にインメモリのアトミックカウンタが真の値であり、rotation は古い生存レコードを新ファイルへ移すだけで誰の番号も振り直さない。
-- ローテーション前の WAL ファイルは、新ファイルへの `rename` が完了した時点で置き換えられるため、明示的な削除は不要である。
+- `next_lsn_` は `rotate_segment()` の中で変更しない。インメモリのアトミックカウンタが真の値である。
+- `size_bytes()` は active セグメントの `fstat` 値であり、4.4 節の WAL サイズトリガの入力になる。`rotate_segment()` が checkpoint サイクルごとに空の active セグメントを開始するためである。
+- 保持条件: checkpoint サイクルは `reorg_running_` で single-flight であり、本呼び出しは前サイクルに active だった世代だけを退役させる。現サイクルの `checkpoint_lsn` は前回 rollover 時点までに reserve されたすべて以上であるため、前世代はコミット済み manifest の範囲内である。
 
 ## 6. Concurrency Contract
 
@@ -484,7 +480,7 @@ T1 `reorganize` は atomic pointer swap 機構で実現され、同様に専用�
 ### 6.2 Required Guarantees
 
 - Get / Scan は通常時にオンラインで実行できる。
-- Insert / Update / Delete は WAL 永続化後に T1 / T2 を更新する。
+- Insert / Update / Delete は T1 / T2 への適用後に WAL append + `fsync` する。
 - T1-only `reorganize` は T2 と独立して高頻度に走らせてよい。
 - Checkpoint は新規 append の短い静止のみを必要とし、in-place 更新はその間も止まらない。
 - T1 `reorganize` は atomic pointer swap が完了した時点で有効化される。専用の stop-the-world は発生しない。
@@ -551,13 +547,13 @@ T1 `reorganize` は atomic pointer swap 機構で実現され、同様に専用�
 
 ### 7.1 Group Commit
 
-**Group Commit は実装済み。** `wal.hpp`/`wal.cpp`の`Wal`クラスを参照。ロックフリー（ホットパスに`std::mutex`を一切使わない）な固定長リングバッファ方式で実装されている。詳細は [Aether](https://dl.acm.org/doi/10.14778/1920841.1920928) の設計を参考にしたが、完全に同一の方式ではない：
+`Wal` は固定長リングバッファ(`kWalRingCapacity = 4096`)による group commit を行う。
 
-- 各`append_*()`呼び出しは、単一のatomic `fetch_add`でLSNを確定し、その値をmod capacityしたスロット番号へ、ヒープ確保した自分のレコードへのポインタをCASで publish する（Aether論文そのものの「可変長バイト列を直接リングへ書き込む」方式ではなく、スロットにはポインタのみを置く簡易版）。
-- 最初にスロットへの publish に成功し、かつ他に実行中のflushがない呼び出し元が"leader"として選出される（`reorg_running_`と同じCAS/atomic wait-notify方式、`std::mutex`は使わない）。leaderは自分を含む待機中の全レコードをドレインし、`writev()`（IOV_MAXごとにチャンク化）でまとめて書き込んだ後、バッチ全体に対して1回だけ`fdatasync()`する（`fsync()`ではない——データ復元に無関係なメタデータの同期を省く。ファイルサイズの同期はPOSIX上保証されるのでreplayに必要な分は失われない。RocksDBのWALと同じ選択）。
-  - 個別レコード毎の`write()`ではなく`writev()`一括書き込みを採用している。失敗はバッチ全体を対象とする単一の共有catchブロックで扱うため、`writev()`化によって失敗セマンティクスの粒度は変わらない。
-  - fsync完了後の起床は、レコード毎の`done`フラグ + 個別`notify_one()`ではなく、バッチの最高LSNを1つの共有カウンタ（`highest_settled_lsn_`）に書き込み`notify_all()`する方式を用いる（follower側は自分のLSN以下になるまで`wait()`）。レコード毎`notify_one()`はバッチサイズに対してループコストが超線形に増大する(batch=32では`fdatasync()`自体の約13倍のコストになる)ため、共有カウンタ方式でバッチ内の起床を1回のnotifyへ集約する。
-- レコードの生存期間はイントルーシブな参照カウント（`std::atomic<int>`一発の`fetch_sub`）で管理する。`std::atomic<std::shared_ptr<T>>`は使わない（多くの実装で内部的にスピンロックを使うため、真のロックフリー性を損なう）。
+- 各 `reserve_*()` は atomic `fetch_add` で LSN を確定し、スロット(`lsn % capacity`)へレコードポインタを CAS で publish する。
+- `flushing_` のアトミック交換で選出された leader が待機中の全レコードをドレインし、`writev()`(IOV_MAX ごとに分割)で書き込み、バッチ全体に 1 回の `fdatasync()` を行う。
+- 起床は共有カウンタ `highest_settled_lsn_` への 1 回の store + `notify_all()` で行う。follower は `settled_mutex_` + `settled_cv_` 配下で自分の LSN が settle されるまで待つ。
+- `fd_close_mu_` は `rotate_segment()` の `close(old_fd)` と `size_bytes()` の `fstat(fd_)` の競合防止専用である。write/fsync 経路には関与しない。
+- レコード生存期間はイントルーシブな参照カウントで管理する。
 
 ### 7.2 Entry-Level Adaptive Covering (Dynamic T1 Inline Optimization)
 
@@ -577,6 +573,11 @@ T1のインデックススロットに十分な空きビット領域がないた
   - 読み出し時、T1から取得したスロットハッシュの最上位ビット（Bit 63）を確認するだけで、T2をフェッチせずにインラインかオフセットかを100%確実に識別できる。
 - **値が 1〜8 バイトの場合**:
   - `payload_bits` に対するビットシフトやビットの埋め込みは行わず、64ビットのビットパターンをそのまま無加工で格納し、デコード時は `inline_size` に従いバイトコピーを行う。これにより、`double`、`time`、連番のサロゲートキー（偶数・奇数を問わず）など、あらゆる64ビット以内のデータ型を完全にインライン化できる。
+- **追加制約**:
+  - キーは 16 バイト以下である。T1 は 16 バイト prefix のみ保持するためである。
+  - キーは非空ではなく、末尾バイトが `0x00` でない。inline entry は T2 record を持たないため、Scan は 16 バイト prefix の末尾ゼロ trim でキー長を復元する。末尾 `0x00` のキーは T2 経路に回す。
+  - 値は非空かつ 8 バイト以下である。
+  - 8 バイト値が `STORE_NOT_FOUND` とビット一致する場合はインライン化しない。T2 offset 経路に回す。
 
 ### 7.3 Sorted Bloom Filter
 
@@ -609,6 +610,10 @@ T2 の「base」領域(2.2節)は書き込み後二度と変更されないた�
 | `DefaultT2CapacityBytes` | Tier 2 最大仮想アドレス空間 |
 | `WalMaxBytesSinceCheckpoint` | 直前 checkpoint 以降に許容する WAL 蓄積バイト数の上限。超過で checkpoint() へ昇格する |
 | `T2SegmentBytes` | defragment のセグメント固定長。調整ノブではない |
-| `T2DefragSpaceOverheadPercent` | defragment 背景起動の許容 overhead(%)。唯一の公開ノブ |
+| `T2DefragSpaceOverheadPercent` | live 比率下限(%)。live が `bytes_used` のこの値以下で初回発火(ヒステリシス付き)。唯一の公開ノブ |
 | `T2DefragMaxMoveBytesPerCycle` | 1 defrag サイクルの移動上限 |
+| `maintenance_soft_threshold` | シャード append 容量の 50%。Scan 取得中は L2 キャッシュサイズ上限に下がる。背景メンテナンス投入閾値 |
+| `kScanBatchSize` | Scan の T2 offset 昇順バッチ件数。128 固定 |
+| `kWalCheckStride` | WAL サイズトリガのサンプリング間隔。64 書き込みごと |
+| `T1ReorgWorkerThreads` | T1 背景ワーカープールサイズ。既定値は hardware_concurrency/4(最低 1) |
 

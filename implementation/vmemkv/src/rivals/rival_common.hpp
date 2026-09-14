@@ -3,28 +3,33 @@
 
 #include <algorithm>
 #include <atomic>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+
+#include "../core/bytes.hpp"
 
 namespace vmemkv::rivals {
 
-// Byte-wise key ordering: memcmp over the shared prefix, shorter key first on ties.
+// Byte-wise key ordering as a thin wrapper over the shared bytes helper.
 inline auto compare_bytes(std::span<const std::byte> a, std::span<const std::byte> b) noexcept -> int {
-  const std::size_t min_len = std::min(a.size(), b.size());
-  const int cmp = min_len == 0 ? 0 : std::memcmp(a.data(), b.data(), min_len);
-  if (cmp != 0) {
-    return cmp;
+  return vmemkv::bytes_compare_3way(a, b);
+}
+
+// Existence-gated mutation shared by rival backends (LMDB shape as model):
+// runs mutate() only when exists() matches required, otherwise reports false.
+template <typename ExistsFn, typename MutateFn>
+inline auto require_exists(ExistsFn &&exists, bool required, MutateFn &&mutate) -> bool {
+  if (std::forward<ExistsFn>(exists)() != required) {
+    return false;
   }
-  if (a.size() == b.size()) {
-    return 0;
-  }
-  return a.size() < b.size() ? -1 : 1;
+  return std::forward<MutateFn>(mutate)();
 }
 
 // Unique per-instance path: appends "_<n><ext>" with a process-wide counter.

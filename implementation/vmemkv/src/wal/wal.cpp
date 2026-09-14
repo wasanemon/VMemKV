@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "../api/utils.hpp"
+#include "../core/spin_backoff.hpp"
 
 namespace vmemkv {
 
@@ -26,19 +28,48 @@ namespace {
 auto compute_checksum(const WalRecordHeader &header,
                       std::span<const std::byte> key,
                       std::span<const std::byte> value) noexcept -> uint64_t {
-  uint64_t hash = checksum_header(header);
-  hash = fnv1a64_update(hash, key.data(), key.size());
-  hash = fnv1a64_update(hash, value.data(), value.size());
-  return hash;
+  return checksum_header_plus_spans(header, {key, value});
 }
 
 constexpr mode_t kWalFilePermissions = 0600;
 
-// Iteration count at which a yield()-retry loop below is considered "stalled" rather than paying
+// Iteration count at which a retry loop below is considered "stalled" rather than paying
 // its expected brief backpressure cost. High enough to never fire in normal operation, low enough
 // to still surface a genuine hang as a log line within seconds even on an oversubscribed box.
 constexpr uint64_t kStallWarnThreshold = 20'000'000;
 constexpr uint64_t kIterationsPerMillionForLog = 1'000'000;
+
+inline void log_wal_stall(const char *role, uint64_t id, size_t slot, uint64_t next_lsn) {
+  // <print>/std::println needs GCC 14+; this toolchain (GCC 13) doesn't have it yet.
+  std::fprintf(  // NOLINT(modernize-use-std-print)
+      stderr,
+      "wal: %s stalled >%luM spins waiting (id=%lu slot=%zu next_lsn_=%lu)\n",
+      role,
+      static_cast<unsigned long>(kStallWarnThreshold / kIterationsPerMillionForLog),
+      static_cast<unsigned long>(id),
+      slot,
+      static_cast<unsigned long>(next_lsn));
+}
+
+// Backoff with a single stall tripwire shared by the three wait loops below.
+struct StallBackoff {
+  SpinBackoff backoff;
+  uint64_t spins = 0;
+  void wait() { backoff.wait(); }
+  auto note_spin() -> uint64_t { return ++spins; }
+  auto should_warn() const -> bool { return spins == kStallWarnThreshold; }
+};
+
+// Exact-size pread shared by read_header_at()/read_payload_at().
+inline void pread_exact(int fd, void *buf, size_t len, off_t offset, const char *what) {
+  if (len == 0) {
+    return;
+  }
+  const ssize_t got = ::pread(fd, buf, len, offset);
+  if (got != static_cast<ssize_t>(len)) {
+    throw std::system_error(errno, std::generic_category(), what);
+  }
+}
 
 }  // namespace
 
@@ -112,8 +143,12 @@ auto Wal::discover_segments(const std::filesystem::path &wal_path) -> std::vecto
     }
     const std::string suffix = name.substr(prefix.size());
     // Pure-digit suffixes only: guards against unrelated files sharing the prefix.
-    if (!suffix.empty() && suffix.find_first_not_of("0123456789") == std::string::npos) {
-      generations.push_back(std::stoull(suffix));
+    if (!suffix.empty()) {
+      uint64_t generation = 0;
+      const auto conv = std::from_chars(suffix.data(), suffix.data() + suffix.size(), generation);
+      if (conv.ec == std::errc{} && conv.ptr == suffix.data() + suffix.size()) {
+        generations.push_back(generation);
+      }
     }
   }
   std::sort(generations.begin(), generations.end());
@@ -168,21 +203,13 @@ auto Wal::scan_and_validate(int segment_fd, bool allow_truncate) -> uint64_t {
 
 auto Wal::read_header_at(int segment_fd, uint64_t offset) -> WalRecordHeader {
   WalRecordHeader header;
-  const ssize_t header_read = ::pread(segment_fd, &header, sizeof(header), static_cast<off_t>(offset));
-  if (header_read != static_cast<ssize_t>(sizeof(header))) {
-    throw std::system_error(errno, std::generic_category(), "pread wal header");
-  }
+  pread_exact(segment_fd, &header, sizeof(header), static_cast<off_t>(offset), "pread wal header");
   return header;
 }
 
 auto Wal::read_payload_at(int segment_fd, uint64_t offset, uint64_t payload_len) -> std::vector<std::byte> {
   std::vector<std::byte> payload(payload_len);
-  if (payload_len > 0) {
-    const ssize_t payload_read = ::pread(segment_fd, payload.data(), payload_len, static_cast<off_t>(offset));
-    if (payload_read != static_cast<ssize_t>(payload_len)) {
-      throw std::system_error(errno, std::generic_category(), "pread wal payload");
-    }
-  }
+  pread_exact(segment_fd, payload.data(), payload_len, static_cast<off_t>(offset), "pread wal payload");
   return payload;
 }
 
@@ -195,8 +222,9 @@ void Wal::fail_all_pending_and_release_leadership(const std::exception_ptr &err)
     while (next_to_flush_ != target) {
       const size_t slot = next_to_flush_ % kWalRingCapacity;
       PendingRecord *rec = ring_[slot].load(std::memory_order_acquire);
+      StallBackoff wait_backoff;
       while (rec == nullptr) {
-        std::this_thread::yield();
+        wait_backoff.wait();
         rec = ring_[slot].load(std::memory_order_acquire);
       }
       rec->error = err;
@@ -231,25 +259,17 @@ void Wal::collect_batch(uint64_t target, std::vector<PendingRecord *> &batch) {
   while (next_to_flush_ != target && batch.size() < kWalRingCapacity) {
     const size_t slot = next_to_flush_ % kWalRingCapacity;
     PendingRecord *rec = ring_[slot].load(std::memory_order_acquire);
-    uint64_t spins = 0;
+    StallBackoff publish_backoff;
     while (rec == nullptr) {
       // fetch_add for this LSN already happened (it's < target), but the producer's CAS-publish
       // into the slot hasn't landed yet -- an unavoidable, brief window.
-      std::this_thread::yield();
+      publish_backoff.wait();
       rec = ring_[slot].load(std::memory_order_acquire);
-      if (++spins == kStallWarnThreshold) {
+      if (publish_backoff.note_spin() == kStallWarnThreshold) {
         // Diagnostic tripwire, not a correctness fix: if the leader is stuck here, no thread is
         // doing real write()/fsync() I/O yet (write_and_fsync_batch() isn't entered until this
         // loop returns). Fires at most once per stall to avoid spamming the log.
-        // <print>/std::println needs GCC 14+; this toolchain (GCC 13) doesn't have it yet.
-        std::fprintf(  // NOLINT(modernize-use-std-print)
-            stderr,
-            "wal: leader stalled >%luM yields waiting for lsn=%lu (slot=%zu) to be "
-            "published (next_lsn_=%lu)\n",
-            static_cast<unsigned long>(kStallWarnThreshold / kIterationsPerMillionForLog),
-            static_cast<unsigned long>(next_to_flush_),
-            slot,
-            static_cast<unsigned long>(next_lsn_.load(std::memory_order_relaxed)));
+        log_wal_stall("leader", next_to_flush_, slot, next_lsn_.load(std::memory_order_relaxed));
       }
     }
     if (rec->lsn != next_to_flush_) {
@@ -393,24 +413,17 @@ auto Wal::reserve_record(WalRecordType type,
 
   const size_t slot = lsn % kWalRingCapacity;
   PendingRecord *expected = nullptr;
-  uint64_t publish_spins = 0;
+  StallBackoff slot_backoff;
   while (!ring_[slot].compare_exchange_weak(expected, rec, std::memory_order_acq_rel)) {
     expected = nullptr;
     // Backpressure: this slot's prior occupant hasn't been retired yet. Should rarely spin
     // meaningfully given kWalRingCapacity's margin over max concurrent callers.
-    std::this_thread::yield();
-    if (++publish_spins == kStallWarnThreshold) {
+    slot_backoff.wait();
+    if (slot_backoff.note_spin() == kStallWarnThreshold) {
       // Matching tripwire to collect_batch()'s: fires when a producer is stuck waiting for the
       // ring to make room, i.e. the leader isn't retiring slots. Seeing this without the
       // collect_batch() tripwire narrows down where the stall is.
-      std::fprintf(  // NOLINT(modernize-use-std-print) -- see the matching NOLINT in collect_batch() above.
-          stderr,
-          "wal: producer stalled >%luM yields waiting for slot=%zu to free (lsn=%lu, "
-          "next_lsn_=%lu)\n",
-          static_cast<unsigned long>(kStallWarnThreshold / kIterationsPerMillionForLog),
-          slot,
-          static_cast<unsigned long>(lsn),
-          static_cast<unsigned long>(next_lsn_.load(std::memory_order_relaxed)));
+      log_wal_stall("producer", lsn, slot, next_lsn_.load(std::memory_order_relaxed));
     }
   }
 

@@ -512,7 +512,7 @@ TEST_CASE_TEMPLATE("reorganize: CRUD still works", Store, STORE_TYPES) {
 // Regression test: a same-size update targeting a record in T2's "base" region (already
 // checkpointed) must be redirected out-of-place instead of taking the in-place fast path -- see
 // update_impl()'s base_boundary check and T2Memory::base_boundary's declaration. Base-region reads
-// go through a seqlock-free path (7.9 節) that assumes the bytes never change again once a record
+// go through a seqlock-free path (low_level_design.md 7.5) that assumes the bytes never change again once a record
 // is base-resident; an in-place write there would violate that assumption. If the redirect were
 // missing or wrong, this test would observe Scan (base_mmap_scan-served) and Get (main-mmap-served)
 // silently disagreeing on "key_a"'s value.

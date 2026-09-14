@@ -1,13 +1,16 @@
 #include "checkpoint.hpp"
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <system_error>
+
+#include "../core/io.hpp"
+#include "../core/mmap.hpp"
 
 namespace vmemkv {
 
@@ -29,13 +32,14 @@ void write_fsync_close(int file_descriptor, const void *data, size_t size, const
   size_t offset = 0;
   size_t synced = 0;
   while (offset < size) {
-    const ssize_t written = ::write(file_descriptor, bytes + offset, size - offset);
-    if (written <= 0) {
-      const int err = errno;
+    const size_t chunk = std::min(kSyncIntervalBytes, size - offset);
+    try {
+      write_all_exact(file_descriptor, bytes + offset, chunk, what);
+    } catch (...) {
       ::close(file_descriptor);
-      throw std::system_error(err, std::generic_category(), what);
+      throw;
     }
-    offset += static_cast<size_t>(written);
+    offset += chunk;
     if (offset - synced >= kSyncIntervalBytes && ::fdatasync(file_descriptor) == 0) {
       ::posix_fadvise(
           file_descriptor, static_cast<off_t>(synced), static_cast<off_t>(offset - synced), POSIX_FADV_DONTNEED);
@@ -48,23 +52,6 @@ void write_fsync_close(int file_descriptor, const void *data, size_t size, const
     throw std::system_error(err, std::generic_category(), what);
   }
   ::close(file_descriptor);
-}
-
-// Plain write loop, no fsync/close -- unlike write_fsync_close, does *not* close `file_descriptor`
-// on error, so a caller wrapping a whole object's worth of incremental writes (e.g.
-// ShardedT1CheckpointWriter) can let a mid-stream failure propagate and rely on that object's own
-// destructor to close the fd and discard its temp file, rather than every individual write call
-// needing to know how to unwind the caller's state.
-void write_all(int file_descriptor, const void *data, size_t size) {
-  const auto *bytes = static_cast<const std::byte *>(data);
-  size_t offset = 0;
-  while (offset < size) {
-    const ssize_t written = ::write(file_descriptor, bytes + offset, size - offset);
-    if (written <= 0) {
-      throw std::system_error(errno, std::generic_category(), "write sharded t1 checkpoint");
-    }
-    offset += static_cast<size_t>(written);
-  }
 }
 
 // Opens a fresh temp file beside `final_path`, invokes `write_body(file_descriptor)`, then
@@ -101,7 +88,7 @@ struct ParsedShardSections {
 auto parse_shard_sections(const std::byte *base,
                           size_t payload_limit,
                           const ShardedT1ChkFileHeader &header,
-                          uint64_t &checksum) -> std::optional<ParsedShardSections> {
+                          FoldingChecksum &checksum) -> std::optional<ParsedShardSections> {
   ParsedShardSections parsed;
   parsed.entries.reserve(header.shard_count);
   size_t offset = 0;
@@ -111,7 +98,7 @@ auto parse_shard_sections(const std::byte *base,
     }
     uint64_t entry_count = 0;
     std::memcpy(&entry_count, base + offset, sizeof(entry_count));
-    checksum = fnv1a64_update(checksum, base + offset, sizeof(entry_count));
+    checksum.add(base + offset, sizeof(entry_count));
     offset += sizeof(entry_count);
     const size_t entry_bytes = entry_count * sizeof(T1ChkEntry);
     if (offset + entry_bytes > payload_limit) {
@@ -119,7 +106,7 @@ auto parse_shard_sections(const std::byte *base,
     }
     parsed.entries.emplace_back(reinterpret_cast<const T1ChkEntry *>(base + offset), static_cast<size_t>(entry_count));
     if (entry_bytes > 0) {
-      checksum = fnv1a64_update(checksum, base + offset, entry_bytes);
+      checksum.add(base + offset, entry_bytes);
     }
     offset += entry_bytes;
     parsed.seen_entries += entry_count;
@@ -136,14 +123,14 @@ auto parse_shard_boundaries(const std::byte *base,
                             size_t payload_limit,
                             const ShardedT1ChkFileHeader &header,
                             uint64_t seen_entries,
-                            uint64_t &checksum) -> const T1ChkKeyPrefix * {
+                            FoldingChecksum &checksum) -> const T1ChkKeyPrefix * {
   const size_t boundary_bytes = header.boundary_count * sizeof(T1ChkKeyPrefix);
   if (offset + boundary_bytes != payload_limit || seen_entries != header.total_entry_count ||
       header.boundary_count + 1 != header.shard_count) {
     return nullptr;
   }
   if (boundary_bytes > 0) {
-    checksum = fnv1a64_update(checksum, base + offset, boundary_bytes);
+    checksum.add(base + offset, boundary_bytes);
   }
   return reinterpret_cast<const T1ChkKeyPrefix *>(base + offset);
 }
@@ -151,7 +138,7 @@ auto parse_shard_boundaries(const std::byte *base,
 }  // namespace
 
 ShardedT1CheckpointWriter::ShardedT1CheckpointWriter(const std::filesystem::path &path)
-    : final_path_(path), temp_path_(path.string() + ".tmp"), checksum_(kFnvOffsetBasis64) {
+    : final_path_(path), temp_path_(path.string() + ".tmp") {
   file_descriptor_ = ::open(temp_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, kCheckpointFilePermissions);
   if (file_descriptor_ < 0) {
     throw std::system_error(errno, std::generic_category(), "open sharded t1 checkpoint temp file");
@@ -170,11 +157,11 @@ ShardedT1CheckpointWriter::~ShardedT1CheckpointWriter() {
 
 void ShardedT1CheckpointWriter::add_shard_entries(const T1ChkEntry *entries, size_t entry_count) {
   const auto count64 = static_cast<uint64_t>(entry_count);
-  write_all(file_descriptor_, &count64, sizeof(count64));
-  checksum_ = fnv1a64_update(checksum_, &count64, sizeof(count64));
+  write_all_exact(file_descriptor_, &count64, sizeof(count64), "write sharded t1 checkpoint");
+  checksum_.add(&count64, sizeof(count64));
   if (entry_count > 0) {
-    write_all(file_descriptor_, entries, entry_count * sizeof(T1ChkEntry));
-    checksum_ = fnv1a64_update(checksum_, entries, entry_count * sizeof(T1ChkEntry));
+    write_all_exact(file_descriptor_, entries, entry_count * sizeof(T1ChkEntry), "write sharded t1 checkpoint");
+    checksum_.add(entries, entry_count * sizeof(T1ChkEntry));
   }
   ++shard_count_;
   total_entry_count_ += entry_count;
@@ -183,8 +170,8 @@ void ShardedT1CheckpointWriter::add_shard_entries(const T1ChkEntry *entries, siz
 void ShardedT1CheckpointWriter::finish(std::span<const T1ChkKeyPrefix> boundaries) {
   if (!boundaries.empty()) {
     const size_t boundary_bytes = boundaries.size() * sizeof(T1ChkKeyPrefix);
-    write_all(file_descriptor_, boundaries.data(), boundary_bytes);
-    checksum_ = fnv1a64_update(checksum_, boundaries.data(), boundary_bytes);
+    write_all_exact(file_descriptor_, boundaries.data(), boundary_bytes, "write sharded t1 checkpoint");
+    checksum_.add(boundaries.data(), boundary_bytes);
   }
 
   ShardedT1ChkFileHeader header;
@@ -194,7 +181,8 @@ void ShardedT1CheckpointWriter::finish(std::span<const T1ChkKeyPrefix> boundarie
   // header.checksum is still its default (0) here -- fold the header in now, with checksum
   // zeroed, exactly like every other format's convention, just last instead of first (see this
   // struct's own comment on why).
-  header.checksum = fnv1a64_update(checksum_, &header, sizeof(header));
+  checksum_.add_header(header);
+  header.checksum = checksum_.value();
 
   // write_fsync_close() always closes the fd itself, on both success and failure -- clear our
   // copy *before* calling it (not after), so a throw from it doesn't leave file_descriptor_
@@ -229,12 +217,9 @@ ShardedT1CheckpointFile::ShardedT1CheckpointFile(const std::filesystem::path &pa
     throw std::runtime_error("sharded t1 checkpoint file smaller than its trailer");
   }
 
-  void *mapped = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, file_descriptor, 0);
-  const int mmap_errno = errno;
+  void *mapped = mmap_shared_or_throw(
+      static_cast<size_t>(file_size), file_descriptor, PROT_READ, "mmap sharded t1 checkpoint", MAP_PRIVATE, 0);
   ::close(file_descriptor);
-  if (mapped == MAP_FAILED) {
-    throw std::system_error(mmap_errno, std::generic_category(), "mmap sharded t1 checkpoint");
-  }
 
   const auto *base = static_cast<const std::byte *>(mapped);
   ShardedT1ChkFileHeader header;
@@ -247,7 +232,7 @@ ShardedT1CheckpointFile::ShardedT1CheckpointFile(const std::filesystem::path &pa
   // entry span as we go. Bounds-checked throughout: a corrupt entry_count claiming more data than
   // remains is exactly what this is guarding against, not just the final checksum comparison.
   bool layout_ok = true;
-  uint64_t checksum = kFnvOffsetBasis64;
+  FoldingChecksum checksum;
   uint64_t seen_entries = 0;
   std::vector<std::span<const T1ChkEntry>> shard_entries;
   const T1ChkKeyPrefix *boundaries = nullptr;
@@ -267,26 +252,22 @@ ShardedT1CheckpointFile::ShardedT1CheckpointFile(const std::filesystem::path &pa
   if (magic_ok && layout_ok) {
     ShardedT1ChkFileHeader header_for_hash = header;
     header_for_hash.checksum = 0;
-    checksum_ok = fnv1a64_update(checksum, &header_for_hash, sizeof(header_for_hash)) == header.checksum;
+    const auto header_bytes =
+        std::span<const std::byte>(reinterpret_cast<const std::byte *>(&header_for_hash), sizeof(header_for_hash));
+    checksum_ok = fnv1a64_range(checksum.value(), header_bytes) == header.checksum;
   }
 
   if (!magic_ok || !layout_ok || !checksum_ok) {
-    ::munmap(mapped, file_size);
     throw std::runtime_error("sharded t1 checkpoint file failed validation (magic/version/layout/checksum)");
   }
 
-  mapped_ = mapped;
-  mapped_bytes_ = file_size;
+  mapping_ = MmapGuard(mapped, static_cast<size_t>(file_size));
   shard_entries_ = std::move(shard_entries);
   boundaries_ = boundaries;
   boundary_count_ = header.boundary_count;
 }
 
-ShardedT1CheckpointFile::~ShardedT1CheckpointFile() noexcept {
-  if (mapped_ != nullptr) {
-    ::munmap(mapped_, mapped_bytes_);
-  }
-}
+ShardedT1CheckpointFile::~ShardedT1CheckpointFile() noexcept = default;
 
 auto ShardedT1CheckpointFile::boundaries() const noexcept -> std::span<const T1ChkKeyPrefix> {
   return {boundaries_, boundary_count_};

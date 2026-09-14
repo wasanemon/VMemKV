@@ -5,15 +5,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <system_error>
-#include <vmemkv/config.hpp>
 
 #include "../checkpoint/checkpoint.hpp"
+#include "../core/mmap.hpp"
 
 namespace vmemkv {
 
@@ -23,7 +22,7 @@ namespace {
 // boundary at `record_base`.
 void write_record(std::byte *record_base, std::span<const std::byte> key, std::span<const std::byte> value) noexcept {
   const uint64_t raw_len = sizeof(ValueRecordHeader) + key.size() + value.size();
-  const uint64_t aligned_len = vmemkv::align_up(raw_len);
+  const uint64_t aligned_len = vmemkv::record_aligned_len(sizeof(ValueRecordHeader), key.size(), value.size());
 
   auto *header = reinterpret_cast<ValueRecordHeader *>(record_base);
   header->key_len = static_cast<uint32_t>(key.size());
@@ -64,9 +63,9 @@ T2FlatFile::~T2FlatFile() noexcept {
   const T2Memory *mem = t2_mem_.load(std::memory_order_relaxed);
   if (mem != nullptr) {
     // wait_until_retired() here only guards against a writer that started before this store began
-    // shutting down still holding a handle -- readers never register in active_writers_ (see its
+    // shutting down still holding a handle -- readers never register in the gate (see its
     // declaration), so there's nothing else to wait for.
-    active_writers_.wait_until_retired(mem);
+    gate_.wait_until_retired(mem);
     delete mem;
   }
 }
@@ -79,10 +78,9 @@ auto T2FlatFile::at(uint64_t payload, const T2Memory *mem) noexcept -> T2RecordV
 auto T2FlatFile::append_default(const T2Memory *mem,
                                 std::span<const std::byte> key,
                                 std::span<const std::byte> value) -> uint64_t {
-  const uint64_t raw_required = sizeof(ValueRecordHeader) + key.size() + value.size();
   // Align all record sizes to 8 bytes. This avoids unaligned memory access penalties
   // on modern CPU architectures and allows callers to cast fields safely.
-  const uint64_t required = vmemkv::align_up(raw_required);
+  const uint64_t required = vmemkv::record_aligned_len(sizeof(ValueRecordHeader), key.size(), value.size());
 
   const uint64_t offset = mem->bytes_used.fetch_add(required, std::memory_order_relaxed);
 
@@ -94,13 +92,6 @@ auto T2FlatFile::append_default(const T2Memory *mem,
   write_record(record_base, key, value);
 
   return offset;
-}
-
-void T2FlatFile::stop_writers_and_wait(const T2Memory *mem) const noexcept {
-  // seq_cst: paired with acquire_write_handle()'s seq_cst writer_stop_ load and
-  // ThreadReferenceTracker::acquire()'s seq_cst store -- see acquire_write_handle()'s comment.
-  writer_stop_.store(true, std::memory_order_seq_cst);
-  active_writers_.wait_until_retired(mem);
 }
 
 auto T2FlatFile::update_value_at(uint64_t payload,
@@ -160,60 +151,37 @@ void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capa
   // MAP_NORESERVE: bypasses the kernel's upfront swap-space reservation check, allowing
   // virtual address spaces much larger than physical RAM + swap without ENOMEM.
   // Physical pages are allocated on demand and can be swapped out normally.
-  void *mapped = ::mmap(nullptr,
-                        static_cast<size_t>(bytes_capacity),
-                        PROT_READ | PROT_WRITE,
-                        MAP_SHARED | MAP_NORESERVE,
-                        file_descriptor,
-                        0);
-  const int mmap_errno = errno;
-  if (mapped == MAP_FAILED) {
+  void *mapped = nullptr;
+  try {
+    mapped = mmap_shared_or_throw(static_cast<size_t>(bytes_capacity),
+                                  file_descriptor,
+                                  PROT_READ | PROT_WRITE,
+                                  "mmap",
+                                  MAP_SHARED | MAP_NORESERVE,
+                                  0);
+  } catch (...) {
     ::close(file_descriptor);
-    throw std::system_error(mmap_errno, std::generic_category(), "mmap");
+    throw;
   }
   // Unconditional (low_level_design.md 7.4).
-  if (::madvise(mapped, static_cast<size_t>(bytes_capacity), MADV_RANDOM) != 0) {
-    const int err = errno;
+  try {
+    madvise_or_throw(mapped, static_cast<size_t>(bytes_capacity), MADV_RANDOM, "madvise MADV_RANDOM");
+  } catch (...) {
     ::munmap(mapped, static_cast<size_t>(bytes_capacity));
     ::close(file_descriptor);
-    throw std::system_error(err, std::generic_category(), "madvise MADV_RANDOM");
+    throw;
   }
 
-  // Best-effort base-region scan mappings/read handle -- see T2Memory::base_mmap_scan's and
-  // T2Memory::read_fd's doc comments for who reads these and why. A failure here is silently
+  // Best-effort base-region scan mappings/read handle -- see BaseRegionMappings's
+  // doc comments for who reads these and why. A failure here is silently
   // non-fatal: the primary mapping above already provides full correctness (scan_impl()'s
   // seqlock fallback), these are purely a speed optimization. Set up unconditionally, even when
   // initial_bytes_used == 0 (a fresh store), so a later checkpoint's incremental base_boundary
   // promotion has real mappings to extend without ever remapping.
-  std::byte *base_mmap_scan_ptr = nullptr;
-  std::byte *base_mmap_scan_seq_ptr = nullptr;
-  int read_fd_dup = -1;
-  {
-    void *base_mapped_scan =
-        ::mmap(nullptr, static_cast<size_t>(bytes_capacity), PROT_READ, MAP_SHARED, file_descriptor, 0);
-    if (base_mapped_scan != MAP_FAILED) {
-      base_mmap_scan_ptr = static_cast<std::byte *>(base_mapped_scan);
-    }
-
-    void *base_mapped_scan_seq =
-        ::mmap(nullptr, static_cast<size_t>(bytes_capacity), PROT_READ, MAP_SHARED, file_descriptor, 0);
-    if (base_mapped_scan_seq != MAP_FAILED) {
-      if (::madvise(base_mapped_scan_seq, static_cast<size_t>(bytes_capacity), MADV_SEQUENTIAL) == 0) {
-        base_mmap_scan_seq_ptr = static_cast<std::byte *>(base_mapped_scan_seq);
-      } else {
-        ::munmap(base_mapped_scan_seq, static_cast<size_t>(bytes_capacity));
-      }
-    }
-
-    // Must dup() before file_descriptor is closed below.
-    read_fd_dup = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
-  }
+  auto *mem = new T2Memory(static_cast<std::byte *>(mapped), bytes_capacity, initial_bytes_used);
+  mem->adopt_best_effort(file_descriptor, bytes_capacity);
 
   ::close(file_descriptor);
-  auto *mem = new T2Memory(static_cast<std::byte *>(mapped), bytes_capacity, initial_bytes_used);
-  mem->base_mmap_scan = base_mmap_scan_ptr;
-  mem->base_mmap_scan_seq = base_mmap_scan_seq_ptr;
-  mem->read_fd = read_fd_dup;
   t2_mem_.store(mem, std::memory_order_release);
 }
 
@@ -244,16 +212,87 @@ void T2FlatFile::create_empty_file(const std::filesystem::path &path, uint64_t b
 }
 
 auto T2FlatFile::punch_if_occupied(uint64_t offset, uint64_t len) const noexcept -> PunchOutcome {
+  return HolePuncher::punch(vmemkv::derive_t2_chk_path(path_), get_memory(), offset, len);
+}
+
+BaseRegionMappings::~BaseRegionMappings() noexcept { dispose(); }
+
+BaseRegionMappings::BaseRegionMappings(BaseRegionMappings &&other) noexcept
+    : base_mmap_scan(other.base_mmap_scan),
+      base_mmap_scan_seq(other.base_mmap_scan_seq),
+      read_fd(other.read_fd),
+      capacity_(other.capacity_) {
+  other.base_mmap_scan = nullptr;
+  other.base_mmap_scan_seq = nullptr;
+  other.read_fd = -1;
+  other.capacity_ = 0;
+}
+
+auto BaseRegionMappings::operator=(BaseRegionMappings &&other) noexcept -> BaseRegionMappings & {
+  if (this != &other) {
+    dispose();
+    base_mmap_scan = other.base_mmap_scan;
+    base_mmap_scan_seq = other.base_mmap_scan_seq;
+    read_fd = other.read_fd;
+    capacity_ = other.capacity_;
+    other.base_mmap_scan = nullptr;
+    other.base_mmap_scan_seq = nullptr;
+    other.read_fd = -1;
+    other.capacity_ = 0;
+  }
+  return *this;
+}
+
+void BaseRegionMappings::adopt_best_effort(int file_descriptor, uint64_t capacity) noexcept {
+  capacity_ = capacity;
+  void *scan = best_effort_mmap_shared(static_cast<size_t>(capacity), file_descriptor, PROT_READ, 0);
+  if (scan != nullptr) {
+    base_mmap_scan = static_cast<std::byte *>(scan);
+  }
+
+  void *scan_seq = best_effort_mmap_shared(static_cast<size_t>(capacity), file_descriptor, PROT_READ, 0);
+  if (scan_seq != nullptr) {
+    if (::madvise(scan_seq, static_cast<size_t>(capacity), MADV_SEQUENTIAL) == 0) {
+      base_mmap_scan_seq = static_cast<std::byte *>(scan_seq);
+    } else {
+      ::munmap(scan_seq, static_cast<size_t>(capacity));
+    }
+  }
+
+  // Must dup() before the caller closes file_descriptor.
+  read_fd = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
+}
+
+void BaseRegionMappings::dispose() noexcept {
+  if (base_mmap_scan != nullptr) {
+    // Mapped to construction-time capacity, not base_boundary.
+    ::munmap(base_mmap_scan, static_cast<size_t>(capacity_));
+    base_mmap_scan = nullptr;
+  }
+  if (base_mmap_scan_seq != nullptr) {
+    ::munmap(base_mmap_scan_seq, static_cast<size_t>(capacity_));
+    base_mmap_scan_seq = nullptr;
+  }
+  if (read_fd >= 0) {
+    ::close(read_fd);
+    read_fd = -1;
+  }
+  capacity_ = 0;
+}
+
+auto HolePuncher::punch(const std::filesystem::path &t2_chk_path,
+                        const T2Memory *mem,
+                        uint64_t offset,
+                        uint64_t len) noexcept -> T2FlatFile::PunchOutcome {
   if (len == 0) {
-    return PunchOutcome::AlreadyHollow;
+    return T2FlatFile::PunchOutcome::AlreadyHollow;
   }
-  const T2Memory *mem = get_memory_handle();
   if (offset + len > mem->capacity) {
-    return PunchOutcome::Failed;
+    return T2FlatFile::PunchOutcome::Failed;
   }
-  const int file_descriptor = ::open(vmemkv::derive_t2_chk_path(path_).c_str(), O_RDWR);
+  const int file_descriptor = ::open(t2_chk_path.c_str(), O_RDWR);
   if (file_descriptor < 0) {
-    return PunchOutcome::Failed;
+    return T2FlatFile::PunchOutcome::Failed;
   }
   const off_t data_at = ::lseek(file_descriptor, static_cast<off_t>(offset), SEEK_DATA);
   const int seek_errno = errno;
@@ -263,22 +302,22 @@ auto T2FlatFile::punch_if_occupied(uint64_t offset, uint64_t len) const noexcept
     // covers the range). Anything else (filesystems without SEEK_DATA support): report
     // not-hollow so the punch below runs and reports support itself.
     if (seek_errno == ENXIO) {
-      return PunchOutcome::AlreadyHollow;
+      return T2FlatFile::PunchOutcome::AlreadyHollow;
     }
   } else if (static_cast<uint64_t>(data_at) >= offset + len) {
     ::close(file_descriptor);
-    return PunchOutcome::AlreadyHollow;
+    return T2FlatFile::PunchOutcome::AlreadyHollow;
   }
   const int punch_rc = ::fallocate(
       file_descriptor, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset), static_cast<off_t>(len));
   ::close(file_descriptor);
   if (punch_rc != 0) {
-    return PunchOutcome::Failed;
+    return T2FlatFile::PunchOutcome::Failed;
   }
   // Drop the range from the page cache as well: punch zeroes the file blocks, but already
   // resident pages would keep serving stale bytes until reclaimed.
   ::madvise(mem->base + offset, static_cast<size_t>(len), MADV_DONTNEED);
-  return PunchOutcome::Punched;
+  return T2FlatFile::PunchOutcome::Punched;
 }
 
 }  // namespace vmemkv

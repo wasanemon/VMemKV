@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "rival_common.hpp"
+#include "master_clone.hpp"
 
 namespace vmemkv::rivals::rocksdb_common {
 
@@ -177,24 +178,21 @@ inline auto exists_in_db(rocksdb::DB *db, std::span<const std::byte> key) -> boo
 }
 
 inline auto insert_into_db(rocksdb::DB *db, std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-  if (exists_in_db(db, key)) {
-    return false;  // already exists
-  }
-  return db->Put(make_durable_write_options(), to_slice(key), to_slice(value)).ok();
+  return require_exists([&] { return exists_in_db(db, key); },
+                        false,
+                        [&] { return db->Put(make_durable_write_options(), to_slice(key), to_slice(value)).ok(); });
 }
 
 inline auto update_in_db(rocksdb::DB *db, std::span<const std::byte> key, std::span<const std::byte> value) -> bool {
-  if (!exists_in_db(db, key)) {
-    return false;  // not found
-  }
-  return db->Put(make_durable_write_options(), to_slice(key), to_slice(value)).ok();
+  return require_exists([&] { return exists_in_db(db, key); },
+                        true,
+                        [&] { return db->Put(make_durable_write_options(), to_slice(key), to_slice(value)).ok(); });
 }
 
 inline auto remove_from_db(rocksdb::DB *db, std::span<const std::byte> key) -> bool {
-  if (!exists_in_db(db, key)) {
-    return false;  // not found
-  }
-  return db->Delete(make_durable_write_options(), to_slice(key)).ok();
+  return require_exists([&] { return exists_in_db(db, key); },
+                        true,
+                        [&] { return db->Delete(make_durable_write_options(), to_slice(key)).ok(); });
 }
 
 template <typename Cb>

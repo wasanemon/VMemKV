@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "../api/utils.hpp"
+#include "../core/mmap.hpp"
+#include "paths.hpp"
 
 namespace vmemkv {
 
@@ -73,7 +75,7 @@ static_assert(std::is_standard_layout_v<ShardedT1ChkFileHeader>);
 // Incremental writer: open once, call add_shard() once per shard in the same ascending order
 // ShardedT1Index::checkpoint_all_shards() invokes its per_shard_writer callback, then
 // finish(boundaries) once that call has returned and the boundary keys it produced are known.
-// Mirrors write_t1_checkpoint_file's temp+fsync+rename discipline, just spread across multiple
+// Mirrors this writer's temp+fsync+rename discipline, just spread across multiple
 // calls instead of one shot, so a shard's entries never need to be held in memory together with
 // any other shard's -- only this object's own small running state (counts and a running
 // checksum) persists across calls. Discards the temp file if destroyed before finish() is called
@@ -90,8 +92,7 @@ class ShardedT1CheckpointWriter {
 
   // `entries` must already be sorted by key ascending (T1Index::reorganize()'s merge output, which
   // ShardedT1Index::checkpoint_all_shards() calls this back with per shard, already satisfies
-  // this). EntrySnapshotLike is duck-typed exactly like write_t1_checkpoint()'s own template
-  // parameter -- see that function's comment.
+  // this).
   template <typename EntrySnapshotLike>
   void add_shard(std::span<const EntrySnapshotLike> entries) {
     std::vector<T1ChkEntry> on_disk;
@@ -115,7 +116,7 @@ class ShardedT1CheckpointWriter {
   int file_descriptor_ = -1;
   uint64_t shard_count_ = 0;
   uint64_t total_entry_count_ = 0;
-  uint64_t checksum_ = 0;  // Running FNV-1a64 state, folded incrementally as bytes are written.
+  FoldingChecksum checksum_;  // Running FNV-1a64 state, folded incrementally as bytes are written.
   bool finished_ = false;
 };
 
@@ -140,8 +141,7 @@ class ShardedT1CheckpointFile {
   }
 
  private:
-  void *mapped_ = nullptr;
-  size_t mapped_bytes_ = 0;
+  MmapGuard mapping_;
   std::vector<std::span<const T1ChkEntry>> shard_entries_;
   const T1ChkKeyPrefix *boundaries_ = nullptr;
   size_t boundary_count_ = 0;
@@ -184,23 +184,6 @@ struct ManifestData {
   uint64_t generation = 0;
   uint64_t t2_bytes_used = 0;
 };
-
-// Derives the sibling manifest path for a given T2 flat-file path.
-inline auto derive_manifest_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
-  return {t2_path.string() + ".manifest"};
-}
-
-// Derives the T1 checkpoint / T2 checkpoint file paths. Each is a single path reused across
-// every checkpoint this store ever commits: the T1 file is fully rewritten each cycle via
-// write_t1_checkpoint()'s temp+rename, and the T2 file is the store's one persistent data file,
-// appended to in place. Neither is trusted by a reader until the manifest names the generation
-// that last wrote them (5.3).
-inline auto derive_t1_chk_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
-  return {t2_path.string() + ".t1chk"};
-}
-inline auto derive_t2_chk_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
-  return {t2_path.string() + ".t2chk"};
-}
 
 // Writes the manifest to a temp file beside `manifest_path` and renames it atomically onto
 // `manifest_path`. Call only after `generation`'s T1 and T2 checkpoint files are already fully

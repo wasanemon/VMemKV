@@ -33,6 +33,12 @@ class RocksDBEngineStore {
 #else
       false;
 #endif
+  static constexpr bool kIsRival = true;
+
+  // RivalPolicy preparation (StoreAdapter unchanged): checkpoint noop,
+  // defragment false.
+  static void checkpoint() noexcept {}
+  static auto defragment() noexcept -> bool { return false; }
 
 #ifdef ENABLE_ROCKSDB
   // Opens a fresh DB at a unique subpath, preventing transient lock contention (ENOLCK) across thread sweeps.
@@ -51,10 +57,8 @@ class RocksDBEngineStore {
   RocksDBEngineStore(const RocksDBEngineStore &) = delete;
   auto operator=(const RocksDBEngineStore &) -> RocksDBEngineStore & = delete;
 
-  // Tag type selecting the clone-from-master constructor below. Public so StoreAdapter's
-  // variadic forwarding constructor can name it directly -- see
-  // for_each_store_variant()'s make_fresh_corpus()/make_fresh_corpus_checkpoint() in bench_kv.cpp.
-  struct CloneFromMasterTag {};
+  // Shared tag selecting the clone-from-master constructor (see master_clone.hpp).
+  using CloneFromMasterTag = ::vmemkv::rivals::CloneFromMasterTag;
 
   // Builds `master_path` once via bulk_load, then clones it via RocksDB's Checkpoint API -- see
   // rocksdb_common::clone_from()'s comment for why this is cheap and safe.
@@ -130,7 +134,7 @@ class RocksDBEngineStore {
   ~RocksDBEngineStore() = default;
   RocksDBEngineStore(const RocksDBEngineStore &) = delete;
   auto operator=(const RocksDBEngineStore &) -> RocksDBEngineStore & = delete;
-  struct CloneFromMasterTag {};
+  using CloneFromMasterTag = ::vmemkv::rivals::CloneFromMasterTag;
   template <typename KeyFn, typename ValueFn>
   RocksDBEngineStore(CloneFromMasterTag /*tag*/,
                      const std::string &master_path,

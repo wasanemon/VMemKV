@@ -5,7 +5,7 @@
 
 #include <doctest/doctest.h>
 
-#include <api/store_adapter.hpp>  // kInlineScalarValueBytes, needed by vmemkv_impl.hpp below (get_impl()'s inline-value path)
+#include <api/store_adapter.hpp>  // needed by vmemkv_impl.hpp below (get_impl()'s inline-value path)
 #include <filesystem>
 #include <span>
 #include <string>
@@ -37,7 +37,7 @@ struct TempT2File {
 
 TEST_CASE("T2FlatFile: append_default then at() round-trips key/value") {
   TempT2File t2;
-  auto mem = t2.file.get_memory_handle();
+  auto mem = t2.file.get_memory();
   const uint64_t offset = t2.file.append_default(mem, as_span(bytes_of("hello")), as_span(bytes_of("world")));
 
   const auto record = t2.file.at(offset, mem);
@@ -47,7 +47,7 @@ TEST_CASE("T2FlatFile: append_default then at() round-trips key/value") {
 
 TEST_CASE("T2FlatFile: update_value_at overwrites in place when the new value fits alloc_len") {
   TempT2File t2;
-  auto mem = t2.file.get_memory_handle();
+  auto mem = t2.file.get_memory();
   const uint64_t offset = t2.file.append_default(mem, as_span(bytes_of("k")), as_span(bytes_of("0123456789")));
 
   CHECK(vmemkv::T2FlatFile::update_value_at(offset, as_span(bytes_of("abc")), mem));
@@ -57,7 +57,7 @@ TEST_CASE("T2FlatFile: update_value_at overwrites in place when the new value fi
 
 TEST_CASE("T2FlatFile: update_value_at fails when the new value exceeds alloc_len") {
   TempT2File t2;
-  auto mem = t2.file.get_memory_handle();
+  auto mem = t2.file.get_memory();
   const uint64_t offset = t2.file.append_default(mem, as_span(bytes_of("k")), as_span(bytes_of("abc")));
 
   CHECK_FALSE(vmemkv::T2FlatFile::update_value_at(offset, as_span(bytes_of("0123456789")), mem));
@@ -71,7 +71,7 @@ TEST_CASE(
     "T2FlatFile: read_t2_record_seqlock always observes the current value, even immediately "
     "after a shrinking update_value_at() (regression)") {
   TempT2File t2;
-  auto mem = t2.file.get_memory_handle();
+  auto mem = t2.file.get_memory();
   const std::string original_value(64, 'A');  // alloc_len becomes 64.
   const uint64_t offset = t2.file.append_default(mem, as_span(bytes_of("k")), as_span(bytes_of(original_value)));
 

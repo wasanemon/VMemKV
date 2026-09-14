@@ -13,11 +13,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <thread>
+
+#include "core/env.hpp"
 
 namespace vmemkv {
 
@@ -29,9 +31,10 @@ class CgroupMemoryThrottle {
   // VMEMKV_CGROUP_ROOT serves the same override role via environment when non-null here.
   explicit CgroupMemoryThrottle(size_t check_interval = 1024, const char *cgroup_dir_override = nullptr)
       : check_interval_(check_interval == 0 ? 1 : check_interval) {
-    const char *env = (cgroup_dir_override != nullptr) ? cgroup_dir_override : std::getenv("VMEMKV_CGROUP_ROOT");
-    if (env != nullptr && *env != '\0') {
-      init_from_dir(env);
+    const std::string_view dir =
+        (cgroup_dir_override != nullptr) ? std::string_view(cgroup_dir_override) : getenv_view("VMEMKV_CGROUP_ROOT");
+    if (!dir.empty()) {
+      init_from_dir(std::string(dir));
     } else {
       init_from_self_cgroup();
     }
@@ -66,20 +69,6 @@ class CgroupMemoryThrottle {
   }
 
  private:
-  static auto read_uint_file(const std::string &path, uint64_t &out) -> bool {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-      return false;
-    }
-    uint64_t value = 0;
-    file >> value;
-    if (file.fail()) {
-      return false;  // Non-numeric content such as memory.high's "max".
-    }
-    out = value;
-    return true;
-  }
-
   void init_from_dir(const std::string &dir) {
     uint64_t high = 0;
     if (!read_uint_file(dir + "/memory.high", high) || high == 0) {

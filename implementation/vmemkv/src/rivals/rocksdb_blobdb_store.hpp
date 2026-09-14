@@ -1,8 +1,8 @@
 // rocksdb_blobdb_store.hpp — Thin RocksDB "BlobDB" wrapper exposing byte-span APIs
 // for comparison.
 //
-// Uses RocksDB's integrated blob-file support (enable_blob_files), not the legacy standalone
-// blob_db.h API (unavailable in this project's RocksDB version). Key-value separation trades
+// Uses RocksDB's integrated blob-file support (enable_blob_files).
+// Key-value separation trades
 // write amplification for reduced compaction I/O on large values -- the interesting comparison
 // point against plain RocksDBStore for the LTM(64KB) scenarios.
 //

@@ -185,18 +185,8 @@ class ShardedT1Index {
           return slot->index->scan(lo_bytes, hi_bytes, callback);
         }
       }
-      const size_t start_idx =
-          dir->boundaries.empty()
-              ? 0
-              : static_cast<size_t>(std::upper_bound(dir->boundaries.begin(), dir->boundaries.end(), lo) -
-                                    dir->boundaries.begin());
       std::vector<ShardSlot *> leaves;
-      for (size_t i = start_idx; i < dir->shards.size(); ++i) {
-        if (i > 0 && hi < dir->boundaries[i - 1]) {
-          break;
-        }
-        collect_leaves(dir->shards[i], lo, hi, leaves);
-      }
+      ShardSetView{dir}.for_each_leaf_in_range(lo, hi, [&](ShardSlot *leaf) { leaves.push_back(leaf); });
       size_t total = 0;
       for (ShardSlot *leaf : leaves) {
         total += leaf->index->scan(lo_bytes, hi_bytes, callback);
@@ -317,16 +307,13 @@ class ShardedT1Index {
   // via load_from_checkpoint().
   //
   // Splits are paused for this whole call (see splits_paused_'s own comment) so the directory
-  // can't gain or lose shards while this iterates -- matching how the unsharded T1Index's own
-  // checkpoint()/reorg_worker_loop() already coordinate via reorg_running_. This alone isn't
-  // sufficient, though: an already-in-flight split (one that won its Closing CAS just before the
-  // pause took effect) isn't stopped by it and could still complete concurrently, so the whole
-  // loop below also stays inside one with_routing_guard() call -- that's what actually keeps any
-  // ShardSlot this loop touches alive for its whole duration (see continue_split()'s comment on
-  // why the CAS itself needs this same protection). The one cost: such an in-flight split's own
-  // final cleanup (its `delete old_dir; delete target;`) is delayed until this call returns,
-  // since that split's own drain must wait for this call's guard to release first -- harmless,
-  // since that split doesn't depend on this call to make progress.
+  // can't gain shards while this iterates. An already-in-flight split (one that won its Closing
+  // CAS just before the pause took effect) can still complete concurrently; each shard touched
+  // below is therefore held alive by ShardSlot::outside_refs instead of one long routing guard,
+  // and continue_split()'s own delete path waits for those refs. Per-shard work (dump or
+  // reorganize_until_captured()) runs outside any guard; only the directory snapshot itself is
+  // taken under a short guard (generation management: the returned boundaries match exactly the
+  // snapshotted shard set this call serialized).
   //
   // Pausing splits does *not* pause ordinary (non-splitting) background maintenance: a worker's
   // own reorganize() on the same shard can still be in flight, or start, concurrently with this
@@ -337,36 +324,48 @@ class ShardedT1Index {
   // retries each shard's call until its callback actually fires.
   template <typename OffsetMapper, typename PerShardWriter>
   auto checkpoint_all_shards(OffsetMapper offset_mapper, PerShardWriter per_shard_writer) -> std::vector<Key> {
-    splits_paused_.store(true, std::memory_order_release);
-    struct ResumeSplits {
-      std::atomic<bool> *flag;
-      ~ResumeSplits() { flag->store(false, std::memory_order_release); }
-    } resume_splits{&splits_paused_};
+    FlagGuard pause(splits_paused_);
 
-    return with_routing_guard([&]() -> std::vector<Key> {
+    std::vector<ShardSlot *> snapshot;
+    std::vector<Key> boundaries;
+    with_routing_guard([&] {
       Directory *dir = directory_.load(std::memory_order_acquire);
-      std::vector<EntrySnapshot> dumped;
-      for (ShardSlot *slot : dir->shards) {
-        // Merge-free shortcut for shards with nothing new to merge: with an empty append
-        // region, a merge's output is this shard's sorted region as-is (same key order, same
-        // tombstone-skipping), so serializing it directly yields byte-identical checkpoint
-        // content at O(sorted) walk cost instead of O(merge) cost. In-place updates to sorted
-        // slots and concurrent background merges stay consistent for the same reason a merge
-        // snapshot does: anything concurrent with this read is WAL-covered past this cycle's
-        // checkpoint_lsn and converges via replay (see checkpoint_internal()'s LSN discipline).
-        // The tombstone counter is deliberately *not* reset here -- only a real merge carries
-        // tombstones away, so the pressure correctly survives until one runs.
-        if (slot->index->append_size() == 0) {
-          slot->index->dump_sorted_region(dumped);
-          offset_mapper(std::span<EntrySnapshot>(dumped));
-          per_shard_writer(dumped);
-          continue;
-        }
-        reorganize_until_captured(*slot->index, offset_mapper, per_shard_writer, /*parallel_sort=*/false);
-        slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
+      boundaries = dir->boundaries;
+      snapshot = dir->shards;
+      for (ShardSlot *slot : snapshot) {
+        slot->outside_refs.fetch_add(1, std::memory_order_relaxed);
       }
-      return dir->boundaries;
     });
+    struct RefRelease {
+      std::vector<ShardSlot *> *slots;
+      ~RefRelease() {
+        for (ShardSlot *slot : *slots) {
+          slot->outside_refs.fetch_sub(1, std::memory_order_relaxed);
+        }
+      }
+    } ref_release{&snapshot};
+
+    std::vector<EntrySnapshot> dumped;
+    for (ShardSlot *slot : snapshot) {
+      // Merge-free shortcut for shards with nothing new to merge: with an empty append
+      // region, a merge's output is this shard's sorted region as-is (same key order, same
+      // tombstone-skipping), so serializing it directly yields byte-identical checkpoint
+      // content at O(sorted) walk cost instead of O(merge) cost. In-place updates to sorted
+      // slots and concurrent background merges stay consistent for the same reason a merge
+      // snapshot does: anything concurrent with this read is WAL-covered past this cycle's
+      // checkpoint_lsn and converges via replay (see checkpoint_internal()'s LSN discipline).
+      // The tombstone counter is deliberately *not* reset here -- only a real merge carries
+      // tombstones away, so the pressure correctly survives until one runs.
+      if (slot->index->append_size() == 0) {
+        slot->index->dump_sorted_region(dumped);
+        offset_mapper(std::span<EntrySnapshot>(dumped));
+        per_shard_writer(dumped);
+        continue;
+      }
+      reorganize_until_captured(*slot->index, offset_mapper, per_shard_writer, /*parallel_sort=*/false);
+      slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
+    }
+    return boundaries;
   }
 
   // Recovery-only: replaces this (freshly constructed, still-empty, not yet shared with any
@@ -427,6 +426,58 @@ class ShardedT1Index {
     // path, checkpoint_all_shards()). Relaxed: a heuristic trigger, exactness unnecessary -- a
     // concurrent put racing the reset only delays the next trigger by one round.
     std::atomic<uint64_t> tombstones_since_maintenance{0};
+    // Hazard refs held while a worker/checkpoint touches this slot outside the routing guard
+    // (see run_maintenance()/checkpoint_all_shards()). continue_split() waits for zero before
+    // deleting the target.
+    std::atomic<int> outside_refs{0};
+  };
+
+  // Pure split-size threshold shared by run_maintenance().
+  static auto split_threshold(size_t target_shard_size, uint32_t percent) noexcept -> size_t {
+    return (target_shard_size * percent) / 100;
+  }
+
+  // RAII true-while-held flag (splits_paused_). Preparation for unifying flag guards.
+  struct FlagGuard {
+    std::atomic<bool> *flag;
+    explicit FlagGuard(std::atomic<bool> &f) : flag(&f) { flag->store(true, std::memory_order_release); }
+    ~FlagGuard() { flag->store(false, std::memory_order_release); }
+    FlagGuard(const FlagGuard &) = delete;
+    auto operator=(const FlagGuard &) -> FlagGuard & = delete;
+  };
+
+  // Queue ownership shared by request_maintenance_if_needed()/run_maintenance()/continue_split().
+  struct ShardQueue {
+    std::mutex mutex;
+    std::deque<ShardSlot *> queue;
+    // Enqueues slot if live: CASes pending false->true, then under lock re-checks superseded
+    // (same mutex continue_split() purges under, making push vs purge race-free).
+    void push_if_live(ShardSlot *slot) {
+      bool expected = false;
+      if (!slot->maintenance_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+      }
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (slot->superseded.load(std::memory_order_acquire) != nullptr) {
+        return;
+      }
+      queue.push_back(slot);
+    }
+    // Pops one entry (or nullptr) and clears its pending flag for the next round.
+    auto pop() -> ShardSlot * {
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (queue.empty()) {
+        return nullptr;
+      }
+      ShardSlot *slot = queue.front();
+      queue.pop_front();
+      slot->maintenance_pending.store(false, std::memory_order_release);
+      return slot;
+    }
+    void purge(ShardSlot *target) {
+      const std::lock_guard<std::mutex> lock(mutex);
+      queue.erase(std::remove(queue.begin(), queue.end(), target), queue.end());
+    }
   };
 
   // Immutable once published; replaced wholesale (RCU-style) on every split. boundaries.size()
@@ -442,6 +493,54 @@ class ShardedT1Index {
     }
   };
 
+  // Read vs write handling of the Closing sentinel, shared by resolve()/resolve_for_write()/
+  // collect_leaves() so the three-way branch exists once.
+  enum class ResolveMode { Read, Write };
+
+  // Single Closing branch: Read treats Closing as a usable leaf, Write signals retry.
+  // Returns nullptr only for Write-on-Closing (caller spins); otherwise the slot to use or
+  // follow, with Split* redirects resolved by the caller.
+  static auto closing_slot_for_mode(ShardSlot *slot, ResolveMode mode) -> ShardSlot * {
+    if (mode == ResolveMode::Read) {
+      return slot;
+    }
+    return nullptr;
+  }
+
+  // View over one Directory snapshot: initial routing plus leaf fan-out in range.
+  struct ShardSetView {
+    Directory *dir;
+    [[nodiscard]] auto initial_slot(const Key &key) const -> ShardSlot * {
+      return dir->shards.size() == 1 ? dir->shards[0] : dir->shard_for(key);
+    }
+    void for_each_leaf_in_range(const Key &lo, const Key &hi, auto &&visit) const {
+      const size_t start_idx =
+          dir->boundaries.empty()
+              ? 0
+              : static_cast<size_t>(std::upper_bound(dir->boundaries.begin(), dir->boundaries.end(), lo) -
+                                    dir->boundaries.begin());
+      for (size_t i = start_idx; i < dir->shards.size(); ++i) {
+        if (i > 0 && hi < dir->boundaries[i - 1]) {
+          break;
+        }
+        collect_into(dir->shards[i], lo, hi, visit);
+      }
+    }
+    static void collect_into(ShardSlot *slot, const Key &lo, const Key &hi, auto &&visit) {
+      Split *split = slot->superseded.load(std::memory_order_acquire);
+      if (split == nullptr || split == kClosingSentinel) {
+        visit(closing_slot_for_mode(slot, ResolveMode::Read));
+        return;
+      }
+      if (lo < split->boundary) {
+        collect_into(split->low, lo, hi, visit);
+      }
+      if (!(hi < split->boundary)) {
+        collect_into(split->high, lo, hi, visit);
+      }
+    }
+  };
+
   // Read-path resolution: chases Split{} redirects but treats Closing as "still safe to read
   // this slot directly" (see class comment / docs/t1_sharding_design.md's scan consistency
   // scope -- get/scan never need to wait on a split in progress). The single-shard case skips
@@ -453,8 +552,11 @@ class ShardedT1Index {
     ShardSlot *slot = dir->shards.size() == 1 ? dir->shards[0] : dir->shard_for(key);
     for (;;) {
       Split *split = slot->superseded.load(std::memory_order_acquire);
-      if (split == nullptr || split == kClosingSentinel) {
+      if (split == nullptr) {
         return slot;
+      }
+      if (split == kClosingSentinel) {
+        return closing_slot_for_mode(slot, ResolveMode::Read);
       }
       slot = (key < split->boundary) ? split->low : split->high;
     }
@@ -472,8 +574,10 @@ class ShardedT1Index {
         return slot;
       }
       if (split == kClosingSentinel) {
-        backoff.wait();
-        continue;
+        if (closing_slot_for_mode(slot, ResolveMode::Write) == nullptr) {
+          backoff.wait();
+          continue;
+        }
       }
       slot = (key < split->boundary) ? split->low : split->high;
     }
@@ -486,7 +590,8 @@ class ShardedT1Index {
   void collect_leaves(ShardSlot *slot, const Key &lo, const Key &hi, std::vector<ShardSlot *> &out) const {
     Split *split = slot->superseded.load(std::memory_order_acquire);
     if (split == nullptr || split == kClosingSentinel) {
-      out.push_back(slot);
+      // Unified Closing branch: reads treat Closing as a leaf (see ResolveMode::Read).
+      out.push_back(closing_slot_for_mode(slot, ResolveMode::Read));
       return;
     }
     if (lo < split->boundary) {
@@ -550,17 +655,11 @@ class ShardedT1Index {
     // why this range, not continue_split()'s full duration, is what a caller cares about.
     const auto split_pause_start = std::chrono::steady_clock::now();
 
-    // Purge any queue entry for `target` now, under the same mutex request_maintenance_if_needed()
-    // re-checks `superseded` under (see that method's comment): together these guarantee no
-    // worker can ever dequeue `target` after this point, which is what makes `delete target`
-    // below safe. Without this, a duplicate queue entry (from a soft-threshold trip racing
-    // run_maintenance()'s own clear-then-reorganize) could sit in the queue past this shard's
-    // physical deletion and be dequeued by a worker as a dangling pointer -- workers, unlike
-    // put()/get()/scan(), aren't routing_epochs_-guarded, so that guard doesn't protect them.
-    {
-      const std::lock_guard<std::mutex> lock(queue_mutex_);
-      queue_.erase(std::remove(queue_.begin(), queue_.end(), target), queue_.end());
-    }
+    // Purge any queue entry for `target` now, under the same mutex push_if_live()
+    // re-checks `superseded` under: together these guarantee no worker can ever dequeue
+    // `target` after this point. Workers that already dequeued it hold outside_refs across
+    // their unguarded reorganize(), which the wait before `delete target` below drains.
+    queue_.purge(target);
 
     // Second reorganize(), taken *after* Closing is visible: captures target's state as of "no
     // new writer can resolve target anymore" (anything already inside T1Index::put() when Closing
@@ -656,6 +755,14 @@ class ShardedT1Index {
     const uint64_t bumped = routing_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     routing_epochs_.wait_until_epoch(bumped);
 
+    // Drain unguarded maintenance/checkpoint users holding outside_refs before freeing.
+    {
+      SpinBackoff backoff;
+      while (target->outside_refs.load(std::memory_order_acquire) != 0) {
+        backoff.wait();
+      }
+    }
+
     delete old_dir;
     delete target;
     total_splits_.fetch_add(1, std::memory_order_relaxed);
@@ -714,18 +821,7 @@ class ShardedT1Index {
     if (!over_soft && !delete_heavy) {
       return;
     }
-    bool expected = false;
-    if (!slot->maintenance_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      return;
-    }
-    const std::lock_guard<std::mutex> lock(queue_mutex_);
-    if (slot->superseded.load(std::memory_order_acquire) != nullptr) {
-      // Lost the race to a concurrent split: `slot` is retired (or about to be). Leave
-      // maintenance_pending=true permanently -- harmless, nothing will ever check it again on a
-      // retired slot -- and, critically, do NOT enqueue it.
-      return;
-    }
-    queue_.push_back(slot);
+    queue_.push_if_live(slot);
   }
 
   // Background worker body. Polls on a short, fixed interval rather than blocking on a condition
@@ -744,93 +840,74 @@ class ShardedT1Index {
   // Only called from inside with_routing_guard() (run_maintenance() below) -- see that method's
   // own comment for why the dequeue itself, not just what's done with the result, must happen
   // under the guard.
-  auto pop_queue() -> ShardSlot * {
-    const std::lock_guard<std::mutex> lock(queue_mutex_);
-    if (queue_.empty()) {
-      return nullptr;
-    }
-    ShardSlot *slot = queue_.front();
-    queue_.pop_front();
-    return slot;
-  }
+  auto pop_queue() -> ShardSlot * { return queue_.pop(); }
 
   // One maintenance cycle: dequeue a slot (if any), a normal reorganize(), then split if the
   // result is big enough. Returns false only when the queue was empty (so worker_loop() knows to
   // poll-sleep); a dequeued slot that turned out to need no action still returns true.
   //
-  // The dequeue itself runs inside with_routing_guard(), not just the reorganize/CAS-attempt that
-  // follows it -- this is load-bearing, not just consistent style. A raw ShardSlot* obtained from
-  // the queue is otherwise unprotected the instant pop_queue() returns it: unlike
-  // resolve()/resolve_for_write() (which look up a slot *while already holding* the guard, so
-  // continue_split()'s routing_epoch_ bump + wait_until_epoch() is guaranteed to drain them before
-  // any delete), a pointer obtained *before* entering the guard could already be stale by the time
-  // the guard is entered, and entering the guard afterward can't retroactively make a
-  // already-freed access safe. Concretely, without this: a worker could pop `slot` off the queue,
-  // then a concurrent split_shard_containing() (which resolves its own target independently of
-  // the queue) could win the Closing CAS on that same slot, run continue_split() to completion,
-  // bump routing_epoch_, and delete slot -- all invisible to routing_epochs_, since the worker
-  // never registered a guard before touching it.
-  //
-  // With the dequeue inside the guard: if it observes `slot` still queued, that's only possible if
-  // it ran (per queue_mutex_'s total order over all queue operations) before any concurrent
-  // continue_split()'s purge of that same slot -- which itself runs before that continue_split()'s
-  // routing_epoch_ bump. So this guard's registration, with the pre-bump epoch, is guaranteed to
-  // predate the bump, and wait_until_epoch() will wait for it. If the dequeue instead runs after
-  // the purge, it simply never observes `slot` in the queue at all. Either way, no race.
-  //
-  // Multiple workers can still end up processing the same slot (a duplicate queue entry from a
-  // fresh soft-threshold trip racing this method's own clear-then-reorganize) -- harmless:
-  // T1Index::reorganize()'s own reorg_in_progress_ CAS makes the second call a no-op with an
-  // empty merged span, and the Closing CAS below makes a resulting split attempt single-flight.
-  // continue_split() (called only once we've actually won the CAS) runs unguarded, after the
-  // guard above has been released, as our own exclusive property -- same as
-  // split_shard_containing().
+  // Lock scope: only the dequeue and the Closing CAS run inside with_routing_guard(); the
+  // reorganize() between them runs outside it. A dequeued slot is kept alive across the
+  // unguarded window by ShardSlot::outside_refs (taken while still guarded): continue_split()
+  // waits for zero before deleting its target, so the pointer stays valid without holding the
+  // routing guard for the whole merge. Multiple workers can still process the same slot --
+  // harmless via T1Index::reorganize()'s reorg_in_progress_ CAS plus the single-flight Closing
+  // CAS below. continue_split() (called only once we've actually won the CAS) runs unguarded,
+  // as our own exclusive property -- same as split_shard_containing().
   auto run_maintenance() -> bool {
-    ShardSlot *claimed_target = nullptr;
-    const bool dequeued = with_routing_guard([&]() -> bool {
+    struct Claimed {
+      ShardSlot *slot = nullptr;
+      bool held = false;
+    };
+    Claimed claimed = with_routing_guard([&]() -> Claimed {
       ShardSlot *slot = pop_queue();
       if (slot == nullptr) {
-        return false;
+        return {};
       }
-      slot->maintenance_pending.store(false, std::memory_order_release);
-
       if (slot->superseded.load(std::memory_order_acquire) != nullptr) {
-        return true;  // Already split/being split by the time this was dequeued -- no-op.
+        return {slot, false};
       }
-      std::vector<EntrySnapshot> merged_entries;
-      bool reorganized = false;
-      slot->index->reorganize(
-          [](std::span<EntrySnapshot> /*merged*/) {},
-          [&](std::span<const EntrySnapshot> merged) {
-            merged_entries.assign(merged.begin(), merged.end());
-            reorganized = true;
-          },
-          /*parallel_sort=*/false);  // See T1Index::reorganize()'s own doc comment on this parameter.
-      if (reorganized) {
-        // The merge above carried this shard's tombstones away -- without this reset the
-        // delete-pressure trigger would re-fire on every subsequent put and churn maintenance
-        // with nothing new to collect. (A no-op lost to reorg_in_progress_ leaves the count
-        // alone, so the pressure correctly survives until a real merge runs.)
-        slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
-      }
-
-      const size_t split_threshold = (target_shard_size_ * Config::T1ShardSplitThresholdPercent) / 100;
-      if (merged_entries.size() < split_threshold) {
-        return true;
-      }
-      if (splits_paused_.load(std::memory_order_acquire)) {
-        return true;  // checkpoint_all_shards() in progress -- see its own comment.
-      }
-      Split *expected = nullptr;
-      if (slot->superseded.compare_exchange_strong(expected, kClosingSentinel, std::memory_order_acq_rel)) {
-        claimed_target = slot;
-      }
+      slot->outside_refs.fetch_add(1, std::memory_order_relaxed);
+      return {slot, true};
+    });
+    if (claimed.slot == nullptr) {
+      return false;
+    }
+    if (!claimed.held) {
       return true;
+    }
+    ShardSlot *slot = claimed.slot;
+
+    std::vector<EntrySnapshot> merged_entries;
+    bool reorganized = false;
+    slot->index->reorganize(
+        [](std::span<EntrySnapshot> /*merged*/) {},
+        [&](std::span<const EntrySnapshot> merged) {
+          merged_entries.assign(merged.begin(), merged.end());
+          reorganized = true;
+        },
+        /*parallel_sort=*/false);
+    if (reorganized) {
+      slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
+    }
+
+    ShardSlot *claimed_target = nullptr;
+    with_routing_guard([&] {
+      const bool big_enough = merged_entries.size() >= split_threshold(target_shard_size_,
+                                                                       Config::T1ShardSplitThresholdPercent);
+      if (big_enough && !splits_paused_.load(std::memory_order_acquire) &&
+          slot->superseded.load(std::memory_order_acquire) == nullptr) {
+        Split *expected = nullptr;
+        if (slot->superseded.compare_exchange_strong(expected, kClosingSentinel, std::memory_order_acq_rel)) {
+          claimed_target = slot;
+        }
+      }
+      slot->outside_refs.fetch_sub(1, std::memory_order_relaxed);
     });
     if (claimed_target != nullptr) {
       continue_split(claimed_target);
     }
-    return dequeued;
+    return true;
   }
 
   // See set_scan_active().
@@ -843,8 +920,7 @@ class ShardedT1Index {
   std::atomic<Directory *> directory_{nullptr};
   size_t append_cap_;
   size_t target_shard_size_;
-  std::mutex queue_mutex_;
-  std::deque<ShardSlot *> queue_;
+  ShardQueue queue_;
   std::vector<std::jthread> workers_;
   // Set for the duration of checkpoint_all_shards() so the directory stays stable throughout
   // (see that method's own comment). Checked only at the point a split would actually be

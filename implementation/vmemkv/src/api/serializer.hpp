@@ -41,17 +41,20 @@ inline auto encode_integral_key(Int value) noexcept -> std::array<std::byte, siz
   return out;
 }
 
-// Shared bodies and type-selection traits for KeySerializer's and ValueSerializer's
-// byte-container/string-like specializations below: neither has a byte-order concern (the bytes
-// are already raw, or a string's bytes have no "order" to flip), so both serializer families
-// share the same behavior here -- only their integral specializations (big-endian + sign-bit flip
-// for keys, little-endian for values) actually differ.
+// Shared body for the byte-container/string-like specializations of both serializer
+// families below: neither has a byte-order concern (the bytes are already raw, or a
+// string's bytes have no "order" to flip), so Key and Value share this behavior -- only
+// their integral specializations (big-endian + sign-bit flip for keys, little-endian
+// for values) actually differ.
 template <typename T>
 inline constexpr bool is_byte_container_v = std::is_same_v<std::decay_t<T>, std::span<const std::byte>> ||
                                             std::is_same_v<std::decay_t<T>, std::vector<std::byte>>;
 
 template <typename T>
 inline constexpr bool is_string_like_v = std::is_convertible_v<std::decay_t<T>, std::string_view>;
+
+template <typename T>
+inline constexpr bool is_raw_bytes_like_v = is_byte_container_v<T> || is_string_like_v<T>;
 
 template <typename T>
 inline auto serialize_byte_container(const T& value) noexcept -> std::span<const std::byte> {
@@ -64,6 +67,18 @@ inline auto serialize_string_like(const T& value) noexcept -> std::span<const st
   return {reinterpret_cast<const std::byte*>(view.data()), view.size()};
 }
 
+// Common base for the raw-bytes specializations of KeySerializer and ValueSerializer.
+template <typename T>
+struct RawBytesSerializer {
+  static auto serialize(const T& value) noexcept -> std::span<const std::byte> {
+    if constexpr (is_byte_container_v<T>) {
+      return serialize_byte_container(value);
+    } else {
+      return serialize_string_like(value);
+    }
+  }
+};
+
 // KeySerializer (Big Endian for lexicographical ordering)
 template <typename T, typename Enable = void>
 struct KeySerializer {
@@ -73,16 +88,7 @@ struct KeySerializer {
 };
 
 template <typename T>
-struct KeySerializer<T, std::enable_if_t<is_byte_container_v<T>>> {
-  static auto serialize(const T& value) noexcept -> std::span<const std::byte> {
-    return serialize_byte_container(value);
-  }
-};
-
-template <typename T>
-struct KeySerializer<T, std::enable_if_t<is_string_like_v<T>>> {
-  static auto serialize(const T& value) noexcept -> std::span<const std::byte> { return serialize_string_like(value); }
-};
+struct KeySerializer<T, std::enable_if_t<is_raw_bytes_like_v<T>>> : RawBytesSerializer<T> {};
 
 template <typename T>
 struct KeySerializer<T, std::enable_if_t<std::is_integral_v<std::decay_t<T>>>> {
@@ -98,27 +104,18 @@ struct ValueSerializer {
 };
 
 template <typename T>
-struct ValueSerializer<T, std::enable_if_t<is_byte_container_v<T>>> {
-  static auto serialize(const T& value) noexcept -> std::span<const std::byte> {
-    return serialize_byte_container(value);
-  }
-};
-
-template <typename T>
-struct ValueSerializer<T, std::enable_if_t<is_string_like_v<T>>> {
-  static auto serialize(const T& value) noexcept -> std::span<const std::byte> { return serialize_string_like(value); }
-};
+struct ValueSerializer<T, std::enable_if_t<is_raw_bytes_like_v<T>>> : RawBytesSerializer<T> {};
 
 template <typename T>
 struct ValueSerializer<T, std::enable_if_t<std::is_integral_v<std::decay_t<T>>>> {
   static auto serialize(T value) noexcept {
-    constexpr uint64_t kByteMask = 0xffU;
-    std::array<std::byte, kEncodedValueBytes> encoded{};
-    auto encoded_value = static_cast<uint64_t>(value);
-    for (size_t index = 0; index < kEncodedValueBytes; ++index) {
-      encoded[index] = static_cast<std::byte>((encoded_value >> (index * kEncodedValueBytes)) & kByteMask);
+    auto encoded = static_cast<uint64_t>(value);
+    if constexpr (std::endian::native == std::endian::big) {
+      encoded = std::byteswap(encoded);
     }
-    return encoded;
+    std::array<std::byte, kEncodedValueBytes> out{};
+    std::memcpy(out.data(), &encoded, sizeof(encoded));
+    return out;
   }
 };
 

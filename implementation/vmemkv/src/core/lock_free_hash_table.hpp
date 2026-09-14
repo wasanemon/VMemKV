@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <system_error>
 
+#include "core/mmap.hpp"
+
 template <typename Key, typename Slot>
 class LockFreeHashTable {
  public:
@@ -30,16 +32,7 @@ class LockFreeHashTable {
   // regardless of how many entries this generation actually holds.
   explicit LockFreeHashTable(size_t slot_capacity)
       : bucket_count_(std::bit_ceil(slot_capacity * 2)),
-        buckets_(static_cast<Bucket *>(::mmap(nullptr,
-                                              bucket_count_ * sizeof(Bucket),
-                                              PROT_READ | PROT_WRITE,
-                                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                                              -1,
-                                              0))) {
-    if (buckets_ == MAP_FAILED) {
-      throw std::system_error(errno, std::generic_category(), "mmap");
-    }
-  }
+        buckets_(static_cast<Bucket *>(vmemkv::mmap_anon_or_throw(bucket_count_ * sizeof(Bucket)))) {}
 
   ~LockFreeHashTable() { ::munmap(buckets_, bucket_count_ * sizeof(Bucket)); }
 

@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <initializer_list>
+#include <span>
 #include <system_error>
 
 namespace vmemkv {
@@ -15,6 +17,14 @@ static_assert(sizeof(EmptyOption) <= 1, "EmptyOption must be a zero-sized or min
 
 constexpr auto align_up(uint64_t size, uint64_t alignment = kDefaultAlignmentBytes) noexcept -> uint64_t {
   return (size + alignment - 1) & ~(alignment - 1);
+}
+
+// Aligned byte length of one record: header plus key plus value, rounded up.
+constexpr auto record_aligned_len(uint64_t header_bytes,
+                                  uint64_t key_bytes,
+                                  uint64_t value_bytes,
+                                  uint64_t alignment = kDefaultAlignmentBytes) noexcept -> uint64_t {
+  return align_up(header_bytes + key_bytes + value_bytes, alignment);
 }
 
 // FNV-1a64: shared by every on-disk format (WAL, checkpoint) that needs a fast, non-cryptographic
@@ -41,6 +51,36 @@ inline auto checksum_header(Header header) noexcept -> uint64_t {
   header.checksum = 0;
   return fnv1a64_update(kFnvOffsetBasis64, &header, sizeof(header));
 }
+
+// Checksum over a header (checksum field zeroed) plus each payload span in order.
+template <typename Header>
+inline auto checksum_header_plus_spans(Header header,
+                                       std::initializer_list<std::span<const std::byte>> spans) noexcept -> uint64_t {
+  uint64_t hash = checksum_header(header);
+  for (const auto span : spans) {
+    hash = fnv1a64_update(hash, span.data(), span.size());
+  }
+  return hash;
+}
+
+// Folding one FNV-1a64 range at a time.
+inline auto fnv1a64_range(uint64_t hash, std::span<const std::byte> data) noexcept -> uint64_t {
+  return fnv1a64_update(hash, data.data(), data.size());
+}
+
+// Incremental FNV-1a64 accumulator over sequentially written bytes.
+struct FoldingChecksum {
+  uint64_t state = kFnvOffsetBasis64;
+
+  void add(const void *data, size_t size) noexcept { state = fnv1a64_update(state, data, size); }
+  void add(std::span<const std::byte> data) noexcept { state = fnv1a64_range(state, data); }
+  template <typename Header>
+  void add_header(Header header) noexcept {
+    header.checksum = 0;
+    state = fnv1a64_update(state, &header, sizeof(header));
+  }
+  [[nodiscard]] auto value() const noexcept -> uint64_t { return state; }
+};
 
 // Best-effort file removal; failures are intentionally ignored (a leftover file is
 // harmless clutter at every call site, never an error).

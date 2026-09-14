@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -41,6 +42,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -54,7 +56,16 @@
 #endif
 
 #include "rival_common.hpp"
+#include "master_clone.hpp"
+#include "../core/spin_backoff.hpp"
 #include "rival_store_disabled_stub.hpp"
+
+namespace vmemkv::rivals {
+struct LeanStorePolicy {
+  static constexpr const char *kLabel = "LeanStore";
+  static constexpr const char *kCloneLabel = "LeanStore (clone)";
+};
+}  // namespace vmemkv::rivals
 
 // RAII file-descriptor guard for the sparse-copy helpers below.
 struct ScopeFd {
@@ -74,6 +85,9 @@ class LeanStoreStore {
 #else
       false;
 #endif
+  static constexpr bool kIsRival = true;
+  static void checkpoint() noexcept {}
+  static auto defragment() noexcept -> bool { return false; }
 
 #ifdef ENABLE_LEANSTORE
   // Worker threads per instance; sized to cover the harness's maximum benchmark thread count.
@@ -149,9 +163,8 @@ class LeanStoreStore {
   LeanStoreStore(const LeanStoreStore &) = delete;
   auto operator=(const LeanStoreStore &) -> LeanStoreStore & = delete;
 
-  // Tag type selecting the clone-from-master constructor below. Public so StoreAdapter's
-  // variadic forwarding constructor can name it directly.
-  struct CloneFromMasterTag {};
+  // Shared tag selecting the clone-from-master constructor (see master_clone.hpp).
+  using CloneFromMasterTag = vmemkv::rivals::CloneFromMasterTag;
 
   // Builds `master_path` once via bulk_load, then clones it with a plain file copy (never a
   // hardlink: pages are written in place).
@@ -381,6 +394,11 @@ class LeanStoreStore {
 
   static auto dram_gib() -> double {
     if (const char *env = std::getenv("LEANSTORE_DRAM_GIB")) {
+      double value = 0;
+      const auto *end = env + std::strlen(env);
+      if (std::from_chars(env, end, value).ec == std::errc{}) {
+        return value;
+      }
       return std::strtod(env, nullptr);
     }
     // Mirror the harness's memory posture: constrained under LTM, generous in-memory.
@@ -399,6 +417,11 @@ class LeanStoreStore {
 
   static auto getenv_u32(const char *name, uint32_t dflt, uint32_t clamp_max) -> uint32_t {
     if (const char *env = std::getenv(name)) {
+      uint32_t parsed = 0;
+      const auto *end = env + std::strlen(env);
+      if (std::from_chars(env, end, parsed).ec == std::errc{}) {
+        return std::min(clamp_max, parsed);
+      }
       return std::min(clamp_max, static_cast<uint32_t>(std::strtoul(env, nullptr, 10)));
     }
     return dflt;
@@ -626,6 +649,7 @@ class LeanStoreStore {
     const uint64_t committed_end = worker.logging.wt_to_lw.getSync().wal_written_offset;
     const uint64_t op_seq = op_seq_.fetch_add(1, std::memory_order_relaxed);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    vmemkv::SpinBackoff backoff;
     while (true) {
       const uint64_t gct = worker.logging.wal_gct_cursor.load(std::memory_order_acquire);
       if (gct == committed_end) {
@@ -641,7 +665,7 @@ class LeanStoreStore {
                      (unsigned)db_->getCRManager().workers_count);
         throw std::runtime_error("LeanStore group-durability wait timed out");
       }
-      std::this_thread::yield();
+      backoff.wait();
     }
   }
 

@@ -7,9 +7,9 @@
 #include <array>
 #include <atomic>
 #include <checkpoint/checkpoint.hpp>
+#include <core/env.hpp>
 #include <cstddef>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -48,8 +48,8 @@ auto per_entry_offset_mapper(PerEntryFn fn) {
 // Base directory for test-created T2/WAL/checkpoint files.
 inline auto test_temp_root() -> const std::filesystem::path & {
   static const std::filesystem::path root = [] {
-    if (const char *env = std::getenv("VMEMKV_TEST_TMPDIR"); env != nullptr && *env != '\0') {
-      return std::filesystem::path(env);
+    if (const std::string_view env = vmemkv::getenv_view("VMEMKV_TEST_TMPDIR"); !env.empty()) {
+      return std::filesystem::path(std::string(env));
     }
     return std::filesystem::temp_directory_path();
   }();
@@ -74,12 +74,11 @@ inline auto reserve_unique_temp_path(std::string_view prefix,
 
 // Removes every file a VMemKVImpl store could have created at `t2_path`.
 inline void remove_store_files(const std::filesystem::path &t2_path) {
-  std::error_code ignored;
-  std::filesystem::remove(t2_path, ignored);
+  vmemkv::remove_quiet(t2_path);
   vmemkv::remove_wal_segments(vmemkv::derive_wal_path(t2_path));
-  std::filesystem::remove(vmemkv::derive_manifest_path(t2_path), ignored);
-  std::filesystem::remove(vmemkv::derive_t1_chk_path(t2_path), ignored);
-  std::filesystem::remove(vmemkv::derive_t2_chk_path(t2_path), ignored);
+  vmemkv::remove_quiet(vmemkv::derive_manifest_path(t2_path));
+  vmemkv::remove_quiet(vmemkv::derive_t1_chk_path(t2_path));
+  vmemkv::remove_quiet(vmemkv::derive_t2_chk_path(t2_path));
 }
 
 // RAII guard around a path from reserve_unique_temp_path().
@@ -102,10 +101,8 @@ class ScopedTempPath {
   std::function<void(const std::filesystem::path &)> cleanup_;
 };
 
-inline void remove_plain_file(const std::filesystem::path &path) {
-  std::error_code ignored;
-  std::filesystem::remove(path, ignored);
-}
+// Alias kept for existing callers; new code uses vmemkv::remove_quiet directly.
+inline void remove_plain_file(const std::filesystem::path &path) { vmemkv::remove_quiet(path); }
 
 inline auto bytes_of(std::string_view value) -> std::vector<std::byte> {
   std::vector<std::byte> out(value.size());
