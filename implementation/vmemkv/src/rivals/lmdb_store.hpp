@@ -21,13 +21,6 @@
 #include "master_clone.hpp"
 #include "rival_store_disabled_stub.hpp"
 
-namespace vmemkv::rivals {
-struct LMDBPolicy {
-  static constexpr const char *kLabel = "LMDB";
-  static constexpr const char *kCloneLabel = "LMDB (clone)";
-};
-}  // namespace vmemkv::rivals
-
 class LMDBStore {
  public:
   static constexpr bool kIsEnabled =
@@ -339,7 +332,7 @@ class LMDBStore {
   // LMDB's default (unnamed) database uses plain memcmp byte-string ordering, so
   // this mirrors that exactly to decide whether `key` is past `upper_bound`.
   static auto compare_to_bound(const MDB_val &key, std::span<const std::byte> upper_bound) noexcept -> int {
-    return vmemkv::rivals::compare_bytes(
+    return vmemkv::bytes_compare_3way(
         std::span<const std::byte>(static_cast<const std::byte *>(key.mv_data), key.mv_size), upper_bound);
   }
 

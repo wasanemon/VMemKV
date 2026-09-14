@@ -17,11 +17,6 @@
 
 namespace vmemkv::rivals {
 
-// Byte-wise key ordering as a thin wrapper over the shared bytes helper.
-inline auto compare_bytes(std::span<const std::byte> a, std::span<const std::byte> b) noexcept -> int {
-  return vmemkv::bytes_compare_3way(a, b);
-}
-
 // Existence-gated mutation shared by rival backends (LMDB shape as model):
 // runs mutate() only when exists() matches required, otherwise reports false.
 template <typename ExistsFn, typename MutateFn>

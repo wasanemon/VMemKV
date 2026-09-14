@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../api/utils.hpp"
+#include "../core/io.hpp"
 #include "../core/spin_backoff.hpp"
 
 namespace vmemkv {
@@ -59,17 +60,6 @@ struct StallBackoff {
   auto note_spin() -> uint64_t { return ++spins; }
   auto should_warn() const -> bool { return spins == kStallWarnThreshold; }
 };
-
-// Exact-size pread shared by read_header_at()/read_payload_at().
-inline void pread_exact(int fd, void *buf, size_t len, off_t offset, const char *what) {
-  if (len == 0) {
-    return;
-  }
-  const ssize_t got = ::pread(fd, buf, len, offset);
-  if (got != static_cast<ssize_t>(len)) {
-    throw std::system_error(errno, std::generic_category(), what);
-  }
-}
 
 }  // namespace
 

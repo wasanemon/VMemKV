@@ -37,12 +37,9 @@ struct is_rival_store<T, std::void_t<decltype(T::kIsRival)>> : std::bool_constan
 
 // Rival (non-VMemKV) backends have no T1/T2 concept: they self-manage storage
 // layout, so reorganize()/get_statistics() are no-ops/empty for all of them.
-// New backends opt in via `static constexpr bool kIsRival = true`; the legacy
-// four-type enumeration below remains only for backends not yet migrated.
+// New backends opt in via `static constexpr bool kIsRival = true`.
 template <typename T>
-inline constexpr bool is_rival_store_v =
-    is_rival_store<T>::value || std::is_same_v<T, ::RocksDBStore> || std::is_same_v<T, ::RocksDBBlobDBStore> ||
-    std::is_same_v<T, ::LMDBStore> || std::is_same_v<T, ::LeanStoreStore>;
+inline constexpr bool is_rival_store_v = is_rival_store<T>::value;
 }  // namespace detail
 
 template <typename KVSImpl>

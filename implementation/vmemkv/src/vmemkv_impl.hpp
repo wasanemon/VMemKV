@@ -25,15 +25,20 @@
 //
 // Below is the Concurrency Matrix detailing synchronization across macro operations:
 //
-// +--------------------------+------------+--------------------+---------------------+-----------------------------+
-// | Operation A \ Operation B | Get / Scan | Write (Same Key)   | Write (Diff Key)    | Reorganize                  |
-// +--------------------------+------------+--------------------+---------------------+-----------------------------+
-// | Get / Scan               | Concurrent | Concurrent         | Concurrent          | Concurrent                  |
-// | Write (Same Key)         | Concurrent | Serial (Stripes)   | Concurrent          | Concurrent                  |
-// | Write (Diff Key)         | Concurrent | Concurrent         | Concurrent (atomic) | Concurrent                  |
-// | Reorganize               | Concurrent | Concurrent         | Concurrent          | Bypassed (reorg_in_progress)|
-// +--------------------------+------------+--------------------+---------------------+-----------------------------+
+// +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
+// | Operation A \ Operation B | Get / Scan | Write (Same Key)   | Write (Diff Key)    | Reorganize (T1-only)        | Checkpoint                  |
+// +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
+// | Get / Scan               | Concurrent | Concurrent         | Concurrent          | Concurrent (retry/snapshot) | Concurrent                  |
+// | Write (Same Key)         | Concurrent | Serial (Stripes)   | Concurrent          | Concurrent                  | Concurrent (brief append stall) |
+// | Write (Diff Key)         | Concurrent | Concurrent         | Concurrent (atomic) | Concurrent                  | Concurrent (brief append stall) |
+// | Reorganize (T1-only)     | Concurrent | Concurrent         | Concurrent          | Single-flight (reorg_.running) | Single-flight (reorg_.running) |
+// | Checkpoint               | Concurrent | Concurrent         | Concurrent          | Single-flight (reorg_.running) | Single-flight (reorg_.running) |
+// +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
 //
+// Reorg/checkpoint single-flight is shared (checkpoint_coordinator.hpp). T1 background
+// maintenance runs on a sharded worker pool with per-shard Closing/Split protocol
+// (t1_sharding_design.md); explicit reorganize()/checkpoint() wait via
+// wait_until_reorg_not_running().
 
 #pragma once
 
@@ -59,8 +64,10 @@
 #include <vmemkv/config.hpp>
 
 #include "checkpoint/checkpoint.hpp"
+#include "core/background_poll.hpp"
 #include "core/cgroup_memory_throttle.hpp"
 #include "core/reference_tracker.hpp"
+#include "core/single_flight.hpp"
 #include "core/swap_check.hpp"
 #include "t1_index/sharded_t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
@@ -140,6 +147,9 @@ class VMemKVImpl {
   static constexpr uint64_t kSizeEmbeddingShift = detail::kPayloadSizeShift;
   static constexpr uint64_t kOffsetMask = detail::kPayloadOffsetMask;
   static constexpr uint64_t kBlockAlignment = detail::kRecordBlockAlignment;
+  static_assert(kSizeEmbeddingShift == detail::kPayloadSizeShift);
+  static_assert(kOffsetMask == detail::kPayloadOffsetMask);
+  static_assert(kBlockAlignment == detail::kRecordBlockAlignment);
 
   // T2's live mmap is MAP_SHARED (T2FlatFile's constructor); on-disk bytes below the manifest's
   // committed boundary are trustworthy, everything above it is not (low_level_design.md 5.1/5.3).
@@ -226,7 +236,7 @@ class VMemKVImpl {
       // Lost the single-flight race to the background worker: its cycle already covers this
       // request's work (same shared trigger state), so wait for it instead of spinning a
       // second one. Bounded by one cycle's duration.
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      std::this_thread::sleep_for(kDefaultPoll10ms);
     }
   }
 
@@ -630,7 +640,7 @@ class VMemKVImpl {
     // cycle's own cost (full T1 scans plus relocation I/O), and the predicate itself is a few
     // atomic loads. A dedicated thread (rather than sharing reorg_worker_loop or T1's
     // shard-typed pool) keeps long relocation cycles from delaying checkpoint triggering.
-    constexpr auto kIdlePollInterval = std::chrono::seconds(1);
+    constexpr auto kIdlePollInterval = kDefragPoll1s;
     while (!stop_token.stop_requested()) {
       std::this_thread::sleep_for(kIdlePollInterval);
       if (stop_token.stop_requested()) {
@@ -668,7 +678,7 @@ class VMemKVImpl {
     // shutdown latency and reaction time to a real reorganize request without needing a wakeup
     // signal. Short enough to be imperceptible against reorganize's own multi-millisecond-plus
     // duration.
-    constexpr auto kIdlePollInterval = std::chrono::milliseconds(10);
+    constexpr auto kIdlePollInterval = kDefaultPoll10ms;
     while (!stop_token.stop_requested()) {
       if (!reorg_.requested.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(kIdlePollInterval);
@@ -679,11 +689,10 @@ class VMemKVImpl {
       }
       reorg_.requested.store(false, std::memory_order_release);
 
-      // CAS, not an unconditional store: the running flag is also claimed by explicit
-      // reorganize()/checkpoint() callers, and the two must never both believe they hold it at
-      // once. If an explicit call already holds it, this request is redundant -- skip this round.
-      bool expected_running = false;
-      if (!reorg_.running.compare_exchange_strong(expected_running, true, std::memory_order_acq_rel)) {
+      // Single-flight against explicit reorganize()/checkpoint() callers sharing
+      // reorg_.running; skip this round if one already holds it.
+      auto running_guard = SingleFlightGuard::try_acquire(reorg_.running);
+      if (!running_guard.holds) {
         continue;
       }
       try {
@@ -710,7 +719,6 @@ class VMemKVImpl {
       } catch (...) {
         // safe recovery in background
       }
-      reorg_.running.store(false, std::memory_order_release);
     }
   }
 

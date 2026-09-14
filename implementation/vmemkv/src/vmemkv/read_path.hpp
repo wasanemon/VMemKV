@@ -287,10 +287,6 @@ inline auto byte_span_equal(std::span<const std::byte> lhs, std::span<const std:
   return vmemkv::bytes_equal(lhs, rhs);
 }
 
-inline auto byte_span_less(std::span<const std::byte> lhs, std::span<const std::byte> rhs) noexcept -> bool {
-  return vmemkv::bytes_less(lhs, rhs);
-}
-
 inline auto key_in_range(std::span<const std::byte> key,
                          std::span<const std::byte> lower_bound,
                          std::span<const std::byte> upper_bound) noexcept -> bool {

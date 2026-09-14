@@ -14,6 +14,16 @@
 #include <string>
 #include <utility>
 
+#include "master_clone.hpp"
+
+namespace vmemkv::rivals {
+// Throws the shared "backend not compiled in" error for a runtime label.
+// Lets templates like RocksDBEngineStore reuse the same message without a macro string literal.
+[[noreturn]] inline void disabled_stub_throw(const std::string &label) {
+  throw std::runtime_error(label + " not enabled in this build");
+}
+}  // namespace vmemkv::rivals
+
 // clang-format off
 #define VMEMKV_RIVAL_DISABLED_STUB(ClassName, EngineLabel)                                            \
   explicit ClassName(const std::string &unused_path) {                                                \
@@ -23,7 +33,7 @@
   ~ClassName() = default;                                                                                  \
   ClassName(const ClassName &) = delete;                                                                    \
   auto operator=(const ClassName &)->ClassName & = delete;                                                   \
-  struct CloneFromMasterTag {};                                                                                \
+  using CloneFromMasterTag = ::vmemkv::rivals::CloneFromMasterTag;                                           \
   template <typename KeyFn, typename ValueFn>                                                                   \
   ClassName(CloneFromMasterTag /*tag*/,                                                                          \
            const std::string &master_path,                                                                       \

@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "api/utils.hpp"
+#include "core/single_flight.hpp"
 #include "t1_index/sharded_t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
 #include "vmemkv/read_path.hpp"
@@ -396,16 +397,12 @@ auto defrag_cycle(DefragState &state,
                   const std::filesystem::path &t2_path,
                   LockStripe &&lock_stripe,
                   MaybeReorg &&maybe_reorg,
-                  uint64_t checkpoint_count,
-                  bool force) -> bool {
-  bool expected_running = false;
-  if (!state.running.compare_exchange_strong(expected_running, true, std::memory_order_acq_rel)) {
+                   uint64_t checkpoint_count,
+                   bool force) -> bool {
+  auto running_guard = SingleFlightGuard::try_acquire(state.running);
+  if (!running_guard.holds) {
     return false;
   }
-  struct RunningReset {
-    std::atomic<bool> *flag;
-    ~RunningReset() { flag->store(false, std::memory_order_release); }
-  } reset{&state.running};
 
   // Relocation without reclamation only grows bytes_used: refuse the whole cycle where
   // holes cannot be punched (see punch_supported()).

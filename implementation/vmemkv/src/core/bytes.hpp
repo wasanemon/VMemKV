@@ -26,10 +26,6 @@ inline auto bytes_equal(std::span<const std::byte> a, std::span<const std::byte>
   return a.size() == b.size() && bytes_compare_3way(a, b) == 0;
 }
 
-inline auto bytes_less(std::span<const std::byte> a, std::span<const std::byte> b) noexcept -> bool {
-  return bytes_compare_3way(a, b) < 0;
-}
-
 inline auto bytes_in_range(std::span<const std::byte> key,
                            std::span<const std::byte> lo,
                            std::span<const std::byte> hi) noexcept -> bool {

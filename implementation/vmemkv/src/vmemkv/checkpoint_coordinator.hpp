@@ -24,6 +24,8 @@
 #include <vector>
 
 #include "checkpoint/checkpoint.hpp"
+#include "core/background_poll.hpp"
+#include "core/single_flight.hpp"
 #include "t1_index/sharded_t1_index.hpp"
 #include "t2_flat_file/t2_flat_file.hpp"
 #include "vmemkv/hooks.hpp"
@@ -100,7 +102,7 @@ inline void maybe_reorganize_if_needed(ReorgState &state, const Wal &wal) {
 // Only serializes explicit reorganize()/checkpoint() callers against a concurrently running
 // cycle; insert/update/delete never call this.
 inline void wait_until_reorg_not_running(const ReorgState &state) {
-  constexpr auto kIdlePollInterval = std::chrono::milliseconds(10);
+  constexpr auto kIdlePollInterval = kDefaultPoll10ms;
   const auto wait_start = std::chrono::steady_clock::now();
   while (state.running.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(kIdlePollInterval);
@@ -328,15 +330,8 @@ void run_reorganize(ReorgState &state,
       return;
     }
 
-    bool expected_running = false;
-    if (state.running.compare_exchange_strong(expected_running, true, std::memory_order_acq_rel)) {
-      try {
-        reorganize_internal(state, t1, t2, wal, own, t2_path, recovering, mode, pre_stop_hook, pre_finish_hook);
-      } catch (...) {
-        state.running.store(false, std::memory_order_release);
-        throw;
-      }
-      state.running.store(false, std::memory_order_release);
+    if (auto guard = SingleFlightGuard::try_acquire(state.running); guard.holds) {
+      reorganize_internal(state, t1, t2, wal, own, t2_path, recovering, mode, pre_stop_hook, pre_finish_hook);
       return;
     }
     // Lost the race: someone else is already running a cycle. Loop back and wait for it, then

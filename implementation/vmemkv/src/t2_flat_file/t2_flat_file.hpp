@@ -142,48 +142,9 @@ struct T2Memory : public BaseRegionMappings {
   // the advancing writer share one T2Memory instance rather than transitioning to a new one.
   mutable std::atomic<uint64_t> base_boundary{0};
 
-  // A second, read-only mmap covering [0, capacity) of this file -- distinct from `base`'s
-  // MADV_RANDOM mapping used everywhere else, left at the kernel's default readahead
-  // policy (no madvise call). Read by scan_impl() (and get_impl()'s large-record path, via
-  // try_read_resident_base_record()) for records whose embedded size hint is larger than one page
-  // -- see `base_mmap_scan_seq` below for the small-record counterpart and the "T2 base-region
-  // reads" comment in vmemkv_impl.hpp for why there are two. Mapped full-capacity (not just
-  // bytes_used-at-creation-time): since both this mapping and `base` are MAP_SHARED over the same
-  // file, they always transparently agree -- reads are only ever gated by the `offset <
-  // base_boundary` check (scan_impl()), never by whether this specific mapping has "seen" a write.
-  // Its lifetime is tied to this T2Memory via the same ThreadReferenceTracker-based retirement
-  // scheme that already protects `base`/`capacity`. Set unconditionally by T2FlatFile's
-  // constructor; nullptr only if that best-effort mapping failed, in which case the reader falls
-  // back to the always-correct `base` + seqlock path.
-  // `mutable` only so the destructor (a const-safe operation) can unmap it through the same
-  // `const T2Memory *` pattern bytes_used already uses; never mutated after construction
-  // otherwise.
-  mutable std::byte *base_mmap_scan = nullptr;
-
-  // A third mapping of the identical [0, capacity) region as `base_mmap_scan` above, advised
-  // MADV_SEQUENTIAL. Read only by scan_impl(), for records whose embedded size hint is one page
-  // or smaller -- get_impl() reads records this small through the primary `base` mapping
-  // instead (see the "T2 base-region reads" comment in vmemkv_impl.hpp for why). madvise is a property
-  // of the whole mapping, not of an individual read, so Scan's own two size classes need
-  // separately-advised mappings rather than one shared policy; which one a given record uses is
-  // decided per record (try_read_base_record() in vmemkv_impl.hpp), so
-  // a corpus with genuinely mixed record sizes is still handled correctly (just a
-  // readahead-policy choice, never a correctness one -- both mappings cover identical bytes).
-  // Same lifetime/retirement/best-effort/nullptr-by-default story as base_mmap_scan.
-  mutable std::byte *base_mmap_scan_seq = nullptr;
-
-  // A `dup()`'d file descriptor onto the same base-region file `base_mmap_scan`/
-  // `base_mmap_scan_seq` above map, used by get_impl() for a bounded `pread()` of one
-  // larger-than-one-page record instead of a page-fault-driven mmap read -- see the "T2
-  // base-region reads" comment in vmemkv_impl.hpp for why Get's large-record path and Scan want
-  // different read mechanisms on the same immutable bytes. `dup()`'d (not the original fd, which
-  // T2FlatFile's constructor closes right after mapping) so this handle's lifetime is
-  // self-contained and tied to this T2Memory, matching the two mappings' own retirement story.
-  // Set unconditionally by that constructor; -1 only if the best-effort dup() failed, in which
-  // case get_impl() falls back to the always-correct `base` + seqlock path. `mutable` for the
-  // same reason as base_mmap_scan.
-  mutable int read_fd = -1;
-
+  // Base-region mappings (scan/pread fast paths) are inherited from
+  // BaseRegionMappings above; see its comments. T2Memory adds only the
+  // mutable base mapping plus usage/boundary counters.
   // `initial_bytes_used`: for a rebuilt/adopted mapping with live records already at construction
   // time; 0 for a brand-new empty file.
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)

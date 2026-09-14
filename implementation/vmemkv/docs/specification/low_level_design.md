@@ -45,7 +45,8 @@ put() の in-place 更新を両立させる。
 
 **オンディスク(checkpoint)表現**: `T1ChkEntry`(32バイト、上記コアフィールドのみ)。`version`/
 `published` はランタイムの並行制御専用であり、単一プロセスの読み込みで完結する
-checkpoint には不要なため永続化しない(5.4節)。
+checkpoint には不要なため永続化しない(5.4節)。`hash` は inline 判定の上位4ビットを含めて
+そのまま永続化し、reload 後も inline 値の decode に使う。
 
 **Invariants**
 
@@ -89,7 +90,11 @@ struct T2Store {
 - `base` の先頭オフセットを `0` とする。
 - `bytes_used` は次に追記する record の offset を表す。
 - record offset は `0 <= offset < bytes_used` を満たす必要がある。
-- record の開始 offset は `alignof(ValueRecordHeader)` 境界にアラインされる。
+- record の開始 offset は `alignof(ValueRecordHeader)` (8バイト) 境界にアラインされる。
+  物理配置は8バイト単位だが、`payload_bits` の embedded block count は16バイト粒度
+  (`aligned_len / 16` を切り捨て) のサイズヒントであり、最大で8バイト過小になる。
+  読み取り側はヒント+16バイトのマージンで判定する。block count が16ビットに収まらない
+  巨大レコードは追記時に失敗として扱い、容量不足とは区別する。
 - record offset を参照する際は、`base + offset` を `ValueRecordHeader*` として解釈し、header に続く key bytes / value bytes を読む。
 
 **Payload Bit Layout**
@@ -126,10 +131,17 @@ struct VMemKV {
     ShardedT1Index t1;
     T2Store t2;
     Wal wal;
+    T2Ownership t2_own;   // セグメント会計・watermark・in-place barrier
+    ReorgState reorg;     // checkpoint/reorganize single-flight 状態
+    DefragState defrag;   // defrag single-flight・punch queue 状態
+    // + key stripe 256、background workers (reorg/defrag/T1 pool)、bulk-load throttle
 };
 ```
 
 起動時のロードや reorganize 後も、`T1Index` / `T2Store` は同じ形に再構築される。
+起動順は `t1_(workers=0)` 構築 → T2 adopt → checkpoint load → `t1_.start_workers()`
+→ WAL replay → workers 起動である。`t2_own_` の live カウンタは checkpoint load と
+WAL tail replay で再構築する。
 
 ## 3. Read / Write Operations
 
@@ -236,7 +248,7 @@ flowchart TD
 
 ### 3.6 Bulk Load
 
-`bulk_load()` は `write_entry_lockfree()` で entry を投入し、WAL をバイパスする。クラッシュ後の耐久保証はない。呼び出し後に `checkpoint()` を行った分のみ耐久される。T1-only reorganize は soft threshold で通常どおり発火する。他 writer との並行呼び出しは不可である。
+`bulk_load()` は `write_entry_lockfree()` で entry を投入し、WAL をバイパスする。クラッシュ後の耐久保証はない。呼び出し後に `checkpoint()` を行った分のみ耐久される。T1-only reorganize は soft threshold で通常どおり発火する。他 writer との並行呼び出しは不可である。投入ペースは `CgroupMemoryThrottle` で cgroup v2 メモリ圧に応じて抑制する。
 
 ## 4. Reorganize
 
@@ -297,8 +309,11 @@ entry 単位でインライン化されている entry(2.1.1 節、7.2 節)は T
 2. 新規 append を短時間止め(`stop_writers_and_wait()`)、この時点の `bytes_used` を `target` として確定する。
 3. 直ちに新規 append を再開する(`resume_writers()`)。in-place 更新はこの手順の間も一切止まらない。
 4. `capture_watermark_` に `target` を格納し、`InPlaceUpdateBarrier::wait_until_retired(target)` で対象範囲への飛行中 in-place 書き込みを drain する。以降の in-place 更新は `offset >= base_boundary` かつ `offset >= capture_watermark_` の場合のみ許可される。
-5. `[old_base_boundary, target)` を `msync(MS_SYNC)` する。
-6. `t1_.reorganize()` を呼ぶ。`append_region` を `sorted_region` へ統合し、T1 checkpoint ファイルを書き出す(temp + `rename`、5.4 節)。`payload_bits` を書き換えない恒等写像を渡す。
+5. `[old_base_boundary, target)` を `msync(MS_SYNC)` する。開始点はページ境界へ切り下げ、
+   前サイクルとの重複再 sync は冪等として許容する。
+6. シャードごとに `checkpoint_all_shards()` で `append_region` を `sorted_region` へ統合し
+   (空 append は sorted dump の shortcut、split 中は pause+retry)、T1 checkpoint ファイルを
+   書き出す(temp + `rename`、5.4 節)。`payload_bits` を書き換えない恒等写像を渡す。
 7. manifest に `checkpoint_lsn` と `target` を書く(5.3 節)。
 8. `base_boundary` を `target` へアトミックに前進させる。
 9. `Wal::rotate_segment()` を呼ぶ(5.5 節)。引数なし。世代連番の切替えのみであり、`checkpoint_lsn` を渡さない。
@@ -332,7 +347,7 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WA
 
 * **`WAL_MAX_BYTES_SINCE_CHECKPOINT`**: 直前 checkpoint の checkpoint LSN 以降に WAL へ append されたバイト数の上限。Checkpoint はこのサイズベースのトリガーのみで判定し、書き込みレートに関わらず起動時の WAL replay 時間を有界に保つ。
 * **`Force`**: `checkpoint()` の明示呼び出し。
-* 公開 API は **`reorganize()`**(T1-only インメモリマージ、T2 に触れず checkpoint もしない)・**`checkpoint()`** の2つ。`checkpoint()` は `checkpoint_internal()` を呼ぶ。
+* 公開 API は **`reorganize()`**(T1-only インメモリマージ、T2 に触れず checkpoint もしない)・**`checkpoint()`**・**`defragment()`** の3つ。`checkpoint()` は `checkpoint_internal()` を呼ぶ。`defragment()` の force 呼び出しは background の space-overhead gate を bypass する。
 
 | API | 効果 |
 |---|---|
@@ -344,8 +359,10 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes\_Since\_Checkpoint} \ge \text{WA
 
 `defragment()` は Storage Fragmentation を解消する唯一の機構である。T2 を 8MiB 固定の
 セグメント列とみなし、凍結済み (`seg_end <= base_boundary`) かつ garbage率 50% 以上の
-セグメントから live record を append frontier へ移設し、WAL-durable になった排出済み
-セグメントを次サイクルで hole-punch する。`bytes_used` は単調増加のまま
+セグメントを victim とする。victim 選択は `T2Ownership` の増分 live カウンタで行い、
+T1 全走査は victim 内 live offset の収集フェーズでのみ行う。収集した live record を
+append frontier へ移設し、WAL-durable になった排出済みセグメントを次サイクルで
+hole-punch する。`bytes_used` は単調増加のまま
 (offset 空間の再利用はしない)、物理ブロックのみ回収する。
 
 - 移設はキー単位 stripe lock 下での offset 一致検証付き T1 put で行い、前景の同一キー
@@ -370,14 +387,15 @@ flowchart TD
     W --> P([next cycle: punch prior victims])
     P --> TR
 ```
-- 起動条件は `T2DefragSpaceOverheadPercent`(既定 20%) を唯一の公開ノブとする。live が `bytes_used` の 20% 以下(= garbage 80% 以上)で初回発火し、以降は 5 ポイント以上の悪化・checkpoint による凍結域の増加・punch 待ちのいずれかで再発火する(ヒステリシス付き)。背景の専用ワーカースレッドが判定する。詳細は
+- 起動条件は `T2DefragSpaceOverheadPercent`(既定 20%) を唯一の公開ノブとする。live が `bytes_used` の 20% 以下(= garbage 80% 以上)で初回発火し、以降は 5 ポイント以上の悪化・checkpoint による凍結域の増加・punch 待ちのいずれかで再発火する(ヒステリシス付き)。実装は overhead 5% 未満を floor として無視し、任意の checkpoint count 変化で再走査し得る。背景の専用ワーカースレッドが判定する。詳細は
   [`../t2_defragment_design.md`](../t2_defragment_design.md) を参照。
 
 ### 4.6 T1 Reorganize Auto-Trigger
 
 各シャードの `append_region` は、専用の背景ワーカースレッドプールによって独立に監視される。
 シャードの `append_size()` が `maintenance_soft_threshold(append_capacity, scan_active)` に達すると、そのシャードだけがメンテナンスキューに投入され、ワーカーが `reorganize()` を実行して
-必要なら split する。他のシャードや呼び出し元スレッドをブロックしない。詳細は
+必要なら split する。他のシャードや呼び出し元スレッドをブロックしない。append が膨らまない
+delete-heavy の場合は `tombstones_since_maintenance >= target_shard_size` でも投入する。詳細は
 [`../t1_sharding_design.md`](../t1_sharding_design.md) の「背景ワーカーのスレッドプール」節を参照。
 
 ## 5. Checkpoint Reload
@@ -456,7 +474,7 @@ WAL は `<wal_path>.<generation>` の連番セグメント列である。`Wal::r
 
 `Wal::rotate_segment()` は group-commit のリーダー権(`flushing_` のアトミック交換)を獲得して以下を実行する。
 
-1. 新世代 `active_generation_ + 1` のセグメントを `O_CREAT | O_EXCL | O_APPEND` で開く。
+1. 新世代 `active_generation_ + 1` のセグメントを `O_RDWR | O_CREAT | O_EXCL | O_APPEND` で開く。
 2. 新 fd を active fd として公開し、`active_generation_` を進め、リーダー権を解放する。事前の `drain_pending()` は行わない。swap 直前に reserve されたレコードが旧・新いずれのセグメントに書き込まれても正しい。`replay()` はディスク上の全セグメントを世代順に読む。
 3. 旧 fd を `fd_close_mu_` 配下で close する。
 4. 2 世代前 `(new_generation - 2)` のセグメントを削除する。定常状態でディスク上に残るのは最大 2 世代である。
@@ -566,7 +584,7 @@ T1のインデックススロットに十分な空きビット領域がないた
 
 - **Bit 63 (`is_inline`)**: `1` の場合はインラインデータ、`0` の場合は T2オフセットを表す。
 - **Bits 62-60 (`inline_size`)**: インラインデータのバイトサイズ（1〜8バイト）を表す。サイズ `8` は `0` としてエンコードされる。
-- **Bits 59-0 (`clean_hash`)**: 実際の60ビットFnvハッシュキー。インデックスの検索、Bloom filterの登録・判定、SIMDスキャン等のハッシュ比較時には、上位4ビットをマスクしてこの60ビット部分のみを比較する。
+- **Bits 59-0 (`clean_hash`)**: 実際の60ビットFnvハッシュキー。インデックスの検索、Bloom filterの登録・判定、ハッシュ比較時には、上位4ビットをマスクしてこの60ビット部分のみを比較する。
 
 #### 7.2.2 インライン化の動作
 - **T2 オフセットとの識別 (判定)**:

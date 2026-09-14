@@ -18,6 +18,8 @@
 #endif
 
 #include "rival_common.hpp"
+#include "master_clone.hpp"
+#include "rival_store_disabled_stub.hpp"
 #include "rocksdb_common.hpp"
 
 namespace vmemkv::rivals {
@@ -129,7 +131,7 @@ class RocksDBEngineStore {
   // (a runtime-visible member, needed since this class is shared across two engine labels) isn't.
   explicit RocksDBEngineStore(const std::string &unused_path) {
     (void)unused_path;
-    throw std::runtime_error(std::string(Policy::kLabel) + " not enabled in this build");
+    vmemkv::rivals::disabled_stub_throw(Policy::kLabel);
   }
   ~RocksDBEngineStore() = default;
   RocksDBEngineStore(const RocksDBEngineStore &) = delete;
@@ -145,7 +147,7 @@ class RocksDBEngineStore {
     (void)key_count;
     (void)make_key;
     (void)make_value;
-    throw std::runtime_error(std::string(Policy::kLabel) + " not enabled in this build");
+    vmemkv::rivals::disabled_stub_throw(Policy::kLabel);
   }
   void reorganize() {}
   template <typename Callback>
@@ -173,7 +175,7 @@ class RocksDBEngineStore {
     (void)key_count;
     (void)make_key;
     (void)make_value;
-    throw std::runtime_error(std::string(Policy::kLabel) + " not enabled in this build");
+    vmemkv::rivals::disabled_stub_throw(Policy::kLabel);
   }
   template <typename Cb>
   auto scan_impl(std::span<const std::byte> low, std::span<const std::byte> high, Cb callback) const -> size_t {

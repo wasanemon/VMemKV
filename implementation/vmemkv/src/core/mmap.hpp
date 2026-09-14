@@ -74,17 +74,6 @@ class MmapGuard {
     return *this;
   }
 
-  [[nodiscard]] auto get() const noexcept -> void * { return address_; }
-  [[nodiscard]] auto size() const noexcept -> size_t { return size_; }
-  [[nodiscard]] auto valid() const noexcept -> bool { return address_ != nullptr; }
-
-  auto release() noexcept -> std::pair<void *, size_t> {
-    auto out = std::pair<void *, size_t>{address_, size_};
-    address_ = nullptr;
-    size_ = 0;
-    return out;
-  }
-
   void reset() noexcept {
     if (address_ != nullptr) {
       ::munmap(address_, size_);

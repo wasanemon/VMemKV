@@ -1,8 +1,9 @@
 // sharded_t1_index.hpp -- Range-sharded routing layer over K independent T1Index instances.
 //
 // See docs/t1_sharding_design.md for the full design (directory RCU, split protocol, forwarding
-// pointer state machine, scan consistency scope). T1Index itself is reused unchanged as the
-// per-shard leaf implementation.
+// pointer state machine, scan consistency scope). T1Index is the per-shard leaf implementation,
+// extended with sharding hooks (freeze/bypass, offset-mapped reorganize, sorted-region
+// dump/load).
 #pragma once
 
 #include <algorithm>
@@ -20,7 +21,9 @@
 #include <vector>
 #include <vmemkv/config.hpp>
 
+#include "../core/background_poll.hpp"
 #include "../core/reference_tracker.hpp"
+#include "../core/single_flight.hpp"
 #include "../core/spin_backoff.hpp"
 #include "t1_index.hpp"
 
@@ -177,8 +180,7 @@ class ShardedT1Index {
       Directory *dir = directory_.load(std::memory_order_acquire);
       if (dir->shards.size() == 1) {
         // No boundary search, no leaf collection, no per-call leaf vector allocation: a single
-        // shard answers the whole range directly (a split in progress reads through Closing,
-        // same as collect_leaves() below).
+        // shard answers the whole range directly (a split in progress reads through Closing).
         ShardSlot *slot = dir->shards[0];
         Split *split = slot->superseded.load(std::memory_order_acquire);
         if (split == nullptr || split == kClosingSentinel) {
@@ -437,14 +439,8 @@ class ShardedT1Index {
     return (target_shard_size * percent) / 100;
   }
 
-  // RAII true-while-held flag (splits_paused_). Preparation for unifying flag guards.
-  struct FlagGuard {
-    std::atomic<bool> *flag;
-    explicit FlagGuard(std::atomic<bool> &f) : flag(&f) { flag->store(true, std::memory_order_release); }
-    ~FlagGuard() { flag->store(false, std::memory_order_release); }
-    FlagGuard(const FlagGuard &) = delete;
-    auto operator=(const FlagGuard &) -> FlagGuard & = delete;
-  };
+  // RAII true-while-held flag (splits_paused_). Shared helper lives in core/single_flight.hpp.
+  using FlagGuard = vmemkv::FlagGuard;
 
   // Queue ownership shared by request_maintenance_if_needed()/run_maintenance()/continue_split().
   struct ShardQueue {
@@ -493,8 +489,8 @@ class ShardedT1Index {
     }
   };
 
-  // Read vs write handling of the Closing sentinel, shared by resolve()/resolve_for_write()/
-  // collect_leaves() so the three-way branch exists once.
+  // Read vs write handling of the Closing sentinel, shared by resolve()/resolve_for_write()
+  // so the three-way branch exists once.
   enum class ResolveMode { Read, Write };
 
   // Single Closing branch: Read treats Closing as a usable leaf, Write signals retry.
@@ -510,9 +506,6 @@ class ShardedT1Index {
   // View over one Directory snapshot: initial routing plus leaf fan-out in range.
   struct ShardSetView {
     Directory *dir;
-    [[nodiscard]] auto initial_slot(const Key &key) const -> ShardSlot * {
-      return dir->shards.size() == 1 ? dir->shards[0] : dir->shard_for(key);
-    }
     void for_each_leaf_in_range(const Key &lo, const Key &hi, auto &&visit) const {
       const size_t start_idx =
           dir->boundaries.empty()
@@ -580,25 +573,6 @@ class ShardedT1Index {
         }
       }
       slot = (key < split->boundary) ? split->low : split->high;
-    }
-  }
-
-  // Appends every leaf reachable from `slot` whose range could intersect [lo, hi]. Fans out into
-  // both sides of a Split{} when the query range straddles its internal boundary. Recursion
-  // depth is bounded by how many times the same slot has been re-split since any reader could
-  // have observed it -- one hop in every realistic case.
-  void collect_leaves(ShardSlot *slot, const Key &lo, const Key &hi, std::vector<ShardSlot *> &out) const {
-    Split *split = slot->superseded.load(std::memory_order_acquire);
-    if (split == nullptr || split == kClosingSentinel) {
-      // Unified Closing branch: reads treat Closing as a leaf (see ResolveMode::Read).
-      out.push_back(closing_slot_for_mode(slot, ResolveMode::Read));
-      return;
-    }
-    if (lo < split->boundary) {
-      collect_leaves(split->low, lo, hi, out);
-    }
-    if (!(hi < split->boundary)) {
-      collect_leaves(split->high, lo, hi, out);
     }
   }
 
@@ -829,7 +803,7 @@ class ShardedT1Index {
   // without needing a wakeup signal, and the interval is imperceptible against a single
   // maintenance cycle's own multi-millisecond-plus duration.
   void worker_loop(const std::stop_token &stop_token) {
-    constexpr auto kIdlePollInterval = std::chrono::milliseconds(10);
+    constexpr auto kIdlePollInterval = kDefaultPoll10ms;
     while (!stop_token.stop_requested()) {
       if (!run_maintenance()) {
         std::this_thread::sleep_for(kIdlePollInterval);

@@ -57,25 +57,15 @@
 
 #include "rival_common.hpp"
 #include "master_clone.hpp"
+#include "../core/io.hpp"
 #include "../core/spin_backoff.hpp"
 #include "rival_store_disabled_stub.hpp"
 
 namespace vmemkv::rivals {
-struct LeanStorePolicy {
-  static constexpr const char *kLabel = "LeanStore";
-  static constexpr const char *kCloneLabel = "LeanStore (clone)";
-};
 }  // namespace vmemkv::rivals
 
 // RAII file-descriptor guard for the sparse-copy helpers below.
-struct ScopeFd {
-  int fd = -1;
-  ~ScopeFd() {
-    if (fd >= 0) {
-      ::close(fd);
-    }
-  }
-};
+using ScopeFd = vmemkv::FdGuard;
 
 class LeanStoreStore {
  public:
@@ -104,8 +94,8 @@ class LeanStoreStore {
 
   // BTreeVI orders keys by raw memcmp, mirroring LMDBStore::compare_to_bound exactly.
   static auto compare_to_bound(const ::u8 *key, ::u16 key_len, std::span<const std::byte> upper_bound) noexcept -> int {
-    return vmemkv::rivals::compare_bytes(std::span<const std::byte>(reinterpret_cast<const std::byte *>(key), key_len),
-                                         upper_bound);
+    return vmemkv::bytes_compare_3way(std::span<const std::byte>(reinterpret_cast<const std::byte *>(key), key_len),
+                                     upper_bound);
   }
 
   // Aborts the current worker TX on ABORT_TX; abortTX() longjmps, so this stays trivial.

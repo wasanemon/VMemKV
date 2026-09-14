@@ -11,9 +11,9 @@ T2のStorage Fragmentation(T1から参照されなくなった旧版・削除済
 
 ## 手順
 
-1. T1全走査でセグメントごとのliveバイトを数え直し、凍結済み (`seg_end <= base_boundary`)
+1. `T2Ownership` の増分 live カウンタで victim を選択する: 凍結済み (`seg_end <= base_boundary`)
    かつgarbage率50%以上のセグメントをgarbageの多い順に victim とする。移動量は
-   1サイクル1GiB上限。
+   1サイクル1GiB上限。カウンタは checkpoint load と WAL replay で再構築する。
 2. 再走査で victim 範囲 (`[S_start - 1MiB, S_end)`) に開始点を持つlive offset を集め、
    昇順・重複除去する。1MiB slop はセグメント境界を跨ぐrecordのtailを逃さないためで、
    これによりpunchはセグメント全体を対象にできる。

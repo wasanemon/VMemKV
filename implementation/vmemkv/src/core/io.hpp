@@ -9,6 +9,31 @@
 
 namespace vmemkv {
 
+// RAII owner of one file descriptor. Closes on destruction, movable, non-copyable.
+struct FdGuard {
+  int fd = -1;
+  FdGuard() noexcept = default;
+  explicit FdGuard(int fd_in) noexcept : fd(fd_in) {}
+  ~FdGuard() noexcept {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+  FdGuard(const FdGuard &) = delete;
+  auto operator=(const FdGuard &) -> FdGuard & = delete;
+  FdGuard(FdGuard &&other) noexcept : fd(other.fd) { other.fd = -1; }
+  auto operator=(FdGuard &&other) noexcept -> FdGuard & {
+    if (this != &other) {
+      if (fd >= 0) {
+        ::close(fd);
+      }
+      fd = other.fd;
+      other.fd = -1;
+    }
+    return *this;
+  }
+};
+
 // Writes exactly `size` bytes or throws. Leaves `file_descriptor` open.
 inline void write_all_exact(int file_descriptor, const void *data, size_t size, const char *what) {
   const auto *bytes = static_cast<const std::byte *>(data);
