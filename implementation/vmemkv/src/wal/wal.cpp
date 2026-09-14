@@ -40,14 +40,14 @@ constexpr mode_t kWalFilePermissions = 0600;
 constexpr uint64_t kStallWarnThreshold = 20'000'000;
 constexpr uint64_t kIterationsPerMillionForLog = 1'000'000;
 
-inline void log_wal_stall(const char *role, uint64_t id, size_t slot, uint64_t next_lsn) {
+inline void log_wal_stall(const char *role, uint64_t worker_id, size_t slot, uint64_t next_lsn) {
   // <print>/std::println needs GCC 14+; this toolchain (GCC 13) doesn't have it yet.
   std::fprintf(  // NOLINT(modernize-use-std-print)
       stderr,
       "wal: %s stalled >%luM spins waiting (id=%lu slot=%zu next_lsn_=%lu)\n",
       role,
       static_cast<unsigned long>(kStallWarnThreshold / kIterationsPerMillionForLog),
-      static_cast<unsigned long>(id),
+      static_cast<unsigned long>(worker_id),
       slot,
       static_cast<unsigned long>(next_lsn));
 }
@@ -58,7 +58,7 @@ struct StallBackoff {
   uint64_t spins = 0;
   void wait() { backoff.wait(); }
   auto note_spin() -> uint64_t { return ++spins; }
-  auto should_warn() const -> bool { return spins == kStallWarnThreshold; }
+  [[nodiscard]] auto should_warn() const -> bool { return spins == kStallWarnThreshold; }
 };
 
 }  // namespace
@@ -255,7 +255,8 @@ void Wal::collect_batch(uint64_t target, std::vector<PendingRecord *> &batch) {
       // into the slot hasn't landed yet -- an unavoidable, brief window.
       publish_backoff.wait();
       rec = ring_[slot].load(std::memory_order_acquire);
-      if (publish_backoff.note_spin() == kStallWarnThreshold) {
+      publish_backoff.note_spin();
+      if (publish_backoff.should_warn()) {
         // Diagnostic tripwire, not a correctness fix: if the leader is stuck here, no thread is
         // doing real write()/fsync() I/O yet (write_and_fsync_batch() isn't entered until this
         // loop returns). Fires at most once per stall to avoid spamming the log.
@@ -409,7 +410,8 @@ auto Wal::reserve_record(WalRecordType type,
     // Backpressure: this slot's prior occupant hasn't been retired yet. Should rarely spin
     // meaningfully given kWalRingCapacity's margin over max concurrent callers.
     slot_backoff.wait();
-    if (slot_backoff.note_spin() == kStallWarnThreshold) {
+    slot_backoff.note_spin();
+    if (slot_backoff.should_warn()) {
       // Matching tripwire to collect_batch()'s: fires when a producer is stuck waiting for the
       // ring to make room, i.e. the leader isn't retiring slots. Seeing this without the
       // collect_batch() tripwire narrows down where the stall is.
